@@ -1,0 +1,15 @@
+[test]
+# Coverage is built into `bun test` — no extra dependency, and it runs in milliseconds.
+coverage = true
+coverageReporter = ["text", "lcov"]
+coverageDir = "coverage"
+coverageSkipTestFiles = true
+
+# Hard gate: `bun test` exits non-zero below this, so the same command CI runs enforces it.
+#
+# MUST be the scalar form. Verified on Bun 1.4.0: both object forms —
+#   coverageThreshold = { line = 0.95, function = 0.95 }
+#   [test.coverageThreshold]
+# parse without complaint and then silently DO NOT enforce (exit 0 at 84% against a 0.99 bar).
+# test/coverage-gate.test.ts guards this so the misconfiguration cannot come back unnoticed.
+coverageThreshold = 0.95

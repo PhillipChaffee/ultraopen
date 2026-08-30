@@ -51,7 +51,7 @@ describe("parse — pure-literal meta", () => {
     )
     expect(meta.name).toBe("review")
     expect(meta.phases?.map((p) => p.title)).toEqual(["Find", "Verify"])
-    expect(meta.phases?.[1].detail).toBe("check")
+    expect(meta.phases?.[1]?.detail).toBe("check")
   })
 
   test("shorthand referencing a variable is rejected with a location", () => {
@@ -206,11 +206,11 @@ describe("sandbox — runtime traps", () => {
 
   test("dynamic Date.now() throws at runtime too", async () => {
     // Static lint cannot see this; the runtime trap is the backstop.
-    await expect(exec(`const k = 'now'; return Date[k]()\n`)).rejects.toThrow(/Date\.now\(\)/)
+    await expect(exec(`const k = 'now'; return Date[k]()\n`)).rejects.toThrow(/Date\.now\(\)/u)
   })
 
   test("dynamic Math.random() throws at runtime too", async () => {
-    await expect(exec(`const k = 'random'; return Math[k]()\n`)).rejects.toThrow(/Math\.random\(\)/)
+    await expect(exec(`const k = 'random'; return Math[k]()\n`)).rejects.toThrow(/Math\.random\(\)/u)
   })
 
   test("new Date(0).getTime() still works", async () => {
@@ -234,8 +234,8 @@ describe("sandbox — runtime traps", () => {
   })
 
   test("require/fetch throw a clear error when reached dynamically", async () => {
-    await expect(run(`return require('node:fs')\n`, noopGlobals)).rejects.toThrow(/require. is not available/)
-    await expect(run(`return fetch('http://x')\n`, noopGlobals)).rejects.toThrow(/fetch. is not available/)
+    await expect(run(`return require('node:fs')\n`, noopGlobals)).rejects.toThrow(/require. is not available/u)
+    await expect(run(`return fetch('http://x')\n`, noopGlobals)).rejects.toThrow(/fetch. is not available/u)
   })
 
   test("top-level await works", async () => {
@@ -243,9 +243,9 @@ describe("sandbox — runtime traps", () => {
   })
 
   test("strict mode blocks an implicit global leak", async () => {
-    const before = (globalThis as Record<string, unknown>).__ultraopen_leak
+    const before = (globalThis as Record<string, unknown>)["__ultraopen_leak"]
     await expect(exec(`__ultraopen_leak = 42\n`)).rejects.toThrow()
-    expect((globalThis as Record<string, unknown>).__ultraopen_leak).toBe(before)
+    expect((globalThis as Record<string, unknown>)["__ultraopen_leak"]).toBe(before)
   })
 
   test("the body cannot see the plugin's module scope", async () => {
@@ -258,5 +258,51 @@ describe("sandbox — runtime traps", () => {
     const result = await run(body, { ...noopGlobals, log: (m: string) => seen.push(m), args: { value: 99 } })
     expect(result).toBe(99)
     expect(seen).toEqual(["hi"])
+  })
+})
+
+describe("sandbox — remaining guards", () => {
+  test("dynamically-constructed `new Date()` throws at runtime", async () => {
+    // The static lint cannot see this form; the Proxy construct trap is the backstop.
+    const body = `const D = Date; return new D()\n`
+    await expect(run(body, noopGlobals)).rejects.toThrow(/new Date\(\)/u)
+  })
+
+  test("`new Date(...)` with arguments still constructs through the trap", async () => {
+    const iso = await run(`return new Date(0).toISOString()\n`, noopGlobals)
+    expect(iso).toBe("1970-01-01T00:00:00.000Z")
+  })
+
+  test("a body that cannot compile reports a ParseError rather than leaking a SyntaxError", async () => {
+    // run() is reachable directly (e.g. by resume replaying a stored body), so it must not assume
+    // parse() already validated the source.
+    const promise = run(`if (\n`, noopGlobals)
+    await expect(promise).rejects.toThrow(WorkflowScriptError)
+    await expect(promise).rejects.toThrow(/failed to compile/u)
+  })
+
+  test("Function and importScripts are denied at runtime", async () => {
+    await expect(run(`return Function('return 1')\n`, noopGlobals)).rejects.toThrow(/Function. is not available/u)
+    await expect(run(`return importScripts('x')\n`, noopGlobals)).rejects.toThrow(/importScripts. is not available/u)
+  })
+
+  test("__dirname and __filename are undefined", async () => {
+    expect(await run(`return [typeof __dirname, typeof __filename]\n`, noopGlobals)).toEqual(["undefined", "undefined"])
+  })
+})
+
+describe("sandbox — Date proxy passthrough", () => {
+  test("non-function Date statics pass through unbound", async () => {
+    // The `get` trap binds functions but must return plain values untouched.
+    expect(await run(`return Date.name\n`, noopGlobals)).toBe("Date")
+    expect(await run(`return Date.length\n`, noopGlobals)).toBe(7)
+  })
+
+  test("Date.parse works through the bound-function branch", async () => {
+    expect(await run(`return Date.parse('1970-01-01T00:00:00.000Z')\n`, noopGlobals)).toBe(0)
+  })
+
+  test("instances keep their prototype methods", async () => {
+    expect(await run(`const d = new Date(86400000); return d.getUTCDate()\n`, noopGlobals)).toBe(2)
   })
 })

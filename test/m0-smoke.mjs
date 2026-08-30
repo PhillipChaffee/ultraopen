@@ -42,14 +42,14 @@ let fail = 0
 const check = (ok, label, detail) => {
   if (ok) {
     pass++
-    console.log(`  \x1b[32m✓\x1b[0m ${label}${detail ? ` — ${detail}` : ""}`)
+    console.log(`  \u001B[32m✓\u001B[0m ${label}${detail ? ` — ${detail}` : ""}`)
     return true
   }
   fail++
-  console.log(`  \x1b[31m✗\x1b[0m ${label}${detail ? ` — ${detail}` : ""}`)
+  console.log(`  \u001B[31m✗\u001B[0m ${label}${detail ? ` — ${detail}` : ""}`)
   return false
 }
-const info = (label, detail) => console.log(`  \x1b[90m·\x1b[0m ${label}${detail ? ` — ${detail}` : ""}`)
+const info = (label, detail) => console.log(`  \u001B[90m·\u001B[0m ${label}${detail ? ` — ${detail}` : ""}`)
 
 /** opencode serve prints its URL to stdout; parse it rather than guessing a port. */
 function startServer(cwd) {
@@ -69,7 +69,7 @@ function startServer(cwd) {
 
     const scan = (chunk) => {
       out += chunk
-      const m = out.match(/https?:\/\/127\.0\.0\.1:(\d+)/)
+      const m = out.match(/https?:\/\/127\.0\.0\.1:(\d+)/u)
       if (m && !settled) {
         settled = true
         clearTimeout(timer)
@@ -94,7 +94,7 @@ async function api(base, path, init = {}, timeoutMs = 30_000) {
     const res = await fetch(`${base}${path}`, {
       ...init,
       signal: ctl.signal,
-      headers: { "content-type": "application/json", ...(init.headers ?? {}) },
+      headers: { "content-type": "application/json", ...init.headers },
     })
     const text = await res.text()
     let body
@@ -179,13 +179,13 @@ async function main() {
       info("variants", `could not introspect ${target} from /config/providers — skipping variant assertions`)
     }
     const variantIds = model?.variants ? Object.keys(model.variants) : []
-    info("variants available", variantIds.length ? variantIds.join(", ") : "(none reported)")
+    info("variants available", variantIds.length > 0 ? variantIds.join(", ") : "(none reported)")
 
     const resolved = variantIds.includes(wantEffort)
       ? wantEffort
       : EFFORT_PREFERENCE.find((v) => variantIds.includes(v))
 
-    if (variantIds.length) {
+    if (variantIds.length > 0) {
       check(
         resolved !== undefined,
         `an effort variant resolves for ${target}`,
@@ -284,7 +284,7 @@ async function main() {
     const stillBroken = poisoned.status === 400
     info(
       "upstream format/history bug",
-      stillBroken ? "STILL PRESENT (expected) — GET message 400s on format sessions" : `\x1b[33mFIXED upstream! status ${poisoned.status} — revisit the journal design\x1b[0m`,
+      stillBroken ? "STILL PRESENT (expected) — GET message 400s on format sessions" : `\u001B[33mFIXED upstream! status ${poisoned.status} — revisit the journal design\u001B[0m`,
     )
 
     // (3b) MULTI-STEP probe — the shape every workflow subagent actually takes.
@@ -369,7 +369,7 @@ async function main() {
       )
       const msgs = await api(url, `/session/${id2}/message`)
       const arr = Array.isArray(msgs.body) ? msgs.body : []
-      const last = arr.filter((m) => (m.info ?? m).role === "user").at(-1)
+      const last = arr.findLast((m) => (m.info ?? m).role === "user")
       const persisted = (last?.info ?? last)?.model?.variant
       check(persisted === resolved, "requested variant persists on the user message", `got ${JSON.stringify(persisted)}`)
       await api(url, `/session/${id2}`, { method: "DELETE" }).catch(() => {})
@@ -378,11 +378,11 @@ async function main() {
     if (sessionID) await api(url, `/session/${sessionID}`, { method: "DELETE" }).catch(() => {})
     proc.kill("SIGTERM")
     setTimeout(() => proc.kill("SIGKILL"), 3000).unref?.()
-    if (!keepDir) await rm(dir, { recursive: true, force: true }).catch(() => {})
-    else console.log(`\nkept workdir: ${dir}`)
+    if (keepDir) console.log(`\nkept workdir: ${dir}`)
+    else await rm(dir, { recursive: true, force: true }).catch(() => {})
   }
 
-  console.log(`\n${fail === 0 ? "\x1b[32mM0 PASS\x1b[0m" : "\x1b[31mM0 FAIL\x1b[0m"}  ${pass} passed, ${fail} failed\n`)
+  console.log(`\n${fail === 0 ? "\u001B[32mM0 PASS\u001B[0m" : "\u001B[31mM0 FAIL\u001B[0m"}  ${pass} passed, ${fail} failed\n`)
   if (fail > 0) {
     console.log("If format+variant was rejected by the provider, the documented fallback is to drop")
     console.log("the variant on schema'd calls only. Record that before building on it.\n")
@@ -391,6 +391,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(`\n\x1b[31mM0 ERROR\x1b[0m ${err.message}\n`)
+  console.error(`\n\u001B[31mM0 ERROR\u001B[0m ${err.message}\n`)
   process.exit(2)
 })

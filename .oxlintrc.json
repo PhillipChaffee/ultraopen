@@ -1,0 +1,79 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error",
+    "pedantic": "error",
+    "perf": "error",
+    "style": "off",
+    "restriction": "off",
+    "nursery": "off"
+  },
+  "plugins": [
+    "typescript",
+    "unicorn",
+    "oxc",
+    "promise",
+    "import",
+    "node"
+  ],
+  "env": {
+    "es2024": true,
+    "node": true
+  },
+  "rules": {
+    "no-console": "off",
+    "eslint/no-await-in-loop": "off",
+    "typescript/consistent-type-imports": "error",
+    "typescript/no-explicit-any": "error",
+    "typescript/no-non-null-assertion": "error",
+    "eslint/eqeqeq": [
+      "error",
+      "always",
+      {
+        "null": "ignore"
+      }
+    ],
+    "eslint/no-param-reassign": "error",
+    "eslint/prefer-const": "error",
+    "unicorn/prefer-node-protocol": "error",
+    "promise/no-return-wrap": "error",
+    "unicorn/no-null": "off",
+    "unicorn/no-array-reduce": "off",
+    "unicorn/filename-case": "off",
+    "eslint/max-depth": [
+      "warn",
+      6
+    ],
+    "eslint/max-lines-per-function": "off",
+    "eslint/sort-keys": "off",
+    "eslint/max-params": "off",
+    "eslint/func-style": "off",
+    "eslint/id-length": "off",
+    "eslint/no-magic-numbers": "off",
+    "unicorn/no-useless-undefined": "off",
+    "import/no-named-export": "off",
+    "unicorn/prefer-top-level-await": "off"
+  },
+  "ignorePatterns": [
+    "dist/**",
+    "dist-test/**",
+    "node_modules/**",
+    "scratch/**",
+    "test/upstream-bugs/**"
+  ],
+  "overrides": [
+    {
+      "files": [
+        "test/**/*.ts",
+        "test/**/*.mjs"
+      ],
+      "rules": {
+        "typescript/no-explicit-any": "off",
+        "typescript/no-non-null-assertion": "off",
+        "eslint/max-lines": "off",
+        "eslint/no-underscore-dangle": "off"
+      }
+    }
+  ]
+}

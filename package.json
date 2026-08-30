@@ -27,13 +27,17 @@
     "@opencode-ai/sdk": "^1.18.20",
     "@types/bun": "^1.4.0",
     "@types/node": "^24.0.0",
+    "oxlint": "^1.80.0",
     "typescript": "^5.9.0"
   },
   "scripts": {
-    "build": "bun run script/build.ts",
+    "lint": "oxlint --config .oxlintrc.json",
+    "lint:fix": "oxlint --config .oxlintrc.json --fix",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "test:node": "node --test test/**/*.node.test.js",
-    "m0": "node test/m0-smoke.mjs"
+    "test:node": "node --test test/node/sandbox-parity.mjs",
+    "check": "bun run lint && bun run typecheck && bun run test && bun run test:node",
+    "m0": "node test/m0-smoke.mjs",
+    "build": "bun run script/build.ts"
   }
 }

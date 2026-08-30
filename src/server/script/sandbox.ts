@@ -15,7 +15,20 @@ import { WorkflowScriptError } from "./errors.js"
  *     threat model is determinism, not confinement — the authoring model already holds bash.
  */
 
-const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor as new (
+/**
+ * The AsyncFunction constructor, which is not exposed as a global.
+ *
+ * The probe is actually invoked rather than left as a bare literal: that turns an otherwise
+ * dead function expression into a genuine load-time self-check that the derived constructor
+ * really does produce async functions on this runtime (Bun and Node are both targets).
+ */
+const asyncProbe = async function asyncProbe(): Promise<void> {}
+/* istanbul ignore next -- defensive: unreachable on any conforming runtime */
+if (!(asyncProbe() instanceof Promise)) {
+  throw new TypeError("ultraopen: runtime does not support async functions")
+}
+
+const AsyncFunction = Object.getPrototypeOf(asyncProbe).constructor as new (
   ...args: string[]
 ) => (...args: unknown[]) => Promise<unknown>
 
@@ -143,5 +156,7 @@ export async function run(body: string, globals: SandboxGlobals): Promise<unknow
     })
   }
 
-  return compiled(...values)
+  // `await` (rather than a bare return) guarantees every failure surfaces as a rejection from
+  // this function, so callers never have to handle both a throw and a rejected promise.
+  return await compiled(...values)
 }

@@ -6,11 +6,15 @@
  * carries a line:col and an actionable suggestion.
  */
 
+export type SourcePosition = { line: number; column: number }
+
 export type Diagnostic = {
   kind: "ParseError" | "MetaError" | "DeterminismError" | "LimitError" | "RuntimeError"
   message: string
-  location?: { line: number; column: number }
-  suggestions?: string[]
+  // `| undefined` is deliberate under exactOptionalPropertyTypes: callers pass a computed
+  // location that may legitimately be absent, rather than conditionally omitting the key.
+  location?: SourcePosition | undefined
+  suggestions?: string[] | undefined
 }
 
 export class WorkflowScriptError extends Error {
@@ -36,17 +40,14 @@ export function render(diagnostic: Diagnostic, source?: string): string {
     const src = source.split("\n")[line - 1]
     if (src !== undefined) {
       const gutter = `${line} | `
-      lines.push("")
-      lines.push(`${gutter}${src}`)
-      lines.push(`${" ".repeat(gutter.length + Math.max(0, column))}^`)
+      lines.push("", `${gutter}${src}`, `${" ".repeat(gutter.length + Math.max(0, column))}^`)
     }
   } else if (diagnostic.location) {
     lines.push(`  at line ${diagnostic.location.line}:${diagnostic.location.column}`)
   }
 
   if (diagnostic.suggestions?.length) {
-    lines.push("")
-    for (const s of diagnostic.suggestions) lines.push(`  → ${s}`)
+    lines.push("", ...diagnostic.suggestions.map((s) => `  → ${s}`))
   }
 
   return lines.join("\n")
