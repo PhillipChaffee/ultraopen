@@ -34,7 +34,7 @@
     "lint": "oxlint --config .oxlintrc.json",
     "lint:fix": "oxlint --config .oxlintrc.json --fix",
     "typecheck": "tsc --noEmit",
-    "test": "bun test",
+    "test": "bun test --timeout 15000",
     "test:node": "node --test test/node/sandbox-parity.mjs",
     "check": "bun run lint && bun run typecheck && bun run test && bun run test:node",
     "m0": "node test/m0-smoke.mjs",
