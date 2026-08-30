@@ -1,0 +1,39 @@
+{
+  "name": "ultraopen",
+  "version": "0.0.0",
+  "description": "Deterministic multi-agent workflow orchestration and an ultracode effort mode for opencode",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    "./server": {
+      "import": "./dist/server.js"
+    },
+    "./tui": {
+      "import": "./dist/tui.js"
+    }
+  },
+  "files": [
+    "dist",
+    "skills"
+  ],
+  "engines": {
+    "opencode": ">=1.18.20"
+  },
+  "dependencies": {
+    "acorn": "8.15.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.18.20",
+    "@opencode-ai/sdk": "^1.18.20",
+    "@types/bun": "^1.4.0",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  },
+  "scripts": {
+    "build": "bun run script/build.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "test:node": "node --test test/**/*.node.test.js",
+    "m0": "node test/m0-smoke.mjs"
+  }
+}
