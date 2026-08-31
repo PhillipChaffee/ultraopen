@@ -1,8 +1,33 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test"
 import { ultraopen } from "../src/server/index.js"
 import { registry } from "../src/server/singleton.js"
 import { WORKFLOW_TOOL } from "../src/server/bridge/permission.js"
 import type { MutableConfig } from "../src/server/ultracode/config.js"
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+
+/**
+ * Point run artifacts at a temp directory.
+ *
+ * The tool persists a manifest, journal, result and script per run. Without this the suite writes
+ * real artifacts into the user's opencode data directory — ~27 stray run folders per `bun test`.
+ */
+let dataHome: string
+let savedDataHome: string | undefined
+
+beforeAll(async () => {
+  dataHome = await mkdtemp(join(tmpdir(), "ultraopen-testdata-"))
+  savedDataHome = process.env["XDG_DATA_HOME"]
+  process.env["XDG_DATA_HOME"] = dataHome
+})
+
+afterAll(async () => {
+  if (savedDataHome === undefined) delete process.env["XDG_DATA_HOME"]
+  else process.env["XDG_DATA_HOME"] = savedDataHome
+  await rm(dataHome, { recursive: true, force: true })
+})
+
 
 type ToolDef = {
   description: string
@@ -14,6 +39,10 @@ const META = "export const meta = { name: 'demo', description: 'a demo workflow'
 
 /** A client that never actually spawns — index tests exercise wiring, not the bridge. */
 const stubClient = {
+  config: {
+    get: () => Promise.resolve({ data: {} }),
+    providers: () => Promise.resolve({ data: { providers: [] } }),
+  },
   session: {
     create: () => Promise.resolve({ data: { id: "child" } }),
     get: () => Promise.resolve({ data: { id: "child" } }),
@@ -297,5 +326,22 @@ describe("model and effort wiring", () => {
     const tool = toolOf(ultraopen({ client: watched }))
     await tool?.execute({ script: `${META}return 1\n`, dryRun: true }, { sessionID: "parent" })
     expect(fetched).toBe(false)
+  })
+})
+
+describe("startup orphan sweep", () => {
+  test("a failing sweep never takes down plugin init", async () => {
+    // The sweep runs in the background during init. A server that rejects an abort — or is not
+    // reachable at all — must not stop the plugin from registering.
+    const hostile = {
+      config: stubClient.config,
+      session: { ...stubClient.session, abort: () => Promise.reject(new Error("server down")) },
+    }
+    const hooks = ultraopen({ client: hostile })
+    expect(toolOf(hooks)).toBeDefined()
+    // Let the detached sweep settle so an unhandled rejection would surface here.
+    await new Promise((resolve) => {
+      setTimeout(resolve, 5)
+    })
   })
 })

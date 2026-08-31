@@ -6,6 +6,10 @@ import { execute, prepare, renderFailure, type WorkflowArgs } from "./tool/workf
 import { WORKFLOW_TOOL } from "./bridge/permission.js"
 import { asClient } from "./types.js"
 import { description } from "./tool/description.js"
+import { beginRun, endRun, loadResume } from "./resume/persist.js"
+import { newBootId, reapOrphans } from "./resume/reaper.js"
+import { runDir } from "./resume/store.js"
+import { registry as runRegistry } from "./singleton.js"
 
 /**
  * The ultraopen server plugin.
@@ -45,6 +49,15 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
   const nested = process.env[ACTIVE_ENV] === "1"
 
   registry.configureConcurrency(options.concurrency)
+
+  // One boot id per process. Runs still marked `running` under a DIFFERENT boot id belonged to a
+  // process that died, and their subagents are still alive and billing — opencode never cascades
+  // an abort to plain parentID children. Swept in the background so plugin init is never blocked
+  // by a slow or unreachable server.
+  const bootId = newBootId()
+  // No .catch(): reapOrphans is contractually non-throwing (every I/O failure is swallowed and
+  // reported in its result), and an unreachable handler here would be untestable defensive code.
+  void reapOrphans(client, bootId, {})
 
   const hooks: Record<string, unknown> = {
     /**
@@ -90,6 +103,7 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
             ...(context.abort ? { signal: context.abort } : {}),
           }
 
+          let manifest
           try {
             // Parse BEFORE asking, so the permission prompt names the real workflow and can show
             // what it intends to do. `meta` is a pure literal specifically so it can be read
@@ -113,8 +127,39 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
               },
             })
 
-            return renderResult(await execute(args, workflowContext))
+            // Resume BEFORE the run starts, so replayed calls never spawn anything.
+            const resume = args.resumeFromRunId
+              ? await loadResume(args.resumeFromRunId, args.args, context.sessionID)
+              : undefined
+
+            manifest = await beginRun({
+              runId,
+              sessionID: context.sessionID,
+              source: prepared.source,
+              args: args.args,
+              bootId,
+            })
+
+            const result = await execute(args, {
+              ...workflowContext,
+              ...(resume && resume.entries.length > 0
+                ? { previousEntries: resume.entries, resumedFrom: args.resumeFromRunId }
+                : {}),
+            })
+
+            await endRun(manifest, {
+              status: "completed",
+              entries: result.journal,
+              value: result.value,
+              childSessionIDs: runRegistry.sessionsOf(runId),
+            })
+
+            return renderResult(result, {
+              resumed: resume?.entries.length ?? 0,
+              argsChanged: resume?.argsChanged === true,
+            })
           } catch (error) {
+            await endRun(manifest, { status: "failed", entries: [], value: null, childSessionIDs: [] })
             return renderFailure(error, args.script)
           }
         },
@@ -133,7 +178,10 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
  * agent is pre-authorised to read and hands back the path. Pre-capping here would stop that spill
  * from ever firing and silently lose the tail.
  */
-function renderResult(result: Awaited<ReturnType<typeof execute>>): string {
+function renderResult(
+  result: Awaited<ReturnType<typeof execute>>,
+  resume?: { resumed: number; argsChanged: boolean },
+): string {
   const lines = [
     `<result workflow="${result.meta.name}" run="${result.runId}" agents="${result.agentCount}">`,
     typeof result.value === "string" ? result.value : JSON.stringify(result.value, null, 2),
@@ -154,9 +202,17 @@ function renderResult(result: Awaited<ReturnType<typeof execute>>): string {
     lines.push("", "<log>", ...result.logs.map((line) => `  ${line}`), "</log>")
   }
 
+  // A replayed run must never read as a fresh one — the whole point of recording replays is that
+  // a cached empty and a fresh empty look identical otherwise.
+  if (resume?.argsChanged === true) {
+    lines.push("", "<resume note=\"args changed since the previous run, so nothing was replayed\" />")
+  }
+
+  const replayed = result.journal.filter((entry) => entry.replayed === true).length
   lines.push(
     "",
-    `<usage agents="${result.agentCount}" failed="${result.nulls.length}" output_tokens="${result.outputTokens}" />`,
+    `<usage agents="${result.agentCount}" failed="${result.nulls.length}" replayed="${replayed}" ` +
+      `output_tokens="${result.outputTokens}" run_dir="${runDir(result.runId)}" />`,
   )
   return lines.join("\n")
 }

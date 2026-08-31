@@ -1,8 +1,33 @@
-import { beforeEach, describe, expect, test } from "bun:test"
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test"
 import { execute } from "../src/server/tool/workflow.js"
 import { registry } from "../src/server/singleton.js"
 import type { JournalEntry } from "../src/server/resume/journal.js"
 import type { OpencodeClient, PromptBody } from "../src/server/types.js"
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+
+/**
+ * Point run artifacts at a temp directory.
+ *
+ * The tool persists a manifest, journal, result and script per run. Without this the suite writes
+ * real artifacts into the user's opencode data directory — ~27 stray run folders per `bun test`.
+ */
+let dataHome: string
+let savedDataHome: string | undefined
+
+beforeAll(async () => {
+  dataHome = await mkdtemp(join(tmpdir(), "ultraopen-testdata-"))
+  savedDataHome = process.env["XDG_DATA_HOME"]
+  process.env["XDG_DATA_HOME"] = dataHome
+})
+
+afterAll(async () => {
+  if (savedDataHome === undefined) delete process.env["XDG_DATA_HOME"]
+  else process.env["XDG_DATA_HOME"] = savedDataHome
+  await rm(dataHome, { recursive: true, force: true })
+})
+
 
 const META = "export const meta = { name: 'r', description: 'resume tests' }\n"
 
