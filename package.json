@@ -1,6 +1,6 @@
 {
   "name": "ultraopen",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Deterministic multi-agent workflow orchestration and an ultracode effort mode for opencode",
   "license": "MIT",
   "type": "module",
@@ -14,7 +14,10 @@
   },
   "files": [
     "dist",
-    "skills"
+    "skills",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
   ],
   "engines": {
     "opencode": ">=1.18.20"
@@ -40,6 +43,31 @@
     "test:node": "node --test test/node/sandbox-parity.mjs",
     "check": "bun run lint && bun run typecheck && bun run test && bun run test:node",
     "m0": "node test/m0-smoke.mjs",
-    "build": "bun run script/build.ts"
+    "build": "bun run script/build.ts",
+    "prepublishOnly": "bun run check && bun run build"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "workflow",
+    "agents",
+    "orchestration",
+    "ultracode"
+  ],
+  "peerDependencies": {
+    "@opentui/core": ">=0.4.5",
+    "@opentui/solid": ">=0.4.5",
+    "solid-js": ">=1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentui/core": {
+      "optional": true
+    },
+    "@opentui/solid": {
+      "optional": true
+    },
+    "solid-js": {
+      "optional": true
+    }
   }
 }

@@ -33,6 +33,13 @@ export async function parallel(thunks: ReadonlyArray<() => unknown>): Promise<un
   }
   assertWithinLimit(thunks.length, "parallel")
 
+  // Validated UP FRONT, not per-thunk inside the catch. Passing promises instead of thunks is the
+  // single most common authoring error, and swallowing it into a row of nulls leaves the author
+  // with no explanation for why nothing ran.
+  if (thunks.some((thunk) => typeof thunk !== "function")) {
+    throw new TypeError("parallel() expects an array of functions, not promises. Wrap each call: () => agent(...)")
+  }
+
   // One frame for the whole call, so every thunk shares it and a sibling parallel() gets its own.
   const frame = openFrame("P")
 
@@ -42,11 +49,6 @@ export async function parallel(thunks: ReadonlyArray<() => unknown>): Promise<un
       // promise (`() => { throw x }`, or a non-function entry) must still resolve to null rather
       // than rejecting the whole barrier.
       try {
-        if (typeof thunk !== "function") {
-          throw new TypeError(
-            "parallel() expects an array of functions, not promises. Wrap each call: () => agent(...)",
-          )
-        }
         // Each thunk gets its own resume scope: thunks past the concurrency cap start in
         // completion order, so a shared sequence would disagree between runs.
         return await withChildScope("P", frame, index, async () => await thunk())

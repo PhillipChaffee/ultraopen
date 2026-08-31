@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto"
+import { join } from "node:path"
 import { resolveOptions } from "./options.js"
 import { registry } from "./singleton.js"
 import { installConfig, type MutableConfig } from "./ultracode/config.js"
@@ -72,7 +73,8 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
      * permanently caching an agent list without `ultracode` for this instance's lifetime.
      */
     config: (config: MutableConfig): void => {
-      installConfig(config, {})
+      // Resolved from this module's own location so it works from node_modules or a file spec.
+      installConfig(config, { skillsPath: join(import.meta.dirname, "..", "skills") })
     },
 
     /**

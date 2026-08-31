@@ -55,10 +55,10 @@ describe("parallel", () => {
     expect(results).toEqual([null, 1])
   })
 
-  test("a non-function entry resolves to null rather than rejecting the barrier", async () => {
-    const notAThunk = Promise.resolve(1) as unknown as () => unknown
-    const results = await parallel([notAThunk, () => 2])
-    expect(results).toEqual([null, 2])
+  test("a non-function entry THROWS rather than resolving to null", async () => {
+    // Passing promises instead of thunks is the most common authoring error. Degrading it to a row
+    // of nulls would leave the author with no explanation for why nothing ran.
+    await expect(parallel([Promise.resolve(1) as unknown as () => unknown])).rejects.toThrow(/not promises/u)
   })
 
   test("passing a non-array throws a TypeError naming the authoring mistake", async () => {
