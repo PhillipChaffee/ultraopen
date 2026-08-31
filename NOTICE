@@ -1,17 +1,12 @@
 Attribution
 ===========
 
-ultraopen ports the design of Claude Code's "Workflow" tool and its "ultracode" effort mode to
-opencode.
+ultraopen is an independent implementation, for opencode, of the workflow-orchestration and
+effort-mode design introduced by Claude Code.
 
-Portions of the tool description and the workflow-authoring reference are adapted from Anthropic's
-Claude Code. They are kept close to the original deliberately: the wording of the opt-in gate, the
-pipeline-versus-parallel decision rule and the pattern catalogue is behaviourally load-bearing — a
-model reads it and writes different code as a result — so paraphrasing it would change what the
-tool does. Treat that text as part of the implementation rather than as documentation.
-
-Adaptations are limited to what opencode actually does:
-  - `Workflow({...})` -> `workflow({...})`, the opencode tool id
-  - "the Agent tool" -> "the task tool"
-  - the asynchronous task-id contract rewritten as blocking, because opencode exposes no
-    background-job route to a plugin
+The tool description and the workflow-authoring reference adapt wording from Claude Code. That text
+is kept close to the original deliberately: the model reads it at runtime and writes different code
+as a result, so it is part of the implementation rather than documentation — paraphrasing it would
+change what the tool does. Adaptations are limited to what opencode actually does, chiefly
+`Workflow({...})` becoming `workflow({...})`, "the Agent tool" becoming "the task tool", and the
+asynchronous task-id contract rewritten as blocking.
