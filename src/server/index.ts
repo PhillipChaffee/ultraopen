@@ -73,11 +73,20 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
         args: workflowArgsSchema(),
         execute: async (args: WorkflowArgs, context: ToolContext): Promise<string> => {
           const runId = `wf_${randomUUID().replaceAll("-", "").slice(0, 12)}`
+          // The session's default model, so `effort` resolves against ITS variant set rather
+          // than a guess. A failure here is non-fatal: effort simply goes unapplied, and the run
+          // log says so.
+          const defaultModel = await client.config
+            ?.get?.()
+            .then((response) => response.data?.model)
+            .catch(() => undefined)
+
           const workflowContext = {
             client,
             sessionID: context.sessionID,
             runId,
             deadlineMs: options.agentDeadlineMs,
+            ...(defaultModel === undefined ? {} : { defaultModel }),
             ...(context.abort ? { signal: context.abort } : {}),
           }
 

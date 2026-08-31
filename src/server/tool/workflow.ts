@@ -3,6 +3,8 @@ import { parse } from "../script/parse.js"
 import { run as runSandbox } from "../script/sandbox.js"
 import { parallel, pipeline } from "../runtime/combinators.js"
 import { Run, type AgentOptions, type ProgressEvent } from "../runtime/run.js"
+import { subagentContract } from "../bridge/contract.js"
+import { makeResolvers } from "../bridge/models.js"
 import { registry } from "../singleton.js"
 import type { Ruleset } from "../bridge/permission.js"
 import type { OpencodeClient } from "../types.js"
@@ -29,8 +31,12 @@ export type WorkflowContext = {
   runId: string
   inheritedPermission?: Ruleset | undefined
   resolveModel?: ((model: string | undefined) => { providerID: string; modelID: string } | undefined) | undefined
-  resolveVariant?: ((effort: string | undefined) => string | undefined) | undefined
+  resolveVariant?:
+    | ((effort: string | undefined, model?: { providerID: string; modelID: string } | undefined) => string | undefined)
+    | undefined
   subagentContract?: ((opts: AgentOptions) => string | undefined) | undefined
+  /** The session's default model, used to resolve effort against the right variant set. */
+  defaultModel?: string | undefined
   deadlineMs?: number | undefined
   signal?: AbortSignal | undefined
   onProgress?: ((event: ProgressEvent) => void) | undefined
@@ -82,13 +88,40 @@ async function runPrepared(
 ): Promise<WorkflowResult> {
   const parsed = prepared
 
+  // Notes can arrive both before the Run exists (catalog fetch) and during the script
+  // (per-model downgrades, emitted lazily when an agent first asks for an effort). Buffer until
+  // the Run is available, then redirect straight to its log — draining once up front would
+  // silently discard every note raised after the script starts, which is most of them.
+  const sink: { emit?: (note: string) => void } = {}
+  const buffered: string[] = []
+  const note = (message: string): void => {
+    if (sink.emit) sink.emit(message)
+    else buffered.push(message)
+  }
+
+  // Read the provider catalog once per run so `effort` resolves against each model's REAL variant
+  // set. Skipped entirely for a dry run, which makes no model calls.
+  let resolvers: { resolveModel: WorkflowContext["resolveModel"]; resolveVariant: WorkflowContext["resolveVariant"] } = {
+    resolveModel: context.resolveModel,
+    resolveVariant: context.resolveVariant,
+  }
+  if (!args.dryRun && !context.resolveVariant) {
+    const built = await makeResolvers(context.client, {
+      ...(context.defaultModel === undefined ? {} : { defaultModel: context.defaultModel }),
+      onNote: note,
+    })
+    resolvers = { resolveModel: context.resolveModel ?? built.resolveModel, resolveVariant: built.resolveVariant }
+  }
+
   const run = new Run({
     runId: context.runId,
     client: context.client,
     parentSessionID: context.sessionID,
-    ...optional("resolveModel", context.resolveModel),
-    ...optional("resolveVariant", context.resolveVariant),
-    ...optional("subagentContract", context.subagentContract),
+    // Every workflow subagent is told its output is a return value, not a reply to a person,
+    // unless the caller supplied its own contract.
+    subagentContract: context.subagentContract ?? subagentContract,
+    ...optional("resolveModel", resolvers.resolveModel),
+    ...optional("resolveVariant", resolvers.resolveVariant),
     ...optional("inheritedPermission", context.inheritedPermission),
     ...optional("deadlineMs", context.deadlineMs),
     ...optional("signal", context.signal),
@@ -106,6 +139,10 @@ async function runPrepared(
         return Promise.resolve(options.schema ? {} : `[dryRun] ${prompt.slice(0, 200)}`)
       }
     : run.agent
+
+  // Redirect first, then flush: anything raised while the script runs must land in the log too.
+  sink.emit = run.log
+  for (const message of buffered) run.log(message)
 
   try {
     const value = await runSandbox(prepared.body, {

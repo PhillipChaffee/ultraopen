@@ -236,3 +236,66 @@ describe("tool execution", () => {
     expect(output).toContain('of="2"')
   })
 })
+
+describe("model and effort wiring", () => {
+  const catalogClient = {
+    config: {
+      get: () => Promise.resolve({ data: { model: "opencode/claude-sonnet-4-6" } }),
+      providers: () =>
+        Promise.resolve({
+          data: {
+            providers: [
+              { id: "opencode", models: { "claude-sonnet-4-6": { variants: { low: {}, high: {}, max: {} } } } },
+            ],
+          },
+        }),
+    },
+    session: {
+      ...stubClient.session,
+      prompt: () =>
+        Promise.resolve({ data: { info: { tokens: { output: 1 } }, parts: [{ type: "text", text: "ok" }] } }),
+    },
+  }
+
+  test("reads the session's default model and resolves effort against ITS variants", async () => {
+    const tool = toolOf(ultraopen({ client: catalogClient }))
+    const script = `${META}await agent('x', { effort: 'xhigh' })\nreturn 'done'\n`
+    const output = await tool?.execute({ script }, { sessionID: "parent" })
+
+    // The model has no xhigh, so the request is downgraded — and the run log SAYS so, rather than
+    // silently applying no extra thinking at all.
+    expect(output).toContain("<log>")
+    expect(output).toContain("unsupported")
+    expect(output).toContain("high")
+  })
+
+  test("a client whose config.get fails still runs", async () => {
+    const failing = {
+      config: {
+        get: () => Promise.reject(new Error("no config")),
+        providers: () => Promise.resolve({ data: { providers: [] } }),
+      },
+      session: catalogClient.session,
+    }
+    const tool = toolOf(ultraopen({ client: failing }))
+    const output = await tool?.execute({ script: `${META}return 'fine'\n` }, { sessionID: "parent" })
+    expect(output).toContain("fine")
+  })
+
+  test("a dry run skips the catalog entirely", async () => {
+    let fetched = false
+    const watched = {
+      config: {
+        get: () => Promise.resolve({ data: { model: "opencode/claude-sonnet-4-6" } }),
+        providers: () => {
+          fetched = true
+          return Promise.resolve({ data: { providers: [] } })
+        },
+      },
+      session: stubClient.session,
+    }
+    const tool = toolOf(ultraopen({ client: watched }))
+    await tool?.execute({ script: `${META}return 1\n`, dryRun: true }, { sessionID: "parent" })
+    expect(fetched).toBe(false)
+  })
+})

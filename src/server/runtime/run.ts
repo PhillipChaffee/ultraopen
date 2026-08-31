@@ -40,8 +40,15 @@ export type RunOptions = {
   runId: string
   client: OpencodeClient
   parentSessionID: string
-  /** Resolves an `effort` string against the target model's real variant map. */
-  resolveVariant?: ((effort: string | undefined) => string | undefined) | undefined
+  /**
+   * Resolves an `effort` string against the target model's real variant map.
+   *
+   * Receives the resolved model, because variants belong to a model and an individual agent() call
+   * may pin one that differs from the run default.
+   */
+  resolveVariant?:
+    | ((effort: string | undefined, model?: { providerID: string; modelID: string } | undefined) => string | undefined)
+    | undefined
   /** Parses a "provider/model" string into the prompt-body model ref. */
   resolveModel?: ((model: string | undefined) => { providerID: string; modelID: string } | undefined) | undefined
   inheritedPermission?: Ruleset | undefined
@@ -138,6 +145,7 @@ export class Run {
     // parallel() nested in a pipeline() stage would deadlock behind its own outer item.
     const release = await registry.semaphore.acquire()
     let outcome: SpawnOutcome
+    const model = this.#options.resolveModel?.(options.model)
     try {
       outcome = await spawnStructured(this.#options.client, {
         prompt,
@@ -147,8 +155,8 @@ export class Run {
         ...pick("agentType", options.agentType),
         ...pick("schema", options.schema),
         ...pick("disallowedTools", options.disallowedTools),
-        ...pick("model", this.#options.resolveModel?.(options.model)),
-        ...pick("variant", this.#options.resolveVariant?.(options.effort)),
+        ...pick("model", model),
+        ...pick("variant", this.#options.resolveVariant?.(options.effort, model)),
         ...pick("system", this.#options.subagentContract?.(options)),
         ...pick("inheritedPermission", this.#options.inheritedPermission),
         ...pick("deadlineMs", this.#options.deadlineMs ?? DEFAULT_AGENT_DEADLINE_MS),

@@ -140,6 +140,16 @@ export type SessionInfo = {
  * and, under `opencode run`, target a fabricated `http://localhost:4096` that points at nothing.
  */
 export type OpencodeClient = {
+  /**
+   * Used once per run to read each model's real reasoning-variant set.
+   *
+   * Optional: effort resolution degrades to "no variants known" when it is absent or fails, which
+   * reports every effort request as unhonoured rather than sending a variant that may not exist.
+   */
+  config?: {
+    providers: () => Promise<{ data?: { providers?: Array<{ id?: string; models?: Record<string, { variants?: Record<string, unknown> } | undefined> }> }; error?: unknown }>
+    get?: () => Promise<{ data?: { model?: string }; error?: unknown }>
+  }
   session: {
     create: (options: { body?: CreateSessionBody; query?: { directory?: string } }) => Promise<{
       data?: SessionInfo
