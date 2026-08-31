@@ -1,20 +1,17 @@
-ultraopen
-=========
+Attribution
+===========
 
-Not affiliated with, endorsed by, or sponsored by Anthropic PBC or the opencode maintainers.
+ultraopen ports the design of Claude Code's "Workflow" tool and its "ultracode" effort mode to
+opencode.
 
-This project ports the design of Claude Code's "Workflow" tool and its "ultracode" effort mode to
-opencode. Portions of the tool description and the workflow-authoring reference are adapted from
-Anthropic's Claude Code, which is copyright Anthropic PBC. They are included here for
-interoperability: the wording of the opt-in gate, the pipeline-versus-parallel decision rule and
-the pattern catalogue is behaviourally load-bearing — a model reads it and writes different code as
-a result — so paraphrasing it would change what the tool does.
+Portions of the tool description and the workflow-authoring reference are adapted from Anthropic's
+Claude Code. They are kept close to the original deliberately: the wording of the opt-in gate, the
+pipeline-versus-parallel decision rule and the pattern catalogue is behaviourally load-bearing — a
+model reads it and writes different code as a result — so paraphrasing it would change what the
+tool does. Treat that text as part of the implementation rather than as documentation.
 
-Adaptations from the original are limited to what opencode actually does:
+Adaptations are limited to what opencode actually does:
   - `Workflow({...})` -> `workflow({...})`, the opencode tool id
   - "the Agent tool" -> "the task tool"
   - the asynchronous task-id contract rewritten as blocking, because opencode exposes no
     background-job route to a plugin
-
-"Claude" and "Claude Code" are trademarks of Anthropic PBC. "opencode" is a trademark of its
-respective owners.
