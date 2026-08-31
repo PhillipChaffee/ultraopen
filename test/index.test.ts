@@ -166,17 +166,45 @@ describe("tool execution", () => {
     expect(await run({ script, dryRun: true })).toContain('agents="3"')
   })
 
-  test("asks for permission before fanning out, scoped to this workflow", async () => {
+  test("asks for permission using the workflow's real name, not the ignored title arg", async () => {
+    // The script is parsed BEFORE asking so the prompt can name the workflow. Using the `title`
+    // argument would be wrong twice over: it is documented as ignored, and models omit it — which
+    // showed up live as a permission prompt reading "null".
     const asked: Array<Record<string, unknown>> = []
     await run(
-      { script: `${META}return 1\n`, dryRun: true, title: "audit" },
+      { script: `${META}return 1\n`, dryRun: true, title: "ignored-title" },
       { ask: (request: Record<string, unknown>) => { asked.push(request); return Promise.resolve() } },
     )
     expect(asked.length).toBe(1)
     expect(asked[0]?.["permission"]).toBe(WORKFLOW_TOOL)
+    expect(asked[0]?.["patterns"]).toEqual(["demo"])
     // NOT ["*"]: an "always" grant is stored instance-wide, so approving with "*" would
     // permanently disable the prompt for every workflow in the directory.
-    expect(asked[0]?.["always"]).toEqual(["audit"])
+    expect(asked[0]?.["always"]).toEqual(["demo"])
+  })
+
+  test("the permission metadata describes what will run", async () => {
+    const asked: Array<Record<string, unknown>> = []
+    const script = "export const meta = { name: 'audit', description: 'Audit auth', phases: [{ title: 'Find' }] }\nreturn 1\n"
+    await run(
+      { script, dryRun: true },
+      { ask: (request: Record<string, unknown>) => { asked.push(request); return Promise.resolve() } },
+    )
+    const metadata = asked[0]?.["metadata"] as Record<string, unknown>
+    expect(metadata["name"]).toBe("audit")
+    expect(metadata["description"]).toBe("Audit auth")
+    expect(metadata["phases"]).toEqual(["Find"])
+  })
+
+  test("a script that fails to parse is rejected BEFORE the permission prompt", async () => {
+    // No point asking the user to approve a run that cannot start.
+    const asked: unknown[] = []
+    const output = await run(
+      { script: `${META}const x: string[] = []\n`, dryRun: true },
+      { ask: (request: unknown) => { asked.push(request); return Promise.resolve() } },
+    )
+    expect(output).toContain("not TypeScript")
+    expect(asked).toEqual([])
   })
 
   test("a parse failure comes back as a rendered diagnostic, not a crash", async () => {

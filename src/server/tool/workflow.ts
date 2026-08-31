@@ -55,10 +55,32 @@ export type WorkflowResult = {
  * never be able to start its own fan-out, and the cheapest place to stop that is at the door.
  */
 export async function execute(args: WorkflowArgs, context: WorkflowContext): Promise<WorkflowResult> {
-  assertNotNested(context.sessionID)
+  const prepared = await prepare(args, context)
+  return await runPrepared(prepared, args, context)
+}
 
+export type PreparedWorkflow = { source: string; meta: ReturnType<typeof parse>["meta"]; body: string }
+
+/**
+ * Resolves and parses the script WITHOUT running it.
+ *
+ * Split out so the permission prompt can name the real workflow and describe what it will do.
+ * Parsing is pure and cheap, and `meta` is a pure literal precisely so it can be read before any
+ * code executes — which is exactly this use case.
+ */
+export async function prepare(args: WorkflowArgs, context: WorkflowContext): Promise<PreparedWorkflow> {
+  assertNotNested(context.sessionID)
   const source = await resolveSource(args, context)
   const parsed = parse(source)
+  return { source, meta: parsed.meta, body: parsed.body }
+}
+
+async function runPrepared(
+  prepared: PreparedWorkflow,
+  args: WorkflowArgs,
+  context: WorkflowContext,
+): Promise<WorkflowResult> {
+  const parsed = prepared
 
   const run = new Run({
     runId: context.runId,
@@ -86,7 +108,7 @@ export async function execute(args: WorkflowArgs, context: WorkflowContext): Pro
     : run.agent
 
   try {
-    const value = await runSandbox(parsed.body, {
+    const value = await runSandbox(prepared.body, {
       agent,
       parallel,
       pipeline,

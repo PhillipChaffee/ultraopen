@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto"
 import { resolveOptions } from "./options.js"
 import { registry } from "./singleton.js"
 import { installConfig, type MutableConfig } from "./ultracode/config.js"
-import { execute, renderFailure, type WorkflowArgs } from "./tool/workflow.js"
+import { execute, prepare, renderFailure, type WorkflowArgs } from "./tool/workflow.js"
 import { WORKFLOW_TOOL } from "./bridge/permission.js"
 import { asClient } from "./types.js"
 import { description } from "./tool/description.js"
@@ -73,26 +73,38 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
         args: workflowArgsSchema(),
         execute: async (args: WorkflowArgs, context: ToolContext): Promise<string> => {
           const runId = `wf_${randomUUID().replaceAll("-", "").slice(0, 12)}`
-
-          // Ask before fanning out. `always` is scoped to this workflow's name rather than "*",
-          // because an "always" grant is stored instance-wide: approving once with "*" would
-          // permanently disable the prompt for every workflow in the directory.
-          await context.ask?.({
-            permission: WORKFLOW_TOOL,
-            patterns: [args.title ?? "workflow"],
-            always: [args.title ?? "workflow"],
-            metadata: { runId, dryRun: args.dryRun === true },
-          })
+          const workflowContext = {
+            client,
+            sessionID: context.sessionID,
+            runId,
+            deadlineMs: options.agentDeadlineMs,
+            ...(context.abort ? { signal: context.abort } : {}),
+          }
 
           try {
-            const result = await execute(args, {
-              client,
-              sessionID: context.sessionID,
-              runId,
-              deadlineMs: options.agentDeadlineMs,
-              ...(context.abort ? { signal: context.abort } : {}),
+            // Parse BEFORE asking, so the permission prompt names the real workflow and can show
+            // what it intends to do. `meta` is a pure literal specifically so it can be read
+            // without running anything. Using the tool's `title` argument here instead would be
+            // wrong twice over: it is documented as ignored, and the model usually omits it.
+            const prepared = await prepare(args, workflowContext)
+
+            // `always` is scoped to this workflow's name rather than "*": an "always" grant is
+            // stored instance-wide, so approving once with "*" would permanently disable the
+            // prompt for every workflow in the directory.
+            await context.ask?.({
+              permission: WORKFLOW_TOOL,
+              patterns: [prepared.meta.name],
+              always: [prepared.meta.name],
+              metadata: {
+                runId,
+                name: prepared.meta.name,
+                description: prepared.meta.description,
+                phases: prepared.meta.phases?.map((phase) => phase.title) ?? [],
+                dryRun: args.dryRun === true,
+              },
             })
-            return renderResult(result)
+
+            return renderResult(await execute(args, workflowContext))
           } catch (error) {
             return renderFailure(error, args.script)
           }
