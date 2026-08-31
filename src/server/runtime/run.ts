@@ -7,6 +7,8 @@ import { Journal, type JournalEntry } from "../resume/journal.js"
 import { toJournalEntry, toReplayedEntry, tryReplay } from "../resume/replay.js"
 import { stableStringify } from "../resume/key.js"
 import { breakScope, nextCallIdentity, rootScope, withScope, type Scope } from "../resume/scope.js"
+import { assertWithinBudget, makeBudget, type Budget } from "./budget.js"
+import { createWorktree } from "../bridge/isolation.js"
 import type { Ruleset } from "../bridge/permission.js"
 import type { OpencodeClient } from "../types.js"
 
@@ -69,6 +71,10 @@ export type RunOptions = {
   resumedFrom?: string | undefined
   /** Root chain seed — the script hash, so any edit invalidates everything. */
   resumeSeed?: string | undefined
+  /** Output-token ceiling for the run, or null for none. */
+  budgetTotal?: number | null | undefined
+  /** Repository root, enabling `isolation: "worktree"`. */
+  worktreeRoot?: string | undefined
 }
 
 /**
@@ -89,6 +95,8 @@ export class Run {
   readonly #journal: Journal
   readonly #rootScope: Scope
   readonly #resumedFrom: string | undefined
+  readonly #budget: Budget
+  readonly #worktrees: Array<() => Promise<void>> = []
 
   constructor(options: RunOptions) {
     this.#options = options
@@ -99,7 +107,13 @@ export class Run {
     // Seeded from the script source, so editing the script anywhere invalidates the root chain
     // and nothing replays against a program that no longer exists.
     this.#rootScope = rootScope(options.resumeSeed ?? "root")
+    this.#budget = makeBudget({ total: options.budgetTotal ?? null, spent: () => this.outputTokens })
     if (options.previousEntries) this.#journal.loadPrevious(options.previousEntries)
+  }
+
+  /** The `budget` global handed to the script. */
+  get budget(): Budget {
+    return this.#budget
   }
 
   /** Runs `work` with this run's root resume scope installed. */
@@ -158,6 +172,10 @@ export class Run {
       })
     }
 
+    // Checked before the call is made: spending past the target and then reporting it would
+    // defeat the point of a ceiling.
+    assertWithinBudget(this.#budget)
+
     // Claim identity synchronously, BEFORE awaiting a permit. Doing it after would make a call's
     // key depend on permit-grant order, which varies with timing — reintroducing exactly the
     // nondeterminism the scoped chain exists to remove.
@@ -191,6 +209,11 @@ export class Run {
     const release = await registry.semaphore.acquire()
     let outcome: SpawnOutcome
     const model = this.#options.resolveModel?.(options.model)
+    const worktree =
+      options.isolation === "worktree" && this.#options.worktreeRoot
+        ? await createWorktree({ worktreeRoot: this.#options.worktreeRoot, label, onNote: this.log })
+        : undefined
+    if (worktree) this.#worktrees.push(worktree.release)
     try {
       outcome = await spawnStructured(this.#options.client, {
         prompt,
@@ -206,6 +229,7 @@ export class Run {
         ...pick("inheritedPermission", this.#options.inheritedPermission),
         ...pick("deadlineMs", this.#options.deadlineMs ?? DEFAULT_AGENT_DEADLINE_MS),
         ...pick("signal", this.#options.signal),
+        ...pick("directory", worktree?.directory),
       })
     } finally {
       release()
@@ -266,6 +290,11 @@ export class Run {
    * they keep running — and billing — after the parent turn ends.
    */
   async abortAll(): Promise<void> {
+    // Worktrees are released first: they hold the agents' working directories, and removing one
+    // while its session is still live is what the host's own retry loop exists to paper over.
+    await Promise.all(this.#worktrees.map((release) => release().catch(() => undefined)))
+    this.#worktrees.length = 0
+
     const sessions = registry.sessionsOf(this.runId)
     await Promise.all(
       sessions.map(async (sessionID) => {

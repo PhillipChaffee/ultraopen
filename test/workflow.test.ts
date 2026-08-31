@@ -85,17 +85,43 @@ describe("source resolution", () => {
 })
 
 describe("nested workflow()", () => {
-  test("calling workflow() from a script THROWS rather than returning null", async () => {
+  test("an unknown saved workflow THROWS rather than returning null", async () => {
     // The spec is explicit that nested workflow() failures are exceptions, unlike agent() which
     // returns null. A script's try/catch around it would be dead code otherwise.
     const script = `${META}return workflow('other')\n`
-    await expect(execute({ script, dryRun: true }, base)).rejects.toThrow(/Nested workflow\(\) is not available/u)
+    await expect(execute({ script, dryRun: true }, base)).rejects.toThrow(/No saved workflow named "other"/u)
   })
 
-  test("a script CAN catch it, which is what the spec promises", async () => {
+  test("a script CAN catch it WITHOUT awaiting, which is what the spec promises", async () => {
+    // Validation is synchronous for exactly this reason: an async function would turn it into a
+    // rejected promise that an un-awaited try/catch silently misses.
     const script = `${META}try { workflow('other') } catch (e) { return 'caught' }\nreturn 'not caught'\n`
-    const result = await execute({ script, dryRun: true }, base)
-    expect(result.value).toBe("caught")
+    expect((await execute({ script, dryRun: true }, base)).value).toBe("caught")
+  })
+
+  test("runs a saved workflow by name and prefixes its narration", async () => {
+    const named = { helper: `export const meta = { name: 'helper', description: 'h' }\nlog('inner')\nreturn 42\n` }
+    const script = `${META}return await workflow('helper')\n`
+    const result = await execute({ script, dryRun: true }, { ...base, named })
+    expect(result.value).toBe(42)
+    expect(result.logs.some((line) => line.startsWith("▸ helper:"))).toBe(true)
+  })
+
+  test("accepts an inline { script } reference", async () => {
+    const script = `${META}return await workflow({ script: "export const meta = { name: 'x', description: 'y' }\\nreturn 7\\n" })\n`
+    expect((await execute({ script, dryRun: true }, base)).value).toBe(7)
+  })
+
+  test("nesting is ONE level only", async () => {
+    // Unbounded depth would make the agent count unbounded with it.
+    const inner = `export const meta = { name: 'inner', description: 'i' }\nreturn await workflow('deeper')\n`
+    const script = `${META}return await workflow({ script: ${JSON.stringify(inner)} })\n`
+    await expect(execute({ script, dryRun: true }, base)).rejects.toThrow(/one level only/u)
+  })
+
+  test("rejects a reference that is neither a name nor a script", async () => {
+    const script = `${META}return workflow(42)\n`
+    await expect(execute({ script, dryRun: true }, base)).rejects.toThrow(/saved workflow name or \{ script \}/u)
   })
 })
 

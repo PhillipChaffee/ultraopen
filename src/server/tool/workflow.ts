@@ -48,6 +48,14 @@ export type WorkflowContext = {
   previousEntries?: readonly JournalEntry[] | undefined
   /** The run id being resumed, recorded on replayed entries. */
   resumedFrom?: string | undefined
+  /** Output-token ceiling for the run, or null for none. */
+  budgetTotal?: number | null | undefined
+  /** Repository root, enabling `isolation: "worktree"`. */
+  worktreeRoot?: string | undefined
+  /** Depth of nesting. workflow() is one level only, so a child runs at depth 1. */
+  depth?: number | undefined
+  /** Saved workflows, resolved by name. */
+  named?: Record<string, string> | undefined
 }
 
 export type WorkflowResult = {
@@ -136,6 +144,8 @@ async function runPrepared(
     resumeSeed: argsHash(args.args),
     ...optional("previousEntries", context.previousEntries),
     ...optional("resumedFrom", context.resumedFrom),
+    ...optional("budgetTotal", context.budgetTotal),
+    ...optional("worktreeRoot", context.worktreeRoot),
     ...optional("resolveModel", resolvers.resolveModel),
     ...optional("resolveVariant", resolvers.resolveVariant),
     ...optional("inheritedPermission", context.inheritedPermission),
@@ -172,8 +182,8 @@ async function runPrepared(
           phase: run.phase,
           log: run.log,
           args: args.args,
-          budget: budgetStub(run),
-          workflow: nestedStub,
+          budget: run.budget,
+          workflow: makeNested(context, run),
         }),
     )
 
@@ -234,26 +244,76 @@ async function resolveSource(args: WorkflowArgs, context: WorkflowContext): Prom
 }
 
 /**
- * `budget` for M1.
+ * Builds the `workflow()` global.
  *
- * Reports real spend so `budget.spent()` is already meaningful, but carries no ceiling — the
- * enforcing form arrives with the rest of the budget work. `total: null` is the spec's own
- * "no target set" signal, and every documented loop guards on it.
+ * Per the spec these failures THROW rather than returning null, unlike `agent()` — a script's
+ * try/catch around a nested workflow would otherwise be dead code.
+ *
+ * The child shares this run's concurrency gate (process-global), agent counter, budget and abort
+ * signal, so nesting cannot be used to escape any of them.
  */
-function budgetStub(run: Run): { total: null; spent: () => number; remaining: () => number } {
-  return {
-    total: null,
-    spent: () => run.outputTokens,
-    remaining: () => Number.POSITIVE_INFINITY,
+function makeNested(
+  context: WorkflowContext,
+  parentRun: Run,
+): (nameOrRef: unknown, childArgs?: unknown) => Promise<unknown> {
+  // Deliberately NOT an async function: validation throws SYNCHRONOUSLY, so both
+  // `workflow('bad')` and `await workflow('bad')` fail at the call site. An async function would
+  // turn every one of these into a rejected promise, and the spec's `catch to handle gracefully`
+  // would silently not catch in the un-awaited form.
+  return (nameOrRef: unknown, childArgs?: unknown): Promise<unknown> => {
+    // One level only. A child that could nest again would make the depth unbounded, and with it
+    // the agent count.
+    if ((context.depth ?? 0) > 0) {
+      throw new WorkflowScriptError({
+        kind: "RuntimeError",
+        message: "workflow() nesting is one level only — a nested workflow cannot call workflow().",
+      })
+    }
+
+    const source = resolveNamed(nameOrRef, context)
+    return runNested(source, childArgs, context, parentRun)
   }
 }
 
-/** Nested workflows arrive later; per the spec these THROW rather than returning null. */
-function nestedStub(): never {
+async function runNested(
+  source: string,
+  childArgs: unknown,
+  context: WorkflowContext,
+  parentRun: Run,
+): Promise<unknown> {
+  const child = await execute(
+      { script: source, args: childArgs },
+    {
+      ...context,
+      depth: (context.depth ?? 0) + 1,
+      // The child's spend counts against the parent's ceiling.
+      budgetTotal: parentRun.budget.total,
+    },
+  )
+
+  // The spec marks a nested run's agents with a "▸ name" prefix so they are distinguishable in the
+  // parent's narration.
+  for (const line of child.logs) parentRun.log(`▸ ${child.meta.name}: ${line}`)
+  return child.value
+}
+
+function resolveNamed(nameOrRef: unknown, context: WorkflowContext): string {
+  if (typeof nameOrRef === "object" && nameOrRef !== null && "script" in nameOrRef) {
+    const script = (nameOrRef as { script?: unknown }).script
+    if (typeof script === "string") return script
+  }
+  if (typeof nameOrRef === "string") {
+    const found = context.named?.[nameOrRef]
+    if (found) return found
+    throw new WorkflowScriptError({
+      kind: "RuntimeError",
+      message: `No saved workflow named "${nameOrRef}".`,
+      suggestions: ["Pass the script inline instead: workflow({ script: '...' })."],
+    })
+  }
   throw new WorkflowScriptError({
     kind: "RuntimeError",
-    message: "Nested workflow() is not available yet in this build.",
-    suggestions: ["Run the phases as separate top-level workflow calls for now."],
+    message: "workflow() expects a saved workflow name or { script }.",
   })
 }
 

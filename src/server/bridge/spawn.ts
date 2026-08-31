@@ -35,6 +35,8 @@ export type SpawnOptions = {
   label: string
   deadlineMs?: number | undefined
   signal?: AbortSignal | undefined
+  /** Working directory for an isolated agent. Routes the child session at its own worktree. */
+  directory?: string | undefined
 }
 
 /**
@@ -74,7 +76,12 @@ export async function createChild(client: OpencodeClient, options: SpawnOptions)
     ...(options.agentType ? { agent: options.agentType } : {}),
   }
 
-  const created = await client.session.create({ body })
+  // The `directory` query is the load-bearing one; the header is accepted too but is read RAW,
+  // so it must not be URL-encoded.
+  const created = await client.session.create({
+    body,
+    ...(options.directory ? { query: { directory: options.directory } } : {}),
+  })
   const sessionID = created.data?.id
   // Carry the real reason forward: "session creation returned no id" tells the user nothing about
   // why, and this is the first place a misconfigured agent name or a rejected body surfaces.
