@@ -306,3 +306,30 @@ describe("sandbox — Date proxy passthrough", () => {
     expect(await run(`const d = new Date(86400000); return d.getUTCDate()\n`, noopGlobals)).toBe(2)
   })
 })
+
+describe("sandbox — documented escape boundary", () => {
+  test("the literal `.constructor` route is rejected statically", () => {
+    // `({}).constructor.constructor` is the real Function constructor, which reaches the host
+    // realm and an untrapped Date.now — silently defeating resume. Verified reachable before
+    // this rule existed.
+    const d = diag(() => parse(`${META}const h = ({}).constructor.constructor('return globalThis')()\n`))
+    expect(d.kind).toBe("DeterminismError")
+    expect(d.message).toContain("constructor")
+    expect(d.location).toBeDefined()
+  })
+
+  test("a bare .constructor read is rejected too", () => {
+    expect(diag(() => parse(`${META}const c = agent.constructor\n`)).kind).toBe("DeterminismError")
+  })
+
+  test("ordinary property access is unaffected", () => {
+    expect(() => parse(`${META}const r = await agent('x'); return r.findings.length\n`)).not.toThrow()
+  })
+
+  test("KNOWN LIMIT: a computed constructor access still gets through the lint", () => {
+    // Documented in sandbox.ts rather than fixed: the threat model is determinism, not
+    // confinement — the authoring model already holds bash. This test pins the boundary so a
+    // future reader knows it is a decision, not an oversight.
+    expect(() => parse(`${META}const c = ({})["const" + "ructor"]\n`)).not.toThrow()
+  })
+})

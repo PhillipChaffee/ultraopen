@@ -46,6 +46,22 @@ export function lintDeterminism(ast: acorn.Program): void {
       })
     }
 
+    // `x.constructor.constructor` is the classic route to the real Function constructor, which
+    // reaches the host realm and with it an untrapped Date.now — silently defeating resume.
+    // Blocking the literal form stops accidental and obvious deliberate use; a computed form
+    // (`x["const"+"ructor"]`) still gets through, which is documented in sandbox.ts.
+    if (node.type === "MemberExpression" && !node.computed && node.property.type === "Identifier" && node.property.name === "constructor") {
+      fail({
+        kind: "DeterminismError",
+        message: "Accessing `.constructor` is not allowed in workflow scripts.",
+        location: loc(node),
+        suggestions: [
+          "It reaches the host realm and an untrapped Date.now(), which breaks resume.",
+          "If you need a class check, compare a discriminant field instead.",
+        ],
+      })
+    }
+
     if (node.type === "MemberExpression" && !node.computed && node.object.type === "Identifier") {
       const property = node.property.type === "Identifier" ? node.property.name : ""
       const target = `${node.object.name}.${property}`

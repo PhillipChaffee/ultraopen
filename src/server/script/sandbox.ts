@@ -11,8 +11,26 @@ import { WorkflowScriptError } from "./errors.js"
  *     `pipeline(items, ...stages)` takes stage callbacks. A realm boundary makes those either
  *     unrepresentable or require cross-realm adoption shims.
  *   - An AsyncFunction body has no access to the plugin's module scope (unlike `eval`), and its
- *     parameters lexically shadow real globals. That is the right isolation level here: the
- *     threat model is determinism, not confinement — the authoring model already holds bash.
+ *     parameters lexically shadow real globals.
+ *
+ * KNOWN LIMIT — read before trusting the traps.
+ *
+ * Parameter shadowing does not close the prototype chain. `({}).constructor.constructor` is the
+ * real Function constructor, and `Function("return globalThis")()` from there yields the host
+ * global with an untrapped `Date.now`. Verified, not theoretical. The static lint rejects the
+ * literal `.constructor` form, but a computed one (`x["const" + "ructor"]`) still gets through.
+ *
+ * That is accepted, deliberately:
+ *   - The threat model is DETERMINISM, not confinement. The model authoring the script already
+ *     holds bash in the same session, so an escape grants it nothing it did not already have.
+ *   - The traps exist to catch ACCIDENTAL nondeterminism — a model reaching for `Date.now()`
+ *     because that is the natural way to write it. They do, and the lint reports line:col.
+ *   - `node:vm` was measured rather than assumed: a fresh realm does hide `process`/`require`,
+ *     but it carries its OWN `Date.now`, so it does not fix determinism either. It would only
+ *     help alongside a prelude that patches that realm's intrinsics — a larger change that buys
+ *     confinement we do not need.
+ *
+ * If a script deliberately circumvents these traps, resume for that run is not trustworthy.
  */
 
 /**

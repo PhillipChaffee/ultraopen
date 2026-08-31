@@ -1,0 +1,222 @@
+import { fail } from "../script/errors.js"
+import { DEFAULT_AGENT_DEADLINE_MS, MAX_AGENTS_PER_RUN } from "../script/limits.js"
+import { registry } from "../singleton.js"
+import { spawn, type NullReason, type SpawnOutcome } from "../bridge/spawn.js"
+import type { Ruleset } from "../bridge/permission.js"
+import type { OpencodeClient } from "../types.js"
+
+/** Options a script may pass to `agent()`. Mirrors the Workflow spec's opts bag. */
+export type AgentOptions = {
+  label?: string
+  phase?: string
+  schema?: Record<string, unknown>
+  model?: string
+  effort?: string
+  agentType?: string
+  isolation?: "worktree"
+  disallowedTools?: readonly string[]
+}
+
+/** One agent's outcome, recorded so partial coverage can never read as full coverage. */
+export type AgentRecord = {
+  index: number
+  label: string
+  phase: string | undefined
+  ok: boolean
+  reason?: NullReason
+  detail?: string
+  sessionID?: string
+  outputTokens: number
+}
+
+export type ProgressEvent =
+  | { type: "agent-start"; index: number; label: string; phase: string | undefined; sessionID?: string }
+  | { type: "agent-end"; index: number; label: string; phase: string | undefined; ok: boolean; sessionID?: string }
+  | { type: "phase"; title: string }
+  | { type: "log"; message: string }
+
+export type RunOptions = {
+  runId: string
+  client: OpencodeClient
+  parentSessionID: string
+  /** Resolves an `effort` string against the target model's real variant map. */
+  resolveVariant?: ((effort: string | undefined) => string | undefined) | undefined
+  /** Parses a "provider/model" string into the prompt-body model ref. */
+  resolveModel?: ((model: string | undefined) => { providerID: string; modelID: string } | undefined) | undefined
+  inheritedPermission?: Ruleset | undefined
+  /** Contract text appended to the child's system prompt (PromptInput.system appends). */
+  subagentContract?: ((opts: AgentOptions) => string | undefined) | undefined
+  deadlineMs?: number | undefined
+  signal?: AbortSignal | undefined
+  onProgress?: ((event: ProgressEvent) => void) | undefined
+}
+
+/**
+ * The per-run engine context.
+ *
+ * Owns the agent counter, the phase/log narration, and the null ledger. One instance per workflow
+ * invocation; the concurrency gate it uses is process-global (see `singleton.ts`).
+ */
+export class Run {
+  readonly runId: string
+  readonly records: AgentRecord[] = []
+  readonly logs: string[] = []
+
+  #currentPhase: string | undefined
+  #spawned = 0
+  readonly #options: RunOptions
+
+  constructor(options: RunOptions) {
+    this.#options = options
+    this.runId = options.runId
+  }
+
+  get agentCount(): number {
+    return this.#spawned
+  }
+
+  get currentPhase(): string | undefined {
+    return this.#currentPhase
+  }
+
+  /** Agents that produced no usable result, with the reason for each. */
+  get nulls(): AgentRecord[] {
+    return this.records.filter((record) => !record.ok)
+  }
+
+  /** Output tokens across every child of this run. */
+  get outputTokens(): number {
+    return this.records.reduce((total, record) => total + record.outputTokens, 0)
+  }
+
+  phase = (title: string): void => {
+    this.#currentPhase = title
+    this.#options.onProgress?.({ type: "phase", title })
+  }
+
+  log = (message: string): void => {
+    this.logs.push(message)
+    this.#options.onProgress?.({ type: "log", message })
+  }
+
+  /**
+   * Spawns one subagent.
+   *
+   * Returns the agent's text (or its structured object when a schema was supplied), or `null` when
+   * it produced nothing usable. Never throws for agent-level failures — the spec makes `null` the
+   * sentinel scripts filter on. Engine faults (the lifetime cap, an aborted run) DO throw, so they
+   * cannot masquerade as an agent that simply returned nothing.
+   */
+  agent = async (prompt: string, options: AgentOptions = {}): Promise<unknown> => {
+    if (typeof prompt !== "string" || prompt.trim() === "") {
+      throw new TypeError("agent() requires a non-empty prompt string as its first argument.")
+    }
+
+    // Checked before the counter moves, so a rejected call does not inflate the count that the
+    // result envelope reports.
+    if (this.#spawned >= MAX_AGENTS_PER_RUN) {
+      fail({
+        kind: "LimitError",
+        message: `Workflow exceeded ${MAX_AGENTS_PER_RUN} agents. This is a runaway-loop backstop.`,
+        suggestions: ["Bound the loop explicitly, or split the work across several workflow runs."],
+      })
+    }
+
+    // Claim the index synchronously, BEFORE awaiting a permit. Source order is then the identity
+    // of a call even for fan-outs wider than the concurrency cap — which is what the resume key
+    // will hang off in M3.
+    const index = this.#spawned
+    this.#spawned++
+
+    const label = options.label ?? deriveLabel(prompt, index)
+    const phase = options.phase ?? this.#currentPhase
+
+    this.#options.onProgress?.({ type: "agent-start", index, label, phase })
+
+    // The permit is held only for the spawn itself. Combinators deliberately do NOT gate, or a
+    // parallel() nested in a pipeline() stage would deadlock behind its own outer item.
+    const release = await registry.semaphore.acquire()
+    let outcome: SpawnOutcome
+    try {
+      outcome = await spawn(this.#options.client, {
+        prompt,
+        runId: this.runId,
+        parentSessionID: this.#options.parentSessionID,
+        label,
+        ...pick("agentType", options.agentType),
+        ...pick("schema", options.schema),
+        ...pick("disallowedTools", options.disallowedTools),
+        ...pick("model", this.#options.resolveModel?.(options.model)),
+        ...pick("variant", this.#options.resolveVariant?.(options.effort)),
+        ...pick("system", this.#options.subagentContract?.(options)),
+        ...pick("inheritedPermission", this.#options.inheritedPermission),
+        ...pick("deadlineMs", this.#options.deadlineMs ?? DEFAULT_AGENT_DEADLINE_MS),
+        ...pick("signal", this.#options.signal),
+      })
+    } finally {
+      release()
+    }
+
+    const record: AgentRecord = outcome.ok
+      ? {
+          index,
+          label,
+          phase,
+          ok: true,
+          outputTokens: outcome.info.tokens.output,
+          ...pick("sessionID", outcome.sessionID),
+        }
+      : {
+          index,
+          label,
+          phase,
+          ok: false,
+          reason: outcome.reason,
+          detail: outcome.detail,
+          outputTokens: 0,
+          ...pick("sessionID", outcome.sessionID),
+        }
+
+    this.records.push(record)
+    this.#options.onProgress?.({
+      type: "agent-end",
+      index,
+      label,
+      phase,
+      ok: outcome.ok,
+      ...pick("sessionID", outcome.sessionID),
+    })
+
+    if (!outcome.ok) return null
+    return options.schema ? outcome.structured : outcome.text
+  }
+
+  /**
+   * Releases every child session this run created.
+   *
+   * `SessionRunState.cancel` walks BackgroundJob entries, which a plugin cannot register, so plain
+   * `session.create({parentID})` children are never cascaded to. Aborting them is ours to do or
+   * they keep running — and billing — after the parent turn ends.
+   */
+  async abortAll(): Promise<void> {
+    const sessions = registry.sessionsOf(this.runId)
+    await Promise.all(
+      sessions.map(async (sessionID) => {
+        await this.#options.client.session.abort({ path: { id: sessionID } }).catch(() => undefined)
+        registry.forget(sessionID)
+      }),
+    )
+  }
+}
+
+/** Includes a key only when the value is present, which `exactOptionalPropertyTypes` requires. */
+function pick<K extends string, V>(key: K, value: V | undefined): Record<K, V> | Record<string, never> {
+  return value === undefined ? {} : ({ [key]: value } as Record<K, V>)
+}
+
+/** A short, stable label derived from the prompt when the script did not supply one. */
+function deriveLabel(prompt: string, index: number): string {
+  const firstLine = prompt.trim().split("\n", 1)[0] ?? ""
+  const trimmed = firstLine.slice(0, 48).trim()
+  return trimmed === "" ? `agent:${index}` : trimmed
+}
