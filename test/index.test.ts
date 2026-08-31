@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 import { ultraopen } from "../src/server/index.js"
 import { registry } from "../src/server/singleton.js"
 import { WORKFLOW_TOOL } from "../src/server/bridge/permission.js"
+import { mode } from "../src/server/ultracode/mode.js"
 import type { MutableConfig } from "../src/server/ultracode/config.js"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -61,6 +62,7 @@ let savedEnv: string | undefined
 
 beforeEach(() => {
   registry.resetForTests()
+  mode.resetForTests()
   savedEnv = process.env["ULTRAOPEN_ACTIVE"]
   delete process.env["ULTRAOPEN_ACTIVE"]
 })
@@ -343,5 +345,57 @@ describe("startup orphan sweep", () => {
     await new Promise((resolve) => {
       setTimeout(resolve, 5)
     })
+  })
+})
+
+describe("ultracode hooks are wired", () => {
+  type Hook = (...args: never[]) => unknown
+  const hookOf = (name: string): Hook => {
+    const hooks = ultraopen({ client: stubClient })
+    return hooks[name] as Hook
+  }
+
+  test("chat.message detects the keyword and raises effort", () => {
+    const output = {
+      message: { id: "m1", model: { variant: undefined as string | undefined } },
+      parts: [{ type: "text", text: "ultracode this" }],
+    }
+    ;(hookOf("chat.message") as (i: unknown, o: unknown) => void)({ sessionID: "s1" }, output)
+    expect(mode.isActive("s1")).toBe(true)
+  })
+
+  test("messages.transform injects the reminder once the mode is on", () => {
+    const hook = hookOf("experimental.chat.messages.transform") as (i: unknown, o: unknown) => void
+    mode.enable("s1", "keyword")
+    const output = { messages: [{ info: { id: "m1", role: "user", sessionID: "s1" }, parts: [] as unknown[] }] }
+    hook({}, output)
+    expect(output.messages[0]?.parts.length).toBe(1)
+  })
+
+  test("chat.params merges the variant's provider options", () => {
+    const hook = hookOf("chat.params") as (i: unknown, o: unknown) => void
+    mode.enable("s1", "keyword")
+    const output = { options: {} as Record<string, unknown> }
+    hook({ sessionID: "s1", model: { variants: { xhigh: { thinking: "adaptive" } } } }, output)
+    expect(output.options["thinking"]).toBe("adaptive")
+  })
+
+  test("/ultracode toggles the mode, and `off` turns it back off", () => {
+    const hook = hookOf("command.execute.before") as (i: unknown) => void
+    hook({ command: "ultracode", sessionID: "s1" })
+    expect(mode.isActive("s1")).toBe(true)
+    hook({ command: "ultracode", sessionID: "s1", arguments: "off" })
+    expect(mode.isActive("s1")).toBe(false)
+  })
+
+  test("other commands are ignored", () => {
+    const hook = hookOf("command.execute.before") as (i: unknown) => void
+    hook({ command: "init", sessionID: "s1" })
+    expect(mode.isActive("s1")).toBe(false)
+  })
+
+  test("the plugin-options flag turns the mode on for fresh sessions", () => {
+    ultraopen({ client: stubClient }, { ultracode: true })
+    expect(mode.isActive("brand-new-session")).toBe(true)
   })
 })

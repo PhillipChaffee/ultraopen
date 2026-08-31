@@ -7,6 +7,9 @@ import { WORKFLOW_TOOL } from "./bridge/permission.js"
 import { asClient } from "./types.js"
 import { description } from "./tool/description.js"
 import { beginRun, endRun, loadResume } from "./resume/persist.js"
+import { onChatMessage, onChatParams, onMessagesTransform } from "./ultracode/hooks.js"
+import { mode } from "./ultracode/mode.js"
+import { resolveEffort } from "./bridge/effort.js"
 import { newBootId, reapOrphans } from "./resume/reaper.js"
 import { runDir } from "./resume/store.js"
 import { registry as runRegistry } from "./singleton.js"
@@ -49,6 +52,7 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
   const nested = process.env[ACTIVE_ENV] === "1"
 
   registry.configureConcurrency(options.concurrency)
+  mode.setDefault(options.ultracode)
 
   // One boot id per process. Runs still marked `running` under a DIFFERENT boot id belonged to a
   // process that died, and their subagents are still alive and billing — opencode never cascades
@@ -68,6 +72,52 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
      */
     config: (config: MutableConfig): void => {
       installConfig(config, {})
+    },
+
+    /**
+     * Detects the `ultracode` keyword and any instruction to stop fanning out, and raises the
+     * effort on the parent turn. Deliberately does NOT write parts: those are persisted, so a
+     * reminder here would accumulate one copy per user turn forever.
+     */
+    "chat.message": (
+      hookInput: Parameters<typeof onChatMessage>[0],
+      output: Parameters<typeof onChatMessage>[1],
+    ): void => {
+      onChatMessage(hookInput, output, {
+        resolveVariant: (effort) => resolveEffort(effort, { available: [] }).variant,
+      })
+    },
+
+    /**
+     * Injects the per-turn reminder. This hook operates on messages re-read from the database each
+     * step, so what it adds is ephemeral — unlike chat.message's parts.
+     */
+    "experimental.chat.messages.transform": (
+      _input: unknown,
+      output: Parameters<typeof onMessagesTransform>[0],
+    ): void => {
+      onMessagesTransform(output)
+    },
+
+    /** Belt-and-braces effort raise, read at a different point than the message variant. */
+    "chat.params": (
+      hookInput: Parameters<typeof onChatParams>[0],
+      output: Parameters<typeof onChatParams>[1],
+    ): void => {
+      onChatParams(hookInput, output, {
+        resolveVariant: (effort, available) => resolveEffort(effort, { available }).variant,
+      })
+    },
+
+    /**
+     * Turns the mode on when the user runs `/ultracode`.
+     *
+     * Fires before the prompt is built, so the same turn already sees the reminder.
+     */
+    "command.execute.before": (hookInput: { command: string; sessionID: string; arguments?: string }): void => {
+      if (hookInput.command !== "ultracode") return
+      if (hookInput.arguments?.trim() === "off") mode.disable(hookInput.sessionID)
+      else mode.enable(hookInput.sessionID, "command")
     },
 
     /**
