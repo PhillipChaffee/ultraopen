@@ -1,37 +1,56 @@
 /**
  * Builds the dual-entry package.
  *
- * `--splitting` is REQUIRED, not an optimisation: without it Bun inlines a private copy of every
- * shared module into each entry, so `./server` and `./tui` would get DIFFERENT
- * `WorkflowScriptError` classes and `instanceof` across the boundary would silently return false.
+ * The two halves are built SEPARATELY because both entry files are named `index`, and a single
+ * build would have them overwrite each other. They never exchange objects — the server writes
+ * progress to disk and the TUI reads it — so they do not need to share a chunk, and an
+ * `instanceof` across the boundary never happens.
  *
  * `--target node` because opencode ships a Node build and `PluginInput.$` is undefined whenever
  * `typeof Bun === "undefined"`.
  */
-import { rm } from "node:fs/promises"
+import { rename, rm } from "node:fs/promises"
+import { join } from "node:path"
 
-const entrypoints = ["src/server/index.ts"]
+const OUT = "dist"
 
-await rm("dist", { recursive: true, force: true })
+/**
+ * Left unbundled at runtime.
+ *
+ * The TUI runtime shares the host's module instances: a bundled second copy of solid-js would give
+ * the plugin its own reactive owner graph, and its components would never update.
+ */
+const EXTERNAL = [
+  "solid-js",
+  "solid-js/*",
+  "@opentui/core",
+  "@opentui/solid",
+  "@opencode-ai/plugin",
+  "@opencode-ai/plugin/*",
+]
 
-const result = await Bun.build({
-  entrypoints,
-  outdir: "dist",
-  target: "node",
-  format: "esm",
-  splitting: true,
-  // acorn is bundled: it is pure JS with no transitive dependencies, and vendoring it keeps the
-  // published package free of a postinstall-capable dependency tree.
-  external: [],
-  // The exports map points at ./dist/server.js; the entry file is index.ts, so name it explicitly
-  // rather than relying on the entrypoint's basename.
-  naming: { entry: "server.js", chunk: "[name]-[hash].js" },
-})
+await rm(OUT, { recursive: true, force: true })
 
-if (!result.success) {
-  for (const log of result.logs) console.error(log)
-  process.exit(1)
+for (const [entry, name] of [
+  ["src/server/index.ts", "server.js"],
+  ["src/tui/index.tsx", "tui.js"],
+] as const) {
+  const result = await Bun.build({
+    entrypoints: [entry],
+    outdir: OUT,
+    target: "node",
+    format: "esm",
+    external: EXTERNAL,
+  })
+
+  if (!result.success) {
+    for (const log of result.logs) console.error(log)
+    process.exit(1)
+  }
+
+  // Both entry files are called `index`, so rename to the names the exports map points at.
+  await rename(join(OUT, "index.js"), join(OUT, name))
+  console.log(`  ${OUT}/${name}`)
 }
 
-for (const output of result.outputs) console.log(`  ${output.path}`)
-console.log(`built ${result.outputs.length} file(s)`)
+console.log("built 2 entries")

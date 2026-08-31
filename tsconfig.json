@@ -1,11 +1,17 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "lib": ["ES2023"],
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
     "module": "ESNext",
     "moduleResolution": "bundler",
     "types": ["node", "bun"],
     "noEmit": true,
+
+    // The TUI half is JSX over @opentui/solid, matching opencode's own TUI package. Both opentui
+    // packages are dev-only: the host provides them at runtime, and bundling a second copy of
+    // solid-js would give the plugin its own reactive owner graph.
+    "jsx": "preserve",
+    "jsxImportSource": "@opentui/solid",
 
     // --- strictness: every flag TypeScript offers ---
     "strict": true,

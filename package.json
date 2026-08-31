@@ -25,6 +25,8 @@
   "devDependencies": {
     "@opencode-ai/plugin": "^1.18.20",
     "@opencode-ai/sdk": "^1.18.20",
+    "@opentui/core": "^0.5.9",
+    "@opentui/solid": "^0.5.9",
     "@types/bun": "^1.4.0",
     "@types/node": "^24.0.0",
     "oxlint": "^1.80.0",

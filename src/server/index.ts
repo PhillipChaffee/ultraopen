@@ -12,6 +12,7 @@ import { mode } from "./ultracode/mode.js"
 import { resolveEffort } from "./bridge/effort.js"
 import { newBootId, reapOrphans } from "./resume/reaper.js"
 import { runDir } from "./resume/store.js"
+import { ProgressWriter } from "./resume/progress.js"
 import { registry as runRegistry } from "./singleton.js"
 
 /**
@@ -182,6 +183,13 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
               ? await loadResume(args.resumeFromRunId, args.args, context.sessionID)
               : undefined
 
+            const progress = new ProgressWriter({
+              runId,
+              workflow: prepared.meta.name,
+              sessionID: context.sessionID,
+              startedAt: Date.now(),
+            })
+
             manifest = await beginRun({
               runId,
               sessionID: context.sessionID,
@@ -192,6 +200,10 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
 
             const result = await execute(args, {
               ...workflowContext,
+              onProgress: (event) => {
+                progress.apply(event, Date.now())
+                void progress.flush()
+              },
               ...(resume && resume.entries.length > 0
                 ? { previousEntries: resume.entries, resumedFrom: args.resumeFromRunId }
                 : {}),
