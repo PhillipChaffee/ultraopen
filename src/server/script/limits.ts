@@ -46,11 +46,31 @@ export const EFFORT_PREFERENCE = ["xhigh", "max", "high", "medium", "low"] as co
 export type Effort = (typeof EFFORT_PREFERENCE)[number]
 
 /**
- * The same variants in ascending STRENGTH, which is a different order: `max` really is stronger
- * than `xhigh`, even though we prefer not to pay for it.
+ * Every reasoning level opencode exposes, in ascending STRENGTH.
  *
- * Downgrades must use this one. Using the preference list instead would resolve a request for
- * "xhigh" on a model offering [low, medium, high, max] up to "max" — silently spending more than
- * was asked for, which is the opposite of a downgrade.
+ * This is a different order from the preference list: `max` really is stronger than `xhigh`, even
+ * though we prefer not to pay for it. Downgrades must use this one — using the preference list
+ * would resolve a request for "xhigh" on a model offering [low, medium, high, max] UP to "max",
+ * spending more than was asked for.
+ *
+ * The set is wider than the Anthropic-shaped ladder suggests. Surveying every model the live
+ * catalog reports gives 13 distinct variant sets, including two levels below "low":
+ *
+ *   ["none","minimal","low","medium","high","xhigh"]   gpt-5-family
+ *   ["low","medium","high","xhigh","max"]              claude 4.7+/5
+ *   ["low","medium","high","max"]                      claude 4.6-class
+ *   ["high","max"]                                     claude sonnet-4, deepseek-v4-pro, glm-5.2
+ *   ["low","medium","high"]                            gemini-3.1-pro, grok-4.5, gpt-5-codex
+ *   ["max"]                                            kimi-k3
+ *
+ * The ordering is taken from opencode's own construction, which builds these arrays ascending:
+ * `OPENAI_EFFORTS = ["none", "minimal", ...["low","medium","high"], "xhigh"]`, and `"minimal"` is
+ * unshifted ahead of the widely-supported three.
  */
-export const EFFORT_STRENGTH = ["low", "medium", "high", "xhigh", "max"] as const
+export const EFFORT_STRENGTH = ["none", "minimal", "low", "medium", "high", "xhigh", "max"] as const
+
+/**
+ * Levels that mean "actually think". `none` is an explicit OFF switch, not a weaker setting, so a
+ * downgrade must never land on it — someone asking for xhigh has not asked for reasoning disabled.
+ */
+export const EFFORT_OFF = "none"

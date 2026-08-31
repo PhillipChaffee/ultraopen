@@ -1,4 +1,4 @@
-import { EFFORT_STRENGTH } from "../script/limits.js"
+import { EFFORT_OFF, EFFORT_STRENGTH } from "../script/limits.js"
 
 /**
  * Resolves a requested reasoning effort against a model's REAL variant map.
@@ -63,24 +63,43 @@ export function resolveEffort(requested: string | undefined, model: ModelVariant
     }
   }
 
-  // EFFORT_STRENGTH ascends, so everything at or below the requested rank is weaker-or-equal.
-  // Scanning that slice from the top finds the strongest supported level that does not exceed
-  // what was asked for — a downgrade, never an escalation.
-  const fallback = EFFORT_STRENGTH.slice(0, requestedRank + 1)
+  // Prefer a DOWNGRADE: the strongest supported level at or below what was asked for. Scanning
+  // the ascending ladder in reverse finds it. `none` is excluded — it is an explicit off switch,
+  // not a weaker setting, and nobody asking for xhigh has asked for reasoning disabled.
+  const downgrade = EFFORT_STRENGTH.slice(0, requestedRank + 1)
     .toReversed()
-    .find((entry) => available.includes(entry))
-  if (fallback === undefined) {
+    .find((entry) => entry !== EFFORT_OFF && available.includes(entry))
+
+  if (downgrade !== undefined) {
     return {
-      variant: undefined,
+      variant: downgrade,
       downgradedFrom: requested,
-      note: `effort "${requested}" unsupported by ${label}, and no weaker level is available either`,
+      note: `effort "${requested}" unsupported by ${label} — using "${downgrade}"`,
+    }
+  }
+
+  // Nothing weaker exists. Some models offer ONLY stronger levels — kimi-k3 exposes just ["max"] —
+  // and refusing there would leave an ultracode run with no reasoning at all, which is further
+  // from the request than overshooting by one rung.
+  //
+  // Bounded to ONE rung deliberately. Escalating freely would turn a request for "low" on that
+  // same kimi-k3 into "max": a large, silent cost increase in the opposite direction from what
+  // was asked. One rung is close enough to be a fair reading of intent; more is a different
+  // decision the caller did not make. Beyond that, send no variant and let the model default.
+  const nextUp = EFFORT_STRENGTH[requestedRank + 1]
+  const escalation = nextUp !== undefined && available.includes(nextUp) ? nextUp : undefined
+  if (escalation !== undefined) {
+    return {
+      variant: escalation,
+      downgradedFrom: requested,
+      note: `effort "${requested}" unsupported by ${label} — using "${escalation}", the nearest level it offers`,
     }
   }
 
   return {
-    variant: fallback,
+    variant: undefined,
     downgradedFrom: requested,
-    note: `effort "${requested}" unsupported by ${label} — using "${fallback}"`,
+    note: `effort "${requested}" unsupported by ${label}, which offers only ${available.join(", ")}`,
   }
 }
 
