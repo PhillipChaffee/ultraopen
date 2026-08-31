@@ -1,0 +1,210 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+import { ultraopen } from "../src/server/index.js"
+import { registry } from "../src/server/singleton.js"
+import { WORKFLOW_TOOL } from "../src/server/bridge/permission.js"
+import type { MutableConfig } from "../src/server/ultracode/config.js"
+
+type ToolDef = {
+  description: string
+  args: Record<string, unknown>
+  execute: (args: Record<string, unknown>, context: Record<string, unknown>) => Promise<string>
+}
+
+const META = "export const meta = { name: 'demo', description: 'a demo workflow' }\n"
+
+/** A client that never actually spawns — index tests exercise wiring, not the bridge. */
+const stubClient = {
+  session: {
+    create: () => Promise.resolve({ data: { id: "child" } }),
+    get: () => Promise.resolve({ data: { id: "child" } }),
+    delete: () => Promise.resolve({}),
+    abort: () => Promise.resolve({}),
+    prompt: () => Promise.resolve({ data: { info: {}, parts: [] } }),
+  },
+}
+
+const toolOf = (hooks: Record<string, unknown>): ToolDef | undefined => {
+  const tools = hooks["tool"] as Record<string, ToolDef> | undefined
+  return tools?.[WORKFLOW_TOOL]
+}
+
+let savedEnv: string | undefined
+
+beforeEach(() => {
+  registry.resetForTests()
+  savedEnv = process.env["ULTRAOPEN_ACTIVE"]
+  delete process.env["ULTRAOPEN_ACTIVE"]
+})
+
+afterEach(() => {
+  if (savedEnv === undefined) delete process.env["ULTRAOPEN_ACTIVE"]
+  else process.env["ULTRAOPEN_ACTIVE"] = savedEnv
+})
+
+describe("plugin registration", () => {
+  test("registers the workflow tool under its bare id", () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    expect(tool).toBeDefined()
+    expect(typeof tool?.execute).toBe("function")
+    expect(tool?.description).toContain("orchestrates multiple subagents")
+  })
+
+  test("exposes a config hook and a shell.env hook", () => {
+    const hooks = ultraopen({ client: stubClient })
+    expect(typeof hooks["config"]).toBe("function")
+    expect(typeof hooks["shell.env"]).toBe("function")
+  })
+
+  test("the args schema accepts title and description so a CC-trained model is not rejected", () => {
+    // The spec says both are accepted and IGNORED. Omitting them would turn a harmless extra
+    // argument into a schema validation error.
+    const args = toolOf(ultraopen({ client: stubClient }))?.args ?? {}
+    expect(Object.keys(args)).toContain("title")
+    expect(Object.keys(args)).toContain("description")
+    expect(Object.keys(args)).toContain("script")
+    expect(Object.keys(args)).toContain("dryRun")
+  })
+
+  test("applies the configured concurrency to the process-wide gate", () => {
+    ultraopen({ client: stubClient }, { concurrency: 3 })
+    expect(registry.semaphore.limit).toBe(3)
+  })
+
+  test("a concurrency of 0 is clamped rather than honoured", () => {
+    // `0 ?? 8` is 0, and a limit below 1 makes every acquire wait forever with no throw.
+    ultraopen({ client: stubClient }, { concurrency: 0 })
+    expect(registry.semaphore.limit).toBeGreaterThanOrEqual(1)
+  })
+})
+
+describe("nested-process guard", () => {
+  test("does NOT register the tool when ULTRAOPEN_ACTIVE is set", () => {
+    // A nested `opencode` gets a fresh server, plugin load and tool, escaping this process's
+    // concurrency cap, agent counter, budget and abort signal. This guard survives every path a
+    // bash command pattern cannot match.
+    process.env["ULTRAOPEN_ACTIVE"] = "1"
+    const hooks = ultraopen({ client: stubClient })
+    expect(hooks["tool"]).toBeUndefined()
+  })
+
+  test("still installs config and hooks when nested", () => {
+    process.env["ULTRAOPEN_ACTIVE"] = "1"
+    const hooks = ultraopen({ client: stubClient })
+    expect(typeof hooks["config"]).toBe("function")
+    expect(typeof hooks["shell.env"]).toBe("function")
+  })
+})
+
+describe("shell.env hook", () => {
+  test("marks shells only inside engine-owned sessions", () => {
+    const hooks = ultraopen({ client: stubClient })
+    const hook = hooks["shell.env"] as (i: { sessionID?: string }, o: { env: Record<string, string> }) => void
+
+    registry.register("child", "run-1")
+
+    const owned = { env: {} as Record<string, string> }
+    hook({ sessionID: "child" }, owned)
+    expect(owned.env["ULTRAOPEN_ACTIVE"]).toBe("1")
+
+    // Scoping matters: a blanket marker would disable the tool for the user's own work too.
+    const foreign = { env: {} as Record<string, string> }
+    hook({ sessionID: "someone-elses" }, foreign)
+    expect(foreign.env["ULTRAOPEN_ACTIVE"]).toBeUndefined()
+
+    const anonymous = { env: {} as Record<string, string> }
+    hook({}, anonymous)
+    expect(anonymous.env["ULTRAOPEN_ACTIVE"]).toBeUndefined()
+  })
+})
+
+describe("config hook", () => {
+  test("installs the ultracode agent, command and permission default", () => {
+    const hooks = ultraopen({ client: stubClient })
+    const config: MutableConfig = {}
+    ;(hooks["config"] as (c: MutableConfig) => void)(config)
+
+    expect(config.agent?.["ultracode"]).toBeDefined()
+    expect(config.command?.["ultracode"]).toBeDefined()
+    expect((config.permission as Record<string, unknown>)["workflow"]).toBe("ask")
+    expect(config.experimental?.primary_tools).toContain(WORKFLOW_TOOL)
+  })
+
+  test("is synchronous — it must not return a promise", () => {
+    // The hook's return value is discarded; mutation is the only channel. Awaiting the client
+    // from inside it can cache an agent list built from the un-mutated config for the whole
+    // instance lifetime.
+    const hooks = ultraopen({ client: stubClient })
+    const result = (hooks["config"] as (c: MutableConfig) => unknown)({})
+    expect(result).toBeUndefined()
+  })
+})
+
+describe("tool execution", () => {
+  const run = async (args: Record<string, unknown>, context: Record<string, unknown> = {}): Promise<string> => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) throw new Error("tool was not registered")
+    return await tool.execute(args, { sessionID: "parent", ...context })
+  }
+
+  test("renders a successful dry run with the value and usage", async () => {
+    const output = await run({ script: `${META}return { ok: 1 }\n`, dryRun: true })
+    expect(output).toContain(`<result workflow="demo"`)
+    expect(output).toContain(`"ok": 1`)
+    expect(output).toContain("<usage")
+  })
+
+  test("includes log lines emitted by the script", async () => {
+    const output = await run({ script: `${META}log('hello from the script')\nreturn 1\n`, dryRun: true })
+    expect(output).toContain("<log>")
+    expect(output).toContain("hello from the script")
+  })
+
+  test("reports the agent count a dry run WOULD have spawned", async () => {
+    // agentCount must reflect the fan-out even when nothing was really spawned, or dryRun cannot
+    // be used to preview cost.
+    const script = `${META}await parallel([() => agent('a'), () => agent('b'), () => agent('c')])\nreturn 'done'\n`
+    expect(await run({ script, dryRun: true })).toContain('agents="3"')
+  })
+
+  test("asks for permission before fanning out, scoped to this workflow", async () => {
+    const asked: Array<Record<string, unknown>> = []
+    await run(
+      { script: `${META}return 1\n`, dryRun: true, title: "audit" },
+      { ask: (request: Record<string, unknown>) => { asked.push(request); return Promise.resolve() } },
+    )
+    expect(asked.length).toBe(1)
+    expect(asked[0]?.["permission"]).toBe(WORKFLOW_TOOL)
+    // NOT ["*"]: an "always" grant is stored instance-wide, so approving with "*" would
+    // permanently disable the prompt for every workflow in the directory.
+    expect(asked[0]?.["always"]).toEqual(["audit"])
+  })
+
+  test("a parse failure comes back as a rendered diagnostic, not a crash", async () => {
+    const output = await run({ script: `${META}const x: string[] = []\n`, dryRun: true })
+    expect(output).toContain("ParseError")
+    expect(output).toContain("not TypeScript")
+    // The caret line proves the source was threaded through to the renderer.
+    expect(output).toContain("^")
+  })
+
+  test("a missing script is reported clearly", async () => {
+    expect(await run({ dryRun: true })).toContain("needs a `script`")
+  })
+
+  test("refuses to run inside a session the engine owns", async () => {
+    registry.register("parent", "outer-run")
+    expect(await run({ script: `${META}return 1\n`, dryRun: true })).toContain("cannot be called from inside")
+  })
+
+  test("surfaces failed agents rather than letting partial coverage read as full", async () => {
+    // A client whose session.create never returns data, so every agent fails to spawn.
+    const failing = { session: { ...stubClient.session, create: () => Promise.resolve({ error: "nope" }) } }
+    const tool = toolOf(ultraopen({ client: failing }))
+    const output = await tool?.execute(
+      { script: `${META}await parallel([() => agent('a'), () => agent('b')])\nreturn 'done'\n` },
+      { sessionID: "parent" },
+    )
+    expect(output).toContain("<failures")
+    expect(output).toContain('of="2"')
+  })
+})

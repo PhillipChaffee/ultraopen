@@ -163,7 +163,7 @@ export class Run {
           label,
           phase,
           ok: true,
-          outputTokens: outcome.info.tokens.output,
+          outputTokens: outputTokensOf(outcome.info),
           ...pick("sessionID", outcome.sessionID),
         }
       : {
@@ -207,6 +207,19 @@ export class Run {
       }),
     )
   }
+}
+
+/**
+ * Reads output tokens defensively.
+ *
+ * The SDK types promise `tokens.output`, but the checked-in types have already drifted from the
+ * server once, and an unexpected response shape must not crash a whole run with an opaque
+ * "undefined is not an object". A missing count degrades to 0 — budget reporting under-counts,
+ * which is visible, rather than the run dying, which is not.
+ */
+function outputTokensOf(info: { tokens?: { output?: number } }): number {
+  const output = info.tokens?.output
+  return typeof output === "number" && Number.isFinite(output) ? output : 0
 }
 
 /** Includes a key only when the value is present, which `exactOptionalPropertyTypes` requires. */

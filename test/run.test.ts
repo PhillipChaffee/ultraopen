@@ -436,3 +436,35 @@ describe("option plumbing", () => {
     expect("system" in promptBody).toBe(false)
   })
 })
+
+describe("Run.agent — defensive token extraction", () => {
+  test("a response with no tokens field degrades to 0 rather than crashing the run", async () => {
+    // Regression: `outcome.info.tokens.output` threw "undefined is not an object" on a message
+    // without a tokens field. Inside parallel() that was caught into a null, but a bare
+    // `await agent(...)` killed the whole workflow with an opaque error. The SDK types have
+    // already drifted from the server once, so an unexpected shape must not be fatal.
+    // Casts are deliberate: these fixtures are INVALID by the declared types, which is exactly
+    // the situation being guarded against — the server returning a shape the SDK types promise
+    // cannot happen.
+    const { client } = makeClient({
+      prompt: () => Promise.resolve({ data: { info: {}, parts: [textPart("fine")] } } as unknown as PromptResult),
+    })
+    const run = makeRun(client)
+
+    expect(await run.agent("x")).toBe("fine")
+    expect(run.outputTokens).toBe(0)
+    expect(run.nulls.length).toBe(0)
+  })
+
+  test("a non-numeric token count is ignored", async () => {
+    const { client } = makeClient({
+      prompt: () =>
+        Promise.resolve({
+          data: { info: { tokens: { output: "lots" } }, parts: [textPart("fine")] },
+        } as unknown as PromptResult),
+    })
+    const run = makeRun(client)
+    await run.agent("x")
+    expect(run.outputTokens).toBe(0)
+  })
+})
