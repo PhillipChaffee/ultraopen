@@ -45,6 +45,21 @@ export type SpawnOptions = {
  * guard for exactly the sessions with the widest blast radius.
  */
 export async function spawn(client: OpencodeClient, options: SpawnOptions): Promise<SpawnOutcome> {
+  const created = await createChild(client, options)
+  if (!created.ok) return { ok: false, reason: "spawn-failed", detail: created.detail }
+  return await promptChild(client, created.sessionID, options.prompt, options)
+}
+
+export type CreateChildResult = { ok: true; sessionID: string } | { ok: false; detail: string }
+
+/**
+ * Creates the child session, returning its id.
+ *
+ * Split from prompting so the structured-output ladder can retry in the SAME session — which
+ * preserves the child's research and is the only construction that repairs a
+ * compaction-stripped `format`.
+ */
+export async function createChild(client: OpencodeClient, options: SpawnOptions): Promise<CreateChildResult> {
   const body: CreateSessionBody = {
     parentID: options.parentSessionID,
     title: `ultraopen · ${options.label}`,
@@ -61,12 +76,21 @@ export async function spawn(client: OpencodeClient, options: SpawnOptions): Prom
 
   const created = await client.session.create({ body })
   const sessionID = created.data?.id
-  if (!sessionID) {
-    return { ok: false, reason: "spawn-failed", detail: describe(created.error) }
-  }
+  // Carry the real reason forward: "session creation returned no id" tells the user nothing about
+  // why, and this is the first place a misconfigured agent name or a rejected body surfaces.
+  if (!sessionID) return { ok: false, detail: describe(created.error) }
 
   registry.register(sessionID, options.runId)
+  return { ok: true, sessionID }
+}
 
+/** Runs one prompt turn in an existing child session. */
+export async function promptChild(
+  client: OpencodeClient,
+  sessionID: string,
+  prompt: string,
+  options: SpawnOptions,
+): Promise<SpawnOutcome> {
   const abortChild = async (): Promise<void> => {
     await client.session.abort({ path: { id: sessionID } }).catch(() => undefined)
   }
@@ -79,13 +103,15 @@ export async function spawn(client: OpencodeClient, options: SpawnOptions): Prom
     if (options.signal?.aborted) return { ok: false, reason: "aborted", detail: "aborted before start", sessionID }
 
     const promptBody: PromptBody = {
-      parts: [{ type: "text", text: options.prompt }],
+      parts: [{ type: "text", text: prompt }],
       // `agent` must be on the PROMPT: create({agent}) is cosmetic, since the agent is resolved
       // from the prompt input and the session row is never consulted (prompt.ts:636-637).
       ...(options.agentType ? { agent: options.agentType } : {}),
       ...(options.model ? { model: options.model } : {}),
       ...(options.variant ? { variant: options.variant } : {}),
       ...(options.system ? { system: options.system } : {}),
+      // `format` MUST be resent on every turn: the host reads it off the LATEST user message, so
+      // a retry without it silently degrades to an unstructured turn.
       ...(options.schema ? { format: { type: "json_schema" as const, schema: options.schema } } : {}),
     }
 

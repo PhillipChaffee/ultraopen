@@ -36,6 +36,21 @@ export const MAX_CONCURRENCY = 32
  */
 export const DEFAULT_AGENT_DEADLINE_MS = 15 * 60 * 1000
 
-/** Effort variants in descending preference. Resolved against the model's real variant map. */
+/**
+ * Effort variants in descending PREFERENCE — which to reach for first when nothing specific was
+ * asked for. `xhigh` outranks `max` deliberately: max costs far more for a marginal gain.
+ *
+ * This is NOT a strength ordering; see EFFORT_STRENGTH.
+ */
 export const EFFORT_PREFERENCE = ["xhigh", "max", "high", "medium", "low"] as const
 export type Effort = (typeof EFFORT_PREFERENCE)[number]
+
+/**
+ * The same variants in ascending STRENGTH, which is a different order: `max` really is stronger
+ * than `xhigh`, even though we prefer not to pay for it.
+ *
+ * Downgrades must use this one. Using the preference list instead would resolve a request for
+ * "xhigh" on a model offering [low, medium, high, max] up to "max" — silently spending more than
+ * was asked for, which is the opposite of a downgrade.
+ */
+export const EFFORT_STRENGTH = ["low", "medium", "high", "xhigh", "max"] as const

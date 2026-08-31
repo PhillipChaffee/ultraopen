@@ -1,7 +1,8 @@
 import { fail } from "../script/errors.js"
 import { DEFAULT_AGENT_DEADLINE_MS, MAX_AGENTS_PER_RUN } from "../script/limits.js"
 import { registry } from "../singleton.js"
-import { spawn, type NullReason, type SpawnOutcome } from "../bridge/spawn.js"
+import { type NullReason, type SpawnOutcome } from "../bridge/spawn.js"
+import { spawnStructured } from "../bridge/structured.js"
 import type { Ruleset } from "../bridge/permission.js"
 import type { OpencodeClient } from "../types.js"
 
@@ -138,7 +139,7 @@ export class Run {
     const release = await registry.semaphore.acquire()
     let outcome: SpawnOutcome
     try {
-      outcome = await spawn(this.#options.client, {
+      outcome = await spawnStructured(this.#options.client, {
         prompt,
         runId: this.runId,
         parentSessionID: this.#options.parentSessionID,
