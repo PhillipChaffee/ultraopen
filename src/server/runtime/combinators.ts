@@ -1,5 +1,6 @@
 import { fail, WorkflowScriptError } from "../script/errors.js"
 import { MAX_ITEMS_PER_CALL } from "../script/limits.js"
+import { openFrame, withChildScope } from "../resume/scope.js"
 
 /**
  * `parallel` and `pipeline`, the two fan-out primitives a workflow script drives.
@@ -32,8 +33,11 @@ export async function parallel(thunks: ReadonlyArray<() => unknown>): Promise<un
   }
   assertWithinLimit(thunks.length, "parallel")
 
+  // One frame for the whole call, so every thunk shares it and a sibling parallel() gets its own.
+  const frame = openFrame("P")
+
   return await Promise.all(
-    thunks.map(async (thunk) => {
+    thunks.map(async (thunk, index) => {
       // The try must wrap the SYNCHRONOUS invocation too: a thunk that throws before returning a
       // promise (`() => { throw x }`, or a non-function entry) must still resolve to null rather
       // than rejecting the whole barrier.
@@ -43,7 +47,9 @@ export async function parallel(thunks: ReadonlyArray<() => unknown>): Promise<un
             "parallel() expects an array of functions, not promises. Wrap each call: () => agent(...)",
           )
         }
-        return await thunk()
+        // Each thunk gets its own resume scope: thunks past the concurrency cap start in
+        // completion order, so a shared sequence would disagree between runs.
+        return await withChildScope("P", frame, index, async () => await thunk())
       } catch (error) {
         // Engine faults must NEVER degrade to null. A LimitError or a determinism trap swallowed
         // here would read as "this agent returned nothing" — the silent truncation the spec
@@ -80,21 +86,28 @@ export async function pipeline(
   }
   assertWithinLimit(items.length, "pipeline")
 
+  const frame = openFrame("L")
+
   return await Promise.all(
-    items.map(async (item, index) => {
-      let current: unknown = item
-      for (const stage of stages) {
-        try {
-          current = await stage(current, item, index)
-        } catch (error) {
-          // Same rule as parallel(): an engine fault propagates and fails the run loudly, rather
-          // than masquerading as a single item that produced no result.
-          if (error instanceof WorkflowScriptError) throw error
-          return null
+    items.map((item, index) =>
+      // One scope PER ITEM, spanning all of its stages. That is what makes resume work here:
+      // stages within an item are genuinely sequential, while stage-N calls across items fire in
+      // model-latency order and must not share a sequence.
+      withChildScope("L", frame, index, async () => {
+        let current: unknown = item
+        for (const stage of stages) {
+          try {
+            current = await stage(current, item, index)
+          } catch (error) {
+            // Same rule as parallel(): an engine fault propagates and fails the run loudly, rather
+            // than masquerading as a single item that produced no result.
+            if (error instanceof WorkflowScriptError) throw error
+            return null
+          }
+          if (current === null || current === undefined) return null
         }
-        if (current === null || current === undefined) return null
-      }
-      return current
-    }),
+        return current
+      }),
+    ),
   )
 }

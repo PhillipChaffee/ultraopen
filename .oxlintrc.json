@@ -53,7 +53,21 @@
     "eslint/no-magic-numbers": "off",
     "unicorn/no-useless-undefined": "off",
     "import/no-named-export": "off",
-    "unicorn/prefer-top-level-await": "off"
+    "unicorn/prefer-top-level-await": "off",
+    "eslint/max-lines": [
+      "error",
+      {
+        "max": 400,
+        "skipComments": true,
+        "skipBlankLines": true
+      }
+    ],
+    "import/max-dependencies": [
+      "error",
+      {
+        "max": 14
+      }
+    ]
   },
   "ignorePatterns": [
     "dist/**",

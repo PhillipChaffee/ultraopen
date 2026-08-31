@@ -5,6 +5,8 @@ import { parallel, pipeline } from "../runtime/combinators.js"
 import { Run, type AgentOptions, type ProgressEvent } from "../runtime/run.js"
 import { subagentContract } from "../bridge/contract.js"
 import { makeResolvers } from "../bridge/models.js"
+import { argsHash } from "../resume/key.js"
+import type { JournalEntry } from "../resume/journal.js"
 import { registry } from "../singleton.js"
 import type { Ruleset } from "../bridge/permission.js"
 import type { OpencodeClient } from "../types.js"
@@ -42,6 +44,10 @@ export type WorkflowContext = {
   onProgress?: ((event: ProgressEvent) => void) | undefined
   /** Reads a persisted script for `scriptPath`. Injected so the engine stays filesystem-free. */
   readScript?: ((path: string) => Promise<string>) | undefined
+  /** Journal entries from the run being resumed. */
+  previousEntries?: readonly JournalEntry[] | undefined
+  /** The run id being resumed, recorded on replayed entries. */
+  resumedFrom?: string | undefined
 }
 
 export type WorkflowResult = {
@@ -52,6 +58,8 @@ export type WorkflowResult = {
   nulls: Array<{ label: string; reason: string; detail: string }>
   logs: string[]
   outputTokens: number
+  /** This run's journal, for persistence and for a follow-up resume. */
+  journal: JournalEntry[]
 }
 
 /**
@@ -120,6 +128,14 @@ async function runPrepared(
     // Every workflow subagent is told its output is a return value, not a reply to a person,
     // unless the caller supplied its own contract.
     subagentContract: context.subagentContract ?? subagentContract,
+    // Seeded from `args`, NOT the script text. The per-call chain already captures every edit
+    // that changes what an agent is asked, and does so incrementally — seeding from the source
+    // hash would make ANY edit invalidate the entire run, destroying the longest-unchanged-prefix
+    // property that makes resume worth having. `args` is different: it is invisible to the chain
+    // but can change every result, so a change there must invalidate everything.
+    resumeSeed: argsHash(args.args),
+    ...optional("previousEntries", context.previousEntries),
+    ...optional("resumedFrom", context.resumedFrom),
     ...optional("resolveModel", resolvers.resolveModel),
     ...optional("resolveVariant", resolvers.resolveVariant),
     ...optional("inheritedPermission", context.inheritedPermission),
@@ -145,16 +161,21 @@ async function runPrepared(
   for (const message of buffered) run.log(message)
 
   try {
-    const value = await runSandbox(prepared.body, {
-      agent,
-      parallel,
-      pipeline,
-      phase: run.phase,
-      log: run.log,
-      args: args.args,
-      budget: budgetStub(run),
-      workflow: nestedStub,
-    })
+    // The sandbox runs INSIDE the root resume scope, so every agent() call — including those
+    // reached through combinator callbacks — sees a scope and gets a stable key.
+    const value = await run.withRootScope(
+      async () =>
+        await runSandbox(prepared.body, {
+          agent,
+          parallel,
+          pipeline,
+          phase: run.phase,
+          log: run.log,
+          args: args.args,
+          budget: budgetStub(run),
+          workflow: nestedStub,
+        }),
+    )
 
     return {
       runId: context.runId,
@@ -168,6 +189,7 @@ async function runPrepared(
       })),
       logs: run.logs,
       outputTokens: run.outputTokens,
+      journal: run.journal.entries,
     }
   } finally {
     // Children are never cascaded to by the host, so releasing them is ours to do — otherwise a

@@ -3,6 +3,10 @@ import { DEFAULT_AGENT_DEADLINE_MS, MAX_AGENTS_PER_RUN } from "../script/limits.
 import { registry } from "../singleton.js"
 import { type NullReason, type SpawnOutcome } from "../bridge/spawn.js"
 import { spawnStructured } from "../bridge/structured.js"
+import { Journal, type JournalEntry } from "../resume/journal.js"
+import { toJournalEntry, toReplayedEntry, tryReplay } from "../resume/replay.js"
+import { stableStringify } from "../resume/key.js"
+import { breakScope, nextCallIdentity, rootScope, withScope, type Scope } from "../resume/scope.js"
 import type { Ruleset } from "../bridge/permission.js"
 import type { OpencodeClient } from "../types.js"
 
@@ -28,6 +32,8 @@ export type AgentRecord = {
   detail?: string
   sessionID?: string
   outputTokens: number
+  /** True when this result came from a previous run's journal rather than a live call. */
+  replayed?: boolean
 }
 
 export type ProgressEvent =
@@ -57,6 +63,12 @@ export type RunOptions = {
   deadlineMs?: number | undefined
   signal?: AbortSignal | undefined
   onProgress?: ((event: ProgressEvent) => void) | undefined
+  /** Journal entries from a previous run, indexed as replay candidates. */
+  previousEntries?: readonly JournalEntry[] | undefined
+  /** The run this one resumes, recorded on replayed entries so they are distinguishable. */
+  resumedFrom?: string | undefined
+  /** Root chain seed — the script hash, so any edit invalidates everything. */
+  resumeSeed?: string | undefined
 }
 
 /**
@@ -69,14 +81,30 @@ export class Run {
   readonly runId: string
   readonly records: AgentRecord[] = []
   readonly logs: string[] = []
+  readonly journal: Journal
 
   #currentPhase: string | undefined
   #spawned = 0
   readonly #options: RunOptions
+  readonly #journal: Journal
+  readonly #rootScope: Scope
+  readonly #resumedFrom: string | undefined
 
   constructor(options: RunOptions) {
     this.#options = options
     this.runId = options.runId
+    this.#journal = new Journal()
+    this.journal = this.#journal
+    this.#resumedFrom = options.resumedFrom
+    // Seeded from the script source, so editing the script anywhere invalidates the root chain
+    // and nothing replays against a program that no longer exists.
+    this.#rootScope = rootScope(options.resumeSeed ?? "root")
+    if (options.previousEntries) this.#journal.loadPrevious(options.previousEntries)
+  }
+
+  /** Runs `work` with this run's root resume scope installed. */
+  async withRootScope<T>(work: () => Promise<T>): Promise<T> {
+    return await withScope(this.#rootScope, work)
   }
 
   get agentCount(): number {
@@ -130,14 +158,31 @@ export class Run {
       })
     }
 
-    // Claim the index synchronously, BEFORE awaiting a permit. Source order is then the identity
-    // of a call even for fan-outs wider than the concurrency cap — which is what the resume key
-    // will hang off in M3.
+    // Claim identity synchronously, BEFORE awaiting a permit. Doing it after would make a call's
+    // key depend on permit-grant order, which varies with timing — reintroducing exactly the
+    // nondeterminism the scoped chain exists to remove.
     const index = this.#spawned
     this.#spawned++
+    const identity = nextCallIdentity(prompt, options, this.#rootScope)
 
     const label = options.label ?? deriveLabel(prompt, index)
     const phase = options.phase ?? this.#currentPhase
+    const schemaHash = options.schema ? stableStringify(options.schema) : undefined
+
+    // Replay before spending anything. `forceLive` covers the sticky break: once a call in this
+    // scope has missed, every later call in it must run live, because their upstream context
+    // changed and a cached result belongs to a different execution.
+    const hit = tryReplay(this.#journal, identity, schemaHash)
+    if (hit) {
+      this.#journal.record(toReplayedEntry(hit.entry, label, phase, this.#resumedFrom))
+      this.#options.onProgress?.({ type: "agent-end", index, label, phase, ok: true })
+      // Replayed spend counts as if paid, or a budget-guarded loop takes a different number of
+      // trips on resume and the script's own control flow diverges.
+      this.records.push({ index, label, phase, ok: true, outputTokens: hit.outputTokens, replayed: true })
+      return hit.value
+    }
+    // A miss breaks the scope for everything after it.
+    if (!identity.forceLive) breakScope(this.#rootScope)
 
     this.#options.onProgress?.({ type: "agent-start", index, label, phase })
 
@@ -187,6 +232,19 @@ export class Run {
         }
 
     this.records.push(record)
+
+    const value = outcome.ok ? (options.schema ? outcome.structured : outcome.text) : undefined
+    this.#journal.record(
+      toJournalEntry({
+        identity,
+        label,
+        phase,
+        schemaHash,
+        outputTokens: record.outputTokens,
+        ...(outcome.ok ? { ok: true, value } : { ok: false, reason: outcome.reason, detail: outcome.detail }),
+      }),
+    )
+
     this.#options.onProgress?.({
       type: "agent-end",
       index,
@@ -197,7 +255,7 @@ export class Run {
     })
 
     if (!outcome.ok) return null
-    return options.schema ? outcome.structured : outcome.text
+    return value
   }
 
   /**
