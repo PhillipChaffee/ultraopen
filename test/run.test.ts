@@ -1,7 +1,14 @@
 import { beforeEach, describe, expect, test } from "bun:test"
+import { execFile } from "node:child_process"
+import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { promisify } from "node:util"
 import { Run, type ProgressEvent, type RunOptions } from "../src/server/runtime/run.js"
 import { registry } from "../src/server/singleton.js"
 import { MAX_AGENTS_PER_RUN } from "../src/server/script/limits.js"
+
+const git = promisify(execFile)
 import type {
   AssistantErrorName,
   AssistantInfo,
@@ -98,6 +105,15 @@ function makeClient(
   }
 
   return { client, createCalls, promptCalls, abortCalls }
+}
+
+/** A promise with its resolver, for gating fake async work from the test body. */
+function gate(): [Promise<void>, () => void] {
+  let release!: () => void
+  const opened = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  return [opened, release]
 }
 
 /** A Run wired to run-1/parent-1 by default, with just the option overrides a test cares about. */
@@ -348,6 +364,111 @@ describe("Run.agent — concurrency", () => {
 
     expect(results.every((result) => result === null)).toBe(true)
     expect(run.nulls.length).toBe(6)
+  })
+})
+
+describe("Run.agent — budget", () => {
+  test("a call past the ceiling throws instead of silently spending", async () => {
+    // The budget is a HARD ceiling, not advisory: `agent()` checks it at entry so a guarded loop
+    // terminates rather than running to the agent cap. This drives the real agent() path.
+    const { client } = makeClient()
+    const run = makeRun(client, { budgetTotal: 100 })
+    await run.agent("burn tokens", { label: "spend" })
+    // Force the spend past the ceiling (outputTokensOf reads only completed records).
+    run.records[0]!.outputTokens = 500
+
+    await expect(run.agent("one more")).rejects.toThrow(/100 output-token budget/u)
+  })
+})
+
+describe("Run.agent — abort", () => {
+  test("an already-aborted run throws BEFORE creating a session or worktree", async () => {
+    // Fail fast: paying for a child session that is aborted on first prompt is wasted money.
+    const { client, createCalls } = makeClient()
+    const controller = new AbortController()
+    controller.abort()
+    const run = makeRun(client, { signal: controller.signal })
+
+    await expect(run.agent("do the thing")).rejects.toThrow(/aborted/u)
+    expect(createCalls).toEqual([])
+  })
+
+  test("an abort while queued for a permit rejects instead of spawning later", async () => {
+    registry.configureConcurrency(1)
+    const [firstPromptGate, releaseFirst] = gate()
+    const [started, markStarted] = gate()
+    const { client, createCalls } = makeClient({
+      prompt: (call) => {
+        markStarted()
+        if (call.path.id === "child-1") {
+          return firstPromptGate.then(() => ({ data: { info: baseInfo(), parts: [textPart("done")] } }))
+        }
+        return Promise.resolve({ data: { info: baseInfo(), parts: [textPart("done")] } })
+      },
+    })
+    const controller = new AbortController()
+    // The run's signal is a Run option, so the whole scenario is built around one from the start.
+    const run = makeRun(client, { signal: controller.signal })
+
+    const first = run.agent("first")
+    // The first agent now holds the only permit.
+    await started
+    // Synchronously registers as a semaphore waiter.
+    const queued = run.agent("second")
+    // The parent aborted while the second agent was queued.
+    controller.abort()
+    releaseFirst()
+
+    await expect(queued).rejects.toThrow(/concurrency permit/u)
+    // The queued agent never reached a session; only the first child exists.
+    expect(createCalls.length).toBe(1)
+    await expect(first).resolves.toBe("done")
+  })
+})
+
+describe("Run.agent — deadline propagation", () => {
+  test("a hung agent is abandoned once deadlineMs passes and surfaces as a null with reason deadline", async () => {
+    // withDeadline is unit-tested in deadline.test.ts; this proves Run actually forwards
+    // deadlineMs through spawnStructured so a hung agent cannot hold a permit forever.
+    const { client } = makeClient({ prompt: () => new Promise(() => {}) })
+    const run = makeRun(client, { deadlineMs: 10 })
+
+    const result = await run.agent("hung")
+    expect(result).toBeNull()
+    const nullRecord = run.nulls[0]
+    if (!nullRecord) throw new Error("expected a null record")
+    expect(nullRecord.reason).toBe("deadline")
+  })
+})
+
+describe("Run.agent — worktree isolation", () => {
+  test("an isolated agent's session is created with the worktree directory and released on abortAll", async () => {
+    // Worktree isolation is a headline feature with no coverage through the real agent() path;
+    // this drives the real createWorktree against a temp repository, like isolation.test.ts does.
+    const repo = await mkdtemp(join(tmpdir(), "ultraopen-run-wt-"))
+    await git("git", ["-C", repo, "init", "-q"])
+    await git("git", ["-C", repo, "config", "user.email", "t@example.com"])
+    await git("git", ["-C", repo, "config", "user.name", "t"])
+    await writeFile(join(repo, "file.txt"), "hello\n")
+    await git("git", ["-C", repo, "add", "."])
+    await git("git", ["-C", repo, "commit", "-qm", "init"])
+
+    const { client, createCalls } = makeClient()
+    const run = makeRun(client, { worktreeRoot: repo })
+
+    try {
+      await run.agent("work in isolation", { isolation: "worktree", label: "iso" })
+      const directory = createCalls[0]?.query?.directory
+      expect(directory).toBeTruthy()
+
+      await run.abortAll()
+      // The clean worktree was released with the run: nothing but the main worktree remains.
+      const { stdout } = await git("git", ["-C", repo, "worktree", "list", "--porcelain"])
+      expect(stdout.match(/^worktree /gmu)?.length).toBe(1)
+    } finally {
+      await git("git", ["-C", repo, "worktree", "prune"]).catch(() => undefined)
+      await rm(repo, { recursive: true, force: true })
+    }
   })
 })
 

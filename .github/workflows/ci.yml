@@ -7,7 +7,13 @@ on:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # macOS is a first-class opencode platform and exercises different path/permission behaviour
+    # than Linux. Windows is left out deliberately: the sandbox parity test relies on POSIX
+    # process signals and the reaper's pid probes are not meaningful there.
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 

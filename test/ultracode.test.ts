@@ -36,6 +36,9 @@ describe("no-fan-out detection", () => {
     ["no subagents please", true],
     ["stop using parallel agents", true],
     ["avoid workflows for this", true],
+    // A negated mention must disable, never enable — enabling here would invert the user's intent.
+    ["don't use ultracode", true],
+    ["stop using ultracode", true],
     ["use a workflow", false],
     ["run this in parallel", false],
   ])("%p -> %p", (text, expected) => {
@@ -49,6 +52,13 @@ describe("mode state", () => {
   test("the ultracode AGENT needs no stored state", () => {
     expect(mode.isActive("s1", "ultracode")).toBe(true)
     expect(mode.isActive("s1", "build")).toBe(false)
+  })
+
+  test("an explicit toggle beats the ultracode AGENT itself", () => {
+    // A user on the ultracode agent who runs /ultracode off must actually get the mode off —
+    // the command is the later, more explicit instruction.
+    mode.disable("s1")
+    expect(mode.isActive("s1", "ultracode")).toBe(false)
   })
 
   test("enable and disable are per session", () => {
@@ -76,6 +86,14 @@ describe("mode state", () => {
     mode.demote("s1")
     expect(mode.isDemoted("s1")).toBe(true)
     expect(mode.isDemoted("s2")).toBe(false)
+  })
+
+  test("an explicit re-enable clears a demotion", () => {
+    // The user saying "use ultracode again" is a later, more explicit instruction than the
+    // earlier "don't fan out" — staying demoted would silently ignore the re-enable.
+    mode.demote("s1")
+    mode.enable("s1", "keyword")
+    expect(mode.isDemoted("s1")).toBe(false)
   })
 })
 
@@ -151,6 +169,36 @@ describe("chat.message hook", () => {
   test("records an instruction to stop fanning out", () => {
     onChatMessage({ sessionID: "s1" }, chatOutput("ultracode but do not fan out"))
     expect(mode.isDemoted("s1")).toBe(true)
+  })
+
+  test("a negated keyword mention demotes and does NOT enable", () => {
+    // "don't use ultracode" must not switch the mode on — the keyword regex cannot see negation,
+    // so the no-fan-out detector gates it.
+    onChatMessage({ sessionID: "s1" }, chatOutput("don't use ultracode"))
+    expect(mode.isActive("s1")).toBe(false)
+    expect(mode.isDemoted("s1")).toBe(true)
+  })
+
+  test("re-mentioning the keyword while active does NOT move the reminder toggle point", () => {
+    // The reminder is ephemeral and re-injected from `fromMessageID` each turn; overwriting it
+    // with each new mention drops earlier messages' reminders and breaks the cache prefix.
+    const first = chatOutput("ultracode this")
+    first.message.id = "m1"
+    onChatMessage({ sessionID: "s1" }, first)
+    const stateBefore = mode.get("s1")
+    expect(stateBefore?.fromMessageID).toBe("m1")
+
+    const again = chatOutput("more ultracode please")
+    again.message.id = "m2"
+    onChatMessage({ sessionID: "s1" }, again)
+    expect(mode.get("s1")?.fromMessageID).toBe("m1")
+  })
+
+  test("mentioning the keyword while disabled by a command DOES re-enable", () => {
+    // The source changed — a fresh keyword mention after /ultracode off is the user asking again.
+    mode.disable("s1")
+    onChatMessage({ sessionID: "s1" }, chatOutput("ultracode this"))
+    expect(mode.isActive("s1")).toBe(true)
   })
 
   test("engine-owned child sessions are never put into ultracode", () => {

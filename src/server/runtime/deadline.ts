@@ -62,7 +62,12 @@ export async function withDeadline<T>(work: Promise<T>, options: DeadlineOptions
   })
 
   try {
-    return await Promise.race([work, timeout])
+    const raced = Promise.race([work, timeout])
+    // If the deadline wins, the abandoned work promise may still reject later (the SDK's fetch
+    // layer throws on transport errors). With no handler that is an unhandled rejection, which
+    // Node treats as fatal — one slow agent would take the whole opencode server down.
+    void work.catch(() => {})
+    return await raced
   } finally {
     timers.clearTimeout(handle)
     if (fired && options.onTimeout) {

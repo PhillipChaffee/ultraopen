@@ -1,6 +1,7 @@
 import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui"
-import { createMemo, createSignal, For, onCleanup, Show } from "solid-js"
-import { activeRuns, dataRoot, formatElapsed, glyph, summarize, type RunView } from "./data.js"
+import { createSignal, For, onCleanup, Show } from "solid-js"
+import { homedir } from "node:os"
+import { RunPoller, dataRoot, formatElapsed, glyph, summarize, type RunView } from "./data.js"
 
 /**
  * The TUI half of ultraopen.
@@ -18,25 +19,27 @@ import { activeRuns, dataRoot, formatElapsed, glyph, summarize, type RunView } f
  * workflow.
  */
 
-const POLL_MS = 1000
+/**
+ * The run directory root, resolved EXACTLY as the server resolves it: $XDG_DATA_HOME, else
+ * `homedir()`. `api.state.path` is deliberately not consulted — it is not guaranteed to be the
+ * user's home and any divergence between the halves means the TUI silently polls an empty
+ * directory and shows no runs at all.
+ */
+function runRoot(): string {
+  return dataRoot(process.env, homedir())
+}
 
-function useRuns(api: TuiPluginApi, sessionID: () => string) {
+/** One poller per plugin instance, shared by every slot the plugin registers. */
+const poller = new RunPoller({ root: runRoot })
+
+function useRuns(sessionID: () => string) {
   const [runs, setRuns] = createSignal<RunView[]>([])
-
-  const refresh = async (): Promise<void> => {
-    const root = dataRoot(process.env, api.state.path?.state ?? process.env["HOME"] ?? "")
-    setRuns(await activeRuns({ root, sessionID: sessionID(), now: Date.now() }))
-  }
-
-  const timer = setInterval(() => void refresh(), POLL_MS)
-  void refresh()
-  onCleanup(() => clearInterval(timer))
-
+  onCleanup(poller.subscribe(sessionID, setRuns))
   return runs
 }
 
 function Sidebar(props: { api: TuiPluginApi; session_id: string }) {
-  const runs = useRuns(props.api, () => props.session_id)
+  const runs = useRuns(() => props.session_id)
   const theme = () => props.api.theme.current
 
   return (
@@ -69,11 +72,11 @@ function Sidebar(props: { api: TuiPluginApi; session_id: string }) {
 
 /** One always-visible line per active run, under the transcript. */
 function BottomStrip(props: { api: TuiPluginApi }) {
-  const current = createMemo(() => {
+  const current = () => {
     const route = props.api.route.current
     return route.name === "session" ? ((route.params?.["sessionID"] as string) ?? "") : ""
-  })
-  const runs = useRuns(props.api, current)
+  }
+  const runs = useRuns(current)
   const theme = () => props.api.theme.current
 
   return (
@@ -96,14 +99,14 @@ function BottomStrip(props: { api: TuiPluginApi }) {
 
 /** Compact status beside the prompt, so a run is visible with the sidebar closed. */
 function PromptStatus(props: { api: TuiPluginApi; session_id: string }) {
-  const runs = useRuns(props.api, () => props.session_id)
+  const runs = useRuns(() => props.session_id)
   const theme = () => props.api.theme.current
 
   return (
     <Show when={runs().length > 0}>
       <text fg={theme().textMuted}>
         {runs().length === 1 && runs()[0]
-          ? `ultracode ⠋ ${runs()[0]?.done}/${runs()[0]?.total} ${formatElapsed(runs()[0]?.elapsedSeconds ?? 0)}`
+          ? `ultracode ⠋ ${runs()[0]?.phase ? `${runs()[0]?.phase} · ` : ""}${runs()[0]?.done}/${runs()[0]?.total} ${formatElapsed(runs()[0]?.elapsedSeconds ?? 0)}`
           : `ultracode ⠋ ${runs().length} runs`}
       </text>
     </Show>

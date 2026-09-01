@@ -42,6 +42,8 @@ export const mode = {
 
   /** Turns the mode on for a session. Later sources overwrite earlier ones. */
   enable(sessionID: string, source: ModeSource, fromMessageID?: string): void {
+    // An explicit re-enable is a later instruction than an earlier "don't fan out", and wins.
+    demoted.delete(sessionID)
     sessions.set(sessionID, { active: true, source, fromMessageID })
   },
 
@@ -56,15 +58,15 @@ export const mode = {
   /**
    * Whether ultracode is on for this turn.
    *
-   * `agentName` is consulted directly rather than stored: selecting the `ultracode` primary agent
-   * is itself the signal, and needs no state at all.
+   * An explicit toggle in this session wins over everything — including the `ultracode` agent
+   * itself. Selecting the `ultracode` primary agent is the signal when no toggle exists, and
+   * needs no state at all; but once the user has run `/ultracode off`, that command must beat
+   * the agent they happen to be sitting on.
    */
   isActive(sessionID: string, agentName?: string): boolean {
-    if (agentName === "ultracode") return true
     const state = sessions.get(sessionID)
-    // An explicit toggle in this session always wins over the project default, so `/ultracode off`
-    // works even when the option is on.
     if (state) return state.active
+    if (agentName === "ultracode") return true
     return defaultOn
   },
 
@@ -105,7 +107,7 @@ export function mentionsKeyword(text: string): boolean {
  * infer intent.
  */
 export function requestsNoFanOut(text: string): boolean {
-  return /\b(?:no|stop|don'?t|do not|avoid|without)\b[^.!?\n]{0,40}\b(?:workflows?|fan[- ]?out|subagents?|parallel agents?)\b/iu.test(
+  return /\b(?:no|stop|don'?t|do not|avoid|without)\b[^.!?\n]{0,40}\b(?:workflows?|fan[- ]?out|subagents?|parallel agents?|ultracode)\b/iu.test(
     text,
   )
 }

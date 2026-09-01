@@ -1,7 +1,7 @@
 import { fail } from "../script/errors.js"
 import { DEFAULT_AGENT_DEADLINE_MS, MAX_AGENTS_PER_RUN } from "../script/limits.js"
 import { registry } from "../singleton.js"
-import { type NullReason, type SpawnOutcome } from "../bridge/spawn.js"
+import { type NullReason } from "../bridge/spawn.js"
 import { spawnStructured } from "../bridge/structured.js"
 import { Journal, type JournalEntry } from "../resume/journal.js"
 import { toJournalEntry, toReplayedEntry, tryReplay } from "../resume/replay.js"
@@ -206,16 +206,21 @@ export class Run {
 
     // The permit is held only for the spawn itself. Combinators deliberately do NOT gate, or a
     // parallel() nested in a pipeline() stage would deadlock behind its own outer item.
-    const release = await registry.semaphore.acquire()
-    let outcome: SpawnOutcome
-    const model = this.#options.resolveModel?.(options.model)
-    const worktree =
-      options.isolation === "worktree" && this.#options.worktreeRoot
-        ? await createWorktree({ worktreeRoot: this.#options.worktreeRoot, label, onNote: this.log })
-        : undefined
-    if (worktree) this.#worktrees.push(worktree.release)
+    // acquire() also rejects promptly if the parent aborts while queued.
+    const release = await registry.semaphore.acquire(this.#options.signal)
     try {
-      outcome = await spawnStructured(this.#options.client, {
+      // Fail HERE rather than after paying for a worktree and a child session that would be
+      // aborted on first prompt.
+      if (this.#options.signal?.aborted) {
+        fail({ kind: "RuntimeError", message: "The run was aborted before this agent could start." })
+      }
+      const model = this.#options.resolveModel?.(options.model)
+      const worktree =
+        options.isolation === "worktree" && this.#options.worktreeRoot
+          ? await createWorktree({ worktreeRoot: this.#options.worktreeRoot, label, onNote: this.log })
+          : undefined
+      if (worktree) this.#worktrees.push(worktree.release)
+      const outcome = await spawnStructured(this.#options.client, {
         prompt,
         runId: this.runId,
         parentSessionID: this.#options.parentSessionID,
@@ -231,55 +236,55 @@ export class Run {
         ...pick("signal", this.#options.signal),
         ...pick("directory", worktree?.directory),
       })
+
+      const record: AgentRecord = outcome.ok
+        ? {
+            index,
+            label,
+            phase,
+            ok: true,
+            outputTokens: outputTokensOf(outcome.info),
+            ...pick("sessionID", outcome.sessionID),
+          }
+        : {
+            index,
+            label,
+            phase,
+            ok: false,
+            reason: outcome.reason,
+            detail: outcome.detail,
+            outputTokens: 0,
+            ...pick("sessionID", outcome.sessionID),
+          }
+
+      this.records.push(record)
+
+      const value = outcome.ok ? (options.schema ? outcome.structured : outcome.text) : undefined
+      this.#journal.record(
+        toJournalEntry({
+          identity,
+          label,
+          phase,
+          schemaHash,
+          outputTokens: record.outputTokens,
+          ...(outcome.ok ? { ok: true, value } : { ok: false, reason: outcome.reason, detail: outcome.detail }),
+        }),
+      )
+
+      this.#options.onProgress?.({
+        type: "agent-end",
+        index,
+        label,
+        phase,
+        ok: outcome.ok,
+        ...pick("sessionID", outcome.sessionID),
+      })
+
+      if (!outcome.ok) return null
+      return value
     } finally {
       release()
     }
-
-    const record: AgentRecord = outcome.ok
-      ? {
-          index,
-          label,
-          phase,
-          ok: true,
-          outputTokens: outputTokensOf(outcome.info),
-          ...pick("sessionID", outcome.sessionID),
-        }
-      : {
-          index,
-          label,
-          phase,
-          ok: false,
-          reason: outcome.reason,
-          detail: outcome.detail,
-          outputTokens: 0,
-          ...pick("sessionID", outcome.sessionID),
-        }
-
-    this.records.push(record)
-
-    const value = outcome.ok ? (options.schema ? outcome.structured : outcome.text) : undefined
-    this.#journal.record(
-      toJournalEntry({
-        identity,
-        label,
-        phase,
-        schemaHash,
-        outputTokens: record.outputTokens,
-        ...(outcome.ok ? { ok: true, value } : { ok: false, reason: outcome.reason, detail: outcome.detail }),
-      }),
-    )
-
-    this.#options.onProgress?.({
-      type: "agent-end",
-      index,
-      label,
-      phase,
-      ok: outcome.ok,
-      ...pick("sessionID", outcome.sessionID),
-    })
-
-    if (!outcome.ok) return null
-    return value
   }
 
   /**
@@ -323,7 +328,14 @@ function pick<K extends string, V>(key: K, value: V | undefined): Record<K, V> |
   return value === undefined ? {} : ({ [key]: value } as Record<K, V>)
 }
 
-/** A short, stable label derived from the prompt when the script did not supply one. */
+/**
+ * A short, stable label derived from the prompt when the script did not supply one.
+ *
+ * The label persists into the child session's title and metadata, so a prompt fragment can end
+ * up in the session database. That is the user's own machine and conversation, but a script
+ * handling sensitive prompts should pass explicit `label`s — or rely on the `agent:${index}`
+ * fallback here by keeping prompts' first lines free of anything they would not store.
+ */
 function deriveLabel(prompt: string, index: number): string {
   const firstLine = prompt.trim().split("\n", 1)[0] ?? ""
   const trimmed = firstLine.slice(0, 48).trim()

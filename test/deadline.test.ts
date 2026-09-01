@@ -108,6 +108,37 @@ describe("withDeadline", () => {
     await expect(promise).rejects.toMatchObject({ ms: 4242, name: "DeadlineExceededError" })
   })
 
+  test("a rejection arriving AFTER the deadline wins is consumed, not unhandled", async () => {
+    // The abandoned work promise still rejects later (the SDK's fetch layer throws on transport
+    // errors). Without a handler that is an unhandled rejection, which Node treats as fatal —
+    // one slow agent would crash the whole opencode server.
+    const timers = fakeTimers()
+    const unhandled: unknown[] = []
+    const onUnhandled = (error: unknown) => unhandled.push(error)
+    // Bun's Process typing omits the Node rejection event; the runtime supports it.
+    const emitter = process as unknown as {
+      on: (event: "unhandledRejection", listener: (error: unknown) => void) => void
+      off: (event: "unhandledRejection", listener: (error: unknown) => void) => void
+    }
+    emitter.on("unhandledRejection", onUnhandled)
+    try {
+      let rejectWork!: (error: unknown) => void
+      const work = new Promise<never>((_resolve, reject) => {
+        rejectWork = reject
+      })
+      const promise = withDeadline(work, { ms: 1000, label: "a", timers: timers.api })
+      timers.fireAll()
+      await expect(promise).rejects.toThrow(DeadlineExceededError)
+      rejectWork(new Error("late transport failure"))
+      // Drain microtasks so any unhandled-rejection bookkeeping would have fired.
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(unhandled).toEqual([])
+    } finally {
+      emitter.off("unhandledRejection", onUnhandled)
+    }
+  })
+
   test("uses the global timer when none is injected", async () => {
     // Small real delay: proves the default path works without a fake clock.
     const promise = withDeadline(new Promise(() => {}), { ms: 5, label: "real" })

@@ -13,7 +13,7 @@ import { MAX_CONCURRENCY, MIN_CONCURRENCY } from "../script/limits.js"
 export class Semaphore {
   #limit: number
   #active = 0
-  readonly #waiters: Array<() => void> = []
+  readonly #waiters: Waiter[] = []
 
   constructor(limit: number) {
     this.#limit = Semaphore.clamp(limit)
@@ -43,7 +43,8 @@ export class Semaphore {
   }
 
   /** Resolves when a permit is available. The returned function releases it exactly once. */
-  async acquire(): Promise<() => void> {
+  async acquire(signal?: AbortSignal): Promise<() => void> {
+    if (signal?.aborted) throw abortedError()
     if (this.#active < this.#limit) {
       this.#active++
       return this.#releaser()
@@ -51,9 +52,29 @@ export class Semaphore {
     // The permit is claimed by #drain at wake time, NOT here. If the waiter incremented after
     // resuming, a synchronous acquire() landing in the microtask gap between resolve() and that
     // resumption would see a free slot and oversubscribe the limit.
-    await new Promise<void>((resolve) => {
-      this.#waiters.push(resolve)
+    const entry = {} as Waiter
+    const gate = new Promise<void>((resolve, reject) => {
+      entry.resolve = resolve
+      entry.reject = reject
     })
+    if (signal) {
+      // An aborted run must not spend its remaining lifetime queued for a permit it would
+      // immediately waste on a child session.
+      entry.signal = signal
+      entry.onAbort = () => {
+        const index = this.#waiters.indexOf(entry)
+        if (index >= 0) this.#waiters.splice(index, 1)
+        entry.reject(abortedError())
+      }
+      signal.addEventListener("abort", entry.onAbort, { once: true })
+    }
+    this.#waiters.push(entry)
+    try {
+      await gate
+    } finally {
+      // The waiter left the queue one way or another; the abort listener must not outlive it.
+      if (entry.signal && entry.onAbort) entry.signal.removeEventListener("abort", entry.onAbort)
+    }
     return this.#releaser()
   }
 
@@ -83,7 +104,20 @@ export class Semaphore {
       const next = this.#waiters.shift()
       if (!next) continue
       this.#active++
-      next()
+      next.resolve()
     }
   }
+}
+
+type Waiter = {
+  resolve: () => void
+  reject: (error: unknown) => void
+  signal?: AbortSignal
+  onAbort?: (() => void) | undefined
+}
+
+function abortedError(): Error {
+  const error = new Error("The run was aborted while this agent was waiting for a concurrency permit.")
+  error.name = "AbortError"
+  return error
 }

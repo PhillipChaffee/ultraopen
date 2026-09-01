@@ -6,6 +6,7 @@ import { Run, type AgentOptions, type ProgressEvent } from "../runtime/run.js"
 import { subagentContract } from "../bridge/contract.js"
 import { makeResolvers } from "../bridge/models.js"
 import { argsHash } from "../resume/key.js"
+import { runDir } from "../resume/store.js"
 import type { JournalEntry } from "../resume/journal.js"
 import { registry } from "../singleton.js"
 import type { Ruleset } from "../bridge/permission.js"
@@ -14,7 +15,6 @@ import type { OpencodeClient } from "../types.js"
 export type WorkflowArgs = {
   script?: string
   scriptPath?: string
-  name?: string
   args?: unknown
   resumeFromRunId?: string
   dryRun?: boolean
@@ -68,6 +68,27 @@ export type WorkflowResult = {
   outputTokens: number
   /** This run's journal, for persistence and for a follow-up resume. */
   journal: JournalEntry[]
+  /** Child sessions captured before the run's cleanup aborts and forgets them. */
+  childSessionIDs: string[]
+}
+
+/**
+ * A run that failed mid-flight, carrying what did complete.
+ *
+ * Without it a failed run would be persisted with an empty journal, destroying the replayable
+ * prefix of agents that succeeded before the failure — resume would then redo work it already
+ * paid for. The cause is kept intact so failure rendering is unchanged.
+ */
+export class WorkflowRunError extends Error {
+  override readonly cause: unknown
+  readonly partial: { journal: JournalEntry[]; childSessionIDs: string[] }
+
+  constructor(cause: unknown, partial: { journal: JournalEntry[]; childSessionIDs: string[] }) {
+    super(cause instanceof Error ? cause.message : String(cause))
+    this.name = "WorkflowRunError"
+    this.cause = cause
+    this.partial = partial
+  }
 }
 
 /**
@@ -200,7 +221,17 @@ async function runPrepared(
       logs: run.logs,
       outputTokens: run.outputTokens,
       journal: run.journal.entries,
+      // Evaluated BEFORE the finally block aborts and forgets every child, so the manifest ends
+      // up with the real list instead of the empty registry it would read afterwards.
+      childSessionIDs: registry.sessionsOf(context.runId),
     }
+  } catch (error) {
+    // Same reasoning, on the failure path: the partial journal and live sessions must survive
+    // the cleanup in finally, or persistence would record a run that accomplished nothing.
+    throw new WorkflowRunError(error, {
+      journal: run.journal.entries,
+      childSessionIDs: registry.sessionsOf(context.runId),
+    })
   } finally {
     // Children are never cascaded to by the host, so releasing them is ours to do — otherwise a
     // failed or aborted run leaves subagents running and billing.
@@ -238,8 +269,8 @@ async function resolveSource(args: WorkflowArgs, context: WorkflowContext): Prom
   if (args.script) return args.script
   throw new WorkflowScriptError({
     kind: "RuntimeError",
-    message: "A workflow needs a `script`, a `scriptPath`, or a saved `name`.",
-    suggestions: ["Pass the script inline via `script` on the first run."],
+    message: "A workflow needs a `script` or a `scriptPath`.",
+    suggestions: ["Pass the script inline via `script`."],
   })
 }
 
@@ -322,7 +353,14 @@ function optional<K extends string, V>(key: K, value: V | undefined): Record<K, 
 }
 
 /** Renders a failure for the model, with the caret line when the script is available. */
-export function renderFailure(error: unknown, source?: string): string {
-  if (error instanceof WorkflowScriptError) return render(error.diagnostic, source)
-  return error instanceof Error ? error.message : String(error)
+export function renderFailure(error: unknown, source?: string, runId?: string): string {
+  const body =
+    error instanceof WorkflowScriptError
+      ? render(error.diagnostic, source)
+      : error instanceof Error
+        ? error.message
+        : String(error)
+  if (runId === undefined) return body
+  // A failed run is the main candidate for a resume; naming it makes that recoverable.
+  return `${body}\n\n<run id="${runId}" dir="${runDir(runId)}" />`
 }

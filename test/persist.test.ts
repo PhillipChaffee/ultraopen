@@ -34,6 +34,10 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+  // Restore write permission before cleanup: one test makes a manifest read-only.
+  await chmod(join(base, "opencode", "tool-output", "ultraopen", "wf_abc123", "manifest.json"), 0o600).catch(
+    () => undefined,
+  )
   await chmod(base, 0o755).catch(() => undefined)
   await rm(base, { recursive: true, force: true })
 })
@@ -81,6 +85,17 @@ describe("endRun", () => {
   test("is a no-op when the run was never opened", async () => {
     await endRun(undefined, { status: "completed", entries: [entry], value: 1, childSessionIDs: [] }, env)
     expect(await readManifest("wf_abc123", env)).toBeUndefined()
+  })
+
+  test("a disk-write failure is swallowed, so a completed run is never lost to a persistence error", async () => {
+    // The manifest FILE is made read-only: overwriting an existing file needs write permission on
+    // the file itself, which makes every endRun write fail while the directory stays usable.
+    const manifest = await beginRun(record, env)
+    await chmod(artifactPaths("wf_abc123", env).manifestPath, 0o400)
+
+    await expect(
+      endRun(manifest, { status: "completed", entries: [entry], value: 1, childSessionIDs: [] }, env),
+    ).resolves.toBeUndefined()
   })
 })
 

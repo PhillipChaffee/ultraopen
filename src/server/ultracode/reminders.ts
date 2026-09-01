@@ -22,11 +22,6 @@ Scout inline first to discover the work-list, then fan out over it. Solo only on
 turns or trivial mechanical edits.
 </system-reminder>`
 
-export const ULTRACODE_OFF = `<system-reminder>
-Ultracode is off — the workflow tool's standard opt-in rule applies again. Do not fan out unless
-the user asks for it.
-</system-reminder>`
-
 /**
  * The demoted form, for spec §1.6.
  *

@@ -1,18 +1,20 @@
 import { randomUUID } from "node:crypto"
+import { readFile } from "node:fs/promises"
 import { join } from "node:path"
 import { resolveOptions } from "./options.js"
 import { registry } from "./singleton.js"
 import { installConfig, type MutableConfig } from "./ultracode/config.js"
-import { execute, prepare, renderFailure, type WorkflowArgs } from "./tool/workflow.js"
+import { execute, prepare, renderFailure, WorkflowRunError, type WorkflowArgs } from "./tool/workflow.js"
 import { WORKFLOW_TOOL } from "./bridge/permission.js"
 import { asClient } from "./types.js"
 import { description } from "./tool/description.js"
 import { beginRun, endRun, loadResume } from "./resume/persist.js"
+import type { Manifest } from "./resume/journal.js"
 import { onChatMessage, onChatParams, onMessagesTransform } from "./ultracode/hooks.js"
 import { mode } from "./ultracode/mode.js"
 import { resolveEffort } from "./bridge/effort.js"
-import { newBootId, reapOrphans } from "./resume/reaper.js"
-import { runDir } from "./resume/store.js"
+import { newBootId, pruneRuns, reapOrphans } from "./resume/reaper.js"
+import { runDir, writeManifest } from "./resume/store.js"
 import { ProgressWriter } from "./resume/progress.js"
 import { registry as runRegistry } from "./singleton.js"
 
@@ -64,6 +66,9 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
   // No .catch(): reapOrphans is contractually non-throwing (every I/O failure is swallowed and
   // reported in its result), and an unreachable handler here would be untestable defensive code.
   void reapOrphans(client, bootId, {})
+  // Same fire-and-forget contract. Runs still on disk past the retention window are pruned after
+  // the reaper marks any interrupted ones, so a just-orphaned run is not deleted mid-sweep.
+  void pruneRuns({})
 
   const hooks: Record<string, unknown> = {
     /**
@@ -119,7 +124,8 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
      */
     "command.execute.before": (hookInput: { command: string; sessionID: string; arguments?: string }): void => {
       if (hookInput.command !== "ultracode") return
-      if (hookInput.arguments?.trim() === "off") mode.disable(hookInput.sessionID)
+      // Case-insensitive: `/ultracode OFF` must not silently re-enable what the user asked to stop.
+      if (hookInput.arguments?.trim().toLowerCase() === "off") mode.disable(hookInput.sessionID)
       else mode.enable(hookInput.sessionID, "command")
     },
 
@@ -152,11 +158,14 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
             sessionID: context.sessionID,
             runId,
             deadlineMs: options.agentDeadlineMs,
+            // Makes the schema-advertised `scriptPath` real: persisted scripts under the run
+            // directory can be re-run by path.
+            readScript: (path: string) => readFile(path, "utf8"),
             ...(defaultModel === undefined ? {} : { defaultModel }),
             ...(context.abort ? { signal: context.abort } : {}),
           }
 
-          let manifest
+          let manifest: Manifest | undefined
           try {
             // Parse BEFORE asking, so the permission prompt names the real workflow and can show
             // what it intends to do. `meta` is a pure literal specifically so it can be read
@@ -200,11 +209,24 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
               bootId,
             })
 
+            // Crash safety: the manifest's child list is updated as sessions appear, so a server
+            // killed mid-run still leaves the reaper a list of children to abort. Written per
+            // agent-start (not per event) to keep the I/O bounded by agent count.
+            let persistedChildren = -1
+            const persistChildren = async (): Promise<void> => {
+              if (!manifest) return
+              const sessions = runRegistry.sessionsOf(runId)
+              if (sessions.length === persistedChildren) return
+              persistedChildren = sessions.length
+              await writeManifest(runId, { ...manifest, childSessionIDs: sessions }).catch(() => undefined)
+            }
+
             const result = await execute(args, {
               ...workflowContext,
               onProgress: (event) => {
                 progress.apply(event, Date.now())
                 void progress.flush()
+                if (event.type === "agent-start") void persistChildren()
               },
               ...(resume && resume.entries.length > 0
                 ? { previousEntries: resume.entries, resumedFrom: args.resumeFromRunId }
@@ -215,7 +237,9 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
               status: "completed",
               entries: result.journal,
               value: result.value,
-              childSessionIDs: runRegistry.sessionsOf(runId),
+              // Captured inside the run before its cleanup forgot the sessions — reading the
+              // registry here would always yield [].
+              childSessionIDs: result.childSessionIDs,
             })
 
             return renderResult(result, {
@@ -223,8 +247,14 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
               argsChanged: resume?.argsChanged === true,
             })
           } catch (error) {
-            await endRun(manifest, { status: "failed", entries: [], value: null, childSessionIDs: [] })
-            return renderFailure(error, args.script)
+            const partial = error instanceof WorkflowRunError ? error.partial : undefined
+            await endRun(manifest, {
+              status: "failed",
+              entries: partial?.journal ?? [],
+              value: null,
+              childSessionIDs: partial?.childSessionIDs ?? [],
+            })
+            return renderFailure(error instanceof WorkflowRunError ? error.cause : error, args.script, runId)
           }
         },
       },
@@ -293,6 +323,10 @@ function workflowArgsSchema(): Record<string, unknown> {
     script: { type: "string", description: "The workflow script. Must begin with `export const meta = {...}`." },
     scriptPath: { type: "string", description: "Path to a persisted script. Takes precedence over `script`." },
     args: { description: "Value exposed to the script as the global `args`. Pass real JSON, not a JSON string." },
+    resumeFromRunId: {
+      type: "string",
+      description: "Resume a previous run from this directory's data: unchanged agent calls replay from its journal instantly, and the first changed call onward runs live.",
+    },
     dryRun: { type: "boolean", description: "Run the script with agent() stubbed out, for zero tokens." },
     title: { type: "string", description: "Ignored." },
     description: { type: "string", description: "Ignored." },

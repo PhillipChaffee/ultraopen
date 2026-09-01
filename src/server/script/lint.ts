@@ -11,6 +11,10 @@ const DENIED_GLOBALS = new Set([
   "require",
   "process",
   "globalThis",
+  // Node's host global object; `global.Date.now()` would bypass every runtime trap.
+  "global",
+  // Bun's alias for the global object (undefined on Node, but the lint must reject both).
+  "self",
   "eval",
   "Function",
   "Bun",

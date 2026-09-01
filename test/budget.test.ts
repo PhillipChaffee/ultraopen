@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { assertWithinBudget, makeBudget, parseBudgetDirective } from "../src/server/runtime/budget.js"
+import { assertWithinBudget, makeBudget } from "../src/server/runtime/budget.js"
 import { WorkflowScriptError } from "../src/server/script/errors.js"
 
 describe("makeBudget", () => {
@@ -48,32 +48,5 @@ describe("assertWithinBudget", () => {
 
   test("never throws when no target was set", () => {
     expect(() => assertWithinBudget(makeBudget({ total: null, spent: () => 1e9 }))).not.toThrow()
-  })
-})
-
-describe("parseBudgetDirective", () => {
-  test.each([
-    ["please +500k for this", 500_000],
-    ["+2m tokens", 2_000_000],
-    ["+1500", 1500],
-    ["+1.5k", 1500],
-    ["do a thorough job +250K", 250_000],
-  ])("%p -> %p", (text, expected) => {
-    expect(parseBudgetDirective(text)).toBe(expected)
-  })
-
-  test.each([
-    ["no directive here", null],
-    // Only an explicit +N form counts, so an ordinary number in prose is not mistaken for a budget.
-    ["increase it to 500k", null],
-    ["version 1.2.3", null],
-    ["+0", null],
-    ["a+500k", null],
-  ])("%p -> %p", (text, expected) => {
-    expect(parseBudgetDirective(text)).toBe(expected)
-  })
-
-  test("finds a directive at the start of the text", () => {
-    expect(parseBudgetDirective("+300k please")).toBe(300_000)
   })
 })

@@ -48,41 +48,61 @@ export function dataRoot(env: NodeJS.ProcessEnv, home: string): string {
  * A run counts as active while its manifest says `running`. Anything unreadable is skipped rather
  * than surfaced — a progress pane must never be the thing that breaks the UI.
  */
-export async function activeRuns(options: {
-  root: string
-  sessionID: string
-  now: number
-}): Promise<RunView[]> {
+/**
+ * Loads every active run view, without filtering by session.
+ *
+ * Split from `activeRuns` so one poll of the directory can serve every subscriber surface.
+ */
+export async function loadAllRuns(root: string, now: number): Promise<RunView[]> {
   let names: string[]
   try {
-    names = await readdir(options.root)
+    names = await readdir(root)
   } catch {
     return []
   }
 
   const views: RunView[] = []
   for (const name of names) {
-    const view = await loadRun(join(options.root, name), options.sessionID, options.now)
+    const view = await loadRun(join(root, name), now)
     if (view) views.push(view)
   }
   // Oldest first, so a long-running workflow does not jump around as newer ones start and finish.
   return views.toSorted((a, b) => a.runId.localeCompare(b.runId))
 }
 
-async function loadRun(dir: string, sessionID: string, now: number): Promise<RunView | undefined> {
+/** Runs belonging to one session. */
+export async function activeRuns(options: {
+  root: string
+  sessionID: string
+  now: number
+}): Promise<RunView[]> {
+  const views = await loadAllRuns(options.root, options.now)
+  return views.filter((view) => view.sessionID === options.sessionID)
+}
+
+async function loadRun(dir: string, now: number): Promise<RunView | undefined> {
   const manifest = await readJson(join(dir, "manifest.json"))
   if (!manifest || manifest["status"] !== "running") return undefined
-  if (manifest["sessionID"] !== sessionID) return undefined
 
   const progress = (await readJson(join(dir, "progress.json"))) as RawProgress | undefined
   if (!progress) return undefined
 
-  return toView(progress, now)
+  const view = toView(progress, now)
+  // The manifest is the authority on which session owns the run; older snapshots may not carry it.
+  if (view.sessionID === "" && typeof manifest["sessionID"] === "string") {
+    view.sessionID = manifest["sessionID"]
+  }
+  return view
 }
 
 /** Shapes a raw snapshot for display, tolerating a partially-written file. */
 export function toView(progress: RawProgress, now: number): RunView {
-  const agents = Array.isArray(progress.agents) ? progress.agents : []
+  // Each element is validated too: a valid array containing nulls (hand-edited or corrupt file)
+  // must degrade to a shorter list, never throw — a throw here loops on every poll cycle.
+  const agents = (Array.isArray(progress.agents) ? progress.agents : []).filter(
+    (agent): agent is AgentRow =>
+      typeof agent === "object" && agent !== null && typeof (agent as AgentRow).status === "string",
+  )
   return {
     runId: typeof progress.runId === "string" ? progress.runId : "unknown",
     workflow: typeof progress.workflow === "string" ? progress.workflow : "workflow",
@@ -93,7 +113,8 @@ export function toView(progress: RawProgress, now: number): RunView {
     failed: agents.filter((agent) => agent.status === "failed").length,
     total: agents.length,
     elapsedSeconds: Math.max(0, Math.round((now - (progress.startedAt ?? now)) / 1000)),
-    logs: Array.isArray(progress.logs) ? progress.logs : [],
+    // Bounded window: the poller re-reads the whole file every second and never renders history.
+    logs: Array.isArray(progress.logs) ? progress.logs.filter((line) => typeof line === "string").slice(-200) : [],
   }
 }
 
@@ -124,4 +145,69 @@ export function glyph(status: AgentRow["status"]): string {
   if (status === "done") return "✓"
   if (status === "failed") return "✗"
   return "⠋"
+}
+
+export type RunsListener = (runs: RunView[]) => void
+
+type TimerBag = {
+  setInterval: (fn: () => void, ms: number) => unknown
+  clearInterval: (handle: unknown) => void
+}
+
+/**
+ * One polling timer shared by every surface.
+ *
+ * The sidebar, bottom strip and prompt status each used to run their own `setInterval`, so a
+ * session with all three slots open read the same directories two or three times a second. The
+ * poller reads once per tick and fans the result out to every subscriber, filtered per session.
+ */
+export class RunPoller {
+  readonly #root: () => string
+  readonly #pollMs: number
+  readonly #timers: TimerBag
+  readonly #subscribers = new Map<RunsListener, () => string>()
+  #timer: unknown = undefined
+
+  constructor(options: {
+    root: () => string
+    pollMs?: number | undefined
+    timers?: TimerBag | undefined
+  }) {
+    this.#root = options.root
+    this.#pollMs = options.pollMs ?? 1000
+    this.#timers = options.timers ?? {
+      setInterval: (fn, ms) => setInterval(fn, ms),
+      clearInterval: (handle) => clearInterval(handle as ReturnType<typeof setInterval>),
+    }
+  }
+
+  /** Subscribes a surface to run updates for its (live-evaluated) session. Returns the unsubscribe fn. */
+  subscribe(sessionID: () => string, listener: RunsListener): () => void {
+    this.#subscribers.set(listener, sessionID)
+    this.#start()
+    void this.#refresh()
+    return () => {
+      this.#subscribers.delete(listener)
+      if (this.#subscribers.size === 0) this.#stop()
+    }
+  }
+
+  #start(): void {
+    if (this.#timer !== undefined) return
+    this.#timer = this.#timers.setInterval(() => void this.#refresh(), this.#pollMs)
+  }
+
+  #stop(): void {
+    if (this.#timer === undefined) return
+    this.#timers.clearInterval(this.#timer)
+    this.#timer = undefined
+  }
+
+  async #refresh(): Promise<void> {
+    // One directory pass, dispatched per subscriber — each surface polls a different session.
+    const views = await loadAllRuns(this.#root(), Date.now())
+    for (const [listener, sessionID] of this.#subscribers) {
+      listener(views.filter((view) => view.sessionID === sessionID()))
+    }
+  }
 }

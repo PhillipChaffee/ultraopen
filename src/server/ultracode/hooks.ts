@@ -48,10 +48,18 @@ export function onChatMessage(
     .map((part) => part.text ?? "")
     .join("\n")
 
-  if (requestsNoFanOut(text)) mode.demote(input.sessionID)
-
-  if (mentionsKeyword(text)) {
-    mode.enable(input.sessionID, "keyword", output.message?.id ?? input.messageID)
+  if (requestsNoFanOut(text)) {
+    mode.demote(input.sessionID)
+  } else if (mentionsKeyword(text)) {
+    // Only a source CHANGE re-enables. Re-mentioning the keyword while already active via the
+    // keyword must not rewrite `fromMessageID`: the reminder is ephemeral and re-injected from
+    // that message each turn, so moving it forward drops earlier messages' reminders and breaks
+    // the byte-stable cache prefix. A negated mention ("don't use ultracode") demotes above and
+    // never enables.
+    const state = mode.get(input.sessionID)
+    if (!(state?.active && state.source === "keyword")) {
+      mode.enable(input.sessionID, "keyword", output.message?.id ?? input.messageID)
+    }
   }
 
   if (!mode.isActive(input.sessionID, input.agent)) return

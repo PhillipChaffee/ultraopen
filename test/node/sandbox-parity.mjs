@@ -91,6 +91,10 @@ describe("sandbox parity on Node", () => {
   test("shadows Node globals", async () => {
     assert.equal(await run("return typeof process\n", globals), "undefined")
     assert.equal(await run("return typeof globalThis\n", globals), "undefined")
+    // `global` is Node's host global; unshadowed, `global.Date.now()` bypassed every trap.
+    assert.equal(await run("return typeof global\n", globals), "undefined")
+    // Node has no `self`; the shadow must be harmless there too.
+    assert.equal(typeof self, "undefined")
     await assert.rejects(() => run("return require('node:fs')\n", globals), /is not available/u)
   })
 

@@ -4,6 +4,7 @@ import { registry } from "../src/server/singleton.js"
 import { WORKFLOW_TOOL } from "../src/server/bridge/permission.js"
 import { mode } from "../src/server/ultracode/mode.js"
 import type { MutableConfig } from "../src/server/ultracode/config.js"
+import { ensureRunDir, readJournal, readManifest, writeScript } from "../src/server/resume/store.js"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -94,6 +95,8 @@ describe("plugin registration", () => {
     expect(Object.keys(args)).toContain("description")
     expect(Object.keys(args)).toContain("script")
     expect(Object.keys(args)).toContain("dryRun")
+    // Resume is a headline feature; if the model cannot see the argument, it can never use it.
+    expect(Object.keys(args)).toContain("resumeFromRunId")
   })
 
   test("applies the configured concurrency to the process-wide gate", () => {
@@ -250,6 +253,62 @@ describe("tool execution", () => {
     expect(await run({ dryRun: true })).toContain("needs a `script`")
   })
 
+  test("a persisted script can be re-run via scriptPath", async () => {
+    // The schema advertises scriptPath; the execute path must actually read it, or the advertised
+    // surface errors at runtime (verified live before this was wired).
+    await ensureRunDir("wf_pathdemo01", undefined)
+    const paths = await writeScript("wf_pathdemo01", `${META}return 'from disk'\n`)
+    expect(await run({ scriptPath: paths })).toContain("from disk")
+  })
+
+  test("a failed run persists its PARTIAL journal so a resume can replay what succeeded", async () => {
+    // Without this, endRun on failure wrote an empty journal and destroyed the replayable prefix
+    // of agents that had already completed — resume would redo work it already paid for.
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) throw new Error("tool was not registered")
+    const script = `${META}await agent('succeeds')\nthrow new Error('script blew up')\n`
+    const output = await tool.execute({ script }, { sessionID: "parent" })
+    expect(output).toContain("script blew up")
+
+    // Find the run id from the tool's rendered failure — the journal is keyed by run.
+    const runId = output.match(/id="([^"]+)"/u)?.[1]
+    expect(runId).toBeDefined()
+    const entries = await readJournal(runId ?? "")
+    expect(entries.length).toBe(1)
+    expect(entries[0]?.status).toBe("ok")
+    expect((await readManifest(runId ?? "", undefined))?.status).toBe("failed")
+  })
+
+  test("an aborted run persists its child sessions in the manifest", async () => {
+    // The manifest's child list is what the startup reaper reads; if it were only written at
+    // endRun — after the registry was cleared — the reaper would always read [].
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) throw new Error("tool was not registered")
+    const script = `${META}await agent('a')\nreturn 'done'\n`
+    const output = await tool.execute({ script }, { sessionID: "parent" })
+    const runId = output.match(/run="([^"]+)"/u)?.[1]
+    expect(runId).toBeDefined()
+    expect((await readManifest(runId ?? "", undefined))?.childSessionIDs).toEqual(["child"])
+  })
+
+  test("a resume with changed args renders the args-changed note", async () => {
+    // A replayed run must never read as a fresh one — this note is the visible marker that
+    // nothing was replayed because the inputs changed.
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) throw new Error("tool was not registered")
+    const script = `${META}await agent('a')\nreturn 'ok'\n`
+
+    const first = await tool.execute({ script, args: { topic: "one" } }, { sessionID: "parent" })
+    const runId = first.match(/run="([^"]+)"/u)?.[1]
+    expect(runId).toBeDefined()
+
+    const second = await tool.execute(
+      { script, args: { topic: "two" }, resumeFromRunId: runId },
+      { sessionID: "parent" },
+    )
+    expect(second).toContain('args changed since the previous run')
+  })
+
   test("refuses to run inside a session the engine owns", async () => {
     registry.register("parent", "outer-run")
     expect(await run({ script: `${META}return 1\n`, dryRun: true })).toContain("cannot be called from inside")
@@ -385,6 +444,13 @@ describe("ultracode hooks are wired", () => {
     hook({ command: "ultracode", sessionID: "s1" })
     expect(mode.isActive("s1")).toBe(true)
     hook({ command: "ultracode", sessionID: "s1", arguments: "off" })
+    expect(mode.isActive("s1")).toBe(false)
+  })
+
+  test("`off` is case-insensitive — `/ultracode OFF` must not re-enable", () => {
+    const hook = hookOf("command.execute.before") as (i: unknown) => void
+    hook({ command: "ultracode", sessionID: "s1" })
+    hook({ command: "ultracode", sessionID: "s1", arguments: "OFF" })
     expect(mode.isActive("s1")).toBe(false)
   })
 

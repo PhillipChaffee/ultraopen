@@ -36,7 +36,10 @@ export function makeBudget(options: BudgetOptions): Budget {
  *
  * Checked at `agent()` entry rather than after: spending past the target and then reporting it
  * would defeat the point of a ceiling. In-flight calls are allowed to finish, since cancelling
- * work already paid for wastes it.
+ * work already paid for wastes it. Concurrency makes the ceiling granular, not exact: calls
+ * fanned out in the same tick all pass the check before any of them reports spend, so a burst
+ * near the target can overshoot by (concurrency − 1) × one agent's spend. Guarding loops on
+ * `remaining()` with headroom, as the suggestion below says, keeps that gap harmless.
  */
 export function assertWithinBudget(budget: Budget): void {
   if (budget.total === null) return
@@ -49,23 +52,4 @@ export function assertWithinBudget(budget: Budget): void {
       "Raise the target, or split the work across several workflow runs.",
     ],
   })
-}
-
-/**
- * Reads a `+500k`-style token target out of a user's message.
- *
- * opencode has no such convention of its own, so this is a private one — recognised only in an
- * explicit `+N` form to avoid mistaking an ordinary number in prose for a budget.
- */
-export function parseBudgetDirective(text: string): number | null {
-  const match = /(?:^|\s)\+(\d+(?:\.\d+)?)\s*([km])?\b/iu.exec(text)
-  if (!match) return null
-
-  const amount = Number(match[1])
-  if (!Number.isFinite(amount) || amount <= 0) return null
-
-  const unit = match[2]?.toLowerCase()
-  if (unit === "k") return Math.round(amount * 1000)
-  if (unit === "m") return Math.round(amount * 1_000_000)
-  return Math.round(amount)
 }

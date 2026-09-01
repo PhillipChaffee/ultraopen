@@ -156,7 +156,8 @@ describe("parse — determinism lint", () => {
   })
 
   test("new Date(arg) is allowed", () => {
-    expect(() => parse(`${META}const d = new Date(args.now)\n`)).not.toThrow()
+    const { body } = parse(`${META}const d = new Date(args.now)\n`)
+    expect(body).toContain("Date(args.now)")
   })
 
   test("imports are rejected", () => {
@@ -167,7 +168,7 @@ describe("parse — determinism lint", () => {
     expect(diag(() => parse(`${META}const m = await import('node:fs')\n`)).kind).toBe("DeterminismError")
   })
 
-  test.each(["require", "process", "globalThis", "Bun", "eval"])("%s is rejected", (name) => {
+  test.each(["require", "process", "globalThis", "Bun", "eval", "global", "self"])("%s is rejected", (name) => {
     expect(diag(() => parse(`${META}const x = ${name}\n`)).kind).toBe("DeterminismError")
   })
 })
@@ -231,6 +232,15 @@ describe("sandbox — runtime traps", () => {
     expect(await run(`return typeof process\n`, noopGlobals)).toBe("undefined")
     expect(await run(`return typeof globalThis\n`, noopGlobals)).toBe("undefined")
     expect(await run(`return typeof Bun\n`, noopGlobals)).toBe("undefined")
+  })
+
+  test("global and self are shadowed to undefined at runtime", async () => {
+    // `global` is the Node host global and `self` the Bun one; either would reach real intrinsics
+    // — `global.Date.now()` bypassed every trap before they were shadowed.
+    expect(await run(`return typeof global\n`, noopGlobals)).toBe("undefined")
+    expect(await run(`return typeof self\n`, noopGlobals)).toBe("undefined")
+    await expect(run(`return global.Date.now()\n`, noopGlobals)).rejects.toThrow()
+    await expect(run(`return Math.random()\n`, noopGlobals)).rejects.toThrow(/Math\.random\(\)/u)
   })
 
   test("require/fetch throw a clear error when reached dynamically", async () => {
@@ -323,13 +333,15 @@ describe("sandbox — documented escape boundary", () => {
   })
 
   test("ordinary property access is unaffected", () => {
-    expect(() => parse(`${META}const r = await agent('x'); return r.findings.length\n`)).not.toThrow()
+    const { body } = parse(`${META}const r = await agent('x'); return r.findings.length\n`)
+    expect(body).toContain("r.findings.length")
   })
 
   test("KNOWN LIMIT: a computed constructor access still gets through the lint", () => {
     // Documented in sandbox.ts rather than fixed: the threat model is determinism, not
     // confinement — the authoring model already holds bash. This test pins the boundary so a
     // future reader knows it is a decision, not an oversight.
-    expect(() => parse(`${META}const c = ({})["const" + "ructor"]\n`)).not.toThrow()
+    const { body } = parse(`${META}const c = ({})["const" + "ructor"]\n`)
+    expect(body).toContain('"const" + "ructor"')
   })
 })

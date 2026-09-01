@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { ProgressWriter } from "../src/server/resume/progress.js"
-import { activeRuns, dataRoot, formatElapsed, glyph, summarize, toView } from "../src/tui/data.js"
+import { RunPoller, activeRuns, dataRoot, formatElapsed, glyph, summarize, toView, type RunView } from "../src/tui/data.js"
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -83,6 +83,55 @@ describe("ProgressWriter", () => {
     await expect(progress.flush()).resolves.toBeUndefined()
   })
 
+  test("an event folded in during an active write is still flushed afterwards", async () => {
+    // Regression: flush() returned immediately when a write was in flight, without rescheduling.
+    // If the skipped event was the run's LAST, its final state never reached disk and the TUI
+    // showed an agent as running after it had finished.
+    let releaseWrite: (() => void) | undefined
+    const writes: string[] = []
+    const progress = new ProgressWriter({
+      runId: "wf_abc123",
+      workflow: "d",
+      sessionID: "s",
+      startedAt: 0,
+      write: async (_path, body) => {
+        if (writes.length === 0) {
+          // The first write blocks until the test releases it — slow-disk simulation.
+          await new Promise<void>((resolve) => {
+            releaseWrite = resolve
+          })
+        }
+        writes.push(body)
+      },
+    })
+
+    progress.apply({ type: "log", message: "first" }, 1)
+    const first = progress.flush()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(releaseWrite).toBeDefined()
+
+    progress.apply({ type: "log", message: "last" }, 2)
+    // Skipped: a write is in flight — this used to lose the event.
+    void progress.flush()
+
+    releaseWrite?.()
+    await first
+    for (let i = 0; i < 100 && writes.length < 2; i++) await Bun.sleep(1)
+    expect(writes.length).toBe(2)
+    expect(writes[1]).toContain("last")
+  })
+
+  test("logs are capped so a chatty run cannot bloat the snapshot", () => {
+    const progress = writer([])
+    for (let i = 0; i < 500; i++) {
+      progress.apply({ type: "log", message: `line ${i}` }, i)
+    }
+    expect(progress.snapshot.logs.length).toBe(200)
+    expect(progress.snapshot.logs.at(-1)).toBe("line 499")
+    expect(progress.snapshot.logs[0]).toBe("line 300")
+  })
+
   test("writes into the run directory", async () => {
     const writes: Array<{ path: string; body: string }> = []
     const progress = writer(writes)
@@ -119,6 +168,28 @@ describe("TUI view shaping", () => {
     expect(view.workflow).toBe("workflow")
     expect(view.agents).toEqual([])
     expect(view.elapsedSeconds).toBe(0)
+  })
+
+  test("tolerates a valid agents array containing non-object entries", () => {
+    // A hand-edited or corrupt progress.json must degrade to a shorter list, never throw — a
+    // throw here would loop on every poll cycle.
+    const view = toView(
+      {
+        runId: "wf_a",
+        agents: [
+          { index: 0, label: "a", status: "done" },
+          null,
+          42,
+          { label: "no status" },
+        ],
+        logs: ["ok", 7, null],
+      } as unknown as Parameters<typeof toView>[0],
+      0,
+    )
+    expect(view.agents.length).toBe(1)
+    expect(view.agents[0]?.label).toBe("a")
+    expect(view.total).toBe(1)
+    expect(view.logs).toEqual(["ok"])
   })
 
   test.each([
@@ -230,5 +301,73 @@ describe("default write path", () => {
     expect(written.workflow).toBe("demo")
     expect(written.agents.length).toBe(1)
     await rm(base, { recursive: true, force: true })
+  })
+})
+
+/** A controllable timer, so poller tests are instant and deterministic. */
+const fakeTimers = () => {
+  const pending: Array<() => void> = []
+  return {
+    api: {
+      setInterval: (fn: () => void) => {
+        pending.push(fn)
+        return pending.length
+      },
+      clearInterval: () => undefined,
+    },
+    tick: () => {
+      for (const fn of pending.slice()) fn()
+    },
+  }
+}
+
+describe("RunPoller", () => {
+  test("with no injected timers, the real interval is cleared on unsubscribe", async () => {
+    // The default timer arrows are the only path the fake-timer tests never reach; a short-lived
+    // real poller exercises them without waiting for a tick.
+    const root = "/definitely/not/here"
+    const poller = new RunPoller({ root: () => root, pollMs: 60_000 })
+    const unsubscribe = poller.subscribe(() => "s1", () => undefined)
+    await Bun.sleep(5)
+    expect(unsubscribe).toBeDefined()
+    unsubscribe()
+  })
+
+  test("one timer serves every subscriber surface, filtered per session", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ultraopen-poll-"))
+    await seed(root, "wf_a", { status: "running", sessionID: "s1" }, { runId: "wf_a", startedAt: 0 })
+    await seed(root, "wf_b", { status: "running", sessionID: "s2" }, { runId: "wf_b", startedAt: 0 })
+    const timers = fakeTimers()
+    const poller = new RunPoller({ root: () => root, pollMs: 1000, timers: timers.api })
+
+    const mine: RunView[][] = []
+    const other: RunView[][] = []
+    const unsub1 = poller.subscribe(() => "s1", (runs) => mine.push(runs))
+    // The immediate refresh fires at subscribe time.
+    await Bun.sleep(5)
+    const unsub2 = poller.subscribe(() => "s2", (runs) => other.push(runs))
+    await Bun.sleep(5)
+
+    expect(mine.at(-1)?.map((run) => run.runId)).toEqual(["wf_a"])
+    expect(other.at(-1)?.map((run) => run.runId)).toEqual(["wf_b"])
+
+// One interval fires once; BOTH subscribers get fresh data from that single directory pass.
+    const mineBefore = mine.length
+    const otherBefore = other.length
+    timers.tick()
+    await Bun.sleep(5)
+    expect(mine.length).toBe(mineBefore + 1)
+    expect(other.length).toBe(otherBefore + 1)
+
+    // With every surface gone, ticking the (now cleared) interval produces no more updates.
+    unsub2()
+    unsub1()
+    const mineAfter = mine.length
+    timers.tick()
+    await Bun.sleep(5)
+    expect(mine.length).toBe(mineAfter)
+    expect(other.length).toBe(otherBefore + 1)
+
+    await rm(root, { recursive: true, force: true })
   })
 })

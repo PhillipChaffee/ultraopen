@@ -32,6 +32,9 @@ export type ProgressSnapshot = {
 
 export const PROGRESS_FILE = "progress.json"
 
+/** Snapshot logs are capped — the TUI re-reads this file every poll and never shows history. */
+export const MAX_SNAPSHOT_LOGS = 200
+
 export function progressPath(runId: string, env?: NodeJS.ProcessEnv): string {
   return join(runDir(runId, env), PROGRESS_FILE)
 }
@@ -81,6 +84,9 @@ export class ProgressWriter {
       }
       case "log": {
         this.snapshot.logs.push(event.message)
+        if (this.snapshot.logs.length > MAX_SNAPSHOT_LOGS) {
+          this.snapshot.logs.splice(0, this.snapshot.logs.length - MAX_SNAPSHOT_LOGS)
+        }
         break
       }
       case "agent-start": {
@@ -120,6 +126,9 @@ export class ProgressWriter {
       // Ignored: see above.
     } finally {
       this.#writing = false
+      // An event folded in while a write was in flight marked #dirty and was skipped by the
+      // guard above; without this re-check the last event of a run would never reach disk.
+      if (this.#dirty) void this.flush()
     }
   }
 }

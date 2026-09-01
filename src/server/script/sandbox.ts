@@ -20,6 +20,11 @@ import { WorkflowScriptError } from "./errors.js"
  * global with an untrapped `Date.now`. Verified, not theoretical. The static lint rejects the
  * literal `.constructor` form, but a computed one (`x["const" + "ructor"]`) still gets through.
  *
+ * For the same reason, `Date.prototype.someField = 1` reaches the real `Date.prototype` (the
+ * guard is a proxy AROUND the real constructor, not a replacement for it) and persists in the
+ * host process. A wrapper that blocked this would have to swap the prototype object, which
+ * breaks `instanceof Date` for every legitimate `new Date(iso)` in the script.
+ *
  * That is accepted, deliberately:
  *   - The threat model is DETERMINISM, not confinement. The model authoring the script already
  *     holds bash in the same session, so an escape grants it nothing it did not already have.
@@ -152,6 +157,10 @@ export async function run(body: string, globals: SandboxGlobals): Promise<unknow
     require: denied("require"),
     process: undefined,
     globalThis: undefined,
+    // `global` is the Node host global and `self` the Bun one (undefined on Node). Left unshadowed
+    // they reach the real intrinsics — `global.Date.now()` bypassed every trap.
+    global: undefined,
+    self: undefined,
     fetch: denied("fetch"),
     Bun: undefined,
     Function: denied("Function"),
