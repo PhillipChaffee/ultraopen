@@ -88,6 +88,10 @@ describe("ProgressWriter", () => {
     // If the skipped event was the run's LAST, its final state never reached disk and the TUI
     // showed an agent as running after it had finished.
     let releaseWrite: (() => void) | undefined
+    let resolveSecond!: () => void
+    const secondWrite = new Promise<void>((resolve) => {
+      resolveSecond = resolve
+    })
     const writes: string[] = []
     const progress = new ProgressWriter({
       runId: "wf_abc123",
@@ -102,6 +106,7 @@ describe("ProgressWriter", () => {
           })
         }
         writes.push(body)
+        if (writes.length === 2) resolveSecond()
       },
     })
 
@@ -117,7 +122,8 @@ describe("ProgressWriter", () => {
 
     releaseWrite?.()
     await first
-    for (let i = 0; i < 100 && writes.length < 2; i++) await Bun.sleep(1)
+    // The chained re-flush (fired from flush's finally) resolves when the second write lands.
+    await secondWrite
     expect(writes.length).toBe(2)
     expect(writes[1]).toContain("last")
   })
@@ -307,30 +313,47 @@ describe("default write path", () => {
 /** A controllable timer, so poller tests are instant and deterministic. */
 const fakeTimers = () => {
   const pending: Array<() => void> = []
+  const cleared: unknown[] = []
   return {
     api: {
       setInterval: (fn: () => void) => {
         pending.push(fn)
         return pending.length
       },
-      clearInterval: () => undefined,
+      clearInterval: (handle: unknown) => {
+        cleared.push(handle)
+      },
     },
     tick: () => {
       for (const fn of pending.slice()) fn()
     },
+    cleared,
   }
 }
 
 describe("RunPoller", () => {
-  test("with no injected timers, the real interval is cleared on unsubscribe", async () => {
-    // The default timer arrows are the only path the fake-timer tests never reach; a short-lived
-    // real poller exercises them without waiting for a tick.
+  test("with no injected timers, the real interval path works and stops on unsubscribe", async () => {
+    // The default timer arrows are the only path the fake-timer tests never reach. A fast real
+    // interval proves ticks fire, and that no tick lands after unsubscribe — i.e. cleanup is
+    // real, not a no-op.
     const root = "/definitely/not/here"
-    const poller = new RunPoller({ root: () => root, pollMs: 60_000 })
-    const unsubscribe = poller.subscribe(() => "s1", () => undefined)
-    await Bun.sleep(5)
-    expect(unsubscribe).toBeDefined()
-    unsubscribe()
+    const poller = new RunPoller({ root: () => root, pollMs: 5 })
+    let calls = 0
+    const unsubscribe = poller.subscribe(() => "s1", () => {
+      calls++
+    })
+    try {
+      // At least one tick fires while subscribed.
+      await Bun.sleep(30)
+      const settled = calls
+      expect(settled).toBeGreaterThanOrEqual(1)
+
+      unsubscribe()
+      await Bun.sleep(30)
+      expect(calls).toBe(settled)
+    } finally {
+      unsubscribe()
+    }
   })
 
   test("one timer serves every subscriber surface, filtered per session", async () => {
@@ -351,7 +374,7 @@ describe("RunPoller", () => {
     expect(mine.at(-1)?.map((run) => run.runId)).toEqual(["wf_a"])
     expect(other.at(-1)?.map((run) => run.runId)).toEqual(["wf_b"])
 
-// One interval fires once; BOTH subscribers get fresh data from that single directory pass.
+    // One interval fires once; BOTH subscribers get fresh data from that single directory pass.
     const mineBefore = mine.length
     const otherBefore = other.length
     timers.tick()
@@ -359,10 +382,12 @@ describe("RunPoller", () => {
     expect(mine.length).toBe(mineBefore + 1)
     expect(other.length).toBe(otherBefore + 1)
 
-    // With every surface gone, ticking the (now cleared) interval produces no more updates.
+    // With every surface gone, the interval is cleared and ticking produces no more updates.
+    const mineAfter = mine.length
     unsub2()
     unsub1()
-    const mineAfter = mine.length
+    // The one started interval was actually cleared.
+    expect(timers.cleared.length).toBe(1)
     timers.tick()
     await Bun.sleep(5)
     expect(mine.length).toBe(mineAfter)

@@ -279,9 +279,10 @@ describe("tool execution", () => {
     expect((await readManifest(runId ?? "", undefined))?.status).toBe("failed")
   })
 
-  test("an aborted run persists its child sessions in the manifest", async () => {
-    // The manifest's child list is what the startup reaper reads; if it were only written at
-    // endRun — after the registry was cleared — the reaper would always read [].
+  test("a completed run persists its child sessions in the manifest", async () => {
+    // The manifest's child list is what the startup reaper reads; if it were only read from the
+    // registry after endRun — which abortAll has already cleared — it would always be []. This
+    // pins the completed path (the capture happens inside the run, before its cleanup).
     const tool = toolOf(ultraopen({ client: stubClient }))
     if (!tool) throw new Error("tool was not registered")
     const script = `${META}await agent('a')\nreturn 'done'\n`
