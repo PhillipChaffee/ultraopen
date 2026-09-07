@@ -40,8 +40,10 @@ return { confirmed: results.flat().filter(Boolean) }
 - **Progress** — a bottom strip, a sidebar panel, and a prompt-row status line, all served by one
   shared poller.
 - **Safety** — a five-layer recursion guard, a wall-clock deadline per agent, a global concurrency
-  cap, budget ceilings, an orphan reaper that releases subagents left by a killed server (skipping
-  runs whose process is still alive), and retention pruning of finished run directories.
+  cap, an orphan reaper that releases subagents left by a killed server (skipping runs whose
+  process is still alive), and retention pruning of finished run directories. The script `budget`
+  global exists and nested runs share their parent's ceiling, but the top-level plugin wires no
+  budget total — the hard ceilings are the per-run agent and per-call item caps.
 
 ## Install
 
@@ -74,7 +76,23 @@ Options go through the tuple form — never a new top-level key, which opencode 
 ```bash
 bun run check   # lint + strict typecheck + tests (95% coverage gate) + Node parity
 bun run m0      # provider smoke test against a live model
+
+bash test/e2e/technical.sh   # live end-to-end: real opencode processes, real model calls
+bash test/e2e/visual.sh      # live TUI in tmux: all three progress surfaces, permission flow
+bash test/e2e/tui-dev.sh     # run `opencode` locally with the TUI plugin actually rendering
 ```
+
+The e2e suites run in an isolated scratch XDG home (real provider auth, throwaway state) and
+assert on the plugin's own on-disk run artifacts plus captured tmux panes. They make real model
+calls — pennies per run on Together. Re-run on flakes: live turns occasionally stall or hit
+transient provider errors, and both suites retry the common cases.
+
+`tui-dev.sh` exists because of an upstream dev-checkout trap: the TUI host injects its own
+Solid/OpenTUI instances into a plugin only when the plugin directory cannot resolve them, and
+`node_modules/solid-js` ships Solid's SSR build under the `node` export condition — signals never
+update, and the progress surfaces silently render nothing. A published install doesn't ship
+`node_modules` and is unaffected; a dev checkout must stash the shadowing packages (the wrapper
+does it for you).
 
 `bun run m0` is a re-runnable health check for the one interaction that cannot be verified from
 source: that `format: {type:"json_schema"}` works together with a high reasoning variant, and that
@@ -83,12 +101,23 @@ that path, so it can regress silently in an opencode release.
 
 ## Status
 
-Verified against opencode 1.18.20. Working end to end: parallel and pipeline fan-out, schema-forced
-structured output, per-model effort resolution, resume across processes, nested `workflow()`,
-budget ceilings, worktree isolation, and all four ultracode activation surfaces.
+Verified against opencode 1.18.29 by the e2e suites (`test/e2e`). Working end to end: parallel and
+pipeline fan-out, schema-forced structured output, per-model effort resolution, resume across
+processes (journal replay returns the recorded values), nested `workflow({ script })`, the
+per-agent deadline option, all four ultracode activation surfaces, and the three TUI progress
+surfaces — which required working around an upstream limitation: opencode 1.18.x never re-renders
+external TUI plugin slots after mount (reactive expressions keep their initial value, `Show`/`For`
+insertion no-ops), so the surfaces update imperatively via `node.content` + `requestRender()`
+(src/tui/index.tsx documents the full constraint).
 
-One cosmetic limitation is upstream: the transcript renderer echoes a tool call's raw arguments,
-so a `workflow` call displays its full script. The progress surfaces (strip, sidebar, prompt
-status) are where live state shows.
+Known gaps the e2e probes confirmed: the named-workflow form of `workflow()` always throws
+(`context.named` is never populated — pass `{ script }` inline), and `agent()`'s
+`isolation: "worktree"` option is inert in the live wiring (`worktreeRoot` is never passed).
+A `bun run check`-clean implementation note lives with each probe in the suites.
+
+Two cosmetic limitations are upstream: the transcript renderer echoes a tool call's raw
+arguments, so a `workflow` call displays its full script; and the failed-agent glyph shares its
+line's muted color instead of the error color (single-node imperative rendering). The progress
+surfaces (strip, sidebar, prompt status) are where live state shows.
 
 See [NOTICE](./NOTICE) for attribution.

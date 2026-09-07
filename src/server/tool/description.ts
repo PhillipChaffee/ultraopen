@@ -5,7 +5,7 @@
  * pipeline-vs-parallel decision rule are what make the model write correct scripts.
  *
  * Adapted from Claude Code's Workflow tool. Differences from the original are deliberate and
- * limited to what opencode actually does — see prompts/SUBSTITUTIONS.md:
+ * limited to what opencode actually does — see NOTICE:
  *   - `Workflow({...})` -> `workflow({...})`, the opencode tool id
  *   - "the Agent tool" -> "the task tool"
  *   - the async task-id contract is rewritten as blocking, because opencode exposes no

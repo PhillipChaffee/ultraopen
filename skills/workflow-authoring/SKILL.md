@@ -46,7 +46,7 @@ workflow.
 | `phase(title)`, `log(msg)` | Progress narration. |
 | `args` | Whatever was passed as `args`, verbatim. |
 | `budget` | `{ total, spent(), remaining() }`. A hard ceiling. |
-| `workflow(nameOrRef, args?)` | Runs another workflow inline. One level only. THROWS on failure, unlike `agent()`. |
+| `workflow({ script }, args?)` | Runs another workflow inline, `{ script }` form only — the named form throws because the shipped plugin never populates `context.named`. One level only. THROWS on failure, unlike `agent()`. |
 
 `agent()` opts: `label`, `phase`, `schema`, `model`, `effort`, `agentType`, `isolation`,
 `disallowedTools`.
