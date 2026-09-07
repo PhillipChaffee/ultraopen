@@ -3,6 +3,13 @@
   "version": "0.1.0",
   "description": "Deterministic multi-agent workflow orchestration and an ultracode effort mode for opencode",
   "license": "MIT",
+  "author": "Phillip Chaffee",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PhillipChaffee/ultraopen.git"
+  },
+  "homepage": "https://github.com/PhillipChaffee/ultraopen#readme",
+  "bugs": "https://github.com/PhillipChaffee/ultraopen/issues",
   "type": "module",
   "exports": {
     "./server": {
