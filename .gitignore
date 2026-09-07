@@ -3,3 +3,4 @@ dist/
 scratch/
 dist-test/
 coverage/
+test/e2e/artifacts/
