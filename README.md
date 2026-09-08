@@ -12,8 +12,10 @@ your terminal.
 [![opencode](https://img.shields.io/badge/opencode-%3E%3D%201.18.20-7C3AED)](https://github.com/anomalyco/opencode)
 [![Made with Bun](https://img.shields.io/badge/made_with-Bun-C0242E?logo=bun&logoColor=white)](https://bun.sh/)
 
+**1,000 agents per run · schema-validated outputs · resumable by journal**
+
 A workflow is a deterministic JavaScript driver in which `agent()` is the only nondeterministic
-call. Control flow — fan-out, loops, dedup, threshnews, early exit, synthesis — is real code, so
+call. Control flow — fan-out, loops, dedup, thresholds, early exit, synthesis — is real code, so
 runs are reproducible and resumable: resume a failed run and the agents that already finished
 replay from the journal instead of running — and billing — again.
 
@@ -35,11 +37,63 @@ const results = await pipeline(
 return { confirmed: results.flat().filter(Boolean) }
 ```
 
-This is not a framework. There is no DSL to learn, no server to run, nothing to deploy — the
-orchestration layer is plain JavaScript that runs inside the coding agent you already use. Reach
-for the heavyweight orchestration frameworks when you need cross-language runtimes, hosted
-memory, or a platform; reach for ultraopen when the work already happens in opencode and you want
-it comprehensible, reproducible, and resumable.
+## What a run looks like
+
+No GIF ships with this repo — run `bash test/e2e/tui-dev.sh` for the live thing. Mid-flight, the
+`review-changes` run above renders on three surfaces (recreated here exactly as the surfaces
+format themselves):
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                                                            │ ┌ ultracode ───────────┐
+│                 your transcript, as always                 │ │ review-changes ·     │
+│                                                            │ │ Verify · 3/5 · 12s   │
+│                                                            │ │ ⠋ review:bugs        │
+│                                                            │ │ ⠋ review:perf        │
+│                                                            │ │ ✗ review:security    │
+└────────────────────────────────────────────────────────────┘ └──────────────────────┘
+┌ input ──────────────────────────────────────────────────────────────────────────────┐
+│ > _                                                        ultracode ⠋ Verify · 3/5 │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+ ultracode · review-changes · Verify · 3/5 · 12s
+   ⠋ review:bugs   ⠋ review:perf   ✗ review:security
+```
+
+- The **bottom strip** keeps one line per run under the transcript, with the agent list indented
+  underneath; with several runs active it collapses to one summary line per run.
+- The **sidebar panel** (`Ctrl-x` then `b`) shows a per-run summary plus one row per agent.
+- The **prompt-row status line** puts live status beside the input, so a run is visible even with
+  the sidebar closed.
+
+Agents show as `⠋` running, `✓` done, `✗` failed. All three surfaces are served by one shared
+poller — one directory pass per second — so having them all open costs one read. Live rendering
+exists only because of a workaround for an upstream limitation: opencode 1.18.x never re-renders
+external TUI plugin slots after mount (reactive expressions keep their initial value, `Show`/`For`
+insertion no-ops), so the surfaces update imperatively via `node.content` + `requestRender()`
+(src/tui/index.tsx documents the full constraint).
+
+## Why ultraopen
+
+opencode can already spawn subagents. The trouble is orchestration by prompting: ask one model to
+fan out and you get a nondeterministic pile of parallel turns — different every run, unreadable in
+review, and lost the moment a turn stalls. ultraopen makes the fan-out a script: short enough to
+read in one screen, diffable in review, and replayable after a crash.
+
+This is not a framework. There is no DSL, no server, nothing to deploy — the orchestration layer
+is plain JavaScript that runs inside the coding agent you already use.
+
+| | Ad-hoc prompt fan-out | Orchestration frameworks | ultraopen |
+| --- | --- | --- | --- |
+| Orchestration lives | in the model's head | a graph DSL plus a server | plain JS, inside your agent |
+| Runs are reproducible | every run differs | deterministic | deterministic — same script, same flow |
+| Recover from a crash | start over | varies | resume; finished agents replay instantly |
+| Reviewable | no | partially | the script is a diff like any other |
+| Cost to start | none | a new runtime and concepts | a plugin you already installed |
+
+If you need cross-language runtimes, hosted memory, or a standalone server, use a framework.
+ultraopen only tries to be the right tool when the work already happens in opencode.
 
 ## What you get
 
@@ -52,8 +106,7 @@ it comprehensible, reproducible, and resumable.
   resume only redoes the unfinished work.
 - **`ultracode` mode** — raises reasoning effort and makes fan-out the default. Four ways in: the
   `ultracode` agent, the keyword, `/ultracode`, or a project config flag.
-- **Live progress** — a bottom strip, a sidebar panel, and a prompt-row status line, all served by
-  one shared poller.
+- **Live progress** — the three TUI surfaces above, served by one shared poller.
 - **Safety rails** — a recursion guard (a nested `workflow()` runs one level only), a wall-clock
   deadline per agent, a global concurrency cap, an orphan reaper that releases subagents left by
   a killed server, and retention pruning of finished run directories.
@@ -66,6 +119,9 @@ it comprehensible, reproducible, and resumable.
 | `phase(title)`, `log(msg)` | progress narration |
 | `budget` | `{ total, spent(), remaining() }` output-token ceiling |
 
+<details>
+<summary>Engine limits and agent options</summary>
+
 | Limit | Value |
 | --- | --- |
 | Agents per run | 1,000 |
@@ -77,24 +133,11 @@ it comprehensible, reproducible, and resumable.
 `agent()` accepts `label`, `phase`, `schema`, `model`, `effort`, `agentType`, `isolation`,
 `disallowedTools`.
 
-## Live progress
+The script `budget` global exists and nested runs share their parent's ceiling, but the top-level
+plugin wires no budget total — the hard ceilings are the per-run agent and per-call item caps
+above.
 
-Three surfaces, one shared poller:
-
-- The **bottom strip** shows one detail line per run, with the agent list indented underneath;
-  when several runs are active it collapses to one summary line per run.
-- The **sidebar panel** shows a per-run summary plus one row per agent. It is closed by default;
-  toggle it with Ctrl-x then b.
-- The **prompt-row status line** shows the current mode and run — e.g. `ultracode ⠋ Verify · 1/2 12s`.
-
-Agents show as `⠋` running, `✓` done, `✗` failed; the run summary reads like
-`workflow · Verify · 3/5 · 12s · 1 failed`. One shared poller — one directory pass per second —
-serves all three surfaces, so having all three open costs one read.
-
-Live rendering exists only because of a workaround for an upstream limitation: opencode 1.18.x
-never re-renders external TUI plugin slots after mount (reactive expressions keep their initial
-value, `Show`/`For` insertion no-ops), so the surfaces update imperatively via `node.content` +
-`requestRender()` (src/tui/index.tsx documents the full constraint).
+</details>
 
 ## Install
 
@@ -111,13 +154,13 @@ value, `Show`/`For` insertion no-ops), so the surfaces update imperatively via `
    // tui.json  — for the progress display
    { "plugin": ["/absolute/path/to/ultraopen"] }
    ```
+   That's it — opencode loads the plugin on next start.
 3. An absolute path is classified as a file plugin, which skips the version-compatibility gate,
    so there is no publish step while iterating.
 4. Options go through the tuple form — never a new top-level key, which opencode hard-rejects:
    ```json
    { "plugin": [["/path/to/ultraopen", { "concurrency": 8, "ultracode": true }]] }
    ```
-5. Options reference (all optional):
    - `concurrency` — global cap on live agents. Default 8, clamped to 1–32, 0 rejected.
    - `ultracode` or `mode: "ultracode"` — enable `ultracode` effort mode. Default off.
    - `agentDeadlineMs` — wall-clock deadline per agent. Default 15 min.
@@ -194,8 +237,8 @@ does it for you).
 
 `bun run m0` is a re-runnable health check for the one interaction that cannot be verified from
 source: that `format: {type:"json_schema"}` works together with a high reasoning variant, and that
-forced tool choice still leaves an agent free to research first. Upstream has no test coverage
-for that path, so it can regress silently in an opencode release.
+forced tool choice still leaves an agent free to research first. Upstream has no test coverage for
+that path, so it can regress silently in an opencode release.
 
 CI runs lint, typecheck, the coverage-gated tests, and Node parity on ubuntu and macOS. The badges
 up top are per-workflow: **Coverage** goes red exactly when coverage drops below the 95% gate in
