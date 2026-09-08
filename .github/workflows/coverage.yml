@@ -1,8 +1,10 @@
 name: Coverage
 
-# Dedicated coverage gate: bunfig.toml enforces coverageThreshold on `bun test`, so this badge
-# goes red exactly when coverage drops below the gate. ci.yml runs the same suite on the full
-# OS matrix; this single-platform copy exists so the badge reflects coverage alone.
+# Dedicated coverage gate: bunfig.toml enforces coverageThreshold on `bun test`, so this
+# workflow fails exactly when coverage drops below the gate. On main it also republishes the
+# numeric percentage to a public gist — the only URL shields.io can fetch anonymously for a
+# private repo. ci.yml runs the same suite on the full OS matrix; this single-platform copy
+# exists so the coverage badge reflects coverage alone.
 
 permissions:
   contents: read
@@ -15,6 +17,9 @@ on:
 jobs:
   coverage:
     runs-on: ubuntu-latest
+    env:
+      # Empty until the owner adds the secret; the publish step checks for it and skips.
+      GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -37,6 +42,23 @@ jobs:
           LF=$(awk -F: '/^LF:/ {s += $2} END {print s + 0}' coverage/lcov.info)
           test "$LF" -gt 0 || { echo "coverage/lcov.info is missing or empty" >&2; exit 1; }
           awk -v lh="$LH" -v lf="$LF" 'BEGIN {printf "coverage: %.1f%% (%d of %d lines)\n", 100*lh/lf, lh, lf}' >> "$GITHUB_STEP_SUMMARY"
+          echo "COVERAGE_LH=$LH" >> "$GITHUB_ENV"
+          echo "COVERAGE_LF=$LF" >> "$GITHUB_ENV"
+
+      # The badge is a shields.io endpoint badge fed by the gist; the default GITHUB_TOKEN
+      # cannot write gists, so this waits for a PAT with the gist scope as GIST_TOKEN.
+      - name: Publish coverage badge
+        if: github.ref == 'refs/heads/main' && env.GIST_TOKEN != ''
+        run: |
+          PCT=$(awk -v lh="$COVERAGE_LH" -v lf="$COVERAGE_LF" 'BEGIN {printf "%.1f", 100*lh/lf}')
+          COLOR=$(awk -v p="$PCT" 'BEGIN {print (p>=95) ? "brightgreen" : (p>=75) ? "yellow" : "red"}')
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}' "$PCT" "$COLOR" > coverage-badge.json
+          jq -n --rawfile content coverage-badge.json '{files: {"coverage-badge.json": {content: $content}}}' > payload.json
+          curl -sf -X PATCH \
+            -H "Authorization: Bearer $GIST_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -d @payload.json \
+            https://api.github.com/gists/17f03963fe3af443e3a0c24f9f9ecf21
 
       - name: Upload coverage
         if: always()

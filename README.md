@@ -5,12 +5,9 @@ Deterministic multi-agent workflow orchestration and an `ultracode` effort mode 
 your terminal.
 
 [![CI](https://github.com/PhillipChaffee/ultraopen/actions/workflows/ci.yml/badge.svg)](https://github.com/PhillipChaffee/ultraopen/actions/workflows/ci.yml)
-[![Lint](https://github.com/PhillipChaffee/ultraopen/actions/workflows/lint.yml/badge.svg)](https://github.com/PhillipChaffee/ultraopen/actions/workflows/lint.yml)
-[![Coverage](https://github.com/PhillipChaffee/ultraopen/actions/workflows/coverage.yml/badge.svg)](https://github.com/PhillipChaffee/ultraopen/actions/workflows/coverage.yml)
+[![coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2FPhillipChaffee%2F17f03963fe3af443e3a0c24f9f9ecf21%2Fraw%2Fcoverage-badge.json)](https://github.com/PhillipChaffee/ultraopen/actions/workflows/coverage.yml)
 [![Security](https://github.com/PhillipChaffee/ultraopen/actions/workflows/security.yml/badge.svg)](https://github.com/PhillipChaffee/ultraopen/actions/workflows/security.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![opencode](https://img.shields.io/badge/opencode-%3E%3D%201.18.20-7C3AED)](https://github.com/anomalyco/opencode)
-[![Made with Bun](https://img.shields.io/badge/made_with-Bun-C0242E?logo=bun&logoColor=white)](https://bun.sh/)
 
 **1,000 agents per run · schema-validated outputs · resumable by journal**
 
@@ -240,11 +237,12 @@ source: that `format: {type:"json_schema"}` works together with a high reasoning
 forced tool choice still leaves an agent free to research first. Upstream has no test coverage for
 that path, so it can regress silently in an opencode release.
 
-CI runs lint, typecheck, the coverage-gated tests, and Node parity on ubuntu and macOS. The badges
-up top are per-workflow: **Coverage** goes red exactly when coverage drops below the 95% gate in
-bunfig.toml; **Security** is a weekly zizmor audit of the workflow files themselves (CodeQL needs
-a public repo or paid GitHub Code Security, and this repo is private); **Lint** is its own
-workflow only because GitHub Actions badges are per-workflow.
+CI runs lint, typecheck, the coverage-gated tests, and Node parity on ubuntu and macOS. The
+badges up top are per-workflow: the numeric **coverage** badge republishes from each main-branch
+run of the gate — a public gist is the only URL shields.io can fetch for a private repo, and it
+goes live once the repo has a `GIST_TOKEN` secret; **Security** is a weekly zizmor audit of the
+workflow files themselves (CodeQL needs a public repo or paid GitHub Code Security, and this
+repo is private).
 
 ## License
 
