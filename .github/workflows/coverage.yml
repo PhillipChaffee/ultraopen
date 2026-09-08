@@ -1,0 +1,40 @@
+name: Coverage
+
+# Dedicated coverage gate: bunfig.toml enforces coverageThreshold on `bun test`, so this badge
+# goes red exactly when coverage drops below the gate. ci.yml runs the same suite on the full
+# OS matrix; this single-platform copy exists so the badge reflects coverage alone.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0"
+
+      - run: bun install --frozen-lockfile
+
+      # Enforces the 95% coverage gate via bunfig.toml's scalar coverageThreshold.
+      - name: Test (Bun, with coverage gate)
+        run: bun run test
+
+      - name: Report coverage
+        run: |
+          LH=$(awk '/^LH:/ {s+=$2} END {print s}' coverage/lcov.info)
+          LF=$(awk '/^LF:/ {s+=$2} END {print s}' coverage/lcov.info)
+          awk -v lh="$LH" -v lf="$LF" 'BEGIN {printf "coverage: %.1f%% (%d of %d lines)\n", 100*lh/lf, lh, lf}' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+          if-no-files-found: ignore
