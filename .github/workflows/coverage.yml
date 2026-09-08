@@ -4,6 +4,9 @@ name: Coverage
 # goes red exactly when coverage drops below the gate. ci.yml runs the same suite on the full
 # OS matrix; this single-platform copy exists so the badge reflects coverage alone.
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
@@ -13,9 +16,11 @@ jobs:
   coverage:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: "1.4.0"
 
@@ -25,15 +30,17 @@ jobs:
       - name: Test (Bun, with coverage gate)
         run: bun run test
 
+      # lcov lines are single tokens (LH:15), so split on the colon, not whitespace.
       - name: Report coverage
         run: |
-          LH=$(awk '/^LH:/ {s+=$2} END {print s}' coverage/lcov.info)
-          LF=$(awk '/^LF:/ {s+=$2} END {print s}' coverage/lcov.info)
+          LH=$(awk -F: '/^LH:/ {s += $2} END {print s + 0}' coverage/lcov.info)
+          LF=$(awk -F: '/^LF:/ {s += $2} END {print s + 0}' coverage/lcov.info)
+          test "$LF" -gt 0 || { echo "coverage/lcov.info is missing or empty" >&2; exit 1; }
           awk -v lh="$LH" -v lf="$LF" 'BEGIN {printf "coverage: %.1f%% (%d of %d lines)\n", 100*lh/lf, lh, lf}' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload coverage
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: coverage
           path: coverage/

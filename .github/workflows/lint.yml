@@ -3,6 +3,9 @@ name: Lint
 # GitHub Actions badges are per-workflow, so the lint checks get their own file and badge.
 # ci.yml keeps running them too; this workflow exists for the badge, not for exclusivity.
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
@@ -12,9 +15,11 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: "1.4.0"
 
