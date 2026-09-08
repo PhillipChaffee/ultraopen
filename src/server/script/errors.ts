@@ -6,9 +6,9 @@
  * carries a line:col and an actionable suggestion.
  */
 
-export type SourcePosition = { line: number; column: number }
+export interface SourcePosition { line: number; column: number }
 
-export type Diagnostic = {
+export interface Diagnostic {
   kind: "ParseError" | "MetaError" | "DeterminismError" | "LimitError" | "RuntimeError"
   message: string
   // `| undefined` is deliberate under exactOptionalPropertyTypes: callers pass a computed
@@ -36,8 +36,8 @@ export function render(diagnostic: Diagnostic, source?: string): string {
   const lines: string[] = [`${diagnostic.kind}: ${diagnostic.message}`]
 
   if (diagnostic.location && source) {
-    const { line, column } = diagnostic.location
-    const src = source.split("\n")[line - 1]
+    const { line, column } = diagnostic.location,
+     src = source.split("\n")[line - 1]
     if (src !== undefined) {
       const gutter = `${line} | `
       lines.push("", `${gutter}${src}`, `${" ".repeat(gutter.length + Math.max(0, column))}^`)

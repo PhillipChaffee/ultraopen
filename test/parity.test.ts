@@ -13,8 +13,8 @@ import type { OpencodeClient, PromptBody } from "../src/server/types.js"
  * editing to run here, the port has diverged in a way that matters more than any unit test.
  */
 
-let dataHome: string
-let saved: string | undefined
+let dataHome: string,
+ saved: string | undefined
 
 beforeAll(async () => {
   dataHome = await mkdtemp(join(tmpdir(), "ultraopen-parity-"))
@@ -23,8 +23,8 @@ beforeAll(async () => {
 })
 
 afterAll(async () => {
-  if (saved === undefined) delete process.env["XDG_DATA_HOME"]
-  else process.env["XDG_DATA_HOME"] = saved
+  if (saved === undefined) {delete process.env["XDG_DATA_HOME"]}
+  else {process.env["XDG_DATA_HOME"] = saved}
   await rm(dataHome, { recursive: true, force: true })
 })
 
@@ -42,8 +42,8 @@ function makeClient() {
       delete: () => Promise.resolve({}),
       abort: () => Promise.resolve({}),
       prompt: (options: { path: { id: string }; body: PromptBody }) => {
-        const text = options.body.parts[0]?.text ?? ""
-        const structured = options.body.format
+        const text = options.body.parts[0]?.text ?? "",
+         structured = options.body.format
           ? { findings: [{ title: `finding for ${text.slice(0, 12)}` }], isReal: true, bugs: [{ desc: text.slice(0, 8) }] }
           : undefined
         return Promise.resolve({
@@ -62,8 +62,8 @@ const run = (script: string, args?: unknown) =>
 
 describe("spec §2.9 — canonical multi-stage pipeline", () => {
   test("runs unchanged", async () => {
-    const FINDINGS = { type: "object", properties: { findings: { type: "array" } } }
-    const script = `export const meta = {
+    const FINDINGS = { type: "object", properties: { findings: { type: "array" } } },
+     script = `export const meta = {
   name: 'review-changes',
   description: 'Review changed files across dimensions, verify each finding',
   phases: [{ title: 'Review' }, { title: 'Verify' }],
@@ -81,9 +81,9 @@ const results = await pipeline(
 )
 const confirmed = results.flat().filter(Boolean).filter(f => f.verdict?.isReal)
 return { confirmed }
-`
-    const result = await run(script)
-    const value = result.value as { confirmed: unknown[] }
+`,
+     result = await run(script),
+     value = result.value as { confirmed: unknown[] }
     expect(value.confirmed.length).toBe(2)
     expect(result.agentCount).toBe(4)
   })
@@ -100,7 +100,8 @@ const deduped = all.filter(Boolean).flatMap(r => r.findings)
 const verified = await parallel(deduped.map(f => () => agent('verify ' + f.title, {schema: VERDICT})))
 return { count: verified.filter(Boolean).length }
 `
-    expect(((await run(script)).value as { count: number }).count).toBe(2)
+    const result = await run(script)
+    expect((result.value as { count: number }).count).toBe(2)
   })
 })
 
@@ -115,8 +116,8 @@ while (bugs.length < 4) {
   log(\`\${bugs.length}/4 found\`)
 }
 return { total: bugs.length }
-`
-    const result = await run(script)
+`,
+     result = await run(script)
     expect((result.value as { total: number }).total).toBeGreaterThanOrEqual(4)
     expect(result.logs.length).toBeGreaterThan(0)
   })
@@ -132,8 +133,8 @@ while (budget.total && budget.remaining() > 1) {
   bugs.push(...result.bugs)
 }
 return { rounds: bugs.length }
-`
-    const result = await execute(
+`,
+     result = await execute(
       { script },
       { client: makeClient(), sessionID: "p", runId: "wf_parity02", budgetTotal: 6 },
     )
@@ -149,7 +150,8 @@ let rounds = 0
 while (budget.total && budget.remaining() > 1) { await agent('x'); rounds++ }
 return { rounds }
 `
-    expect(((await run(script)).value as { rounds: number }).rounds).toBe(0)
+    const result = await run(script)
+    expect((result.value as { rounds: number }).rounds).toBe(0)
   })
 })
 
@@ -175,9 +177,9 @@ while (dry < 2) {
   confirmed.push(...judged.filter(v => v.real).map(v => v.b))
 }
 return { confirmed: confirmed.length }
-`
+`,
     // Terminates: the second round finds nothing new, so `dry` reaches 2.
-    const result = await run(script)
+     result = await run(script)
     expect((result.value as { confirmed: number }).confirmed).toBeGreaterThan(0)
   })
 })
@@ -198,15 +200,15 @@ const flaky = await agent('grep CI logs for retry markers', {schema: FLAKY_SCHEM
 phase('Fix')
 const fixes = await parallel(flaky.bugs.map(b => () => agent('fix ' + b.desc)))
 return { fixed: fixes.filter(Boolean).length }
-`
-    const result = await run(script)
+`,
+     result = await run(script)
     expect((result.value as { fixed: number }).fixed).toBe(1)
   })
 })
 
 describe("spec §3.3 — the gotchas checklist is enforced", () => {
-  const META = "export const meta = { name: 'g', description: 'gotchas' }\n"
-  const fails = async (body: string): Promise<string> => {
+  const META = "export const meta = { name: 'g', description: 'gotchas' }\n",
+   fails = async (body: string): Promise<string> => {
     try {
       await run(META + body)
       return "(did not throw)"
@@ -223,8 +225,8 @@ describe("spec §3.3 — the gotchas checklist is enforced", () => {
     ["argless new Date()", "const d = new Date()\n", "", "new Date()"],
     ["an import", "import fs from 'node:fs'\n", "", "cannot import"],
   ])("rejects %s", async (_label, body, whole, expected) => {
-    const message = whole === "" ? await fails(body) : await fails("").then(() => fails(whole.slice(META.length)))
-    const actual = whole === "" ? message : await (async () => {
+    const message = whole === "" ? await fails(body) : await fails("").then(() => fails(whole.slice(META.length))),
+     actual = whole === "" ? message : await (async () => {
       try {
         await run(whole)
         return "(did not throw)"
@@ -247,7 +249,8 @@ describe("spec §3.3 — the gotchas checklist is enforced", () => {
 const out = await pipeline([1], () => null, () => { reached++; return 'x' })
 return { out, reached }
 `
-    const result = (await run(script)).value as { out: unknown[]; reached: number }
+    const outcome = await run(script)
+    const result = outcome.value as { out: unknown[]; reached: number }
     expect(result.out).toEqual([null])
     expect(result.reached).toBe(0)
   })

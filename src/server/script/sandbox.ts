@@ -53,9 +53,9 @@ if (!(asyncProbe() instanceof Promise)) {
 
 const AsyncFunction = Object.getPrototypeOf(asyncProbe).constructor as new (
   ...args: string[]
-) => (...args: unknown[]) => Promise<unknown>
+) => (...args: unknown[]) => Promise<unknown>,
 
-const determinism = (message: string, suggestion: string) =>
+ determinism = (message: string, suggestion: string) =>
   new WorkflowScriptError({ kind: "DeterminismError", message, suggestions: [suggestion] })
 
 /**
@@ -116,7 +116,7 @@ function denied(name: string): () => never {
   }
 }
 
-export type SandboxGlobals = {
+export interface SandboxGlobals {
   agent: unknown
   parallel: unknown
   pipeline: unknown
@@ -167,18 +167,18 @@ export async function run(body: string, globals: SandboxGlobals): Promise<unknow
     importScripts: denied("importScripts"),
     __dirname: undefined,
     __filename: undefined,
-  }
+  },
 
-  const names = Object.keys(bindings)
-  const values = names.map((n) => bindings[n])
+   names = Object.keys(bindings),
+   values = names.map((n) => bindings[n])
 
   let compiled: (...a: unknown[]) => Promise<unknown>
   try {
     compiled = new AsyncFunction(...names, `"use strict";${body}`)
-  } catch (err) {
+  } catch (error) {
     throw new WorkflowScriptError({
       kind: "ParseError",
-      message: `Workflow script failed to compile: ${(err as Error).message}`,
+      message: `Workflow script failed to compile: ${(error as Error).message}`,
       suggestions: ["Workflow scripts are plain JavaScript, not TypeScript."],
     })
   }

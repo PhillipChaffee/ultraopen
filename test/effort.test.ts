@@ -2,9 +2,9 @@ import { describe, expect, test } from "bun:test"
 import { makeEffortResolver, resolveEffort } from "../src/server/bridge/effort.js"
 
 /** Real variant sets, taken from what opencode reports for these model families. */
-const CLAUDE_5 = { available: ["low", "medium", "high", "xhigh", "max"], modelLabel: "claude-opus-5" }
-const CLAUDE_46 = { available: ["low", "medium", "high", "max"], modelLabel: "claude-sonnet-4-6" }
-const NO_VARIANTS = { available: [], modelLabel: "kimi-k2.6" }
+const CLAUDE_5 = { available: ["low", "medium", "high", "xhigh", "max"], modelLabel: "claude-opus-5" },
+ CLAUDE_46 = { available: ["low", "medium", "high", "max"], modelLabel: "claude-sonnet-4-6" },
+ NO_VARIANTS = { available: [], modelLabel: "kimi-k2.6" }
 
 describe("resolveEffort", () => {
   test("passes through a supported variant unchanged", () => {
@@ -59,8 +59,8 @@ describe("resolveEffort", () => {
   test("does not escalate a LOW request several rungs up to an expensive level", () => {
     // A model offering only ["max"] cannot honour "low". Jumping to max would be a large, silent
     // cost increase in the opposite direction from what was asked, so send nothing instead.
-    const onlyMax = { available: ["max"], modelLabel: "odd" }
-    const result = resolveEffort("low", onlyMax)
+    const onlyMax = { available: ["max"], modelLabel: "odd" },
+     result = resolveEffort("low", onlyMax)
     expect(result.variant).toBeUndefined()
     expect(result.note).toContain("offers only max")
   })
@@ -76,8 +76,8 @@ describe("resolveEffort", () => {
 
 describe("makeEffortResolver", () => {
   test("resolves and reports downgrades to the run log", () => {
-    const notes: string[] = []
-    const resolve = makeEffortResolver(CLAUDE_46, (note) => notes.push(note))
+    const notes: string[] = [],
+     resolve = makeEffortResolver(CLAUDE_46, (note) => notes.push(note))
 
     expect(resolve("xhigh")).toBe("high")
     expect(notes.length).toBe(1)
@@ -85,8 +85,8 @@ describe("makeEffortResolver", () => {
   })
 
   test("stays quiet when the request is honoured exactly", () => {
-    const notes: string[] = []
-    const resolve = makeEffortResolver(CLAUDE_5, (note) => notes.push(note))
+    const notes: string[] = [],
+     resolve = makeEffortResolver(CLAUDE_5, (note) => notes.push(note))
 
     expect(resolve("xhigh")).toBe("xhigh")
     expect(notes).toEqual([])
@@ -161,10 +161,10 @@ describe("real-world variant sets", () => {
 
   test("every real set resolves an xhigh request to SOMETHING when it has any usable level", () => {
     for (const [name, available] of Object.entries(REAL_SETS)) {
-      const usable = available.filter((entry) => entry !== "none")
-      const result = resolveEffort("xhigh", { available, modelLabel: name })
-      if (usable.length === 0) expect(result.variant).toBeUndefined()
-      else expect(result.variant).toBeDefined()
+      const usable = available.filter((entry) => entry !== "none"),
+       result = resolveEffort("xhigh", { available, modelLabel: name })
+      if (usable.length === 0) {expect(result.variant).toBeUndefined()}
+      else {expect(result.variant).toBeDefined()}
     }
   })
 

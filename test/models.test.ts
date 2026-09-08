@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
-import { makeResolvers, parseModelRef, variantsOf, type CatalogClient, type ProviderCatalog } from "../src/server/bridge/models.js"
+import { makeResolvers, parseModelRef, variantsOf } from "../src/server/bridge/models.js"
+import type { CatalogClient, ProviderCatalog } from "../src/server/bridge/models.js"
 
 const CATALOG: ProviderCatalog = {
   providers: [
@@ -13,9 +14,9 @@ const CATALOG: ProviderCatalog = {
     },
     { id: "together", models: { "Qwen/Qwen3.5": { variants: { low: {}, high: {} } } } },
   ],
-}
+},
 
-const clientWith = (catalog: ProviderCatalog | undefined, fail = false): CatalogClient => ({
+ clientWith = (catalog: ProviderCatalog | undefined, fail = false): CatalogClient => ({
   config: {
     providers: () =>
       fail ? Promise.reject(new Error("offline")) : Promise.resolve(catalog === undefined ? {} : { data: catalog }),
@@ -70,32 +71,32 @@ describe("makeResolvers", () => {
   test("resolves effort against a PER-CALL model, not the default", async () => {
     // Variants belong to a model. Resolving a pinned model's effort against the run default would
     // send a variant that model may not support — the silent no-op this path exists to prevent.
-    const notes: string[] = []
-    const resolvers = await makeResolvers(clientWith(CATALOG), {
+    const notes: string[] = [],
+     resolvers = await makeResolvers(clientWith(CATALOG), {
       defaultModel: "opencode/claude-opus-5",
       onNote: (note) => notes.push(note),
-    })
+    }),
 
-    const pinned = resolvers.resolveModel("opencode/claude-sonnet-4-6")
+     pinned = resolvers.resolveModel("opencode/claude-sonnet-4-6")
     expect(resolvers.resolveVariant("xhigh", pinned)).toBe("high")
     expect(notes.some((note) => note.includes("claude-sonnet-4-6"))).toBe(true)
   })
 
   test("reports each distinct downgrade once, not once per agent", async () => {
     // A 15-agent fan-out on the same model would otherwise write 15 identical log lines.
-    const notes: string[] = []
-    const resolvers = await makeResolvers(clientWith(CATALOG), {
+    const notes: string[] = [],
+     resolvers = await makeResolvers(clientWith(CATALOG), {
       defaultModel: "opencode/claude-sonnet-4-6",
       onNote: (note) => notes.push(note),
     })
 
-    for (let i = 0; i < 15; i++) resolvers.resolveVariant("xhigh")
+    for (let i = 0; i < 15; i++) {resolvers.resolveVariant("xhigh")}
     expect(notes.length).toBe(1)
   })
 
   test("still reports a DIFFERENT downgrade", async () => {
-    const notes: string[] = []
-    const resolvers = await makeResolvers(clientWith(CATALOG), {
+    const notes: string[] = [],
+     resolvers = await makeResolvers(clientWith(CATALOG), {
       defaultModel: "opencode/claude-sonnet-4-6",
       onNote: (note) => notes.push(note),
     })
@@ -115,8 +116,8 @@ describe("makeResolvers", () => {
   })
 
   test("a catalog fetch failure degrades rather than throwing", async () => {
-    const notes: string[] = []
-    const resolvers = await makeResolvers(clientWith(undefined, true), {
+    const notes: string[] = [],
+     resolvers = await makeResolvers(clientWith(undefined, true), {
       defaultModel: "opencode/claude-opus-5",
       onNote: (note) => notes.push(note),
     })

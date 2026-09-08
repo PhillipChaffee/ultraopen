@@ -22,7 +22,7 @@ export function newBootId(): string {
   return `${process.pid}-${Math.trunc(performance.timeOrigin)}`
 }
 
-export type ReapResult = {
+export interface ReapResult {
   runs: number
   sessions: number
   failures: number
@@ -68,16 +68,16 @@ export async function reapOrphans(
   try {
     // findOrphans swallows its own I/O errors and returns [], so no catch is needed here.
     const orphans = await findOrphans(bootId, options.env)
-    if (orphans.length === 0) return { runs: 0, sessions: 0, failures: 0, live: 0 }
+    if (orphans.length === 0) {return { runs: 0, sessions: 0, failures: 0, live: 0 }}
 
-    const alive = options.isProcessAlive ?? defaultProcessAlive
+    const alive = options.isProcessAlive ?? defaultProcessAlive,
     // A live pid means the run may still be executing in another concurrent process. Skip it —
     // the reaper's whole job is to stop billing, never to kill work in progress.
-    const reapable = orphans.filter((manifest) => !Number.isInteger(manifest.pid) || !alive(manifest.pid))
-    const live = orphans.length - reapable.length
+     reapable = orphans.filter((manifest) => !Number.isInteger(manifest.pid) || !alive(manifest.pid)),
+     live = orphans.length - reapable.length
 
-    let sessions = 0
-    let failures = 0
+    let sessions = 0,
+     failures = 0
 
     for (const manifest of reapable) {
       for (const sessionID of manifest.childSessionIDs ?? []) {
@@ -100,9 +100,9 @@ export async function reapOrphans(
 
     if (reapable.length > 0 || live > 0) {
       options.onNote?.(
-        `ultraopen: released ${sessions} subagent session(s) from ${reapable.length} interrupted run(s)` +
-          (failures > 0 ? ` (${failures} could not be aborted)` : "") +
-          (live > 0 ? ` (${live} run(s) skipped — their process is still alive)` : ""),
+        `ultraopen: released ${sessions} subagent session(s) from ${reapable.length} interrupted run(s)${ 
+          failures > 0 ? ` (${failures} could not be aborted)` : "" 
+          }${live > 0 ? ` (${live} run(s) skipped — their process is still alive)` : ""}`,
       )
     }
 
@@ -145,9 +145,9 @@ export async function pruneRuns(
   let pruned = 0
   for (const name of names) {
     const manifest = await readManifest(name, options.env)
-    if (!manifest || manifest.status === "running") continue
+    if (!manifest || manifest.status === "running") {continue}
     const ended = manifest.endedAt ?? manifest.startedAt
-    if (typeof ended !== "number" || ended > cutoff) continue
+    if (typeof ended !== "number" || ended > cutoff) {continue}
     await rm(runDir(name, options.env), { recursive: true, force: true }).catch(ignore)
     pruned++
   }

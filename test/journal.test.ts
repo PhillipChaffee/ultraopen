@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
-import { Journal, parseJournal, type JournalEntry } from "../src/server/resume/journal.js"
+import { Journal, parseJournal } from "../src/server/resume/journal.js"
+import type { JournalEntry } from "../src/server/resume/journal.js"
 
 const entry = (overrides: Partial<JournalEntry> = {}): JournalEntry => ({
   type: "result",
@@ -102,7 +103,8 @@ describe("parseJournal", () => {
   })
 
   test("skips blank lines and unparseable content", () => {
-    expect(parseJournal(`\n\nnot json\n${JSON.stringify(entry())}\n`).length).toBe(1)
+    const serialized = JSON.stringify(entry())
+    expect(parseJournal(`\n\nnot json\n${serialized}\n`).length).toBe(1)
   })
 
   test.each([

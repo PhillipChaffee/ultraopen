@@ -33,7 +33,7 @@ Ultracode's reasoning effort is still raised, but the user has asked you not to 
 automatically. Do the work yourself unless they explicitly ask for a workflow.
 </system-reminder>`
 
-export type MessageLike = {
+export interface MessageLike {
   info?: { id?: string; role?: string; sessionID?: string; agent?: string }
   parts?: unknown[]
 }
@@ -41,7 +41,7 @@ export type MessageLike = {
 /** Marker used to detect an already-decorated message, so the hook is idempotent. */
 export const REMINDER_MARKER = "Ultracode is on:"
 
-export type TextPart = {
+export interface TextPart {
   id: string
   messageID: string
   sessionID: string
@@ -80,21 +80,21 @@ export function decorate(
   messages: MessageLike[],
   options: { text: string; fromMessageID?: string | undefined },
 ): number {
-  let decorated = 0
-  let reached = options.fromMessageID === undefined
+  let decorated = 0,
+   reached = options.fromMessageID === undefined
 
   for (const message of messages) {
-    if (message.info?.role !== "user") continue
+    if (message.info?.role !== "user") {continue}
     if (!reached) {
-      if (message.info.id !== options.fromMessageID) continue
+      if (message.info.id !== options.fromMessageID) {continue}
       reached = true
     }
 
-    const parts = message.parts
-    if (!Array.isArray(parts)) continue
+    const {parts} = message
+    if (!Array.isArray(parts)) {continue}
     // Idempotent: the hook can fire more than once per turn, and duplicate reminders would both
     // waste context and break the cache prefix.
-    if (parts.some((part) => isReminder(part))) continue
+    if (parts.some((part) => isReminder(part))) {continue}
 
     parts.push(reminderPart(message, options.text, decorated))
     decorated++
@@ -103,7 +103,7 @@ export function decorate(
 }
 
 function isReminder(part: unknown): boolean {
-  if (typeof part !== "object" || part === null) return false
+  if (typeof part !== "object" || part === null) {return false}
   const record = part as Record<string, unknown>
   return typeof record["id"] === "string" && record["id"].startsWith("ultraopen-reminder-")
 }

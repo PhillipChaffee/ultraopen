@@ -38,8 +38,8 @@ describe("Semaphore admission", () => {
   })
 
   test("queues beyond the limit and admits on release", async () => {
-    const sem = new Semaphore(1)
-    const first = await sem.acquire()
+    const sem = new Semaphore(1),
+     first = await sem.acquire()
     let admitted = false
     const pending = sem.acquire().then((release) => {
       admitted = true
@@ -57,10 +57,10 @@ describe("Semaphore admission", () => {
   })
 
   test("never exceeds the limit under a burst", async () => {
-    const limit = 4
-    const sem = new Semaphore(limit)
-    let peak = 0
-    let running = 0
+    const limit = 4,
+     sem = new Semaphore(limit)
+    let peak = 0,
+     running = 0
 
     await Promise.all(
       Array.from({ length: 40 }, async () => {
@@ -81,10 +81,10 @@ describe("Semaphore admission", () => {
   test("a synchronous acquire cannot steal a slot from a woken waiter", async () => {
     // The permit is claimed at wake time inside #drain. If it were claimed after the waiter
     // resumed, an acquire landing in that microtask gap would oversubscribe the limit.
-    const sem = new Semaphore(1)
-    const first = await sem.acquire()
+    const sem = new Semaphore(1),
+     first = await sem.acquire(),
 
-    const queued = sem.acquire()
+     queued = sem.acquire()
     first()
     const sneaky = sem.acquire()
 
@@ -95,8 +95,8 @@ describe("Semaphore admission", () => {
   })
 
   test("release is idempotent", async () => {
-    const sem = new Semaphore(2)
-    const release = await sem.acquire()
+    const sem = new Semaphore(2),
+     release = await sem.acquire()
     release()
     release()
     release()
@@ -104,11 +104,11 @@ describe("Semaphore admission", () => {
   })
 
   test("waiters are admitted in FIFO order", async () => {
-    const sem = new Semaphore(1)
-    const held = await sem.acquire()
-    const order: number[] = []
+    const sem = new Semaphore(1),
+     held = await sem.acquire(),
+     order: number[] = [],
 
-    const waiters = [1, 2, 3].map(async (n) => {
+     waiters = [1, 2, 3].map(async (n) => {
       const release = await sem.acquire()
       order.push(n)
       release()

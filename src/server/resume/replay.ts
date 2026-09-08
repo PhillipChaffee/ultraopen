@@ -9,7 +9,7 @@ import type { NullReason } from "../bridge/spawn.js"
  * together, rather than interleaved with spawn plumbing.
  */
 
-export type ReplayHit = {
+export interface ReplayHit {
   value: unknown
   outputTokens: number
   entry: JournalEntry
@@ -32,9 +32,9 @@ export function tryReplay(
   identity: CallIdentity,
   schemaHash: string | undefined,
 ): ReplayHit | undefined {
-  if (identity.forceLive) return undefined
+  if (identity.forceLive) {return undefined}
   const entry = journal.lookup(identity.key, schemaHash)
-  if (!entry) return undefined
+  if (!entry) {return undefined}
   return { value: entry.value, outputTokens: entry.outputTokens, entry }
 }
 

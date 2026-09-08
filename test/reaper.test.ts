@@ -7,8 +7,8 @@ import { ensureRunDir, readManifest, writeManifest } from "../src/server/resume/
 import type { Manifest } from "../src/server/resume/journal.js"
 import type { OpencodeClient } from "../src/server/types.js"
 
-let base: string
-let env: NodeJS.ProcessEnv
+let base: string,
+ env: NodeJS.ProcessEnv
 
 const manifest = (overrides: Partial<Manifest> = {}): Manifest => ({
   runId: "wf_dead001",
@@ -21,20 +21,20 @@ const manifest = (overrides: Partial<Manifest> = {}): Manifest => ({
   childSessionIDs: ["child-1", "child-2"],
   startedAt: 0,
   ...overrides,
-})
+}),
 
 // Tests must not depend on whether real pids happen to be alive on the host machine.
-const DEAD = () => false
+ DEAD = () => false,
 
-const finished = (startedAt: number, endedAt?: number): Partial<Manifest> => ({
+ finished = (startedAt: number, endedAt?: number): Partial<Manifest> => ({
   status: "completed",
   startedAt,
   ...(endedAt === undefined ? {} : { endedAt }),
 })
 
 function makeClient(abort: (id: string) => Promise<unknown> = () => Promise.resolve({})) {
-  const aborted: string[] = []
-  const client = {
+  const aborted: string[] = [],
+   client = {
     session: {
       create: () => Promise.resolve({}),
       get: () => Promise.resolve({}),
@@ -80,9 +80,9 @@ describe("reapOrphans", () => {
     // opencode never cascades an abort to plain parentID children, so without this they keep
     // running — and billing — after the server that started them is gone.
     await seed()
-    const { client, aborted } = makeClient()
+    const { client, aborted } = makeClient(),
 
-    const result = await reapOrphans(client, "current-boot", { env, isProcessAlive: DEAD })
+     result = await reapOrphans(client, "current-boot", { env, isProcessAlive: DEAD })
     expect(aborted).toEqual(["child-1", "child-2"])
     expect(result).toEqual({ runs: 1, sessions: 2, failures: 0, live: 0 })
   })
@@ -92,7 +92,8 @@ describe("reapOrphans", () => {
     const { client } = makeClient()
     await reapOrphans(client, "current-boot", { env, isProcessAlive: DEAD })
 
-    expect((await readManifest("wf_dead001", env))?.status).toBe("orphaned")
+    const orphanManifest = await readManifest("wf_dead001", env)
+    expect(orphanManifest?.status).toBe("orphaned")
 
     const second = makeClient()
     expect(await reapOrphans(second.client, "current-boot", { env, isProcessAlive: DEAD })).toEqual({
@@ -108,17 +109,18 @@ describe("reapOrphans", () => {
     // Several opencode instances share one data root. A fresh boot id must not condemn another
     // live process's run — that would abort workflows that are working correctly.
     await seed()
-    const { client, aborted } = makeClient()
-    const notes: string[] = []
+    const { client, aborted } = makeClient(),
+     notes: string[] = [],
 
-    const result = await reapOrphans(client, "current-boot", {
+     result = await reapOrphans(client, "current-boot", {
       env,
       isProcessAlive: () => true,
       onNote: (note) => notes.push(note),
     })
     expect(aborted).toEqual([])
     expect(result).toEqual({ runs: 0, sessions: 0, failures: 0, live: 1 })
-    expect((await readManifest("wf_dead001", env))?.status).toBe("running")
+    const orphanManifest = await readManifest("wf_dead001", env)
+    expect(orphanManifest?.status).toBe("running")
     // The skip is visible rather than silent.
     expect(notes[0]).toContain("still alive")
   })
@@ -146,17 +148,18 @@ describe("reapOrphans", () => {
     // A session may already be gone. The run is lost either way; the point is to stop it costing
     // money, not to insist every abort lands.
     await seed()
-    const { client } = makeClient((id) => (id === "child-1" ? Promise.reject(new Error("gone")) : Promise.resolve({})))
+    const { client } = makeClient((id) => (id === "child-1" ? Promise.reject(new Error("gone")) : Promise.resolve({}))),
 
-    const result = await reapOrphans(client, "current-boot", { env, isProcessAlive: DEAD })
+     result = await reapOrphans(client, "current-boot", { env, isProcessAlive: DEAD })
     expect(result).toEqual({ runs: 1, sessions: 1, failures: 1, live: 0 })
-    expect((await readManifest("wf_dead001", env))?.status).toBe("orphaned")
+    const orphanManifest = await readManifest("wf_dead001", env)
+    expect(orphanManifest?.status).toBe("orphaned")
   })
 
   test("reports what it released", async () => {
     await seed()
-    const notes: string[] = []
-    const { client } = makeClient()
+    const notes: string[] = [],
+     { client } = makeClient()
     await reapOrphans(client, "current-boot", { env, isProcessAlive: DEAD, onNote: (note) => notes.push(note) })
 
     expect(notes[0]).toContain("released 2 subagent session(s)")
@@ -165,16 +168,16 @@ describe("reapOrphans", () => {
 
   test("mentions failures in the note", async () => {
     await seed()
-    const notes: string[] = []
-    const { client } = makeClient(() => Promise.reject(new Error("gone")))
+    const notes: string[] = [],
+     { client } = makeClient(() => Promise.reject(new Error("gone")))
     await reapOrphans(client, "current-boot", { env, isProcessAlive: DEAD, onNote: (note) => notes.push(note) })
 
     expect(notes[0]).toContain("2 could not be aborted")
   })
 
   test("stays silent and cheap when there is nothing to reap", async () => {
-    const notes: string[] = []
-    const { client } = makeClient()
+    const notes: string[] = [],
+     { client } = makeClient()
     expect(await reapOrphans(client, "boot", { env, isProcessAlive: DEAD, onNote: (note) => notes.push(note) })).toEqual({
       runs: 0,
       sessions: 0,
@@ -216,8 +219,8 @@ describe("failure tolerance", () => {
     // an existing file only needs write permission on the file itself.
     await chmod(join(base, "opencode", "tool-output", "ultraopen", entry.runId, "manifest.json"), 0o400)
 
-    const { client, aborted } = makeClient()
-    const result = await reapOrphans(client, "current-boot", { env, isProcessAlive: DEAD })
+    const { client, aborted } = makeClient(),
+     result = await reapOrphans(client, "current-boot", { env, isProcessAlive: DEAD })
 
     expect(aborted).toEqual(["child-1", "child-2"])
     expect(result.sessions).toBe(2)
@@ -241,8 +244,8 @@ describe("non-throwing contract", () => {
 describe("pruneRuns", () => {
   test("deletes finished runs past the retention window and keeps everything else", async () => {
     // Old enough to be pruned no matter when the test runs.
-    const ancient = 0
-    const seed = async (runId: string, overrides: Partial<Manifest>): Promise<void> => {
+    const ancient = 0,
+     seed = async (runId: string, overrides: Partial<Manifest>): Promise<void> => {
       await ensureRunDir(runId, env)
       await writeManifest(runId, manifest({ runId, ...overrides }), env)
     }

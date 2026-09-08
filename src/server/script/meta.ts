@@ -1,9 +1,10 @@
 import type * as acorn from "acorn"
-import { fail, type SourcePosition } from "./errors.js"
+import { fail } from "./errors.js"
+import type { SourcePosition } from "./errors.js"
 import { literal } from "./literal.js"
 import { loc } from "./walk.js"
 
-export type Phase = {
+export interface Phase {
   title: string
   /** Display-only detail shown in the progress UI. */
   detail?: string
@@ -15,7 +16,7 @@ export type Phase = {
   model?: string
 }
 
-export type Meta = {
+export interface Meta {
   name: string
   description: string
   whenToUse?: string
@@ -53,24 +54,24 @@ export function extractMeta(ast: acorn.Program): Meta {
   if (decl.id.type !== "Identifier" || decl.id.name !== "meta") {
     fail({ kind: "MetaError", message: "The first statement must declare `meta`, not another name.", location: loc(decl) })
   }
-  const init = decl.init
+  const {init} = decl
   if (!init) {
     fail({ kind: "MetaError", message: "`meta` must be initialised with an object literal.", location: loc(decl) })
   }
 
-  const at = loc(init)
-  const value = literal(init)
+  const at = loc(init),
+   value = literal(init)
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     fail({ kind: "MetaError", message: "`meta` must be an object literal.", location: at })
   }
 
-  const raw = value as Record<string, unknown>
-  const meta: Meta = {
+  const raw = value as Record<string, unknown>,
+   meta: Meta = {
     name: requireString(raw, "name", at),
     description: requireString(raw, "description", at),
-  }
+  },
 
-  const whenToUse = raw["whenToUse"]
+   {whenToUse} = raw
   if (whenToUse !== undefined) {
     if (typeof whenToUse !== "string") {
       fail({ kind: "MetaError", message: "meta.whenToUse must be a string.", location: at })
@@ -78,7 +79,7 @@ export function extractMeta(ast: acorn.Program): Meta {
     meta.whenToUse = whenToUse
   }
 
-  const phases = raw["phases"]
+  const {phases} = raw
   if (phases !== undefined) {
     if (!Array.isArray(phases)) {
       fail({ kind: "MetaError", message: "meta.phases must be an array.", location: at })
@@ -102,8 +103,8 @@ function parsePhase(entry: unknown, index: number, at: SourcePosition | undefine
     fail({ kind: "MetaError", message: `meta.phases[${index}] must be an object.`, location: at })
   }
 
-  const raw = entry as Record<string, unknown>
-  const title = raw["title"]
+  const raw = entry as Record<string, unknown>,
+   {title} = raw
   if (typeof title !== "string" || title.trim() === "") {
     fail({
       kind: "MetaError",
@@ -115,7 +116,7 @@ function parsePhase(entry: unknown, index: number, at: SourcePosition | undefine
   const phase: Phase = { title }
   for (const key of ["detail", "model"] as const) {
     const value = raw[key]
-    if (value === undefined) continue
+    if (value === undefined) {continue}
     if (typeof value !== "string") {
       fail({ kind: "MetaError", message: `meta.phases[${index}].${key} must be a string.`, location: at })
     }

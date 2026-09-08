@@ -1,7 +1,8 @@
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises"
+import { appendFile, mkdir, readFile, readdir, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
-import { parseJournal, type JournalEntry, type Manifest } from "./journal.js"
+import { parseJournal } from "./journal.js"
+import type { JournalEntry, Manifest } from "./journal.js"
 
 /**
  * On-disk layout for workflow runs.
@@ -25,8 +26,8 @@ const NAMESPACE = "ultraopen"
 
 /** Mirrors opencode's XDG resolution: $XDG_DATA_HOME, else ~/.local/share. */
 export function dataRoot(env: NodeJS.ProcessEnv = process.env): string {
-  const xdg = env["XDG_DATA_HOME"]
-  const base = xdg && xdg.trim() !== "" ? xdg : join(homedir(), ".local", "share")
+  const xdg = env["XDG_DATA_HOME"],
+   base = xdg && xdg.trim() !== "" ? xdg : join(homedir(), ".local", "share")
   return join(base, "opencode", "tool-output", NAMESPACE)
 }
 
@@ -34,7 +35,7 @@ export function runDir(runId: string, env?: NodeJS.ProcessEnv): string {
   return join(dataRoot(env), runId)
 }
 
-export type RunArtifacts = {
+export interface RunArtifacts {
   dir: string
   journalPath: string
   manifestPath: string
@@ -64,7 +65,7 @@ export function isSafeRunId(runId: string): boolean {
 }
 
 export async function ensureRunDir(runId: string, env?: NodeJS.ProcessEnv): Promise<RunArtifacts> {
-  if (!isSafeRunId(runId)) throw new Error(`unsafe run id: ${runId}`)
+  if (!isSafeRunId(runId)) {throw new Error(`unsafe run id: ${runId}`)}
   const paths = artifactPaths(runId, env)
   await mkdir(paths.dir, { recursive: true })
   return paths
@@ -87,6 +88,45 @@ export async function readManifest(runId: string, env?: NodeJS.ProcessEnv): Prom
 export async function appendJournal(runId: string, text: string, env?: NodeJS.ProcessEnv): Promise<void> {
   const paths = artifactPaths(runId, env)
   await writeFile(paths.journalPath, text, "utf8")
+}
+
+/**
+ * Incremental journal flush: one line per entry as it is recorded, so a process killed mid-run
+ * keeps every completed agent. `parseJournal` already tolerates a torn final line — that is the
+ * crash mode of a mid-write kill — so a plain append is safe. `appendJournal` still rewrites the
+ * full file at endRun, which settles ordering and stays idempotent.
+ *
+ * This wrapper never rejects: persistence is best-effort by design, and a floating rejection from
+ * the tool layer would take down the TUI process.
+ */
+export async function flushJournalEntry(
+  runId: string,
+  entry: JournalEntry,
+  env?: NodeJS.ProcessEnv,
+): Promise<void> {
+  try {
+    await appendJournalEntry(runId, entry, env)
+  } catch {
+    // A torn tail otherwise glues the NEXT entry onto the partial line, losing both —
+    // rebuild the file from what still parses, then re-append the new entry.
+    const entries = await readJournal(runId, env)
+    const rebuilt = `${[...entries, entry].map((e) => JSON.stringify(e)).join("\n")}\n`
+    await appendJournal(runId, rebuilt, env).catch(() => undefined)
+  }
+}
+
+export async function appendJournalEntry(
+  runId: string,
+  entry: JournalEntry,
+  env?: NodeJS.ProcessEnv,
+): Promise<void> {
+  const paths = artifactPaths(runId, env)
+  // A torn tail (mid-write kill or ENOSPC) would glue this entry onto the partial line,
+  // losing both on the next parse. Journals are small, so re-establish the newline
+  // boundary before appending.
+  const existing = await readFile(paths.journalPath, "utf8").catch(() => "")
+  const prefix = existing === "" || existing.endsWith("\n") ? "" : "\n"
+  await appendFile(paths.journalPath, `${prefix}${JSON.stringify(entry)}\n`, "utf8")
 }
 
 export async function readJournal(runId: string, env?: NodeJS.ProcessEnv): Promise<JournalEntry[]> {
@@ -128,10 +168,10 @@ export async function findOrphans(bootId: string, env?: NodeJS.ProcessEnv): Prom
 
   const orphans: Manifest[] = []
   for (const name of names) {
-    if (!isSafeRunId(name)) continue
+    if (!isSafeRunId(name)) {continue}
     const manifest = await readManifest(name, env)
-    if (!manifest) continue
-    if (manifest.status === "running" && manifest.bootId !== bootId) orphans.push(manifest)
+    if (!manifest) {continue}
+    if (manifest.status === "running" && manifest.bootId !== bootId) {orphans.push(manifest)}
   }
   return orphans
 }

@@ -25,8 +25,8 @@ describe("parallel", () => {
   })
 
   test("runs concurrently rather than sequentially", async () => {
-    let running = 0
-    let peak = 0
+    let running = 0,
+     peak = 0
     const thunk = async () => {
       running++
       peak = Math.max(peak, running)
@@ -40,8 +40,8 @@ describe("parallel", () => {
   })
 
   test("a thunk that returns a rejected promise resolves to null, and the call does not reject", async () => {
-    const rejected = Promise.reject(new Error("boom"))
-    const results = await parallel([() => rejected, () => 1])
+    const rejected = Promise.reject(new Error("boom")),
+     results = await parallel([() => rejected, () => 1])
     expect(results).toEqual([null, 1])
   })
 
@@ -64,13 +64,13 @@ describe("parallel", () => {
   test("passing a non-array throws a TypeError naming the authoring mistake", async () => {
     // parallel() is an `async function`, so a synchronous throw inside it surfaces as a
     // rejected promise, not a synchronous throw from the call site — must await it.
-    const notAnArray = Promise.resolve([1, 2, 3]) as unknown as ReadonlyArray<() => unknown>
+    const notAnArray = Promise.resolve([1, 2, 3]) as unknown as readonly (() => unknown)[]
     try {
       await parallel(notAnArray)
       throw new Error("expected parallel() to reject")
     } catch (error) {
       expect(error).toBeInstanceOf(TypeError)
-      const message = (error as TypeError).message
+      const {message} = (error as TypeError)
       expect(message).toContain("not promises")
       expect(message).toContain("() => agent(...)")
     }
@@ -82,8 +82,8 @@ describe("parallel", () => {
   })
 
   test("exactly MAX_ITEMS_PER_CALL items is allowed", async () => {
-    const thunks = Array.from({ length: MAX_ITEMS_PER_CALL }, () => () => 1)
-    const results = await parallel(thunks)
+    const thunks = Array.from({ length: MAX_ITEMS_PER_CALL }, () => () => 1),
+     results = await parallel(thunks)
     expect(results.length).toBe(MAX_ITEMS_PER_CALL)
   })
 
@@ -109,7 +109,7 @@ describe("pipeline", () => {
   })
 
   test("every stage receives (prev, originalItem, index) with the ORIGINAL item, not the previous result", async () => {
-    const seen: Array<{ prev: unknown; item: unknown; index: number }> = []
+    const seen: { prev: unknown; item: unknown; index: number }[] = []
     await pipeline(
       ["a", "b"],
       (prev, item, index) => {
@@ -131,9 +131,9 @@ describe("pipeline", () => {
   })
 
   test("no barrier between stages: a fast item's later stage can start before a slow item's earlier stage ends", async () => {
-    const log: string[] = []
+    const log: string[] = [],
 
-    const results = await pipeline(
+     results = await pipeline(
       ["A", "B"],
       async (_prev, item) => {
         log.push(`${item as string}:s1:start`)
@@ -148,8 +148,8 @@ describe("pipeline", () => {
     )
 
     expect(results).toEqual(["A", "B"])
-    const a2Start = log.indexOf("A:s2:start")
-    const bEnd = log.indexOf("B:s1:end")
+    const a2Start = log.indexOf("A:s2:start"),
+     bEnd = log.indexOf("B:s1:end")
     expect(a2Start).toBeGreaterThanOrEqual(0)
     expect(bEnd).toBeGreaterThanOrEqual(0)
     expect(a2Start).toBeLessThan(bEnd)
@@ -160,7 +160,7 @@ describe("pipeline", () => {
     const results = await pipeline(
       [1, 2],
       (_prev, item) => {
-        if (item === 1) throw new Error("boom")
+        if (item === 1) {throw new Error("boom")}
         return item
       },
       (prev) => prev,
@@ -210,7 +210,7 @@ describe("pipeline", () => {
     const results = await pipeline(
       [1, 2, 3],
       (_prev, item) => {
-        if (item === 2) throw new Error("boom")
+        if (item === 2) {throw new Error("boom")}
         return (item as number) * 10
       },
     )
@@ -234,8 +234,8 @@ describe("pipeline", () => {
   })
 
   test("exactly MAX_ITEMS_PER_CALL items is allowed", async () => {
-    const items = Array.from({ length: MAX_ITEMS_PER_CALL }, (_unused, index) => index)
-    const results = await pipeline(items, (prev) => prev)
+    const items = Array.from({ length: MAX_ITEMS_PER_CALL }, (_unused, index) => index),
+     results = await pipeline(items, (prev) => prev)
     expect(results.length).toBe(MAX_ITEMS_PER_CALL)
   })
 

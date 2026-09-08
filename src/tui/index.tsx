@@ -1,7 +1,8 @@
 import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { createEffect, createSignal, onCleanup } from "solid-js"
 import { homedir } from "node:os"
-import { RunPoller, dataRoot, formatElapsed, glyph, summarize, type RunView } from "./data.js"
+import { RunPoller, dataRoot, formatElapsed, glyph, summarize } from "./data.js"
+import type { RunView } from "./data.js"
 
 /**
  * The TUI half of ultraopen.
@@ -43,22 +44,22 @@ function useRuns(sessionID: () => string) {
 
 /** Mount one <text> and hand its renderable to an imperative writer. */
 function sidebarLines(rs: RunView[]): string {
-  if (rs.length === 0) return ""
+  if (rs.length === 0) {return ""}
   const lines: string[] = ["ultracode"]
   for (const run of rs) {
     lines.push(summarize(run))
-    for (const agent of run.agents) lines.push(`${glyph(agent.status)} ${agent.label}`)
+    for (const agent of run.agents) {lines.push(`${glyph(agent.status)} ${agent.label}`)}
   }
   return lines.join("\n")
 }
 
 function Sidebar(props: { api: TuiPluginApi; session_id: string }) {
-  const runs = useRuns(() => props.session_id)
-  const theme = () => props.api.theme.current
+  const runs = useRuns(() => props.session_id),
+   theme = () => props.api.theme.current
   let node: TextNode
 
   createEffect(() => {
-    if (!node) return
+    if (!node) {return}
     node.content = sidebarLines(runs())
     node.requestRender?.()
     props.api.renderer.requestRender?.()
@@ -67,23 +68,39 @@ function Sidebar(props: { api: TuiPluginApi; session_id: string }) {
   return <text fg={theme().textMuted} ref={(r: TextNode) => (node = r)} />
 }
 
+// The input box's border sits at column 2 and its right edge at width-2 (measured from live
+// Frames at 200 and 60 columns). The strip pads to the box's left edge and clips at its right
+// Edge so it cannot spill past either. Width comes from stdout.columns — the plugin runs in the
+// TUI host process, where stdout is the pane — read per update, so resizes are picked up.
+const STRIP_INSET = 2,
+ alignStrip = (content: string): string => {
+  const width = process.stdout.columns ?? 0
+  return content
+    .split("\n")
+    .map((line) => {
+      const padded = " ".repeat(STRIP_INSET) + line
+      return width > STRIP_INSET ? padded.slice(0, width - STRIP_INSET) : padded
+    })
+    .join("\n")
+}
+
 /** One always-visible line per active run, under the transcript. */
 function BottomStrip(props: { api: TuiPluginApi }) {
   const current = () => {
     const route = props.api.route.current
     return route.name === "session" ? ((route.params?.["sessionID"] as string) ?? "") : ""
-  }
-  const runs = useRuns(current)
-  const theme = () => props.api.theme.current
+  },
+   runs = useRuns(current),
+   theme = () => props.api.theme.current
   let node: TextNode
 
   createEffect(() => {
     const rs = runs()
-    if (!node) return
+    if (!node) {return}
     let content = ""
     if (rs.length === 1) {
-      const run = rs[0]
-      const agents =
+      const run = rs[0],
+       agents =
         run.agents.length > 0
           ? `  ${run.agents.map((agent) => `${glyph(agent.status)} ${agent.label}`).join("   ")}`
           : ""
@@ -91,7 +108,7 @@ function BottomStrip(props: { api: TuiPluginApi }) {
     } else if (rs.length > 1) {
       content = rs.map((run) => `ultracode · ${summarize(run)}`).join("\n")
     }
-    node.content = content
+    node.content = alignStrip(content)
     node.requestRender?.()
     props.api.renderer.requestRender?.()
   })
@@ -101,13 +118,13 @@ function BottomStrip(props: { api: TuiPluginApi }) {
 
 /** Compact status beside the prompt, so a run is visible with the sidebar closed. */
 function PromptStatus(props: { api: TuiPluginApi; session_id: string }) {
-  const runs = useRuns(() => props.session_id)
-  const theme = () => props.api.theme.current
+  const runs = useRuns(() => props.session_id),
+   theme = () => props.api.theme.current
   let node: TextNode
 
   createEffect(() => {
     const rs = runs()
-    if (!node) return
+    if (!node) {return}
     let content = ""
     const run = rs[0]
     if (rs.length === 1 && run) {
@@ -141,4 +158,6 @@ const tui: TuiPlugin = async (api) => {
   })
 }
 
-export default { id: "ultraopen", tui }
+const plugin = { id: "ultraopen", tui }
+
+export default plugin

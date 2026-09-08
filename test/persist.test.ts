@@ -3,11 +3,11 @@ import { chmod, mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { beginRun, endRun, loadResume } from "../src/server/resume/persist.js"
-import { artifactPaths, readJournal, readManifest, writeManifest, ensureRunDir } from "../src/server/resume/store.js"
+import { artifactPaths, ensureRunDir, readJournal, readManifest, writeManifest } from "../src/server/resume/store.js"
 import type { JournalEntry } from "../src/server/resume/journal.js"
 
-let base: string
-let env: NodeJS.ProcessEnv
+let base: string,
+ env: NodeJS.ProcessEnv
 
 const record = {
   runId: "wf_abc123",
@@ -15,9 +15,9 @@ const record = {
   source: "export const meta = {}",
   args: { a: 1 },
   bootId: "boot-1",
-}
+},
 
-const entry: JournalEntry = {
+ entry: JournalEntry = {
   type: "result",
   key: "k1",
   scopePath: "root",
@@ -72,14 +72,17 @@ describe("endRun", () => {
     expect(updated?.status).toBe("completed")
     expect(updated?.childSessionIDs).toEqual(["c1"])
     expect(updated?.endedAt).toBeGreaterThan(0)
-    expect((await readJournal("wf_abc123", env)).length).toBe(1)
-    expect(JSON.parse(await Bun.file(artifactPaths("wf_abc123", env).resultPath).text())).toEqual({ done: true })
+    const entries = await readJournal("wf_abc123", env)
+    expect(entries.length).toBe(1)
+    const result = JSON.parse(await Bun.file(artifactPaths("wf_abc123", env).resultPath).text())
+    expect(result).toEqual({ done: true })
   })
 
   test("records a failed status", async () => {
     const manifest = await beginRun(record, env)
     await endRun(manifest, { status: "failed", entries: [], value: null, childSessionIDs: [] }, env)
-    expect((await readManifest("wf_abc123", env))?.status).toBe("failed")
+    const reread = await readManifest("wf_abc123", env)
+    expect(reread?.status).toBe("failed")
   })
 
   test("is a no-op when the run was never opened", async () => {

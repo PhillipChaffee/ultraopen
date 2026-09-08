@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, test } from "bun:test"
 import { mentionsKeyword, mode, requestsNoFanOut } from "../src/server/ultracode/mode.js"
-import { decorate, REMINDER_MARKER, ULTRACODE_DEMOTED, ULTRACODE_ON, type MessageLike } from "../src/server/ultracode/reminders.js"
+import { decorate, REMINDER_MARKER, ULTRACODE_DEMOTED, ULTRACODE_ON } from "../src/server/ultracode/reminders.js"
+import type { MessageLike } from "../src/server/ultracode/reminders.js"
 import { onChatMessage, onChatParams, onMessagesTransform } from "../src/server/ultracode/hooks.js"
 import { registry } from "../src/server/singleton.js"
 

@@ -22,7 +22,7 @@ import type { Ruleset } from "./bridge/permission.js"
  * NOTE the model shape here is `{id, providerID, variant?}` — DIFFERENT from the prompt body's
  * `{providerID, modelID}` (session.ts:216-220 vs prompt.ts:1494-1497).
  */
-export type CreateSessionBody = {
+export interface CreateSessionBody {
   parentID?: string
   title?: string
   agent?: string
@@ -50,8 +50,8 @@ export type OutputFormat = { type: "text" } | { type: "json_schema"; schema: Rec
  * the session's permission ruleset (`prompt.ts:1060-1066`), silently wiping the child's denies for
  * every later turn. Tool restrictions belong in the create-time ruleset instead.
  */
-export type PromptBody = {
-  parts: Array<{ type: "text"; text: string; synthetic?: boolean }>
+export interface PromptBody {
+  parts: { type: "text"; text: string; synthetic?: boolean }[]
   messageID?: string
   model?: { providerID: string; modelID: string }
   agent?: string
@@ -82,7 +82,7 @@ export type AssistantErrorName =
  * `structured` is the field that carries schema-forced output — NOT `structured_output`, which is
  * what the published docs claim.
  */
-export type AssistantInfo = {
+export interface AssistantInfo {
   id: string
   sessionID: string
   role: "assistant"
@@ -117,13 +117,13 @@ export type MessagePart =
  * back here as one step with no research tool parts. So `agent()` extracting its result from this
  * envelope is correct, but part counts here are NOT evidence of what the agent did.
  */
-export type PromptResponse = {
+export interface PromptResponse {
   info: AssistantInfo
   parts: MessagePart[]
 }
 
 /** Minimal session row, covering the fields the recursion guard and cleanup need. */
-export type SessionInfo = {
+export interface SessionInfo {
   id: string
   parentID?: string
   directory?: string
@@ -139,7 +139,7 @@ export type SessionInfo = {
  * `PluginInput.client` — never a self-built client, which would re-arm the 5-minute fetch timeout
  * and, under `opencode run`, target a fabricated `http://localhost:4096` that points at nothing.
  */
-export type OpencodeClient = {
+export interface OpencodeClient {
   /**
    * Used once per run to read each model's real reasoning-variant set.
    *
@@ -147,7 +147,7 @@ export type OpencodeClient = {
    * reports every effort request as unhonoured rather than sending a variant that may not exist.
    */
   config?: {
-    providers: () => Promise<{ data?: { providers?: Array<{ id?: string; models?: Record<string, { variants?: Record<string, unknown> } | undefined> }> }; error?: unknown }>
+    providers: () => Promise<{ data?: { providers?: { id?: string; models?: Record<string, { variants?: Record<string, unknown> } | undefined> }[] }; error?: unknown }>
     get?: () => Promise<{ data?: { model?: string }; error?: unknown }>
   }
   session: {

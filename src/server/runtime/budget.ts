@@ -11,13 +11,13 @@ import { fail } from "../script/errors.js"
  * target `remaining()` is Infinity, and an unguarded loop would run to the 1000-agent backstop.
  */
 
-export type Budget = {
+export interface Budget {
   total: number | null
   spent: () => number
   remaining: () => number
 }
 
-export type BudgetOptions = {
+export interface BudgetOptions {
   total: number | null
   /** Output tokens spent so far. Live, because it grows as agents complete. */
   spent: () => number
@@ -42,8 +42,8 @@ export function makeBudget(options: BudgetOptions): Budget {
  * `remaining()` with headroom, as the suggestion below says, keeps that gap harmless.
  */
 export function assertWithinBudget(budget: Budget): void {
-  if (budget.total === null) return
-  if (budget.spent() < budget.total) return
+  if (budget.total === null) {return}
+  if (budget.spent() < budget.total) {return}
   fail({
     kind: "LimitError",
     message: `Workflow reached its ${budget.total} output-token budget (spent ${budget.spent()}).`,

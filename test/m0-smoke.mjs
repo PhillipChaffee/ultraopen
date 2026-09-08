@@ -22,23 +22,23 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-const EFFORT_PREFERENCE = ["xhigh", "max", "high", "medium", "low"]
-const BOOT_TIMEOUT_MS = 60_000
-const PROMPT_TIMEOUT_MS = 240_000
+const EFFORT_PREFERENCE = ["xhigh", "max", "high", "medium", "low"],
+ BOOT_TIMEOUT_MS = 60_000,
+ PROMPT_TIMEOUT_MS = 240_000,
 
-const args = process.argv.slice(2)
-const flag = (name) => {
+ args = process.argv.slice(2),
+ flag = (name) => {
   const i = args.indexOf(`--${name}`)
   return i === -1 ? undefined : args[i + 1]
-}
-const has = (name) => args.includes(`--${name}`)
+},
+ has = (name) => args.includes(`--${name}`),
 
-const wantModel = flag("model")
-const wantEffort = flag("effort") ?? "xhigh"
-const keepDir = has("keep")
+ wantModel = flag("model"),
+ wantEffort = flag("effort") ?? "xhigh",
+ keepDir = has("keep")
 
-let pass = 0
-let fail = 0
+let pass = 0,
+ fail = 0
 const check = (ok, label, detail) => {
   if (ok) {
     pass++
@@ -48,28 +48,28 @@ const check = (ok, label, detail) => {
   fail++
   console.log(`  \u001B[31m✗\u001B[0m ${label}${detail ? ` — ${detail}` : ""}`)
   return false
-}
-const info = (label, detail) => console.log(`  \u001B[90m·\u001B[0m ${label}${detail ? ` — ${detail}` : ""}`)
+},
+ info = (label, detail) => console.log(`  \u001B[90m·\u001B[0m ${label}${detail ? ` — ${detail}` : ""}`)
 
-/** opencode serve prints its URL to stdout; parse it rather than guessing a port. */
+/** Opencode serve prints its URL to stdout; parse it rather than guessing a port. */
 function startServer(cwd) {
   return new Promise((resolve, reject) => {
     const proc = spawn("opencode", ["serve", "--port", "0", "--hostname", "127.0.0.1"], {
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
     })
-    let out = ""
-    let settled = false
+    let out = "",
+     settled = false
     const timer = setTimeout(() => {
-      if (settled) return
+      if (settled) {return}
       settled = true
       proc.kill("SIGKILL")
       reject(new Error(`server did not report a URL within ${BOOT_TIMEOUT_MS}ms. stdout:\n${out}`))
-    }, BOOT_TIMEOUT_MS)
+    }, BOOT_TIMEOUT_MS),
 
-    const scan = (chunk) => {
+     scan = (chunk) => {
       out += chunk
-      const m = out.match(/https?:\/\/127\.0\.0\.1:(\d+)/u)
+      const m = out.match(/https?:\/\/127\.0\.0\.1:(?<port>\d+)/u)
       if (m && !settled) {
         settled = true
         clearTimeout(timer)
@@ -79,7 +79,7 @@ function startServer(cwd) {
     proc.stdout.on("data", (d) => scan(d.toString()))
     proc.stderr.on("data", (d) => scan(d.toString()))
     proc.on("exit", (code) => {
-      if (settled) return
+      if (settled) {return}
       settled = true
       clearTimeout(timer)
       reject(new Error(`server exited early (code ${code}). output:\n${out}`))
@@ -88,15 +88,15 @@ function startServer(cwd) {
 }
 
 async function api(base, path, init = {}, timeoutMs = 30_000) {
-  const ctl = new AbortController()
-  const t = setTimeout(() => ctl.abort(), timeoutMs)
+  const ctl = new AbortController(),
+   t = setTimeout(() => ctl.abort(), timeoutMs)
   try {
     const res = await fetch(`${base}${path}`, {
       ...init,
       signal: ctl.signal,
       headers: { "content-type": "application/json", ...init.headers },
-    })
-    const text = await res.text()
+    }),
+     text = await res.text()
     let body
     try {
       body = text ? JSON.parse(text) : undefined
@@ -116,11 +116,11 @@ async function api(base, path, init = {}, timeoutMs = 30_000) {
  * the schema without reading, the test proves nothing about whether toolChoice:"required" leaves
  * room to do research first, which is the whole question.
  */
-const MARKER = "QX7F2M-PLUM-4419-KESTREL"
-const SECRET_LINE_COUNT = 11
-const NEEDLE_ANSWER = "HALIBUT-5502-VERDIGRIS"
+const MARKER = "QX7F2M-PLUM-4419-KESTREL",
+ SECRET_LINE_COUNT = 11,
+ NEEDLE_ANSWER = "HALIBUT-5502-VERDIGRIS",
 
-const SCHEMA = {
+ SCHEMA = {
   type: "object",
   additionalProperties: false,
   required: ["marker", "lineCount", "summary"],
@@ -132,10 +132,10 @@ const SCHEMA = {
 }
 
 async function main() {
-  const dir = await mkdtemp(join(tmpdir(), "ultraopen-m0-"))
+  const dir = await mkdtemp(join(tmpdir(), "ultraopen-m0-")),
   // Content deliberately NOT inferable from the filename: an arbitrary marker token and an
   // odd line count. The only way to report these is to actually read the file.
-  const lines = [
+   lines = [
     "# fixture for the ultraopen M0 smoke test",
     `MARKER = "${MARKER}"`,
     "",
@@ -148,8 +148,8 @@ async function main() {
     "if __name__ == '__main__':",
     "    print(MARKER, compute(19))",
   ]
-  if (lines.length !== SECRET_LINE_COUNT) throw new Error(`fixture drift: ${lines.length} lines, expected ${SECRET_LINE_COUNT}`)
-  await writeFile(join(dir, "sample.py"), lines.join("\n") + "\n")
+  if (lines.length !== SECRET_LINE_COUNT) {throw new Error(`fixture drift: ${lines.length} lines, expected ${SECRET_LINE_COUNT}`)}
+  await writeFile(join(dir, "sample.py"), `${lines.join("\n")  }\n`)
 
   console.log(`\nM0 provider smoke test`)
   console.log(`workdir: ${dir}\n`)
@@ -161,20 +161,20 @@ async function main() {
   let sessionID
   try {
     // ---- resolve the model -------------------------------------------------
-    const cfg = await api(url, "/config")
-    const defaultModel = cfg.body?.model
-    const target = wantModel ?? defaultModel
-    if (!target) throw new Error("no model configured and none passed via --model")
-    const [providerID, ...rest] = target.split("/")
-    const modelID = rest.join("/")
+    const cfg = await api(url, "/config"),
+     defaultModel = cfg.body?.model,
+     target = wantModel ?? defaultModel
+    if (!target) {throw new Error("no model configured and none passed via --model")}
+    const [providerID, ...rest] = target.split("/"),
+     modelID = rest.join("/")
     info("configured default", defaultModel ?? "(none)")
     info("testing model", target)
 
     // ---- does the requested variant actually exist? ------------------------
-    const providers = await api(url, "/config/providers")
-    const list = providers.body?.providers ?? providers.body ?? []
-    const provider = Array.isArray(list) ? list.find((p) => p.id === providerID) : undefined
-    const model = provider?.models?.[modelID]
+    const providers = await api(url, "/config/providers"),
+     list = providers.body?.providers ?? providers.body ?? [],
+     provider = Array.isArray(list) ? list.find((p) => p.id === providerID) : undefined,
+     model = provider?.models?.[modelID]
     if (!model) {
       info("variants", `could not introspect ${target} from /config/providers — skipping variant assertions`)
     }
@@ -203,7 +203,7 @@ async function main() {
     })
     check(created.ok, "POST /session", `status ${created.status}`)
     sessionID = created.body?.id
-    if (!sessionID) throw new Error(`no session id in response: ${JSON.stringify(created.body)}`)
+    if (!sessionID) {throw new Error(`no session id in response: ${JSON.stringify(created.body)}`)}
 
     const body = {
       parts: [
@@ -218,12 +218,12 @@ async function main() {
       model: { providerID, modelID },
       format: { type: "json_schema", schema: SCHEMA },
     }
-    if (resolved) body.variant = resolved
+    if (resolved) {body.variant = resolved}
 
     console.log("\nprompting (this makes a real model call, may take a minute)…")
-    const started = Date.now()
-    const res = await api(url, `/session/${sessionID}/message`, { method: "POST", body: JSON.stringify(body) }, PROMPT_TIMEOUT_MS)
-    const elapsed = ((Date.now() - started) / 1000).toFixed(1)
+    const started = Date.now(),
+     res = await api(url, `/session/${sessionID}/message`, { method: "POST", body: JSON.stringify(body) }, PROMPT_TIMEOUT_MS),
+     elapsed = ((Date.now() - started) / 1000).toFixed(1)
     console.log("")
 
     check(res.ok, "prompt returned 2xx", `status ${res.status} in ${elapsed}s`)
@@ -231,8 +231,8 @@ async function main() {
       console.log(`\n  response body:\n${JSON.stringify(res.body, null, 2).slice(0, 2000)}\n`)
     }
 
-    const msgInfo = res.body?.info
-    const parts = res.body?.parts ?? []
+    const msgInfo = res.body?.info,
+     parts = res.body?.parts ?? []
 
     if (msgInfo?.error) {
       check(false, "no assistant error", `${msgInfo.error.name}: ${msgInfo.error.message ?? ""}`)
@@ -280,8 +280,8 @@ async function main() {
     // Consequence for ultraopen: results MUST come from the prompt envelope (they do), the
     // journal MUST copy values rather than point at child sessions, and child sessions are not
     // re-readable via the message API.
-    const poisoned = await api(url, `/session/${sessionID}/message`)
-    const stillBroken = poisoned.status === 400
+    const poisoned = await api(url, `/session/${sessionID}/message`),
+     stillBroken = poisoned.status === 400
     info(
       "upstream format/history bug",
       stillBroken ? "STILL PRESENT (expected) — GET message 400s on format sessions" : `\u001B[33mFIXED upstream! status ${poisoned.status} — revisit the journal design\u001B[0m`,
@@ -299,11 +299,11 @@ async function main() {
       for (let i = 0; i < 12; i++) {
         await writeFile(join(nest, `mod_${i}.txt`), `filler ${i}\n`.repeat(20))
       }
-      await writeFile(join(nest, "mod_7.txt"), `filler\n`.repeat(9) + `NEEDLE_TOKEN\n${NEEDLE_ANSWER}\n` + `filler\n`.repeat(9))
+      await writeFile(join(nest, "mod_7.txt"), `${`filler\n`.repeat(9)  }NEEDLE_TOKEN\n${NEEDLE_ANSWER}\n${  `filler\n`.repeat(9)}`)
 
-      const s3 = await api(url, "/session", { method: "POST", body: JSON.stringify({ title: "ultraopen m0 multistep" }) })
-      const id3 = s3.body?.id
-      const body3 = {
+      const s3 = await api(url, "/session", { method: "POST", body: JSON.stringify({ title: "ultraopen m0 multistep" }) }),
+       id3 = s3.body?.id,
+       body3 = {
         parts: [
           {
             type: "text",
@@ -323,13 +323,13 @@ async function main() {
           },
         },
       }
-      if (resolved) body3.variant = resolved
-      const r3 = await api(url, `/session/${id3}/message`, { method: "POST", body: JSON.stringify(body3) }, PROMPT_TIMEOUT_MS)
-      const p3 = r3.body?.parts ?? []
-      const tools3 = p3.filter((p) => p.type === "tool")
-      const research = tools3.filter((p) => p.tool !== "StructuredOutput")
-      const steps = p3.filter((p) => p.type === "step-start").length
-      const st3 = r3.body?.info?.structured
+      if (resolved) {body3.variant = resolved}
+      const r3 = await api(url, `/session/${id3}/message`, { method: "POST", body: JSON.stringify(body3) }, PROMPT_TIMEOUT_MS),
+       p3 = r3.body?.parts ?? [],
+       tools3 = p3.filter((p) => p.type === "tool"),
+       research = tools3.filter((p) => p.tool !== "StructuredOutput"),
+       steps = p3.filter((p) => p.type === "step-start").length,
+       st3 = r3.body?.info?.structured
 
       // NOTE: the POST envelope carries only the FINAL assistant message of the turn, not the
       // whole turn — verified by running this same task without `format` and reading history,
@@ -340,7 +340,7 @@ async function main() {
       // its result from the envelope is correct: the envelope IS the final message.)
       info("envelope tools (final message only)", [...new Set(tools3.map((p) => p.tool))].join(", ") || "none")
       info("envelope steps", String(steps))
-      if (research.length > 0) info("research visible in envelope", `${research.length} call(s)`)
+      if (research.length > 0) {info("research visible in envelope", `${research.length} call(s)`)}
       check(
         st3?.lineAfter?.trim() === NEEDLE_ANSWER,
         'multi-step research ran under toolChoice:"required" (unreachable without grep+read)',
@@ -352,8 +352,8 @@ async function main() {
 
     // (4) Variant persistence, checked on a SEPARATE format-free session so history is readable.
     if (resolved) {
-      const s2 = await api(url, "/session", { method: "POST", body: JSON.stringify({ title: "ultraopen m0 variant" }) })
-      const id2 = s2.body?.id
+      const s2 = await api(url, "/session", { method: "POST", body: JSON.stringify({ title: "ultraopen m0 variant" }) }),
+       id2 = s2.body?.id
       await api(
         url,
         `/session/${id2}/message`,
@@ -367,19 +367,19 @@ async function main() {
         },
         PROMPT_TIMEOUT_MS,
       )
-      const msgs = await api(url, `/session/${id2}/message`)
-      const arr = Array.isArray(msgs.body) ? msgs.body : []
-      const last = arr.findLast((m) => (m.info ?? m).role === "user")
-      const persisted = (last?.info ?? last)?.model?.variant
+      const msgs = await api(url, `/session/${id2}/message`),
+       arr = Array.isArray(msgs.body) ? msgs.body : [],
+       last = arr.findLast((m) => (m.info ?? m).role === "user"),
+       persisted = (last?.info ?? last)?.model?.variant
       check(persisted === resolved, "requested variant persists on the user message", `got ${JSON.stringify(persisted)}`)
       await api(url, `/session/${id2}`, { method: "DELETE" }).catch(() => {})
     }
   } finally {
-    if (sessionID) await api(url, `/session/${sessionID}`, { method: "DELETE" }).catch(() => {})
+    if (sessionID) {await api(url, `/session/${sessionID}`, { method: "DELETE" }).catch(() => {})}
     proc.kill("SIGTERM")
     setTimeout(() => proc.kill("SIGKILL"), 3000).unref?.()
-    if (keepDir) console.log(`\nkept workdir: ${dir}`)
-    else await rm(dir, { recursive: true, force: true }).catch(() => {})
+    if (keepDir) {console.log(`\nkept workdir: ${dir}`)}
+    else {await rm(dir, { recursive: true, force: true }).catch(() => {})}
   }
 
   console.log(`\n${fail === 0 ? "\u001B[32mM0 PASS\u001B[0m" : "\u001B[31mM0 FAIL\u001B[0m"}  ${pass} passed, ${fail} failed\n`)
@@ -390,7 +390,9 @@ async function main() {
   process.exit(fail === 0 ? 0 : 1)
 }
 
-main().catch((err) => {
-  console.error(`\n\u001B[31mM0 ERROR\u001B[0m ${err.message}\n`)
+try {
+  await main()
+} catch (error) {
+  console.error(`\n\u001B[31mM0 ERROR\u001B[0m ${error.message}\n`)
   process.exit(2)
-})
+}

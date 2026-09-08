@@ -20,7 +20,14 @@ restore() {
   done
   rmdir "$STASH" 2>/dev/null || true
 }
-trap restore EXIT
+# EXIT alone does not fire when the script is SIGINT/SIGTERM'd (a killed
+# terminal window kills the process group), which would leave the packages
+# stashed and the repo silently typecheck-broken. Trap the signals too.
+trap restore EXIT INT TERM
+
+# A previous abnormal exit may have left a stale stash; fold it back first
+# so this run stashes exactly one live copy.
+restore
 
 if [ ! -d dist ]; then
   echo "dist/ missing — running bun run build first"

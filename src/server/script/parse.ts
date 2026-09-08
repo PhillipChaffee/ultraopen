@@ -2,9 +2,10 @@ import * as acorn from "acorn"
 import { fail } from "./errors.js"
 import { MAX_SCRIPT_CHARS } from "./limits.js"
 import { lintDeterminism } from "./lint.js"
-import { extractMeta, type Meta } from "./meta.js"
+import { extractMeta } from "./meta.js"
+import type { Meta } from "./meta.js"
 
-export type ParsedScript = {
+export interface ParsedScript {
   meta: Meta
   /** Source with every `export ` keyword blanked in place. Byte offsets are preserved. */
   body: string
@@ -68,7 +69,7 @@ export function parse(source: string): ParsedScript {
  * would otherwise pass the literal walk and then throw an opaque syntax error with no location.
  */
 function blankExports(ast: acorn.Program, source: string): string {
-  const spans: Array<[number, number]> = []
+  const spans: [number, number][] = []
   for (const node of ast.body) {
     if (node.type === "ExportNamedDeclaration" && node.declaration) {
       spans.push([node.start, node.declaration.start])
@@ -79,12 +80,12 @@ function blankExports(ast: acorn.Program, source: string): string {
       spans.push([node.start, node.end])
     }
   }
-  if (spans.length === 0) return source
+  if (spans.length === 0) {return source}
 
   const chars = [...source]
   for (const [start, end] of spans) {
     for (let i = start; i < end; i++) {
-      if (chars[i] !== "\n") chars[i] = " "
+      if (chars[i] !== "\n") {chars[i] = " "}
     }
   }
   return chars.join("")

@@ -21,15 +21,15 @@ export function validate(value: unknown, schema: Record<string, unknown>): Valid
 }
 
 function check(value: unknown, schema: Record<string, unknown>, path: string, errors: string[]): void {
-  const where = path === "" ? "value" : path
+  const where = path === "" ? "value" : path,
 
-  const enumValues = schema["enum"]
+   enumValues = schema["enum"]
   if (Array.isArray(enumValues) && !enumValues.some((candidate) => deepEqual(candidate, value))) {
     errors.push(`${where} must be one of ${JSON.stringify(enumValues)}`)
     return
   }
 
-  const type = schema["type"]
+  const {type} = schema
   if (typeof type === "string" && !matchesType(value, type)) {
     errors.push(`${where} must be a ${type}, got ${describe(value)}`)
     return
@@ -40,10 +40,10 @@ function check(value: unknown, schema: Record<string, unknown>, path: string, er
     return
   }
 
-  if (isPlainObject(value)) checkObject(value, schema, path, errors)
-  if (Array.isArray(value)) checkArray(value, schema, path, errors)
-  if (typeof value === "number") checkNumber(value, schema, where, errors)
-  if (typeof value === "string") checkString(value, schema, where, errors)
+  if (isPlainObject(value)) {checkObject(value, schema, path, errors)}
+  if (Array.isArray(value)) {checkArray(value, schema, path, errors)}
+  if (typeof value === "number") {checkNumber(value, schema, where, errors)}
+  if (typeof value === "string") {checkString(value, schema, where, errors)}
 }
 
 function checkObject(
@@ -52,7 +52,7 @@ function checkObject(
   path: string,
   errors: string[],
 ): void {
-  const required = schema["required"]
+  const {required} = schema
   if (Array.isArray(required)) {
     for (const key of required) {
       if (typeof key === "string" && !(key in value)) {
@@ -61,44 +61,44 @@ function checkObject(
     }
   }
 
-  const properties = schema["properties"]
+  const {properties} = schema
   if (isPlainObject(properties)) {
     for (const [key, sub] of Object.entries(properties)) {
-      if (!(key in value) || !isPlainObject(sub)) continue
+      if (!(key in value) || !isPlainObject(sub)) {continue}
       check(value[key], sub, path === "" ? key : `${path}.${key}`, errors)
     }
 
     if (schema["additionalProperties"] === false) {
       for (const key of Object.keys(value)) {
-        if (!(key in properties)) errors.push(`${path === "" ? "value" : path} has unexpected property "${key}"`)
+        if (!(key in properties)) {errors.push(`${path === "" ? "value" : path} has unexpected property "${key}"`)}
       }
     }
   }
 }
 
 function checkArray(value: unknown[], schema: Record<string, unknown>, path: string, errors: string[]): void {
-  const items = schema["items"]
+  const {items} = schema
   if (isPlainObject(items)) {
     value.forEach((entry, index) => {
       check(entry, items, `${path === "" ? "" : path}[${index}]`, errors)
     })
   }
 
-  const minItems = schema["minItems"]
+  const {minItems} = schema
   if (typeof minItems === "number" && value.length < minItems) {
     errors.push(`${path === "" ? "value" : path} must have at least ${minItems} item(s), got ${value.length}`)
   }
 }
 
 function checkNumber(value: number, schema: Record<string, unknown>, where: string, errors: string[]): void {
-  const minimum = schema["minimum"]
-  if (typeof minimum === "number" && value < minimum) errors.push(`${where} must be >= ${minimum}`)
-  const maximum = schema["maximum"]
-  if (typeof maximum === "number" && value > maximum) errors.push(`${where} must be <= ${maximum}`)
+  const {minimum} = schema
+  if (typeof minimum === "number" && value < minimum) {errors.push(`${where} must be >= ${minimum}`)}
+  const {maximum} = schema
+  if (typeof maximum === "number" && value > maximum) {errors.push(`${where} must be <= ${maximum}`)}
 }
 
 function checkString(value: string, schema: Record<string, unknown>, where: string, errors: string[]): void {
-  const minLength = schema["minLength"]
+  const {minLength} = schema
   if (typeof minLength === "number" && value.length < minLength) {
     errors.push(`${where} must be at least ${minLength} character(s)`)
   }
@@ -106,24 +106,32 @@ function checkString(value: string, schema: Record<string, unknown>, where: stri
 
 function matchesType(value: unknown, type: string): boolean {
   switch (type) {
-    case "object":
+    case "object": {
       return isPlainObject(value)
-    case "array":
+    }
+    case "array": {
       return Array.isArray(value)
-    case "string":
+    }
+    case "string": {
       return typeof value === "string"
+    }
     // JSON Schema's "integer" is a number constraint, not a distinct JS type.
-    case "integer":
+    case "integer": {
       return typeof value === "number" && Number.isInteger(value)
-    case "number":
+    }
+    case "number": {
       return typeof value === "number" && Number.isFinite(value)
-    case "boolean":
+    }
+    case "boolean": {
       return typeof value === "boolean"
-    case "null":
+    }
+    case "null": {
       return value === null
-    default:
+    }
+    default: {
       // An unrecognised type keyword is treated as satisfied rather than rejected.
       return true
+    }
   }
 }
 
@@ -132,14 +140,14 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 function describe(value: unknown): string {
-  if (value === null) return "null"
-  if (Array.isArray(value)) return "array"
+  if (value === null) {return "null"}
+  if (Array.isArray(value)) {return "array"}
   return typeof value
 }
 
 function deepEqual(a: unknown, b: unknown): boolean {
-  if (a === b) return true
-  if (typeof a !== typeof b || a === null || b === null) return false
+  if (a === b) {return true}
+  if (typeof a !== typeof b || a === null || b === null) {return false}
   if (Array.isArray(a) && Array.isArray(b)) {
     return a.length === b.length && a.every((entry, index) => deepEqual(entry, b[index]))
   }

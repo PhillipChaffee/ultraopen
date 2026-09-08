@@ -10,15 +10,15 @@ import { readFileSync } from "node:fs"
  * enforced with no visible signal, so assert the shape here.
  */
 describe("coverage gate", () => {
-  const raw = readFileSync(new URL("../bunfig.toml", import.meta.url), "utf8")
+  const raw = readFileSync(new URL("../bunfig.toml", import.meta.url), "utf8"),
   // Strip comments — the file documents the broken forms, so a naive scan would match its own docs.
-  const bunfig = raw
+   bunfig = raw
     .split("\n")
     .filter((line) => !line.trimStart().startsWith("#"))
     .join("\n")
 
   test("coverageThreshold uses the scalar form, which is the only one Bun enforces", () => {
-    const match = bunfig.match(/^coverageThreshold\s*=\s*([\d.]+)\s*$/mu)
+    const match = bunfig.match(/^coverageThreshold\s*=\s*(?<threshold>[\d.]+)\s*$/mu)
     expect(match).not.toBeNull()
     expect(Number(match?.[1])).toBeGreaterThanOrEqual(0.95)
   })

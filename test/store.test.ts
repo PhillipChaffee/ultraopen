@@ -1,13 +1,15 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
-import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises"
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
   appendJournal,
+  appendJournalEntry,
   artifactPaths,
   dataRoot,
   ensureRunDir,
   findOrphans,
+  flushJournalEntry,
   isSafeRunId,
   readJournal,
   readManifest,
@@ -16,10 +18,13 @@ import {
   writeResult,
   writeScript,
 } from "../src/server/resume/store.js"
-import type { Manifest } from "../src/server/resume/journal.js"
+import type { JournalEntry, Manifest } from "../src/server/resume/journal.js"
 
-let base: string
-let env: NodeJS.ProcessEnv
+const entry = (key: string): JournalEntry =>
+  ({ type: "result", key, scopePath: "root", ordinal: 0, label: "l", outputTokens: 0, status: "ok" }) as JournalEntry
+
+let base: string,
+ env: NodeJS.ProcessEnv
 
 const manifest = (overrides: Partial<Manifest> = {}): Manifest => ({
   runId: "wf_abc123",
@@ -98,13 +103,55 @@ describe("artifacts", () => {
   test("creates the directory and round-trips a manifest", async () => {
     await ensureRunDir("wf_abc123", env)
     await writeManifest("wf_abc123", manifest(), env)
-    expect((await readManifest("wf_abc123", env))?.runId).toBe("wf_abc123")
+    const reread = await readManifest("wf_abc123", env)
+    expect(reread?.runId).toBe("wf_abc123")
   })
 
   test("round-trips a journal", async () => {
     await ensureRunDir("wf_abc123", env)
     await appendJournal("wf_abc123", '{"type":"result","key":"k","status":"ok","outputTokens":0}', env)
-    expect((await readJournal("wf_abc123", env)).length).toBe(1)
+    const entries = await readJournal("wf_abc123", env)
+    expect(entries.length).toBe(1)
+  })
+
+
+  test("appendJournalEntry appends one line per entry, so a killed run keeps completed agents", async () => {
+    await ensureRunDir("wf_abc123", env)
+    await appendJournalEntry("wf_abc123", entry("k1"), env)
+    await appendJournalEntry("wf_abc123", entry("k2"), env)
+    const persisted = await readJournal("wf_abc123", env)
+    expect(persisted.map((e) => e.key)).toEqual(["k1", "k2"])
+  })
+
+  test("appendJournalEntry output survives a full endRun rewrite and parses identically", async () => {
+    await ensureRunDir("wf_abc123", env)
+    const entries = [entry("k1"), entry("k2")]
+    for (const e of entries) {await appendJournalEntry("wf_abc123", e, env)}
+    // EndRun settles the file with a full rewrite; incremental lines and the rewrite
+    // Must produce the same journal.
+    await appendJournal("wf_abc123", entries.map((e) => JSON.stringify(e)).join("\n"), env)
+    const persisted = await readJournal("wf_abc123", env)
+    expect(persisted.map((e) => e.key)).toEqual(["k1", "k2"])
+  })
+
+test("flushJournalEntry never rejects — a disk failure must not lose a live run", async () => {
+    // A data home that is a FILE makes every write under it fail.
+    const blocker = await mkdtemp(join(tmpdir(), "ultraopen-blocker-"))
+    const fileHome = join(blocker, "file")
+    await writeFile(fileHome, "x", "utf8")
+    await flushJournalEntry("wf_abc123", entry("k1"), { XDG_DATA_HOME: fileHome } as NodeJS.ProcessEnv)
+    await rm(blocker, { recursive: true })
+  })
+
+  test("flushJournalEntry repairs a torn tail instead of gluing the next entry onto it", async () => {
+    await ensureRunDir("wf_abc123", env)
+    // Simulate a mid-write kill: a partial final line without its newline.
+    await writeFile(artifactPaths("wf_abc123", env).journalPath, `${JSON.stringify(entry("k1"))}\n${JSON.stringify(entry("k2")).slice(0, 20)}`, "utf8")
+    await flushJournalEntry("wf_abc123", entry("k3"), env)
+    const reread = await readJournal("wf_abc123", env)
+    const keys = reread.map((e) => e.key)
+    // k2 is genuinely lost (torn), but k1 survived and k3 did not glue onto the torn line.
+    expect(keys).toEqual(["k1", "k3"])
   })
 
   test("writes result and script, returning their paths", async () => {
@@ -133,7 +180,7 @@ describe("orphan detection", () => {
     await writeManifest("wf_dead001", manifest({ runId: "wf_dead001", bootId: "old-boot" }), env)
 
     const orphans = await findOrphans("current-boot", env)
-    expect(orphans.map((entry) => entry.runId)).toEqual(["wf_dead001"])
+    expect(orphans.map((orphan) => orphan.runId)).toEqual(["wf_dead001"])
   })
 
   test("ignores runs from the CURRENT boot, which are still live", async () => {

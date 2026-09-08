@@ -4,11 +4,12 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { promisify } from "node:util"
-import { Run, type ProgressEvent, type RunOptions } from "../src/server/runtime/run.js"
+import { Run } from "../src/server/runtime/run.js"
+import type { ProgressEvent, RunOptions } from "../src/server/runtime/run.js"
+import type { JournalEntry } from "../src/server/resume/journal.js"
 import { registry } from "../src/server/singleton.js"
 import { MAX_AGENTS_PER_RUN } from "../src/server/script/limits.js"
 
-const git = promisify(execFile)
 import type {
   AssistantErrorName,
   AssistantInfo,
@@ -19,6 +20,8 @@ import type {
   PromptResponse,
   SessionInfo,
 } from "../src/server/types.js"
+
+const git = promisify(execFile)
 
 // registry is process-wide (module-level) state by design, so every test must start from a clean
 // slate or bleed into the next one.
@@ -48,11 +51,11 @@ function textPart(text: string): MessagePart {
   return { type: "text", text }
 }
 
-type CreateCall = { body?: CreateSessionBody; query?: { directory?: string } }
-type PromptCall = { path: { id: string }; body: PromptBody }
-type CreateResult = { data?: SessionInfo; error?: unknown }
-type PromptResult = { data?: PromptResponse; error?: unknown }
-type AbortResult = { data?: unknown; error?: unknown }
+interface CreateCall { body?: CreateSessionBody; query?: { directory?: string } }
+interface PromptCall { path: { id: string }; body: PromptBody }
+interface CreateResult { data?: SessionInfo; error?: unknown }
+interface PromptResult { data?: PromptResponse; error?: unknown }
+interface AbortResult { data?: unknown; error?: unknown }
 
 /**
  * A hand-rolled fake OpencodeClient — no mocking library. Records every call so tests can assert on
@@ -69,9 +72,9 @@ function makeClient(
     abort?: (id: string) => Promise<AbortResult>
   } = {},
 ): { client: OpencodeClient; createCalls: CreateCall[]; promptCalls: PromptCall[]; abortCalls: string[] } {
-  const createCalls: CreateCall[] = []
-  const promptCalls: PromptCall[] = []
-  const abortCalls: string[] = []
+  const createCalls: CreateCall[] = [],
+   promptCalls: PromptCall[] = [],
+   abortCalls: string[] = []
   let nextSessionId = 0
 
   const create =
@@ -79,13 +82,13 @@ function makeClient(
     ((): Promise<CreateResult> => {
       nextSessionId++
       return Promise.resolve({ data: { id: `child-${nextSessionId}` } })
-    })
-  const prompt =
+    }),
+   prompt =
     options.prompt ??
-    ((): Promise<PromptResult> => Promise.resolve({ data: { info: baseInfo(), parts: [textPart("done")] } }))
-  const abort = options.abort ?? ((): Promise<AbortResult> => Promise.resolve({ data: {} }))
+    ((): Promise<PromptResult> => Promise.resolve({ data: { info: baseInfo(), parts: [textPart("done")] } })),
+   abort = options.abort ?? ((): Promise<AbortResult> => Promise.resolve({ data: {} })),
 
-  const client: OpencodeClient = {
+   client: OpencodeClient = {
     session: {
       create: (call: CreateCall) => {
         createCalls.push(call)
@@ -129,20 +132,20 @@ describe("Run.agent — happy path", () => {
     const { client } = makeClient({
       prompt: () =>
         Promise.resolve({ data: { info: baseInfo({ outputTokens: 5 }), parts: [textPart("first"), textPart("second")] } }),
-    })
-    const run = makeRun(client)
-    const result = await run.agent("do the thing")
+    }),
+     run = makeRun(client),
+     result = await run.agent("do the thing")
     expect(result).toBe("second")
   })
 
   test("returns info.structured (NOT text) when a schema is supplied", async () => {
-    const structured = { answer: 42 }
-    const { client } = makeClient({
+    const structured = { answer: 42 },
+     { client } = makeClient({
       prompt: () =>
         Promise.resolve({ data: { info: baseInfo({ structured, outputTokens: 5 }), parts: [textPart("ignored")] } }),
-    })
-    const run = makeRun(client)
-    const result = await run.agent("do the thing", { schema: { type: "object" } })
+    }),
+     run = makeRun(client),
+     result = await run.agent("do the thing", { schema: { type: "object" } })
     expect(result).toBe(structured)
     expect(result).not.toBe("ignored")
   })
@@ -150,21 +153,21 @@ describe("Run.agent — happy path", () => {
   test("records one entry with ok:true, the right index, and outputTokens from info.tokens.output", async () => {
     const { client } = makeClient({
       prompt: () => Promise.resolve({ data: { info: baseInfo({ outputTokens: 17 }), parts: [textPart("hi")] } }),
-    })
-    const run = makeRun(client)
+    }),
+     run = makeRun(client)
     await run.agent("do the thing")
 
     expect(run.records.length).toBe(1)
     const record = run.records[0]
-    if (!record) throw new Error("expected a record")
+    if (!record) {throw new Error("expected a record")}
     expect(record.ok).toBe(true)
     expect(record.index).toBe(0)
     expect(record.outputTokens).toBe(17)
   })
 
   test("agentCount increments with each spawn", async () => {
-    const { client } = makeClient()
-    const run = makeRun(client)
+    const { client } = makeClient(),
+     run = makeRun(client)
     expect(run.agentCount).toBe(0)
     await run.agent("first")
     expect(run.agentCount).toBe(1)
@@ -173,8 +176,8 @@ describe("Run.agent — happy path", () => {
   })
 
   test("index is assigned in call order across multiple agents", async () => {
-    const { client } = makeClient()
-    const run = makeRun(client)
+    const { client } = makeClient(),
+     run = makeRun(client)
     await run.agent("first")
     await run.agent("second")
     expect(run.records.map((record) => record.index)).toEqual([0, 1])
@@ -183,20 +186,20 @@ describe("Run.agent — happy path", () => {
 
 describe("Run.agent — failure", () => {
   test("a failing spawn (create returns no data) resolves to null, not throw", async () => {
-    const { client } = makeClient({ create: () => Promise.resolve({ error: "boom" }) })
-    const run = makeRun(client)
-    const result = await run.agent("do the thing")
+    const { client } = makeClient({ create: () => Promise.resolve({ error: "boom" }) }),
+     run = makeRun(client),
+     result = await run.agent("do the thing")
     expect(result).toBeNull()
   })
 
   test("the failure is recorded in run.nulls with a reason and detail", async () => {
-    const { client } = makeClient({ create: () => Promise.resolve({ error: "boom" }) })
-    const run = makeRun(client)
+    const { client } = makeClient({ create: () => Promise.resolve({ error: "boom" }) }),
+     run = makeRun(client)
     await run.agent("do the thing")
 
     expect(run.nulls.length).toBe(1)
     const nullRecord = run.nulls[0]
-    if (!nullRecord) throw new Error("expected a null record")
+    if (!nullRecord) {throw new Error("expected a null record")}
     expect(nullRecord.reason).toBe("spawn-failed")
     expect(nullRecord.detail).toBe("boom")
     // create() never produced a session, so there is nothing to key a sessionID off of.
@@ -204,12 +207,12 @@ describe("Run.agent — failure", () => {
   })
 
   test("a failure AFTER a session was created (prompt-failed) still carries the sessionID", async () => {
-    const { client } = makeClient({ prompt: () => Promise.resolve({ error: "server exploded" }) })
-    const run = makeRun(client)
+    const { client } = makeClient({ prompt: () => Promise.resolve({ error: "server exploded" }) }),
+     run = makeRun(client)
     await run.agent("do the thing")
 
     const nullRecord = run.nulls[0]
-    if (!nullRecord) throw new Error("expected a null record")
+    if (!nullRecord) {throw new Error("expected a null record")}
     expect(nullRecord.reason).toBe("prompt-failed")
     expect(nullRecord.sessionID).toBe("child-1")
   })
@@ -222,8 +225,8 @@ describe("Run.agent — failure", () => {
         return createCallCount === 1 ? Promise.resolve({ data: { id: "child-1" } }) : Promise.resolve({ error: "boom" })
       },
       prompt: () => Promise.resolve({ data: { info: baseInfo({ outputTokens: 20 }), parts: [textPart("ok")] } }),
-    })
-    const run = makeRun(client)
+    }),
+     run = makeRun(client)
     await run.agent("first")
     await run.agent("second")
     expect(run.outputTokens).toBe(20)
@@ -232,21 +235,21 @@ describe("Run.agent — failure", () => {
 
 describe("Run.agent — labels", () => {
   test("an explicit label is used", async () => {
-    const { client } = makeClient()
-    const run = makeRun(client)
+    const { client } = makeClient(),
+     run = makeRun(client)
     await run.agent("do the thing", { label: "custom-label" })
     const record = run.records[0]
-    if (!record) throw new Error("expected a record")
+    if (!record) {throw new Error("expected a record")}
     expect(record.label).toBe("custom-label")
   })
 
   test("no label derives one from the prompt's first line, truncated to 48 characters", async () => {
-    const { client } = makeClient()
-    const run = makeRun(client)
-    const longLine = "y".repeat(80)
+    const { client } = makeClient(),
+     run = makeRun(client),
+     longLine = "y".repeat(80)
     await run.agent(`${longLine}\nsecond line is ignored`)
     const record = run.records[0]
-    if (!record) throw new Error("expected a record")
+    if (!record) {throw new Error("expected a record")}
     expect(record.label).toBe(longLine.slice(0, 48))
     expect(record.label.length).toBe(48)
   })
@@ -263,27 +266,27 @@ describe("Run.agent — labels", () => {
 
 describe("Run.phase()", () => {
   test("sets run.currentPhase and it is used for subsequent agents", async () => {
-    const { client } = makeClient()
-    const run = makeRun(client)
+    const { client } = makeClient(),
+     run = makeRun(client)
     run.phase("discovery")
     expect(run.currentPhase).toBe("discovery")
 
     await run.agent("do the thing")
     const record = run.records[0]
-    if (!record) throw new Error("expected a record")
+    if (!record) {throw new Error("expected a record")}
     expect(record.phase).toBe("discovery")
   })
 
   test("an explicit opts.phase overrides the current phase for that agent only", async () => {
-    const { client } = makeClient()
-    const run = makeRun(client)
+    const { client } = makeClient(),
+     run = makeRun(client)
     run.phase("discovery")
     await run.agent("first", { phase: "override" })
     await run.agent("second")
 
-    const first = run.records[0]
-    const second = run.records[1]
-    if (!first || !second) throw new Error("expected two records")
+    const first = run.records[0],
+     second = run.records[1]
+    if (!first || !second) {throw new Error("expected two records")}
     expect(first.phase).toBe("override")
     expect(second.phase).toBe("discovery")
   })
@@ -291,14 +294,14 @@ describe("Run.phase()", () => {
 
 describe("Run.agent — validation and caps", () => {
   test("a non-string prompt throws a TypeError", async () => {
-    const { client } = makeClient()
-    const run = makeRun(client)
+    const { client } = makeClient(),
+     run = makeRun(client)
     await expect(run.agent(42 as unknown as string)).rejects.toThrow(TypeError)
   })
 
   test("an empty or whitespace-only prompt throws a TypeError", async () => {
-    const { client } = makeClient()
-    const run = makeRun(client)
+    const { client } = makeClient(),
+     run = makeRun(client)
     await expect(run.agent("")).rejects.toThrow(TypeError)
     await expect(run.agent("   \n\t  ")).rejects.toThrow(TypeError)
   })
@@ -311,10 +314,10 @@ describe("Run.agent — validation and caps", () => {
     // actually spawned. The fake client's create() fails immediately, so each spawn that does run
     // settles in a handful of microtasks — the whole loop completes in well under a second.
     registry.configureConcurrency(32)
-    const { client } = makeClient({ create: () => Promise.resolve({ error: "cap-test" }) })
-    const run = makeRun(client)
+    const { client } = makeClient({ create: () => Promise.resolve({ error: "cap-test" }) }),
+     run = makeRun(client),
 
-    const promises: Promise<unknown>[] = []
+     promises: Promise<unknown>[] = []
     for (let i = 0; i < MAX_AGENTS_PER_RUN; i++) {
       promises.push(run.agent(`prompt ${i}`))
     }
@@ -333,8 +336,8 @@ describe("Run.agent — validation and caps", () => {
 describe("Run.agent — concurrency", () => {
   test("the semaphore is respected: at most the configured limit of prompts run at once", async () => {
     registry.configureConcurrency(2)
-    let inFlight = 0
-    let peak = 0
+    let inFlight = 0,
+     peak = 0
     const { client } = makeClient({
       prompt: () =>
         new Promise((resolve) => {
@@ -345,8 +348,8 @@ describe("Run.agent — concurrency", () => {
             resolve({ data: { info: baseInfo(), parts: [textPart("done")] } })
           }, 0)
         }),
-    })
-    const run = makeRun(client)
+    }),
+     run = makeRun(client)
 
     await Promise.all(Array.from({ length: 6 }, (_unused, i) => run.agent(`prompt ${i}`)))
 
@@ -357,10 +360,10 @@ describe("Run.agent — concurrency", () => {
 
   test("the permit is released even when spawn fails, so failing agents never deadlock", async () => {
     registry.configureConcurrency(2)
-    const { client } = makeClient({ create: () => Promise.resolve({ error: "boom" }) })
-    const run = makeRun(client)
+    const { client } = makeClient({ create: () => Promise.resolve({ error: "boom" }) }),
+     run = makeRun(client),
 
-    const results = await Promise.all(Array.from({ length: 6 }, (_unused, i) => run.agent(`prompt ${i}`)))
+     results = await Promise.all(Array.from({ length: 6 }, (_unused, i) => run.agent(`prompt ${i}`)))
 
     expect(results.every((result) => result === null)).toBe(true)
     expect(run.nulls.length).toBe(6)
@@ -371,8 +374,8 @@ describe("Run.agent — budget", () => {
   test("a call past the ceiling throws instead of silently spending", async () => {
     // The budget is a HARD ceiling, not advisory: `agent()` checks it at entry so a guarded loop
     // terminates rather than running to the agent cap. This drives the real agent() path.
-    const { client } = makeClient()
-    const run = makeRun(client, { budgetTotal: 100 })
+    const { client } = makeClient(),
+     run = makeRun(client, { budgetTotal: 100 })
     await run.agent("burn tokens", { label: "spend" })
     // Force the spend past the ceiling (outputTokensOf reads only completed records).
     run.records[0]!.outputTokens = 500
@@ -384,8 +387,8 @@ describe("Run.agent — budget", () => {
 describe("Run.agent — abort", () => {
   test("an already-aborted run throws BEFORE creating a session or worktree", async () => {
     // Fail fast: paying for a child session that is aborted on first prompt is wasted money.
-    const { client, createCalls } = makeClient()
-    const controller = new AbortController()
+    const { client, createCalls } = makeClient(),
+     controller = new AbortController()
     controller.abort()
     const run = makeRun(client, { signal: controller.signal })
 
@@ -395,9 +398,9 @@ describe("Run.agent — abort", () => {
 
   test("an abort while queued for a permit rejects instead of spawning later", async () => {
     registry.configureConcurrency(1)
-    const [firstPromptGate, releaseFirst] = gate()
-    const [started, markStarted] = gate()
-    const { client, createCalls } = makeClient({
+    const [firstPromptGate, releaseFirst] = gate(),
+     [started, markStarted] = gate(),
+     { client, createCalls } = makeClient({
       prompt: (call) => {
         markStarted()
         if (call.path.id === "child-1") {
@@ -405,12 +408,12 @@ describe("Run.agent — abort", () => {
         }
         return Promise.resolve({ data: { info: baseInfo(), parts: [textPart("done")] } })
       },
-    })
-    const controller = new AbortController()
+    }),
+     controller = new AbortController(),
     // The run's signal is a Run option, so the whole scenario is built around one from the start.
-    const run = makeRun(client, { signal: controller.signal })
+     run = makeRun(client, { signal: controller.signal }),
 
-    const first = run.agent("first")
+     first = run.agent("first")
     // The first agent now holds the only permit.
     await started
     // Synchronously registers as a semaphore waiter.
@@ -430,13 +433,13 @@ describe("Run.agent — deadline propagation", () => {
   test("a hung agent is abandoned once deadlineMs passes and surfaces as a null with reason deadline", async () => {
     // withDeadline is unit-tested in deadline.test.ts; this proves Run actually forwards
     // deadlineMs through spawnStructured so a hung agent cannot hold a permit forever.
-    const { client } = makeClient({ prompt: () => new Promise(() => {}) })
-    const run = makeRun(client, { deadlineMs: 10 })
+    const { client } = makeClient({ prompt: () => new Promise(() => {}) }),
+     run = makeRun(client, { deadlineMs: 10 }),
 
-    const result = await run.agent("hung")
+     result = await run.agent("hung")
     expect(result).toBeNull()
     const nullRecord = run.nulls[0]
-    if (!nullRecord) throw new Error("expected a null record")
+    if (!nullRecord) {throw new Error("expected a null record")}
     expect(nullRecord.reason).toBe("deadline")
   })
 })
@@ -453,8 +456,8 @@ describe("Run.agent — worktree isolation", () => {
     await git("git", ["-C", repo, "add", "."])
     await git("git", ["-C", repo, "commit", "-qm", "init"])
 
-    const { client, createCalls } = makeClient()
-    const run = makeRun(client, { worktreeRoot: repo })
+    const { client, createCalls } = makeClient(),
+     run = makeRun(client, { worktreeRoot: repo })
 
     try {
       await run.agent("work in isolation", { isolation: "worktree", label: "iso" })
@@ -474,16 +477,16 @@ describe("Run.agent — worktree isolation", () => {
 
 describe("progress", () => {
   test("onProgress fires agent-start before agent-end for an agent, plus phase and log events", async () => {
-    const events: ProgressEvent[] = []
-    const { client } = makeClient()
-    const run = makeRun(client, { onProgress: (event) => events.push(event) })
+    const events: ProgressEvent[] = [],
+     { client } = makeClient(),
+     run = makeRun(client, { onProgress: (event) => events.push(event) })
 
     run.phase("discovery")
     run.log("starting up")
     await run.agent("do the thing")
 
-    const startIndex = events.findIndex((event) => event.type === "agent-start")
-    const endIndex = events.findIndex((event) => event.type === "agent-end")
+    const startIndex = events.findIndex((event) => event.type === "agent-start"),
+     endIndex = events.findIndex((event) => event.type === "agent-end")
     expect(startIndex).toBeGreaterThanOrEqual(0)
     expect(endIndex).toBeGreaterThan(startIndex)
 
@@ -491,9 +494,24 @@ describe("progress", () => {
     expect(events.some((event) => event.type === "log" && event.message === "starting up")).toBe(true)
   })
 
+  test("onJournal fires once per agent, at record time — the incremental-flush contract", async () => {
+    const entries: JournalEntry[] = [],
+     { client } = makeClient(),
+     run = makeRun(client, { onJournal: (entry) => entries.push(entry) })
+
+    await run.agent("first")
+    await run.agent("second")
+
+    expect(entries.length).toBe(2)
+    expect(entries[0]?.status).toBe("ok")
+    expect(entries[1]?.status).toBe("ok")
+    // The flushed entries must be exactly what endRun would write.
+    expect(run.journal.entries).toEqual(entries)
+  })
+
   test("log() appends to run.logs", () => {
-    const { client } = makeClient()
-    const run = makeRun(client)
+    const { client } = makeClient(),
+     run = makeRun(client)
     run.log("hello")
     run.log("world")
     expect(run.logs).toEqual(["hello", "world"])
@@ -502,8 +520,8 @@ describe("progress", () => {
 
 describe("abortAll", () => {
   test("calls client.session.abort once per child session and clears them from the registry", async () => {
-    const { client, abortCalls } = makeClient()
-    const run = makeRun(client)
+    const { client, abortCalls } = makeClient(),
+     run = makeRun(client)
     await run.agent("first")
     await run.agent("second")
     expect(registry.sessionsOf("run-1").length).toBe(2)
@@ -515,8 +533,8 @@ describe("abortAll", () => {
   })
 
   test("an abort that rejects does not make abortAll() reject", async () => {
-    const { client } = makeClient({ abort: () => Promise.reject(new Error("remote abort endpoint is down")) })
-    const run = makeRun(client)
+    const { client } = makeClient({ abort: () => Promise.reject(new Error("remote abort endpoint is down")) }),
+     run = makeRun(client)
     await run.agent("first")
 
     await expect(run.abortAll()).resolves.toBeUndefined()
@@ -526,8 +544,8 @@ describe("abortAll", () => {
 
 describe("option plumbing", () => {
   test("resolveModel/resolveVariant/subagentContract results reach the prompt body", async () => {
-    const { client, promptCalls } = makeClient()
-    const run = makeRun(client, {
+    const { client, promptCalls } = makeClient(),
+     run = makeRun(client, {
       resolveModel: () => ({ providerID: "anthropic", modelID: "claude-x" }),
       resolveVariant: () => "high",
       subagentContract: () => "extra contract text",
@@ -535,15 +553,15 @@ describe("option plumbing", () => {
     await run.agent("do the thing", { model: "anthropic/claude-x", effort: "high" })
 
     const promptBody = promptCalls[0]?.body
-    if (!promptBody) throw new Error("expected a prompt call")
+    if (!promptBody) {throw new Error("expected a prompt call")}
     expect(promptBody.model).toEqual({ providerID: "anthropic", modelID: "claude-x" })
     expect(promptBody.variant).toBe("high")
     expect(promptBody.system).toBe("extra contract text")
   })
 
   test("when the resolvers return undefined, the corresponding keys are absent from the prompt body", async () => {
-    const { client, promptCalls } = makeClient()
-    const run = makeRun(client, {
+    const { client, promptCalls } = makeClient(),
+     run = makeRun(client, {
       resolveModel: () => undefined,
       resolveVariant: () => undefined,
       subagentContract: () => undefined,
@@ -551,7 +569,7 @@ describe("option plumbing", () => {
     await run.agent("do the thing")
 
     const promptBody = promptCalls[0]?.body
-    if (!promptBody) throw new Error("expected a prompt call")
+    if (!promptBody) {throw new Error("expected a prompt call")}
     expect("model" in promptBody).toBe(false)
     expect("variant" in promptBody).toBe(false)
     expect("system" in promptBody).toBe(false)
@@ -569,8 +587,8 @@ describe("Run.agent — defensive token extraction", () => {
     // cannot happen.
     const { client } = makeClient({
       prompt: () => Promise.resolve({ data: { info: {}, parts: [textPart("fine")] } } as unknown as PromptResult),
-    })
-    const run = makeRun(client)
+    }),
+     run = makeRun(client)
 
     expect(await run.agent("x")).toBe("fine")
     expect(run.outputTokens).toBe(0)
@@ -583,8 +601,8 @@ describe("Run.agent — defensive token extraction", () => {
         Promise.resolve({
           data: { info: { tokens: { output: "lots" } }, parts: [textPart("fine")] },
         } as unknown as PromptResult),
-    })
-    const run = makeRun(client)
+    }),
+     run = makeRun(client)
     await run.agent("x")
     expect(run.outputTokens).toBe(0)
   })

@@ -8,8 +8,8 @@ import { createWorktree, isGitRepository } from "../src/server/bridge/isolation.
 
 const run = promisify(execFile)
 
-let repo: string
-let plain: string
+let repo: string,
+ plain: string
 
 beforeEach(async () => {
   repo = await mkdtemp(join(tmpdir(), "ultraopen-repo-"))
@@ -46,8 +46,8 @@ describe("createWorktree", () => {
   })
 
   test("creates no branch, so an N-agent phase leaves no refs behind", async () => {
-    const worktree = await createWorktree({ worktreeRoot: repo, label: "agent-b" })
-    const { stdout } = await run("git", ["-C", repo, "branch", "--list"])
+    const worktree = await createWorktree({ worktreeRoot: repo, label: "agent-b" }),
+     { stdout } = await run("git", ["-C", repo, "branch", "--list"])
     // --detach: only the original branch exists.
     expect(stdout.split("\n").filter((line) => line.trim() !== "").length).toBe(1)
     await worktree?.release()
@@ -56,8 +56,8 @@ describe("createWorktree", () => {
   test("degrades with a note when the directory is not a repository", async () => {
     // Isolation is an optimisation for parallel edits; a workflow that cannot have it should still
     // run in place rather than fail.
-    const notes: string[] = []
-    const worktree = await createWorktree({ worktreeRoot: plain, label: "a", onNote: (note) => notes.push(note) })
+    const notes: string[] = [],
+     worktree = await createWorktree({ worktreeRoot: plain, label: "a", onNote: (note) => notes.push(note) })
     expect(worktree).toBeUndefined()
     expect(notes[0]).toContain("not a git repository")
   })
@@ -91,8 +91,8 @@ describe("release", () => {
   test("RETAINS a dirty worktree and says so", async () => {
     // A dirty worktree holds the agent's uncommitted work — deleting it would silently discard
     // the very output the isolation existed to produce.
-    const notes: string[] = []
-    const worktree = await createWorktree({ worktreeRoot: repo, label: "dirty", onNote: (note) => notes.push(note) })
+    const notes: string[] = [],
+     worktree = await createWorktree({ worktreeRoot: repo, label: "dirty", onNote: (note) => notes.push(note) })
     await writeFile(join(worktree?.directory ?? "", "new.txt"), "uncommitted\n")
 
     await worktree?.release()
@@ -102,8 +102,8 @@ describe("release", () => {
   })
 
   test("reports rather than throws when the worktree is already gone", async () => {
-    const notes: string[] = []
-    const worktree = await createWorktree({ worktreeRoot: repo, label: "vanish", onNote: (note) => notes.push(note) })
+    const notes: string[] = [],
+     worktree = await createWorktree({ worktreeRoot: repo, label: "vanish", onNote: (note) => notes.push(note) })
     await rm(worktree?.directory ?? "", { recursive: true, force: true })
 
     await expect(worktree?.release()).resolves.toBeUndefined()
@@ -117,9 +117,9 @@ describe("creation failure", () => {
     // place rather than fail outright.
     const empty = await mkdtemp(join(tmpdir(), "ultraopen-empty-"))
     await run("git", ["-C", empty, "init", "-q"])
-    const notes: string[] = []
+    const notes: string[] = [],
 
-    const worktree = await createWorktree({ worktreeRoot: empty, label: "a", onNote: (note) => notes.push(note) })
+     worktree = await createWorktree({ worktreeRoot: empty, label: "a", onNote: (note) => notes.push(note) })
     expect(worktree).toBeUndefined()
     expect(notes.some((note) => note.includes("unavailable"))).toBe(true)
 
@@ -131,12 +131,12 @@ describe("removal failure", () => {
   test("reports rather than throws when git refuses to remove the worktree", async () => {
     // By cleanup time opencode has an instance loaded on that directory with file watchers holding
     // it, so removal can legitimately fail. Reporting beats failing the run.
-    const notes: string[] = []
-    const worktree = await createWorktree({ worktreeRoot: repo, label: "stuck", onNote: (note) => notes.push(note) })
+    const notes: string[] = [],
+     worktree = await createWorktree({ worktreeRoot: repo, label: "stuck", onNote: (note) => notes.push(note) }),
 
     // Make the worktree's PARENT read-only: `git status` inside still works, but neither git nor
     // rm can delete the directory itself.
-    const parent = dirname(worktree?.directory ?? "")
+     parent = dirname(worktree?.directory ?? "")
     await chmod(parent, 0o500)
 
     await expect(worktree?.release()).resolves.toBeUndefined()

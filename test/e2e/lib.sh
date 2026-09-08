@@ -117,10 +117,13 @@ build_plugin() {
 ULTRAOPEN_STASH="${TMPDIR:-/tmp}/ultraopen-e2e-nm-stash"
 
 stash_host_modules() {
+  # A previous abnormal exit may have left a stale stash; fold it back first —
+  # the existence guard below would otherwise silently skip stashing.
+  restore_host_modules
   mkdir -p "$ULTRAOPEN_STASH"
   local m
   for m in solid-js @opentui; do
-    if [ -d "$PLUGIN_PATH/node_modules/$m" ] && [ ! -d "$ULTRAOPEN_STASH/$m" ]; then
+    if [ -d "$PLUGIN_PATH/node_modules/$m" ]; then
       mv "$PLUGIN_PATH/node_modules/$m" "$ULTRAOPEN_STASH/$m"
     fi
   done

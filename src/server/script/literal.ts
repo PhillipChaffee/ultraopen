@@ -9,6 +9,17 @@ import { loc } from "./walk.js"
  * list can be rendered. Nothing computable is available at that point, which is why the spec
  * requires a pure literal rather than merely a serialisable value.
  */
+/** A meta property's key as a string, or undefined for non-stringifiable keys. */
+function propertyKey(prop: acorn.Property): string | undefined {
+  if (prop.key.type === "Identifier") {
+    return prop.key.name
+  }
+  if (prop.key.type === "Literal") {
+    return String(prop.key.value)
+  }
+  return undefined
+}
+
 export function literal(node: acorn.AnyNode): unknown {
   switch (node.type) {
     case "Literal": {
@@ -52,7 +63,7 @@ export function literal(node: acorn.AnyNode): unknown {
     // eslint-disable-next-line no-fallthrough -- fail() above returns never
     case "ArrayExpression": {
       return node.elements.map((el) => {
-        if (el === null) return undefined
+        if (el === null) {return undefined}
         if (el.type === "SpreadElement") {
           fail({
             kind: "MetaError",
@@ -96,13 +107,12 @@ export function literal(node: acorn.AnyNode): unknown {
             location: loc(prop),
           })
         }
-        const key =
-          prop.key.type === "Identifier" ? prop.key.name : prop.key.type === "Literal" ? String(prop.key.value) : undefined
+        const key = propertyKey(prop)
         if (key === undefined) {
           fail({ kind: "MetaError", message: "meta must be a pure literal — unsupported key type.", location: loc(prop.key) })
         }
         // Never let a literal reach through to Object.prototype.
-        if (key === "__proto__") continue
+        if (key === "__proto__") {continue}
         out[key] = literal(prop.value)
       }
       return out

@@ -26,7 +26,7 @@ export class Semaphore {
    * a hang with no throw, no log and no progress.
    */
   static clamp(limit: number): number {
-    if (!Number.isFinite(limit)) return MIN_CONCURRENCY
+    if (!Number.isFinite(limit)) {return MIN_CONCURRENCY}
     return Math.min(MAX_CONCURRENCY, Math.max(MIN_CONCURRENCY, Math.floor(limit)))
   }
 
@@ -44,7 +44,7 @@ export class Semaphore {
 
   /** Resolves when a permit is available. The returned function releases it exactly once. */
   async acquire(signal?: AbortSignal): Promise<() => void> {
-    if (signal?.aborted) throw abortedError()
+    if (signal?.aborted) {throw abortedError()}
     if (this.#active < this.#limit) {
       this.#active++
       return this.#releaser()
@@ -52,8 +52,8 @@ export class Semaphore {
     // The permit is claimed by #drain at wake time, NOT here. If the waiter incremented after
     // resuming, a synchronous acquire() landing in the microtask gap between resolve() and that
     // resumption would see a free slot and oversubscribe the limit.
-    const entry = {} as Waiter
-    const gate = new Promise<void>((resolve, reject) => {
+    const entry = {} as Waiter,
+     gate = new Promise<void>((resolve, reject) => {
       entry.resolve = resolve
       entry.reject = reject
     })
@@ -63,7 +63,7 @@ export class Semaphore {
       entry.signal = signal
       entry.onAbort = () => {
         const index = this.#waiters.indexOf(entry)
-        if (index >= 0) this.#waiters.splice(index, 1)
+        if (index !== -1) {this.#waiters.splice(index, 1)}
         entry.reject(abortedError())
       }
       signal.addEventListener("abort", entry.onAbort, { once: true })
@@ -73,7 +73,7 @@ export class Semaphore {
       await gate
     } finally {
       // The waiter left the queue one way or another; the abort listener must not outlive it.
-      if (entry.signal && entry.onAbort) entry.signal.removeEventListener("abort", entry.onAbort)
+      if (entry.signal && entry.onAbort) {entry.signal.removeEventListener("abort", entry.onAbort)}
     }
     return this.#releaser()
   }
@@ -81,7 +81,7 @@ export class Semaphore {
   #releaser(): () => void {
     let released = false
     return () => {
-      if (released) return
+      if (released) {return}
       released = true
       this.#active--
       this.#drain()
@@ -102,14 +102,14 @@ export class Semaphore {
   #drain(): void {
     while (this.#active < this.#limit && this.#waiters.length > 0) {
       const next = this.#waiters.shift()
-      if (!next) continue
+      if (!next) {continue}
       this.#active++
       next.resolve()
     }
   }
 }
 
-type Waiter = {
+interface Waiter {
   resolve: () => void
   reject: (error: unknown) => void
   signal?: AbortSignal
