@@ -53,26 +53,29 @@ return { confirmed: results.flat().filter(Boolean) }
 Real captures from the live TUI (`bash test/e2e/visual.sh` — real opencode processes, real model
 calls), re-themed in presentation only.
 
-**1. You hand the model a workflow script.** It runs it — the transcript echoes the raw
-`workflow` call, an upstream renderer quirk and exactly why the progress surfaces exist.
+**1. You hand the model the script; the engine fans out instantly.** Four review agents spawn
+in parallel — the transcript echoes the raw `workflow` call (an upstream renderer quirk, and
+exactly why the progress surfaces exist), the bottom strip gains one row per agent, the sidebar
+fills in, and `ultracode ⠋ 0/4` appears beside the input.
 
 ![Invoking a workflow](assets/screenshots/01-invoking.png)
 
-**2. Mid-run, all three surfaces are live.** The bottom strip keeps one line per run with the
-agent list underneath; the sidebar (`Ctrl-x` then `b`) shows a summary plus one row per agent;
-the prompt-row status keeps a run visible even with the sidebar closed.
+**2. The fan-out keeps working.** Two minutes later the same run is still going — four real
+review agents (real model calls, real file reads) with progress and elapsed time updating every
+second.
 
-![Three live surfaces](assets/screenshots/02-three-surfaces.png)
+![The fan-out mid-run](assets/screenshots/02-grinding.png)
 
-**3. Failures surface where you can see them.** The `✗` glyph and a `· 1 failed` in the summary —
-drawn muted, faithfully to how upstream renders it.
+**3. Up close: the sidebar panel.** Opened with `Ctrl-x` then `b` — one summary line per run,
+one row per agent, glyphs for state.
 
-![A failed agent](assets/screenshots/03-failure.png)
+![The sidebar panel](assets/screenshots/03-sidebar.png)
 
-**4. When the run finishes, the surfaces vanish** — live state only — and the result is in your
-transcript.
+**4. The findings come back as a value.** When the run returns, the model reports what it
+confirmed — here, specific findings about a staged demo diff, from an uncaught fetch to the
+off-by-one loop planted in `src/pagination.ts`.
 
-![Run finished](assets/screenshots/04-result.png)
+![Findings in the transcript](assets/screenshots/04-results.png)
 
 Agents show as `⠋` running, `✓` done, `✗` failed. All three surfaces are served by one shared
 poller — one directory pass per second — so having them all open costs one read. Live rendering
@@ -226,8 +229,9 @@ Each probe carries a `bun run check`-clean implementation note in the suites.
 Cosmetic limitations (upstream): the transcript renderer echoes a tool call's raw arguments, so
 a `workflow` call displays its full script (visible in the first screenshot above); the
 failed-agent glyph shares its line's muted color instead of the error color (single-node
-imperative rendering — the failure screenshot is faithful); and an open sidebar renders one
-blank line when no runs are active. The progress surfaces (strip, sidebar, prompt status) are
+imperative rendering); and an open sidebar renders one
+blank line when no runs are active. The progress
+surfaces (strip, sidebar, prompt status) are
 where live state shows.
 
 <a id="development"></a>
