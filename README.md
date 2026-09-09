@@ -1,3 +1,7 @@
+<div align="center">
+
+<img src="./assets/logo.svg" width="72" alt="ultraopen logo" />
+
 # ultraopen
 
 Deterministic multi-agent workflow orchestration and an `ultracode` effort mode for
@@ -10,6 +14,14 @@ your terminal.
 [![opencode](https://img.shields.io/badge/opencode-%3E%3D%201.18.20-7C3AED)](https://github.com/anomalyco/opencode)
 
 **1,000 agents per run · schema-validated outputs · resumable by journal**
+
+[Install](#install) · [Authoring workflows](#authoring) · [Compatibility](#compatibility) · [Development](#development)
+
+</div>
+
+> [!TIP]
+> **See it live.** `bash test/e2e/tui-dev.sh` starts opencode with the real TUI rendering —
+> nothing here between you and the thing.
 
 A workflow is a deterministic JavaScript driver in which `agent()` is the only nondeterministic
 call. Control flow — fan-out, loops, dedup, thresholds, early exit, synthesis — is real code, so
@@ -34,35 +46,33 @@ const results = await pipeline(
 return { confirmed: results.flat().filter(Boolean) }
 ```
 
-## What a run looks like
+<a id="how-it-works"></a>
 
-No GIF ships with this repo — run `bash test/e2e/tui-dev.sh` for the live thing. Mid-flight, the
-`review-changes` run above renders on three surfaces (recreated here exactly as the surfaces
-format themselves):
+## 🎬 What a run looks like
 
-```
-┌────────────────────────────────────────────────────────────┐
-│                                                            │ ┌ ultracode ───────────┐
-│                 your transcript, as always                 │ │ review-changes ·     │
-│                                                            │ │ Verify · 3/5 · 12s   │
-│                                                            │ │ ⠋ review:bugs        │
-│                                                            │ │ ⠋ review:perf        │
-│                                                            │ │ ✗ review:security    │
-└────────────────────────────────────────────────────────────┘ └──────────────────────┘
-┌ input ──────────────────────────────────────────────────────────────────────────────┐
-│ > _                                                        ultracode ⠋ Verify · 3/5 │
-│                                                                                     │
-└─────────────────────────────────────────────────────────────────────────────────────┘
+Real captures from the live TUI (`bash test/e2e/visual.sh` — real opencode processes, real model
+calls), re-themed in presentation only.
 
- ultracode · review-changes · Verify · 3/5 · 12s
-   ⠋ review:bugs   ⠋ review:perf   ✗ review:security
-```
+**1. You hand the model a workflow script.** It runs it — the transcript echoes the raw
+`workflow` call, an upstream renderer quirk and exactly why the progress surfaces exist.
 
-- The **bottom strip** keeps one line per run under the transcript, with the agent list indented
-  underneath; with several runs active it collapses to one summary line per run.
-- The **sidebar panel** (`Ctrl-x` then `b`) shows a per-run summary plus one row per agent.
-- The **prompt-row status line** puts live status beside the input, so a run is visible even with
-  the sidebar closed.
+![Invoking a workflow](assets/screenshots/01-invoking.png)
+
+**2. Mid-run, all three surfaces are live.** The bottom strip keeps one line per run with the
+agent list underneath; the sidebar (`Ctrl-x` then `b`) shows a summary plus one row per agent;
+the prompt-row status keeps a run visible even with the sidebar closed.
+
+![Three live surfaces](assets/screenshots/02-three-surfaces.png)
+
+**3. Failures surface where you can see them.** The `✗` glyph and a `· 1 failed` in the summary —
+drawn muted, faithfully to how upstream renders it.
+
+![A failed agent](assets/screenshots/03-failure.png)
+
+**4. When the run finishes, the surfaces vanish** — live state only — and the result is in your
+transcript.
+
+![Run finished](assets/screenshots/04-result.png)
 
 Agents show as `⠋` running, `✓` done, `✗` failed. All three surfaces are served by one shared
 poller — one directory pass per second — so having them all open costs one read. Live rendering
@@ -71,7 +81,9 @@ external TUI plugin slots after mount (reactive expressions keep their initial v
 insertion no-ops), so the surfaces update imperatively via `node.content` + `requestRender()`
 (src/tui/index.tsx documents the full constraint).
 
-## Why ultraopen
+<a id="why"></a>
+
+## 🤔 Why ultraopen
 
 opencode can already spawn subagents. The trouble is orchestration by prompting: ask one model to
 fan out and you get a nondeterministic pile of parallel turns — different every run, unreadable in
@@ -92,7 +104,9 @@ is plain JavaScript that runs inside the coding agent you already use.
 If you need cross-language runtimes, hosted memory, or a standalone server, use a framework.
 ultraopen only tries to be the right tool when the work already happens in opencode.
 
-## What you get
+<a id="features"></a>
+
+## ✨ What you get
 
 - **`workflow` tool** — runs a JavaScript script that fans out across parallel subagents. Scripts
   pass inline or by path (`scriptPath`), and a previous run replays with `resumeFromRunId`.
@@ -136,7 +150,9 @@ above.
 
 </details>
 
-## Install
+<a id="install"></a>
+
+## 📦 Install
 
 1. Build:
    ```bash
@@ -164,7 +180,9 @@ above.
    - `effortPreference` — the effort ladder tried in order. Default
      `["xhigh", "max", "high", "medium", "low"]`.
 
-## Authoring workflows
+<a id="authoring"></a>
+
+## 📖 Authoring workflows
 
 The full authoring reference lives in this repo at
 [skills/workflow-authoring/SKILL.md](./skills/workflow-authoring/SKILL.md): the globals table,
@@ -179,7 +197,9 @@ shape check with `agent()` stubbed. Every run persists its journal, manifest, an
 the opencode tool-output dir (`ultraopen/<runId>/`) — read `journal.jsonl` to see each agent's
 recorded value.
 
-## Compatibility and known limits
+<a id="compatibility"></a>
+
+## 🧭 Compatibility and known limits
 
 Verified against opencode 1.18.29 by the live e2e suites (`test/e2e`).
 
@@ -204,12 +224,15 @@ Known gaps the e2e probes confirmed:
 Each probe carries a `bun run check`-clean implementation note in the suites.
 
 Cosmetic limitations (upstream): the transcript renderer echoes a tool call's raw arguments, so
-a `workflow` call displays its full script; the failed-agent glyph shares its line's muted color
-instead of the error color (single-node imperative rendering); and an open sidebar renders one
-blank line when no runs are active (same single-node imperative rendering). The progress
-surfaces (strip, sidebar, prompt status) are where live state shows.
+a `workflow` call displays its full script (visible in the first screenshot above); the
+failed-agent glyph shares its line's muted color instead of the error color (single-node
+imperative rendering — the failure screenshot is faithful); and an open sidebar renders one
+blank line when no runs are active. The progress surfaces (strip, sidebar, prompt status) are
+where live state shows.
 
-## Development
+<a id="development"></a>
+
+## 🛠️ Development
 
 ```bash
 bun run check   # lint + strict typecheck + tests (95% coverage gate) + Node parity
@@ -223,7 +246,8 @@ bash test/e2e/tui-dev.sh     # run `opencode` locally with the TUI plugin actual
 The e2e suites run in an isolated scratch XDG home (real provider auth, throwaway state) and
 assert on the plugin's own on-disk run artifacts plus captured tmux panes. They make real model
 calls — pennies per run on Together. Re-run on flakes: live turns occasionally stall or hit
-transient provider errors, and both suites retry the common cases.
+transient provider errors, and both suites retry the common cases. The screenshots at the top
+are rendered from `visual.sh` frame captures (see `assets/`).
 
 `tui-dev.sh` exists because of an upstream dev-checkout trap: the TUI host injects its own
 Solid/OpenTUI instances into a plugin only when the plugin directory cannot resolve them, and
@@ -244,7 +268,7 @@ goes live once the repo has a `GIST_TOKEN` secret; **Security** is a weekly zizm
 workflow files themselves (CodeQL needs a public repo or paid GitHub Code Security, and this
 repo is private).
 
-## License
+## ⚖️ License
 
 MIT — see [LICENSE](./LICENSE). Attribution for the adapted workflow tool description lives in
 [NOTICE](./NOTICE).
