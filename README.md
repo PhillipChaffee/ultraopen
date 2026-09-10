@@ -13,7 +13,7 @@ your terminal.
 [![Security](https://github.com/PhillipChaffee/ultraopen/actions/workflows/security.yml/badge.svg)](https://github.com/PhillipChaffee/ultraopen/actions/workflows/security.yml)
 [![opencode](https://img.shields.io/badge/opencode-%3E%3D%201.18.20-7C3AED)](https://github.com/anomalyco/opencode)
 
-**1,000 agents per run · schema-validated outputs · resumable by journal**
+**Fan out many agents at once · validated results · resume instead of restarting**
 
 [Install](#install) · [Authoring workflows](#authoring) · [Compatibility](#compatibility) · [Development](#development)
 
