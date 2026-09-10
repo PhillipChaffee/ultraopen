@@ -9,7 +9,7 @@ Deterministic multi-agent workflow orchestration and an `ultracode` effort mode 
 your terminal.
 
 [![CI](https://github.com/PhillipChaffee/ultraopen/actions/workflows/ci.yml/badge.svg)](https://github.com/PhillipChaffee/ultraopen/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/PhillipChaffee/ultraopen/graph/badge.svg)](https://codecov.io/gh/PhillipChaffee/ultraopen)
+[![Coverage Status](https://coveralls.io/repos/github/PhillipChaffee/ultraopen/badge.svg?branch=main)](https://coveralls.io/github/PhillipChaffee/ultraopen?branch=main)
 [![Security](https://github.com/PhillipChaffee/ultraopen/actions/workflows/security.yml/badge.svg)](https://github.com/PhillipChaffee/ultraopen/actions/workflows/security.yml)
 [![opencode](https://img.shields.io/badge/opencode-%3E%3D%201.18.20-7C3AED)](https://github.com/anomalyco/opencode)
 
@@ -266,10 +266,11 @@ forced tool choice still leaves an agent free to research first. Upstream has no
 that path, so it can regress silently in an opencode release.
 
 CI runs lint, typecheck, the coverage-gated tests, and Node parity on ubuntu and macOS. The
-badges up top are per-workflow: the **codecov** badge is the numeric percentage from each
-coverage-gated run — Codecov is free for public repos, and uploads authenticate with the
-Actions OIDC token, so there is no secret to set; **Security** is a weekly zizmor audit of the
-workflow files themselves (CodeQL also works on public repos and would be the next step up).
+badges up top are per-workflow: the **Coverage Status** badge is the percentage Coveralls
+computes from each coverage-gated run — Coveralls is free for public repos, registers the repo
+on first upload, and authenticates with the token Actions already provides, so there is no
+secret to set; **Security** is a weekly zizmor audit of the workflow files themselves (CodeQL
+also works on public repos and would be the next step up).
 
 ## ⚖️ License
 
