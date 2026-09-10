@@ -9,7 +9,7 @@ Deterministic multi-agent workflow orchestration and an `ultracode` effort mode 
 your terminal.
 
 [![CI](https://github.com/PhillipChaffee/ultraopen/actions/workflows/ci.yml/badge.svg)](https://github.com/PhillipChaffee/ultraopen/actions/workflows/ci.yml)
-[![coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2FPhillipChaffee%2F17f03963fe3af443e3a0c24f9f9ecf21%2Fraw%2Fcoverage-badge.json)](https://github.com/PhillipChaffee/ultraopen/actions/workflows/coverage.yml)
+[![codecov](https://codecov.io/gh/PhillipChaffee/ultraopen/graph/badge.svg)](https://codecov.io/gh/PhillipChaffee/ultraopen)
 [![Security](https://github.com/PhillipChaffee/ultraopen/actions/workflows/security.yml/badge.svg)](https://github.com/PhillipChaffee/ultraopen/actions/workflows/security.yml)
 [![opencode](https://img.shields.io/badge/opencode-%3E%3D%201.18.20-7C3AED)](https://github.com/anomalyco/opencode)
 
@@ -266,11 +266,10 @@ forced tool choice still leaves an agent free to research first. Upstream has no
 that path, so it can regress silently in an opencode release.
 
 CI runs lint, typecheck, the coverage-gated tests, and Node parity on ubuntu and macOS. The
-badges up top are per-workflow: the numeric **coverage** badge republishes from each main-branch
-run of the gate — a public gist is the only URL shields.io can fetch for a private repo, and it
-goes live once the repo has a `GIST_TOKEN` secret; **Security** is a weekly zizmor audit of the
-workflow files themselves (CodeQL needs a public repo or paid GitHub Code Security, and this
-repo is private).
+badges up top are per-workflow: the **codecov** badge is the numeric percentage from each
+coverage-gated run — Codecov is free for public repos, and uploads authenticate with the
+Actions OIDC token, so there is no secret to set; **Security** is a weekly zizmor audit of the
+workflow files themselves (CodeQL also works on public repos and would be the next step up).
 
 ## ⚖️ License
 
