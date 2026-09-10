@@ -1,14 +1,13 @@
 name: Coverage
 
 # Dedicated coverage gate: bunfig.toml enforces coverageThreshold on `bun test`, so this
-# workflow fails exactly when coverage drops below the gate. Codecov is free for public
-# repos and publishes the numeric badge; uploads authenticate with the Actions OIDC
-# token (use_oidc), so no secret is stored. ci.yml runs the same suite on the full OS
-# matrix; this single-platform copy exists so the coverage badge reflects coverage alone.
+# workflow fails exactly when coverage drops below the gate. Coveralls authenticates with
+# the GITHUB_TOKEN that Actions provides automatically: no account to create, no repository
+# secret, and it registers the repo on first upload. ci.yml runs the same suite on the full
+# OS matrix; this single-platform copy exists so the coverage badge reflects coverage alone.
 
 permissions:
   contents: read
-  id-token: write
 
 on:
   push:
@@ -33,7 +32,6 @@ jobs:
       - name: Test (Bun, with coverage gate)
         run: bun run test
 
-      # lcov lines are single tokens (LH:15), so split on the colon, not whitespace.
       - name: Report coverage
         run: |
           LH=$(awk -F: '/^LH:/ {s += $2} END {print s + 0}' coverage/lcov.info)
@@ -41,12 +39,11 @@ jobs:
           test "$LF" -gt 0 || { echo "coverage/lcov.info is missing or empty" >&2; exit 1; }
           awk -v lh="$LH" -v lf="$LF" 'BEGIN {printf "coverage: %.1f%% (%d of %d lines)\n", 100*lh/lf, lh, lf}' >> "$GITHUB_STEP_SUMMARY"
 
-      # OIDC replaces the upload token: no CODECOV_TOKEN secret, no PAT.
-      - name: Upload to Codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+      - name: Upload to Coveralls
+        uses: coverallsapp/github-action@8d6379e14d29928660c4ba802d8e85393440b329 # v2
         with:
-          files: coverage/lcov.info
-          use_oidc: true
+          file: coverage/lcov.info
+          format: lcov
 
       - name: Upload coverage artifact
         if: always()
