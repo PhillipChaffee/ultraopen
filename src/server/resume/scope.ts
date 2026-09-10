@@ -19,7 +19,7 @@ import type { AgentOptions } from "../runtime/run.js"
  * AsyncFunction sandbox, into a user-supplied stage callback, and back into `agent()`.
  */
 
-export type Scope = {
+export interface Scope {
   /** Human-readable position, e.g. `root/L0.2/P1.0`. Recorded in the journal for debugging. */
   path: string
   /** Rolling chain key. Each agent() call in this scope advances it. */
@@ -64,10 +64,10 @@ export async function withChildScope<T>(
   work: () => Promise<T>,
 ): Promise<T> {
   const parent = currentScope()
-  if (!parent) return await work()
+  if (!parent) {return await work()}
 
-  const frameLabel = `${kind}${frame}.${index}`
-  const child: Scope = {
+  const frameLabel = `${kind}${frame}.${index}`,
+   child: Scope = {
     path: `${parent.path}/${frameLabel}`,
     chain: scopeSeed(parent.chain, frameLabel),
     ordinal: 0,
@@ -88,13 +88,13 @@ export async function withChildScope<T>(
  */
 export function openFrame(kind: string): number {
   const parent = currentScope()
-  if (!parent) return 0
+  if (!parent) {return 0}
   const next = parent.counters.get(kind) ?? 0
   parent.counters.set(kind, next + 1)
   return next
 }
 
-export type CallIdentity = {
+export interface CallIdentity {
   key: string
   scopePath: string
   ordinal: number
@@ -110,8 +110,8 @@ export type CallIdentity = {
  * reintroducing exactly the nondeterminism scoping exists to remove.
  */
 export function nextCallIdentity(prompt: string, options: AgentOptions, fallback: Scope): CallIdentity {
-  const scope = currentScope() ?? fallback
-  const ordinal = scope.ordinal
+  const scope = currentScope() ?? fallback,
+   {ordinal} = scope
   scope.ordinal++
   scope.chain = chainKey(scope.chain, prompt, options)
   return { key: scope.chain, scopePath: scope.path, ordinal, forceLive: scope.broken }

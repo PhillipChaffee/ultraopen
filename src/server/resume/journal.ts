@@ -9,7 +9,7 @@ import type { NullReason } from "../bridge/spawn.js"
  * because using `format` permanently breaks message listing for that session.
  */
 
-export type JournalEntry = {
+export interface JournalEntry {
   type: "result"
   key: string
   scopePath: string
@@ -30,7 +30,7 @@ export type JournalEntry = {
   sourceRunId?: string | undefined
 }
 
-export type Manifest = {
+export interface Manifest {
   runId: string
   bootId: string
   pid: number
@@ -67,7 +67,7 @@ export class Journal {
    */
   loadPrevious(entries: readonly JournalEntry[]): void {
     for (const entry of entries) {
-      if (entry.status !== "ok") continue
+      if (entry.status !== "ok") {continue}
       this.#replayable.set(entry.key, entry)
     }
   }
@@ -85,8 +85,8 @@ export class Journal {
    */
   lookup(key: string, schemaHash: string | undefined): JournalEntry | undefined {
     const entry = this.#replayable.get(key)
-    if (!entry) return undefined
-    if (entry.schemaHash !== schemaHash) return undefined
+    if (!entry) {return undefined}
+    if (entry.schemaHash !== schemaHash) {return undefined}
     return entry
   }
 
@@ -101,11 +101,11 @@ export class Journal {
 
   get stats(): { total: number; ok: number; failed: number; replayed: number } {
     // One pass rather than three filters: the counts are always read together.
-    let ok = 0
-    let replayed = 0
+    let ok = 0,
+     replayed = 0
     for (const entry of this.entries) {
-      if (entry.status === "ok") ok++
-      if (entry.replayed === true) replayed++
+      if (entry.status === "ok") {ok++}
+      if (entry.replayed === true) {replayed++}
     }
     return { total: this.entries.length, ok, failed: this.entries.length - ok, replayed }
   }
@@ -121,10 +121,10 @@ export function parseJournal(text: string): JournalEntry[] {
   const entries: JournalEntry[] = []
   for (const line of text.split("\n")) {
     const trimmed = line.trim()
-    if (trimmed === "") continue
+    if (trimmed === "") {continue}
     try {
       const parsed: unknown = JSON.parse(trimmed)
-      if (isEntry(parsed)) entries.push(parsed)
+      if (isEntry(parsed)) {entries.push(parsed)}
     } catch {
       // Skip an unparseable line rather than failing the load.
     }
@@ -133,7 +133,7 @@ export function parseJournal(text: string): JournalEntry[] {
 }
 
 function isEntry(value: unknown): value is JournalEntry {
-  if (typeof value !== "object" || value === null) return false
+  if (typeof value !== "object" || value === null) {return false}
   const record = value as Record<string, unknown>
   return (
     record["type"] === "result" &&

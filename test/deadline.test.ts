@@ -21,7 +21,7 @@ function fakeTimers() {
       // in this same pass.
       const due = [...pending.values()]
       pending.clear()
-      for (const entry of due) entry.fn()
+      for (const entry of due) {entry.fn()}
     },
     get size() {
       return pending.size
@@ -31,8 +31,8 @@ function fakeTimers() {
 
 describe("withDeadline", () => {
   test("passes through a value when work wins", async () => {
-    const timers = fakeTimers()
-    const result = await withDeadline(Promise.resolve("ok"), { ms: 1000, label: "a", timers: timers.api })
+    const timers = fakeTimers(),
+     result = await withDeadline(Promise.resolve("ok"), { ms: 1000, label: "a", timers: timers.api })
     expect(result).toBe("ok")
   })
 
@@ -43,15 +43,15 @@ describe("withDeadline", () => {
   })
 
   test("propagates a rejection from the work itself", async () => {
-    const timers = fakeTimers()
-    const promise = withDeadline(Promise.reject(new Error("boom")), { ms: 1000, label: "a", timers: timers.api })
+    const timers = fakeTimers(),
+     promise = withDeadline(Promise.reject(new Error("boom")), { ms: 1000, label: "a", timers: timers.api })
     await expect(promise).rejects.toThrow("boom")
     expect(timers.size).toBe(0)
   })
 
   test("rejects with DeadlineExceededError when the deadline fires", async () => {
-    const timers = fakeTimers()
-    const promise = withDeadline(new Promise(() => {}), { ms: 900_000, label: "verify:jwt", timers: timers.api })
+    const timers = fakeTimers(),
+     promise = withDeadline(new Promise(() => {}), { ms: 900_000, label: "verify:jwt", timers: timers.api })
     timers.fireAll()
     await expect(promise).rejects.toThrow(DeadlineExceededError)
     await expect(promise).rejects.toThrow(/verify:jwt/u)
@@ -90,8 +90,8 @@ describe("withDeadline", () => {
   })
 
   test("a failing onTimeout does not mask the deadline error", async () => {
-    const timers = fakeTimers()
-    const promise = withDeadline(new Promise(() => {}), {
+    const timers = fakeTimers(),
+     promise = withDeadline(new Promise(() => {}), {
       ms: 1000,
       label: "a",
       timers: timers.api,
@@ -102,8 +102,8 @@ describe("withDeadline", () => {
   })
 
   test("carries the configured ms on the error for logging", async () => {
-    const timers = fakeTimers()
-    const promise = withDeadline(new Promise(() => {}), { ms: 4242, label: "a", timers: timers.api })
+    const timers = fakeTimers(),
+     promise = withDeadline(new Promise(() => {}), { ms: 4242, label: "a", timers: timers.api })
     timers.fireAll()
     await expect(promise).rejects.toMatchObject({ ms: 4242, name: "DeadlineExceededError" })
   })
@@ -112,11 +112,11 @@ describe("withDeadline", () => {
     // The abandoned work promise still rejects later (the SDK's fetch layer throws on transport
     // errors). Without a handler that is an unhandled rejection, which Node treats as fatal —
     // one slow agent would crash the whole opencode server.
-    const timers = fakeTimers()
-    const unhandled: unknown[] = []
-    const onUnhandled = (error: unknown) => unhandled.push(error)
+    const timers = fakeTimers(),
+     unhandled: unknown[] = [],
+     onUnhandled = (error: unknown) => unhandled.push(error),
     // Bun's Process typing omits the Node rejection event; the runtime supports it.
-    const emitter = process as unknown as {
+     emitter = process as unknown as {
       on: (event: "unhandledRejection", listener: (error: unknown) => void) => void
       off: (event: "unhandledRejection", listener: (error: unknown) => void) => void
     }
@@ -125,8 +125,8 @@ describe("withDeadline", () => {
       let rejectWork!: (error: unknown) => void
       const work = new Promise<never>((_resolve, reject) => {
         rejectWork = reject
-      })
-      const promise = withDeadline(work, { ms: 1000, label: "a", timers: timers.api })
+      }),
+       promise = withDeadline(work, { ms: 1000, label: "a", timers: timers.api })
       timers.fireAll()
       await expect(promise).rejects.toThrow(DeadlineExceededError)
       rejectWork(new Error("late transport failure"))

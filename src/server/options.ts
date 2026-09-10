@@ -9,7 +9,7 @@ import { MAX_CONCURRENCY, MIN_CONCURRENCY } from "./script/limits.js"
  * hard-rejected — `ConfigParse` throws `Unrecognized keys` and breaks config loading entirely for
  * the user — and `experimental` is a closed struct, so keys nested there are dropped at decode.
  */
-export type UltraopenOptions = {
+export interface UltraopenOptions {
   /** Process-wide concurrent agent spawns. Clamped; 0 is rejected rather than honoured. */
   concurrency: number
   /** When true, ultracode's standing opt-in applies from the first turn in this project. */
@@ -34,7 +34,7 @@ const DEFAULTS: UltraopenOptions = {
  * bad value here would otherwise surface much later as a hang or a silently ignored setting.
  */
 export function resolveOptions(raw: unknown): UltraopenOptions {
-  if (typeof raw !== "object" || raw === null) return { ...DEFAULTS }
+  if (typeof raw !== "object" || raw === null) {return { ...DEFAULTS }}
   const input = raw as Record<string, unknown>
 
   return {
@@ -52,17 +52,17 @@ export function resolveOptions(raw: unknown): UltraopenOptions {
  * forever — a hang with no throw, no log and no progress.
  */
 function clampConcurrency(value: unknown): number {
-  if (typeof value !== "number" || !Number.isFinite(value)) return DEFAULTS.concurrency
+  if (typeof value !== "number" || !Number.isFinite(value)) {return DEFAULTS.concurrency}
   return Math.min(MAX_CONCURRENCY, Math.max(MIN_CONCURRENCY, Math.floor(value)))
 }
 
 function positiveNumber(value: unknown): number | undefined {
-  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return undefined
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {return undefined}
   return value
 }
 
 function stringArray(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) return undefined
+  if (!Array.isArray(value)) {return undefined}
   const out = value.filter((entry): entry is string => typeof entry === "string" && entry.trim() !== "")
   return out.length > 0 ? out : undefined
 }

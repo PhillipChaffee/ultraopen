@@ -1,4 +1,4 @@
-import { readdir, readFile } from "node:fs/promises"
+import { readFile, readdir } from "node:fs/promises"
 import { join } from "node:path"
 
 /**
@@ -12,14 +12,14 @@ import { join } from "node:path"
  * All logic lives here rather than in the JSX component so it can be tested without a terminal.
  */
 
-export type AgentRow = {
+export interface AgentRow {
   index: number
   label: string
   phase?: string | undefined
   status: "running" | "done" | "failed"
 }
 
-export type RunView = {
+export interface RunView {
   runId: string
   workflow: string
   sessionID: string
@@ -37,8 +37,8 @@ type RawProgress = Partial<RunView> & { startedAt?: number; agents?: AgentRow[] 
 
 /** Mirrors the server's XDG resolution so both halves agree on where runs live. */
 export function dataRoot(env: NodeJS.ProcessEnv, home: string): string {
-  const xdg = env["XDG_DATA_HOME"]
-  const base = xdg && xdg.trim() !== "" ? xdg : join(home, ".local", "share")
+  const xdg = env["XDG_DATA_HOME"],
+   base = xdg && xdg.trim() !== "" ? xdg : join(home, ".local", "share")
   return join(base, "opencode", "tool-output", "ultraopen")
 }
 
@@ -64,7 +64,7 @@ export async function loadAllRuns(root: string, now: number): Promise<RunView[]>
   const views: RunView[] = []
   for (const name of names) {
     const view = await loadRun(join(root, name), now)
-    if (view) views.push(view)
+    if (view) {views.push(view)}
   }
   // Oldest first, so a long-running workflow does not jump around as newer ones start and finish.
   return views.toSorted((a, b) => a.runId.localeCompare(b.runId))
@@ -82,10 +82,10 @@ export async function activeRuns(options: {
 
 async function loadRun(dir: string, now: number): Promise<RunView | undefined> {
   const manifest = await readJson(join(dir, "manifest.json"))
-  if (!manifest || manifest["status"] !== "running") return undefined
+  if (!manifest || manifest["status"] !== "running") {return undefined}
 
   const progress = (await readJson(join(dir, "progress.json"))) as RawProgress | undefined
-  if (!progress) return undefined
+  if (!progress) {return undefined}
 
   const view = toView(progress, now)
   // The manifest is the authority on which session owns the run; older snapshots may not carry it.
@@ -129,27 +129,27 @@ async function readJson(path: string): Promise<Record<string, unknown> | undefin
 
 /** `4m12s`, or `12s` under a minute. */
 export function formatElapsed(seconds: number): string {
-  if (seconds < 60) return `${seconds}s`
+  if (seconds < 60) {return `${seconds}s`}
   return `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, "0")}s`
 }
 
 /** One-line summary, used by the compact surfaces. */
 export function summarize(run: RunView): string {
-  const phase = run.phase ? `${run.phase} ` : ""
-  const failed = run.failed > 0 ? ` · ${run.failed} failed` : ""
+  const phase = run.phase ? `${run.phase} ` : "",
+   failed = run.failed > 0 ? ` · ${run.failed} failed` : ""
   return `${run.workflow} · ${phase}${run.done}/${run.total} · ${formatElapsed(run.elapsedSeconds)}${failed}`
 }
 
 /** Status glyph for an agent row. */
 export function glyph(status: AgentRow["status"]): string {
-  if (status === "done") return "✓"
-  if (status === "failed") return "✗"
+  if (status === "done") {return "✓"}
+  if (status === "failed") {return "✗"}
   return "⠋"
 }
 
 export type RunsListener = (runs: RunView[]) => void
 
-type TimerBag = {
+interface TimerBag {
   setInterval: (fn: () => void, ms: number) => unknown
   clearInterval: (handle: unknown) => void
 }
@@ -188,17 +188,17 @@ export class RunPoller {
     void this.#refresh()
     return () => {
       this.#subscribers.delete(listener)
-      if (this.#subscribers.size === 0) this.#stop()
+      if (this.#subscribers.size === 0) {this.#stop()}
     }
   }
 
   #start(): void {
-    if (this.#timer !== undefined) return
+    if (this.#timer !== undefined) {return}
     this.#timer = this.#timers.setInterval(() => void this.#refresh(), this.#pollMs)
   }
 
   #stop(): void {
-    if (this.#timer === undefined) return
+    if (this.#timer === undefined) {return}
     this.#timers.clearInterval(this.#timer)
     this.#timer = undefined
   }

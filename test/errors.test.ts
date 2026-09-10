@@ -1,10 +1,11 @@
 import { describe, expect, test } from "bun:test"
-import { fail, render, WorkflowScriptError, type Diagnostic } from "../src/server/script/errors.js"
+import { fail, render, WorkflowScriptError } from "../src/server/script/errors.js"
+import type { Diagnostic } from "../src/server/script/errors.js"
 
 describe("WorkflowScriptError", () => {
   test("carries its diagnostic and a conventional name", () => {
-    const diagnostic: Diagnostic = { kind: "MetaError", message: "boom" }
-    const err = new WorkflowScriptError(diagnostic)
+    const diagnostic: Diagnostic = { kind: "MetaError", message: "boom" },
+     err = new WorkflowScriptError(diagnostic)
     expect(err).toBeInstanceOf(Error)
     expect(err.name).toBe("WorkflowScriptError")
     expect(err.message).toBe("boom")
@@ -20,8 +21,8 @@ describe("render", () => {
   const source = ["const a = 1", "const b = 2", "const c = 3"].join("\n")
 
   test("renders a caret line under the offending column when source is supplied", () => {
-    const out = render({ kind: "MetaError", message: "bad", location: { line: 2, column: 6 } }, source)
-    const lines = out.split("\n")
+    const out = render({ kind: "MetaError", message: "bad", location: { line: 2, column: 6 } }, source),
+     lines = out.split("\n")
     expect(lines[0]).toBe("MetaError: bad")
     expect(lines[2]).toBe("2 | const b = 2")
     // The caret sits under column 6 of the source, offset by the gutter width.

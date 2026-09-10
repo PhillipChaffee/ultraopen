@@ -1,5 +1,5 @@
 import { argsHash, sourceHash } from "./key.js"
-import { parseJournal, type JournalEntry, type Manifest } from "./journal.js"
+import type { JournalEntry, Manifest } from "./journal.js"
 import {
   appendJournal,
   ensureRunDir,
@@ -18,7 +18,7 @@ import {
  * losing the ability to RESUME is a much smaller harm than losing the run itself.
  */
 
-export type RunRecord = {
+export interface RunRecord {
   runId: string
   sessionID: string
   source: string
@@ -58,7 +58,7 @@ export async function endRun(
   outcome: { status: "completed" | "failed"; entries: readonly JournalEntry[]; value: unknown; childSessionIDs: string[] },
   env?: NodeJS.ProcessEnv,
 ): Promise<void> {
-  if (!manifest) return
+  if (!manifest) {return}
   try {
     await appendJournal(manifest.runId, outcome.entries.map((entry) => JSON.stringify(entry)).join("\n"), env)
     await writeResult(manifest.runId, outcome.value, env)
@@ -77,7 +77,7 @@ export async function endRun(
   }
 }
 
-export type ResumeSource = {
+export interface ResumeSource {
   entries: JournalEntry[]
   /** Set when the previous run's args differ, which invalidates every cached result. */
   argsChanged: boolean
@@ -97,15 +97,15 @@ export async function loadResume(
   env?: NodeJS.ProcessEnv,
 ): Promise<ResumeSource> {
   const manifest = await readManifest(resumeFromRunId, env)
-  if (!manifest) return { entries: [], argsChanged: false }
+  if (!manifest) {return { entries: [], argsChanged: false }}
 
   // Resume is same-session by design: a journal from another conversation would replay results
   // produced for a different context.
-  if (manifest.sessionID !== sessionID) return { entries: [], argsChanged: false }
+  if (manifest.sessionID !== sessionID) {return { entries: [], argsChanged: false }}
 
-  if (manifest.argsHash !== argsHash(currentArgs)) return { entries: [], argsChanged: true }
+  if (manifest.argsHash !== argsHash(currentArgs)) {return { entries: [], argsChanged: true }}
 
   return { entries: await readJournal(resumeFromRunId, env), argsChanged: false }
 }
 
-export { parseJournal }
+export { parseJournal } from "./journal.js"

@@ -1,7 +1,8 @@
 import { DeadlineExceededError, withDeadline } from "../runtime/deadline.js"
 import { registry } from "../singleton.js"
 import { DEFAULT_AGENT_DEADLINE_MS } from "../script/limits.js"
-import { childRuleset, type Ruleset } from "./permission.js"
+import { childRuleset } from "./permission.js"
+import type { Ruleset } from "./permission.js"
 import type { AssistantInfo, CreateSessionBody, OpencodeClient, PromptBody, PromptResponse } from "../types.js"
 
 /** Why an agent produced no usable result. Surfaced per-agent so partial coverage is never silent. */
@@ -18,7 +19,7 @@ export type SpawnOutcome =
   | { ok: true; text: string; structured?: unknown; info: AssistantInfo; sessionID: string }
   | { ok: false; reason: NullReason; detail: string; sessionID?: string }
 
-export type SpawnOptions = {
+export interface SpawnOptions {
   prompt: string
   runId: string
   parentSessionID: string
@@ -48,7 +49,7 @@ export type SpawnOptions = {
  */
 export async function spawn(client: OpencodeClient, options: SpawnOptions): Promise<SpawnOutcome> {
   const created = await createChild(client, options)
-  if (!created.ok) return { ok: false, reason: "spawn-failed", detail: created.detail }
+  if (!created.ok) {return { ok: false, reason: "spawn-failed", detail: created.detail }}
   return await promptChild(client, created.sessionID, options.prompt, options)
 }
 
@@ -74,18 +75,18 @@ export async function createChild(client: OpencodeClient, options: SpawnOptions)
     // empty but the session row is not.
     metadata: { ultraopen: { runId: options.runId, label: options.label } },
     ...(options.agentType ? { agent: options.agentType } : {}),
-  }
+  },
 
   // The `directory` query is the load-bearing one; the header is accepted too but is read RAW,
   // so it must not be URL-encoded.
-  const created = await client.session.create({
+   created = await client.session.create({
     body,
     ...(options.directory ? { query: { directory: options.directory } } : {}),
-  })
-  const sessionID = created.data?.id
+  }),
+   sessionID = created.data?.id
   // Carry the real reason forward: "session creation returned no id" tells the user nothing about
   // why, and this is the first place a misconfigured agent name or a rejected body surfaces.
-  if (!sessionID) return { ok: false, detail: describe(created.error) }
+  if (!sessionID) {return { ok: false, detail: describe(created.error) }}
 
   registry.register(sessionID, options.runId)
   return { ok: true, sessionID }
@@ -100,14 +101,14 @@ export async function promptChild(
 ): Promise<SpawnOutcome> {
   const abortChild = async (): Promise<void> => {
     await client.session.abort({ path: { id: sessionID } }).catch(() => undefined)
-  }
+  },
 
   // Attach BEFORE the first await on the prompt, so an abort that lands mid-flight is not missed.
-  const onAbort = (): void => void abortChild()
+   onAbort = (): void => void abortChild()
   options.signal?.addEventListener("abort", onAbort, { once: true })
 
   try {
-    if (options.signal?.aborted) return { ok: false, reason: "aborted", detail: "aborted before start", sessionID }
+    if (options.signal?.aborted) {return { ok: false, reason: "aborted", detail: "aborted before start", sessionID }}
 
     const promptBody: PromptBody = {
       parts: [{ type: "text", text: prompt }],
@@ -120,9 +121,9 @@ export async function promptChild(
       // `format` MUST be resent on every turn: the host reads it off the LATEST user message, so
       // a retry without it silently degrades to an unstructured turn.
       ...(options.schema ? { format: { type: "json_schema" as const, schema: options.schema } } : {}),
-    }
+    },
 
-    const response = await withDeadline(client.session.prompt({ path: { id: sessionID }, body: promptBody }), {
+     response = await withDeadline(client.session.prompt({ path: { id: sessionID }, body: promptBody }), {
       ms: options.deadlineMs ?? DEFAULT_AGENT_DEADLINE_MS,
       label: options.label,
       onTimeout: abortChild,
@@ -155,10 +156,10 @@ export async function promptChild(
  * would hand the script a string where its schema promised an object.
  */
 export function interpret(response: PromptResponse, sessionID: string, wantedSchema: boolean): SpawnOutcome {
-  const info = response.info
-  const text = lastText(response.parts)
+  const {info} = response
+  const text = lastText(response.parts),
 
-  const errorName = info.error?.name
+   errorName = info.error?.name
   if (errorName === "MessageAbortedError") {
     return { ok: false, reason: "aborted", detail: "run was interrupted", sessionID }
   }
@@ -186,9 +187,9 @@ function lastText(parts: PromptResponse["parts"]): string {
 }
 
 function describe(error: unknown): string {
-  if (error === undefined || error === null) return "unknown error"
-  if (error instanceof Error) return error.message
-  if (typeof error === "string") return error
-  if (typeof error === "object" && "name" in error && typeof error.name === "string") return error.name
+  if (error === undefined || error === null) {return "unknown error"}
+  if (error instanceof Error) {return error.message}
+  if (typeof error === "string") {return error}
+  if (typeof error === "object" && "name" in error && typeof error.name === "string") {return error.name}
   return JSON.stringify(error).slice(0, 200)
 }

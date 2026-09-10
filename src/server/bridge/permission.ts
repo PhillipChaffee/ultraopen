@@ -8,7 +8,7 @@
 
 export type PermissionAction = "allow" | "ask" | "deny"
 
-export type PermissionRule = {
+export interface PermissionRule {
   permission: string
   pattern: string
   action: PermissionAction
@@ -66,7 +66,7 @@ export function childRuleset(options: {
   // Carry down external_directory grants and every deny, so a workflow child is never MORE
   // privileged than a `task` child spawned from the same session.
   for (const rule of options.inherited ?? []) {
-    if (rule.action === "deny" || rule.permission === "external_directory") rules.push({ ...rule })
+    if (rule.action === "deny" || rule.permission === "external_directory") {rules.push({ ...rule })}
   }
 
   for (const tool of [...CHILD_DENIED_TOOLS, ...(options.disallowedTools ?? [])]) {
@@ -90,7 +90,7 @@ export function childRuleset(options: {
   // matching the permission and checks ITS pattern, so appending `pattern:"opencode *"` after an
   // inherited blanket deny makes bash visible again. That would hand a workflow child more
   // privilege than a plain `task` child of the same parent. Re-assert the hide.
-  if (bashAlreadyHidden) rules.push({ permission: "bash", pattern: "*", action: "deny" })
+  if (bashAlreadyHidden) {rules.push({ permission: "bash", pattern: "*", action: "deny" })}
 
   // MUST be last: rulesets are evaluated last-match-wins, so this re-arms StructuredOutput even
   // when the parent contributed a blanket deny.
@@ -110,14 +110,14 @@ export function childRuleset(options: {
 export function evaluate(permission: string, pattern: string, ruleset: Ruleset): PermissionAction {
   let action: PermissionAction = "ask"
   for (const rule of ruleset) {
-    if (wildcardMatch(permission, rule.permission) && wildcardMatch(pattern, rule.pattern)) action = rule.action
+    if (wildcardMatch(permission, rule.permission) && wildcardMatch(pattern, rule.pattern)) {action = rule.action}
   }
   return action
 }
 
-/** opencode collapses these tool ids onto a single permission key before evaluating. */
-const EDIT_ALIASES = new Set(["edit", "write", "apply_patch"])
-const READ_ALIASES = new Set(["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"])
+/** Opencode collapses these tool ids onto a single permission key before evaluating. */
+const EDIT_ALIASES = new Set(["edit", "write", "apply_patch"]),
+ READ_ALIASES = new Set(["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"])
 
 /**
  * True when the tool is hidden from the model entirely, not merely denied.
@@ -127,8 +127,19 @@ const READ_ALIASES = new Set(["list_mcp_resources", "list_mcp_resource_templates
  * Filtering by `pattern === "*"` *inside* the search instead would report a tool as hidden even
  * when a later narrow rule for the same permission is what actually applies.
  */
+/** Maps a tool id onto opencode's collapsed permission key before rule evaluation. */
+function aliasFor(tool: string): string {
+  if (EDIT_ALIASES.has(tool)) {
+    return "edit"
+  }
+  if (READ_ALIASES.has(tool)) {
+    return "read"
+  }
+  return tool
+}
+
 export function isHidden(tool: string, ruleset: Ruleset): boolean {
-  const permission = EDIT_ALIASES.has(tool) ? "edit" : READ_ALIASES.has(tool) ? "read" : tool
+  const permission = aliasFor(tool)
   const last = ruleset.findLast((rule) => wildcardMatch(permission, rule.permission))
   return last?.pattern === "*" && last.action === "deny"
 }
@@ -138,12 +149,12 @@ export function isHidden(tool: string, ruleset: Ruleset): boolean {
  * `" *"` also matches the bare word (so `"opencode *"` matches `opencode` with no arguments).
  */
 export function wildcardMatch(value: string, pattern: string): boolean {
-  if (pattern === "*") return true
+  if (pattern === "*") {return true}
   // Detect the trailing " *" on the RAW pattern: the escape pass below does not touch spaces or
   // asterisks, so testing the escaped form would look for characters that are never produced.
-  const trailingArgs = pattern.endsWith(" *")
-  const core = trailingArgs ? pattern.slice(0, -2) : pattern
-  const escaped = core.replaceAll(/[.+?^${}()|[\]\\]/gu, String.raw`\$&`).replaceAll("*", ".*")
-  const source = trailingArgs ? `${escaped}( .*)?` : escaped
+  const trailingArgs = pattern.endsWith(" *"),
+   core = trailingArgs ? pattern.slice(0, -2) : pattern,
+   escaped = core.replaceAll(/[.+?^${}()|[\]\\]/gu, String.raw`\$&`).replaceAll("*", ".*"),
+   source = trailingArgs ? `${escaped}( .*)?` : escaped
   return new RegExp(`^${source}$`, "su").test(value)
 }

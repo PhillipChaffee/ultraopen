@@ -10,10 +10,10 @@ const SCHEMA = {
   properties: { answer: { type: "string" } },
 }
 
-type PromptCall = { body: PromptBody }
+interface PromptCall { body: PromptBody }
 
 /** Fake client whose prompt behaviour is scripted per attempt. */
-function makeClient(responses: Array<Partial<PromptResponse> | "no-data">) {
+function makeClient(responses: (Partial<PromptResponse> | "no-data")[]) {
   const prompts: PromptCall[] = []
   let index = 0
   const client = {
@@ -26,7 +26,7 @@ function makeClient(responses: Array<Partial<PromptResponse> | "no-data">) {
         prompts.push({ body: options.body })
         const next = responses[Math.min(index, responses.length - 1)]
         index++
-        if (next === "no-data") return Promise.resolve({ error: "boom" })
+        if (next === "no-data") {return Promise.resolve({ error: "boom" })}
         return Promise.resolve({
           data: { info: { tokens: { output: 1 } }, parts: [], ...next } as unknown as PromptResponse,
         })
@@ -50,8 +50,8 @@ beforeEach(() => {
 
 describe("happy path", () => {
   test("returns on the first attempt when the value is valid", async () => {
-    const { client, prompts } = makeClient([{ info: { structured: { answer: "yes" } } } as Partial<PromptResponse>])
-    const result = await spawnStructured(client, options)
+    const { client, prompts } = makeClient([{ info: { structured: { answer: "yes" } } } as Partial<PromptResponse>]),
+     result = await spawnStructured(client, options)
 
     expect(result.ok).toBe(true)
     expect(result.attempts).toBe(1)
@@ -65,8 +65,8 @@ describe("happy path", () => {
   })
 
   test("a call without a schema runs exactly once", async () => {
-    const { client, prompts: noSchemaPrompts } = makeClient([{ parts: [{ type: "text", text: "plain" }] } as Partial<PromptResponse>])
-    const result = await spawnStructured(client, { ...options, schema: undefined })
+    const { client, prompts: noSchemaPrompts } = makeClient([{ parts: [{ type: "text", text: "plain" }] } as Partial<PromptResponse>]),
+     result = await spawnStructured(client, { ...options, schema: undefined })
 
     expect(result.ok).toBe(true)
     expect(result.attempts).toBe(1)
@@ -79,8 +79,8 @@ describe("retry ladder", () => {
     const { client } = makeClient([
       { info: {} } as Partial<PromptResponse>,
       { info: { structured: { answer: "yes" } } } as Partial<PromptResponse>,
-    ])
-    const result = await spawnStructured(client, options)
+    ]),
+     result = await spawnStructured(client, options)
 
     expect(result.ok).toBe(true)
     expect(result.attempts).toBe(2)
@@ -95,7 +95,7 @@ describe("retry ladder", () => {
     const { client, prompts } = makeClient([{ info: {} } as Partial<PromptResponse>])
     await spawnStructured(client, options)
     expect(prompts.length).toBe(3)
-    for (const call of prompts) expect(call.body.format).toBeDefined()
+    for (const call of prompts) {expect(call.body.format).toBeDefined()}
   })
 
   test("the retry prompt names the required fields", async () => {
@@ -115,8 +115,8 @@ describe("retry ladder", () => {
   })
 
   test("gives up after three attempts with a descriptive reason", async () => {
-    const { client, prompts } = makeClient([{ info: {} } as Partial<PromptResponse>])
-    const result = await spawnStructured(client, options)
+    const { client, prompts } = makeClient([{ info: {} } as Partial<PromptResponse>]),
+     result = await spawnStructured(client, options)
 
     expect(result.ok).toBe(false)
     expect(result.attempts).toBe(3)
@@ -133,8 +133,8 @@ describe("retry ladder", () => {
     const { client, prompts } = makeClient([
       { info: { structured: { wrong: 1 } } } as Partial<PromptResponse>,
       { info: { structured: { answer: "ok" } } } as Partial<PromptResponse>,
-    ])
-    const result = await spawnStructured(client, options)
+    ]),
+     result = await spawnStructured(client, options)
 
     expect(result.ok).toBe(true)
     expect(result.attempts).toBe(2)
@@ -150,11 +150,11 @@ describe("non-retryable outcomes", () => {
   ] as const)("%s stops immediately rather than retrying", async (errorName, expectedReason) => {
     // Retrying an aborted run would fight the user; an auth failure or an exhausted context will
     // not improve by asking again.
-    const { client, prompts } = makeClient([{ info: { error: { name: errorName } } } as Partial<PromptResponse>])
-    const result = await spawnStructured(client, options)
+    const { client, prompts } = makeClient([{ info: { error: { name: errorName } } } as Partial<PromptResponse>]),
+     result = await spawnStructured(client, options)
 
     expect(result.ok).toBe(false)
-    if (!result.ok) expect(result.reason).toBe(expectedReason)
+    if (!result.ok) {expect(result.reason).toBe(expectedReason)}
     expect(prompts.length).toBe(1)
   })
 
@@ -167,9 +167,9 @@ describe("non-retryable outcomes", () => {
         abort: () => Promise.resolve({}),
         prompt: () => Promise.resolve({}),
       },
-    } as unknown as OpencodeClient
+    } as unknown as OpencodeClient,
 
-    const result = await spawnStructured(client, options)
+     result = await spawnStructured(client, options)
     expect(result.ok).toBe(false)
     expect(result.attempts).toBe(0)
     if (!result.ok) {
@@ -179,19 +179,19 @@ describe("non-retryable outcomes", () => {
   })
 
   test("a prompt transport failure is not retried as a schema miss", async () => {
-    const { client, prompts } = makeClient(["no-data"])
-    const result = await spawnStructured(client, options)
+    const { client, prompts } = makeClient(["no-data"]),
+     result = await spawnStructured(client, options)
 
     expect(result.ok).toBe(false)
-    if (!result.ok) expect(result.reason).toBe("prompt-failed")
+    if (!result.ok) {expect(result.reason).toBe("prompt-failed")}
     expect(prompts.length).toBe(1)
   })
 })
 
 describe("nudge construction", () => {
   test("handles a schema with no required list", async () => {
-    const loose = { type: "object", properties: { a: { type: "string" } } }
-    const { client, prompts } = makeClient([{ info: {} } as Partial<PromptResponse>])
+    const loose = { type: "object", properties: { a: { type: "string" } } },
+     { client, prompts } = makeClient([{ info: {} } as Partial<PromptResponse>])
     await spawnStructured(client, { ...options, schema: loose })
 
     const second = prompts[1]?.body.parts[0]?.text ?? ""
@@ -210,8 +210,8 @@ describe("nudge construction", () => {
         flag: { type: "boolean" },
         nothing: { type: "null" },
       },
-    }
-    const { client, prompts } = makeClient([{ info: {} } as Partial<PromptResponse>])
+    },
+     { client, prompts } = makeClient([{ info: {} } as Partial<PromptResponse>])
     await spawnStructured(client, { ...options, schema: complex })
 
     const third = prompts[2]?.body.parts[0]?.text ?? ""

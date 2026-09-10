@@ -1,4 +1,4 @@
-import { fail, WorkflowScriptError } from "../script/errors.js"
+import { WorkflowScriptError, fail } from "../script/errors.js"
 import { MAX_ITEMS_PER_CALL } from "../script/limits.js"
 import { openFrame, withChildScope } from "../resume/scope.js"
 
@@ -27,7 +27,7 @@ function assertWithinLimit(count: number, caller: "parallel" | "pipeline"): void
  * until a slot frees. A thunk that throws resolves to `null` in the result array; the call itself
  * never rejects, so callers must `.filter(Boolean)`.
  */
-export async function parallel(thunks: ReadonlyArray<() => unknown>): Promise<unknown[]> {
+export async function parallel(thunks: readonly (() => unknown)[]): Promise<unknown[]> {
   if (!Array.isArray(thunks)) {
     throw new TypeError("parallel() expects an array of functions, not promises. Wrap each call: () => agent(...)")
   }
@@ -56,7 +56,7 @@ export async function parallel(thunks: ReadonlyArray<() => unknown>): Promise<un
         // Engine faults must NEVER degrade to null. A LimitError or a determinism trap swallowed
         // here would read as "this agent returned nothing" — the silent truncation the spec
         // explicitly forbids. Only agent/user failures become null.
-        if (error instanceof WorkflowScriptError) throw error
+        if (error instanceof WorkflowScriptError) {throw error}
         return null
       }
     }),
@@ -81,7 +81,7 @@ export async function parallel(thunks: ReadonlyArray<() => unknown>): Promise<un
  */
 export async function pipeline(
   items: readonly unknown[],
-  ...stages: ReadonlyArray<(prev: unknown, item: unknown, index: number) => unknown>
+  ...stages: readonly ((prev: unknown, item: unknown, index: number) => unknown)[]
 ): Promise<unknown[]> {
   if (!Array.isArray(items)) {
     throw new TypeError("pipeline() expects an array of items as its first argument.")
@@ -103,10 +103,10 @@ export async function pipeline(
           } catch (error) {
             // Same rule as parallel(): an engine fault propagates and fails the run loudly, rather
             // than masquerading as a single item that produced no result.
-            if (error instanceof WorkflowScriptError) throw error
+            if (error instanceof WorkflowScriptError) {throw error}
             return null
           }
-          if (current === null || current === undefined) return null
+          if (current === null || current === undefined) {return null}
         }
         return current
       }),

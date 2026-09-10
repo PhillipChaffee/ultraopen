@@ -11,7 +11,7 @@ import { EFFORT_OFF, EFFORT_STRENGTH } from "../script/limits.js"
  * Every resolution is therefore explicit, and every downgrade is reported.
  */
 
-export type EffortResolution = {
+export interface EffortResolution {
   /** The variant to send, or undefined to send none. */
   variant: string | undefined
   /** Set when the request could not be honoured exactly. */
@@ -20,7 +20,7 @@ export type EffortResolution = {
   note?: string
 }
 
-export type ModelVariants = {
+export interface ModelVariants {
   /** Variant ids the model actually supports, e.g. ["low","medium","high","xhigh","max"]. */
   available: readonly string[]
   /** For the message. */
@@ -37,12 +37,12 @@ export type ModelVariants = {
  */
 export function resolveEffort(requested: string | undefined, model: ModelVariants): EffortResolution {
   const available = model.available.filter((entry) => typeof entry === "string" && entry !== "")
-  if (requested === undefined || requested === "") return { variant: undefined }
+  if (requested === undefined || requested === "") {return { variant: undefined }}
 
   // "default" is opencode's own sentinel for "no variant".
-  if (requested === "default") return { variant: undefined }
+  if (requested === "default") {return { variant: undefined }}
 
-  if (available.includes(requested)) return { variant: requested }
+  if (available.includes(requested)) {return { variant: requested }}
 
   const label = model.modelLabel ?? "this model"
 
@@ -86,8 +86,8 @@ export function resolveEffort(requested: string | undefined, model: ModelVariant
   // same kimi-k3 into "max": a large, silent cost increase in the opposite direction from what
   // was asked. One rung is close enough to be a fair reading of intent; more is a different
   // decision the caller did not make. Beyond that, send no variant and let the model default.
-  const nextUp = EFFORT_STRENGTH[requestedRank + 1]
-  const escalation = nextUp !== undefined && available.includes(nextUp) ? nextUp : undefined
+  const nextUp = EFFORT_STRENGTH[requestedRank + 1],
+   escalation = nextUp !== undefined && available.includes(nextUp) ? nextUp : undefined
   if (escalation !== undefined) {
     return {
       variant: escalation,
@@ -115,7 +115,7 @@ export function makeEffortResolver(
 ): (effort: string | undefined) => string | undefined {
   return (effort) => {
     const resolution = resolveEffort(effort, model)
-    if (resolution.note) onDowngrade?.(resolution.note)
+    if (resolution.note) {onDowngrade?.(resolution.note)}
     return resolution.variant
   }
 }

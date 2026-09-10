@@ -1,11 +1,15 @@
 {
   "$schema": "./node_modules/oxlint/configuration_schema.json",
+  // Strictness policy: correctness, suspicious, pedantic, perf, and style are all enforced.
+  // Every rule turned off below carries its reason inline. The "restriction" and "nursery"
+  // categories stay off: restriction rules enforce opinionated no-go policies (broad denies,
+  // not lint) and nursery rules are unstable oxlint previews.
   "categories": {
     "correctness": "error",
     "suspicious": "error",
     "pedantic": "error",
     "perf": "error",
-    "style": "off",
+    "style": "error",
     "restriction": "off",
     "nursery": "off"
   },
@@ -22,11 +26,42 @@
     "node": true
   },
   "rules": {
-    "no-console": "off",
-    "eslint/no-await-in-loop": "off",
-    "typescript/consistent-type-imports": "error",
-    "typescript/no-explicit-any": "error",
-    "typescript/no-non-null-assertion": "error",
+    // --- off, with reasons (style category unless noted) ---
+    "eslint/no-console": "off", // console.error is a deliberate host-visible diagnostics channel
+    "eslint/no-await-in-loop": "off", // the combinators are inherently sequential; awaiting in loops is the engine's shape
+    "unicorn/no-null": "off", // budget.total uses null as the explicit "no ceiling" sentinel
+    "unicorn/no-array-reduce": "off", // the effort ladder folds preference lists; reduce is the clearest form
+    "unicorn/filename-case": "off", // run ids and upstream-mirrored test fixtures dictate their own names
+    "unicorn/no-useless-undefined": "off", // optional() helper returns undefined deliberately for exactOptionalPropertyTypes
+    "unicorn/prefer-top-level-await": "off", // plugin entry points must be synchronous exports
+    "import/no-named-export": "off", // named exports are the convention except the dual entry files
+    "eslint/sort-keys": "off", // key order is semantic (grouped by role, not alphabet)
+    "eslint/max-lines-per-function": "off", // bounded by max-lines(400) + max-depth(6) instead
+    "eslint/max-params": "off", // options bags are single-object by design; param count is not the risk here
+    "eslint/func-style": "off", // module-level arrow consts are the established pattern
+    "eslint/id-length": "off", // short names (rs, r, n) are idiomatic in tight test and render loops
+    "eslint/no-magic-numbers": "off", // limits live in script/limits.ts; other numbers are self-evident in place
+    "eslint/one-var": "off", // grouped declarations are the established pattern (option bags, fixtures)
+    "eslint/sort-vars": "off", // sorting declarations is pure churn
+    "import/group-exports": "off", // each export carries its own doc comment; a grouped block would orphan them
+    "import/exports-last": "off", // an export lives with its doc comment, not herded to end-of-file
+    "eslint/sort-imports": "off", // import order is semantic (builtins -> framework -> relative), not alphabetical
+    "eslint/no-duplicate-imports": "off", // verbatimModuleSyntax requires separate `import type` lines, which this counts as duplicates
+    "import/prefer-default-export": "off", // the dual server/tui entry contract makes named exports deliberate; only entry files default-export
+    "eslint/no-ternary": "off", // conditional expressions are the TUI half's rendering idiom under the mount-only constraint
+    "eslint/no-continue": "off", // early-continue is the parsers' loop-skip idiom (journal parsing, AST walking)
+    "eslint/max-statements": "off", // already bounded by max-lines(400) + max-depth(6); a statement ceiling double-penalizes dense wiring
+    "eslint/init-declarations": "off", // deferred assignment (renderable refs, resolver bindings) is a deliberate pattern
+    "promise/avoid-new": "off", // `new Promise` is the deferred-resolver pattern for stub callbacks in tests
+    "import/no-nodejs-modules": "off", // browser-domain rule; this is a Node/Bun opencode plugin using node: builtins by design
+    "import/no-namespace": "off", // acorn's parser API requires `import * as acorn`
+    "eslint/no-template-curly-in-string": "off", // the tool description documents template-literal syntax inside plain strings
+    "eslint/prefer-destructuring": "off", // dynamic-index access in test loops; destructuring would obscure the index
+    "promise/prefer-await-to-then": "off", // fire-and-forget rejection guards (`void p.catch()`) exist precisely to NOT await
+    "node/no-sync": "off", // sync IO is deliberate in the gate and Node-parity harness (it asserts sync/async equivalence)
+    "eslint/capitalized-comments": "off", // multi-line prose comments read as sentences; capitalizing every line breaks mid-sentence continuations
+    "promise/no-return-wrap": "error",
+    "unicorn/prefer-node-protocol": "error",
     "eslint/eqeqeq": [
       "error",
       "always",
@@ -36,24 +71,13 @@
     ],
     "eslint/no-param-reassign": "error",
     "eslint/prefer-const": "error",
-    "unicorn/prefer-node-protocol": "error",
-    "promise/no-return-wrap": "error",
-    "unicorn/no-null": "off",
-    "unicorn/no-array-reduce": "off",
-    "unicorn/filename-case": "off",
+    "typescript/consistent-type-imports": "error",
+    "typescript/no-explicit-any": "error",
+    "typescript/no-non-null-assertion": "error",
     "eslint/max-depth": [
       "warn",
       6
     ],
-    "eslint/max-lines-per-function": "off",
-    "eslint/sort-keys": "off",
-    "eslint/max-params": "off",
-    "eslint/func-style": "off",
-    "eslint/id-length": "off",
-    "eslint/no-magic-numbers": "off",
-    "unicorn/no-useless-undefined": "off",
-    "import/no-named-export": "off",
-    "unicorn/prefer-top-level-await": "off",
     "eslint/max-lines": [
       "error",
       {
@@ -83,10 +107,10 @@
         "test/**/*.mjs"
       ],
       "rules": {
-        "typescript/no-explicit-any": "off",
-        "typescript/no-non-null-assertion": "off",
-        "eslint/max-lines": "off",
-        "eslint/no-underscore-dangle": "off"
+        "typescript/no-explicit-any": "off", // fixtures mirror untyped upstream wire shapes on purpose
+        "typescript/no-non-null-assertion": "off", // tests assert presence before access
+        "eslint/max-lines": "off", // fixture-driven tests exceed file limits legitimately
+        "eslint/no-underscore-dangle": "off" // upstream protocol names (#journal, etc.)
       }
     }
   ]

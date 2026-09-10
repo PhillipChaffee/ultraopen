@@ -1,13 +1,6 @@
 import { describe, expect, test } from "bun:test"
-import {
-  childRuleset,
-  evaluate,
-  isHidden,
-  STRUCTURED_OUTPUT_TOOL,
-  wildcardMatch,
-  type PermissionRule,
-  type Ruleset,
-} from "../src/server/bridge/permission.js"
+import { childRuleset, evaluate, isHidden, STRUCTURED_OUTPUT_TOOL, wildcardMatch } from "../src/server/bridge/permission.js"
+import type { PermissionRule, Ruleset } from "../src/server/bridge/permission.js"
 
 describe("wildcardMatch", () => {
   test.each(["", "read", "opencode run x", "/a/b/c"])('"*" matches %p', (value) => {
@@ -133,23 +126,23 @@ describe("childRuleset", () => {
   })
 
   test("inherited denies are carried down ahead of our own rules, so ours can still override them", () => {
-    const inherited: Ruleset = [{ permission: "read", pattern: "*", action: "deny" }]
-    const ruleset = childRuleset({ inherited })
-    const inheritedIndex = ruleset.findIndex((rule) => rule.permission === "read" && rule.action === "deny")
-    const ownIndex = ruleset.findIndex((rule) => rule.permission === "workflow")
+    const inherited: Ruleset = [{ permission: "read", pattern: "*", action: "deny" }],
+     ruleset = childRuleset({ inherited }),
+     inheritedIndex = ruleset.findIndex((rule) => rule.permission === "read" && rule.action === "deny"),
+     ownIndex = ruleset.findIndex((rule) => rule.permission === "workflow")
     expect(inheritedIndex).toBeGreaterThanOrEqual(0)
     expect(inheritedIndex).toBeLessThan(ownIndex)
   })
 
   test("drops an inherited allow rule for an ordinary permission", () => {
-    const inherited: Ruleset = [{ permission: "read", pattern: "*", action: "allow" }]
-    const ruleset = childRuleset({ inherited })
+    const inherited: Ruleset = [{ permission: "read", pattern: "*", action: "allow" }],
+     ruleset = childRuleset({ inherited })
     expect(ruleset).not.toContainEqual({ permission: "read", pattern: "*", action: "allow" })
   })
 
   test("keeps an inherited allow rule when the permission is external_directory", () => {
-    const grant: PermissionRule = { permission: "external_directory", pattern: "*", action: "allow" }
-    const ruleset = childRuleset({ inherited: [grant] })
+    const grant: PermissionRule = { permission: "external_directory", pattern: "*", action: "allow" },
+     ruleset = childRuleset({ inherited: [grant] })
     expect(ruleset).toContainEqual(grant)
   })
 

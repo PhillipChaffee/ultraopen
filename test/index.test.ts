@@ -15,8 +15,8 @@ import { join } from "node:path"
  * The tool persists a manifest, journal, result and script per run. Without this the suite writes
  * real artifacts into the user's opencode data directory — ~27 stray run folders per `bun test`.
  */
-let dataHome: string
-let savedDataHome: string | undefined
+let dataHome: string,
+ savedDataHome: string | undefined
 
 beforeAll(async () => {
   dataHome = await mkdtemp(join(tmpdir(), "ultraopen-testdata-"))
@@ -25,22 +25,22 @@ beforeAll(async () => {
 })
 
 afterAll(async () => {
-  if (savedDataHome === undefined) delete process.env["XDG_DATA_HOME"]
-  else process.env["XDG_DATA_HOME"] = savedDataHome
+  if (savedDataHome === undefined) {delete process.env["XDG_DATA_HOME"]}
+  else {process.env["XDG_DATA_HOME"] = savedDataHome}
   await rm(dataHome, { recursive: true, force: true })
 })
 
 
-type ToolDef = {
+interface ToolDef {
   description: string
   args: Record<string, unknown>
   execute: (args: Record<string, unknown>, context: Record<string, unknown>) => Promise<string>
 }
 
-const META = "export const meta = { name: 'demo', description: 'a demo workflow' }\n"
+const META = "export const meta = { name: 'demo', description: 'a demo workflow' }\n",
 
 /** A client that never actually spawns — index tests exercise wiring, not the bridge. */
-const stubClient = {
+ stubClient = {
   config: {
     get: () => Promise.resolve({ data: {} }),
     providers: () => Promise.resolve({ data: { providers: [] } }),
@@ -52,9 +52,9 @@ const stubClient = {
     abort: () => Promise.resolve({}),
     prompt: () => Promise.resolve({ data: { info: {}, parts: [] } }),
   },
-}
+},
 
-const toolOf = (hooks: Record<string, unknown>): ToolDef | undefined => {
+ toolOf = (hooks: Record<string, unknown>): ToolDef | undefined => {
   const tools = hooks["tool"] as Record<string, ToolDef> | undefined
   return tools?.[WORKFLOW_TOOL]
 }
@@ -69,8 +69,8 @@ beforeEach(() => {
 })
 
 afterEach(() => {
-  if (savedEnv === undefined) delete process.env["ULTRAOPEN_ACTIVE"]
-  else process.env["ULTRAOPEN_ACTIVE"] = savedEnv
+  if (savedEnv === undefined) {delete process.env["ULTRAOPEN_ACTIVE"]}
+  else {process.env["ULTRAOPEN_ACTIVE"] = savedEnv}
 })
 
 describe("plugin registration", () => {
@@ -131,8 +131,8 @@ describe("nested-process guard", () => {
 
 describe("shell.env hook", () => {
   test("marks shells only inside engine-owned sessions", () => {
-    const hooks = ultraopen({ client: stubClient })
-    const hook = hooks["shell.env"] as (i: { sessionID?: string }, o: { env: Record<string, string> }) => void
+    const hooks = ultraopen({ client: stubClient }),
+     hook = hooks["shell.env"] as (i: { sessionID?: string }, o: { env: Record<string, string> }) => void
 
     registry.register("child", "run-1")
 
@@ -153,8 +153,8 @@ describe("shell.env hook", () => {
 
 describe("config hook", () => {
   test("installs the ultracode agent, command and permission default", () => {
-    const hooks = ultraopen({ client: stubClient })
-    const config: MutableConfig = {}
+    const hooks = ultraopen({ client: stubClient }),
+     config: MutableConfig = {}
     ;(hooks["config"] as (c: MutableConfig) => void)(config)
 
     expect(config.agent?.["ultracode"]).toBeDefined()
@@ -167,8 +167,8 @@ describe("config hook", () => {
     // The hook's return value is discarded; mutation is the only channel. Awaiting the client
     // from inside it can cache an agent list built from the un-mutated config for the whole
     // instance lifetime.
-    const hooks = ultraopen({ client: stubClient })
-    const result = (hooks["config"] as (c: MutableConfig) => unknown)({})
+    const hooks = ultraopen({ client: stubClient }),
+     result = (hooks["config"] as (c: MutableConfig) => unknown)({})
     expect(result).toBeUndefined()
   })
 })
@@ -176,7 +176,7 @@ describe("config hook", () => {
 describe("tool execution", () => {
   const run = async (args: Record<string, unknown>, context: Record<string, unknown> = {}): Promise<string> => {
     const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) throw new Error("tool was not registered")
+    if (!tool) {throw new Error("tool was not registered")}
     return await tool.execute(args, { sessionID: "parent", ...context })
   }
 
@@ -204,7 +204,7 @@ describe("tool execution", () => {
     // The script is parsed BEFORE asking so the prompt can name the workflow. Using the `title`
     // argument would be wrong twice over: it is documented as ignored, and models omit it — which
     // showed up live as a permission prompt reading "null".
-    const asked: Array<Record<string, unknown>> = []
+    const asked: Record<string, unknown>[] = []
     await run(
       { script: `${META}return 1\n`, dryRun: true, title: "ignored-title" },
       { ask: (request: Record<string, unknown>) => { asked.push(request); return Promise.resolve() } },
@@ -218,8 +218,8 @@ describe("tool execution", () => {
   })
 
   test("the permission metadata describes what will run", async () => {
-    const asked: Array<Record<string, unknown>> = []
-    const script = "export const meta = { name: 'audit', description: 'Audit auth', phases: [{ title: 'Find' }] }\nreturn 1\n"
+    const asked: Record<string, unknown>[] = [],
+     script = "export const meta = { name: 'audit', description: 'Audit auth', phases: [{ title: 'Find' }] }\nreturn 1\n"
     await run(
       { script, dryRun: true },
       { ask: (request: Record<string, unknown>) => { asked.push(request); return Promise.resolve() } },
@@ -232,8 +232,8 @@ describe("tool execution", () => {
 
   test("a script that fails to parse is rejected BEFORE the permission prompt", async () => {
     // No point asking the user to approve a run that cannot start.
-    const asked: unknown[] = []
-    const output = await run(
+    const asked: unknown[] = [],
+     output = await run(
       { script: `${META}const x: string[] = []\n`, dryRun: true },
       { ask: (request: unknown) => { asked.push(request); return Promise.resolve() } },
     )
@@ -265,18 +265,19 @@ describe("tool execution", () => {
     // Without this, endRun on failure wrote an empty journal and destroyed the replayable prefix
     // of agents that had already completed — resume would redo work it already paid for.
     const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) throw new Error("tool was not registered")
-    const script = `${META}await agent('succeeds')\nthrow new Error('script blew up')\n`
-    const output = await tool.execute({ script }, { sessionID: "parent" })
+    if (!tool) {throw new Error("tool was not registered")}
+    const script = `${META}await agent('succeeds')\nthrow new Error('script blew up')\n`,
+     output = await tool.execute({ script }, { sessionID: "parent" })
     expect(output).toContain("script blew up")
 
     // Find the run id from the tool's rendered failure — the journal is keyed by run.
-    const runId = output.match(/id="([^"]+)"/u)?.[1]
+    const runId = output.match(/id="(?<runId>[^"]+)"/u)?.[1]
     expect(runId).toBeDefined()
     const entries = await readJournal(runId ?? "")
     expect(entries.length).toBe(1)
     expect(entries[0]?.status).toBe("ok")
-    expect((await readManifest(runId ?? "", undefined))?.status).toBe("failed")
+    const manifest = await readManifest(runId ?? "", undefined)
+    expect(manifest?.status).toBe("failed")
   })
 
   test("a completed run persists its child sessions in the manifest", async () => {
@@ -284,23 +285,24 @@ describe("tool execution", () => {
     // registry after endRun — which abortAll has already cleared — it would always be []. This
     // pins the completed path (the capture happens inside the run, before its cleanup).
     const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) throw new Error("tool was not registered")
-    const script = `${META}await agent('a')\nreturn 'done'\n`
-    const output = await tool.execute({ script }, { sessionID: "parent" })
-    const runId = output.match(/run="([^"]+)"/u)?.[1]
+    if (!tool) {throw new Error("tool was not registered")}
+    const script = `${META}await agent('a')\nreturn 'done'\n`,
+     output = await tool.execute({ script }, { sessionID: "parent" }),
+     runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1]
     expect(runId).toBeDefined()
-    expect((await readManifest(runId ?? "", undefined))?.childSessionIDs).toEqual(["child"])
+    const manifest = await readManifest(runId ?? "", undefined)
+    expect(manifest?.childSessionIDs).toEqual(["child"])
   })
 
   test("a resume with changed args renders the args-changed note", async () => {
     // A replayed run must never read as a fresh one — this note is the visible marker that
     // nothing was replayed because the inputs changed.
     const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) throw new Error("tool was not registered")
-    const script = `${META}await agent('a')\nreturn 'ok'\n`
+    if (!tool) {throw new Error("tool was not registered")}
+    const script = `${META}await agent('a')\nreturn 'ok'\n`,
 
-    const first = await tool.execute({ script, args: { topic: "one" } }, { sessionID: "parent" })
-    const runId = first.match(/run="([^"]+)"/u)?.[1]
+     first = await tool.execute({ script, args: { topic: "one" } }, { sessionID: "parent" }),
+     runId = first.match(/run="(?<runId>[^"]+)"/u)?.[1]
     expect(runId).toBeDefined()
 
     const second = await tool.execute(
@@ -317,9 +319,9 @@ describe("tool execution", () => {
 
   test("surfaces failed agents rather than letting partial coverage read as full", async () => {
     // A client whose session.create never returns data, so every agent fails to spawn.
-    const failing = { session: { ...stubClient.session, create: () => Promise.resolve({ error: "nope" }) } }
-    const tool = toolOf(ultraopen({ client: failing }))
-    const output = await tool?.execute(
+    const failing = { session: { ...stubClient.session, create: () => Promise.resolve({ error: "nope" }) } },
+     tool = toolOf(ultraopen({ client: failing })),
+     output = await tool?.execute(
       { script: `${META}await parallel([() => agent('a'), () => agent('b')])\nreturn 'done'\n` },
       { sessionID: "parent" },
     )
@@ -349,9 +351,9 @@ describe("model and effort wiring", () => {
   }
 
   test("reads the session's default model and resolves effort against ITS variants", async () => {
-    const tool = toolOf(ultraopen({ client: catalogClient }))
-    const script = `${META}await agent('x', { effort: 'xhigh' })\nreturn 'done'\n`
-    const output = await tool?.execute({ script }, { sessionID: "parent" })
+    const tool = toolOf(ultraopen({ client: catalogClient })),
+     script = `${META}await agent('x', { effort: 'xhigh' })\nreturn 'done'\n`,
+     output = await tool?.execute({ script }, { sessionID: "parent" })
 
     // The model has no xhigh, so the request is downgraded — and the run log SAYS so, rather than
     // silently applying no extra thinking at all.
@@ -367,9 +369,9 @@ describe("model and effort wiring", () => {
         providers: () => Promise.resolve({ data: { providers: [] } }),
       },
       session: catalogClient.session,
-    }
-    const tool = toolOf(ultraopen({ client: failing }))
-    const output = await tool?.execute({ script: `${META}return 'fine'\n` }, { sessionID: "parent" })
+    },
+     tool = toolOf(ultraopen({ client: failing })),
+     output = await tool?.execute({ script: `${META}return 'fine'\n` }, { sessionID: "parent" })
     expect(output).toContain("fine")
   })
 
@@ -384,8 +386,8 @@ describe("model and effort wiring", () => {
         },
       },
       session: stubClient.session,
-    }
-    const tool = toolOf(ultraopen({ client: watched }))
+    },
+     tool = toolOf(ultraopen({ client: watched }))
     await tool?.execute({ script: `${META}return 1\n`, dryRun: true }, { sessionID: "parent" })
     expect(fetched).toBe(false)
   })
@@ -398,8 +400,8 @@ describe("startup orphan sweep", () => {
     const hostile = {
       config: stubClient.config,
       session: { ...stubClient.session, abort: () => Promise.reject(new Error("server down")) },
-    }
-    const hooks = ultraopen({ client: hostile })
+    },
+     hooks = ultraopen({ client: hostile })
     expect(toolOf(hooks)).toBeDefined()
     // Let the detached sweep settle so an unhandled rejection would surface here.
     await new Promise((resolve) => {

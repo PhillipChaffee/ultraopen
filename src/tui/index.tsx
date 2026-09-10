@@ -1,7 +1,8 @@
 import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui"
-import { createSignal, For, onCleanup, Show } from "solid-js"
+import { createEffect, createSignal, onCleanup } from "solid-js"
 import { homedir } from "node:os"
-import { RunPoller, dataRoot, formatElapsed, glyph, summarize, type RunView } from "./data.js"
+import { RunPoller, dataRoot, formatElapsed, glyph, summarize } from "./data.js"
+import type { RunView } from "./data.js"
 
 /**
  * The TUI half of ultraopen.
@@ -13,18 +14,21 @@ import { RunPoller, dataRoot, formatElapsed, glyph, summarize, type RunView } fr
  * This file is deliberately thin. Every decision lives in ./data.ts, which is tested without a
  * terminal; a JSX component cannot be unit-tested here and so should contain as little as possible.
  *
- * Progress is READ FROM DISK rather than pushed. `ctx.metadata()` is a no-op for plugin tools, and
- * the transcript renderer only knows about built-in tools, so there is no server→TUI channel for
- * arbitrary data. Polling the run directory also works when the TUI is not the process running the
- * workflow.
+ * RENDERING MODEL (opencode 1.18.x / @opentui 0.4.5): external TUI plugin slots render their
+ * initial state and then NEVER re-render — reactive expressions keep their mount-time value and
+ * Show/For insertion silently no-ops. Solid reactivity is therefore unusable for live progress;
+ * every surface below is a single statically-mounted <text> whose content the poller-driven
+ * createEffect writes imperatively (node.content + requestRender), which does repaint. Two
+ * visible consequences of the single-node model: the failed-agent glyph shares the muted color
+ * of its line instead of the error color, and an open sidebar shows one blank line when the
+ * session has no active runs. test/e2e/visual.sh asserts all of this against the live TUI; the
+ * bisect that established the constraint is in the repo's session history for 2026-09-07.
  */
 
-/**
- * The run directory root, resolved EXACTLY as the server resolves it: $XDG_DATA_HOME, else
- * `homedir()`. `api.state.path` is deliberately not consulted — it is not guaranteed to be the
- * user's home and any divergence between the halves means the TUI silently polls an empty
- * directory and shows no runs at all.
- */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type TextNode = any
+
+// The run-data root must resolve exactly like the server half's (src/server/resume/store.ts).
 function runRoot(): string {
   return dataRoot(process.env, homedir())
 }
@@ -38,36 +42,46 @@ function useRuns(sessionID: () => string) {
   return runs
 }
 
-function Sidebar(props: { api: TuiPluginApi; session_id: string }) {
-  const runs = useRuns(() => props.session_id)
-  const theme = () => props.api.theme.current
+/** Mount one <text> and hand its renderable to an imperative writer. */
+function sidebarLines(rs: RunView[]): string {
+  if (rs.length === 0) {return ""}
+  const lines: string[] = ["ultracode"]
+  for (const run of rs) {
+    lines.push(summarize(run))
+    for (const agent of run.agents) {lines.push(`${glyph(agent.status)} ${agent.label}`)}
+  }
+  return lines.join("\n")
+}
 
-  return (
-    <Show when={runs().length > 0}>
-      <box>
-        <text fg={theme().text}>
-          <b>ultracode</b>
-        </text>
-        <For each={runs()}>
-          {(run) => (
-            <box>
-              <text fg={theme().textMuted}>{summarize(run)}</text>
-              <For each={run.agents}>
-                {(agent) => (
-                  <box flexDirection="row" gap={1}>
-                    <text fg={agent.status === "failed" ? theme().error : theme().textMuted}>
-                      {glyph(agent.status)}
-                    </text>
-                    <text fg={theme().textMuted}>{agent.label}</text>
-                  </box>
-                )}
-              </For>
-            </box>
-          )}
-        </For>
-      </box>
-    </Show>
-  )
+function Sidebar(props: { api: TuiPluginApi; session_id: string }) {
+  const runs = useRuns(() => props.session_id),
+   theme = () => props.api.theme.current
+  let node: TextNode
+
+  createEffect(() => {
+    if (!node) {return}
+    node.content = sidebarLines(runs())
+    node.requestRender?.()
+    props.api.renderer.requestRender?.()
+  })
+
+  return <text fg={theme().textMuted} ref={(r: TextNode) => (node = r)} />
+}
+
+// The input box's border sits at column 2 and its right edge at width-2 (measured from live
+// Frames at 200 and 60 columns). The strip pads to the box's left edge and clips at its right
+// Edge so it cannot spill past either. Width comes from stdout.columns — the plugin runs in the
+// TUI host process, where stdout is the pane — read per update, so resizes are picked up.
+const STRIP_INSET = 2,
+ alignStrip = (content: string): string => {
+  const width = process.stdout.columns ?? 0
+  return content
+    .split("\n")
+    .map((line) => {
+      const padded = " ".repeat(STRIP_INSET) + line
+      return width > STRIP_INSET ? padded.slice(0, width - STRIP_INSET) : padded
+    })
+    .join("\n")
 }
 
 /** One always-visible line per active run, under the transcript. */
@@ -75,42 +89,55 @@ function BottomStrip(props: { api: TuiPluginApi }) {
   const current = () => {
     const route = props.api.route.current
     return route.name === "session" ? ((route.params?.["sessionID"] as string) ?? "") : ""
-  }
-  const runs = useRuns(current)
-  const theme = () => props.api.theme.current
+  },
+   runs = useRuns(current),
+   theme = () => props.api.theme.current
+  let node: TextNode
 
-  return (
-    <Show when={runs().length > 0}>
-      <box>
-        <For each={runs()}>
-          {(run) => (
-            <text fg={theme().textMuted}>
-              ultracode · {summarize(run)}
-              {run.agents.length > 0 && runs().length === 1
-                ? `  ${run.agents.map((agent) => `${glyph(agent.status)} ${agent.label}`).join("   ")}`
-                : ""}
-            </text>
-          )}
-        </For>
-      </box>
-    </Show>
-  )
+  createEffect(() => {
+    const rs = runs()
+    if (!node) {return}
+    let content = ""
+    if (rs.length === 1) {
+      const run = rs[0],
+       agents =
+        run.agents.length > 0
+          ? `  ${run.agents.map((agent) => `${glyph(agent.status)} ${agent.label}`).join("   ")}`
+          : ""
+      content = `ultracode · ${summarize(run)}${agents}`
+    } else if (rs.length > 1) {
+      content = rs.map((run) => `ultracode · ${summarize(run)}`).join("\n")
+    }
+    node.content = alignStrip(content)
+    node.requestRender?.()
+    props.api.renderer.requestRender?.()
+  })
+
+  return <text fg={theme().textMuted} ref={(r: TextNode) => (node = r)} />
 }
 
 /** Compact status beside the prompt, so a run is visible with the sidebar closed. */
 function PromptStatus(props: { api: TuiPluginApi; session_id: string }) {
-  const runs = useRuns(() => props.session_id)
-  const theme = () => props.api.theme.current
+  const runs = useRuns(() => props.session_id),
+   theme = () => props.api.theme.current
+  let node: TextNode
 
-  return (
-    <Show when={runs().length > 0}>
-      <text fg={theme().textMuted}>
-        {runs().length === 1 && runs()[0]
-          ? `ultracode ⠋ ${runs()[0]?.phase ? `${runs()[0]?.phase} · ` : ""}${runs()[0]?.done}/${runs()[0]?.total} ${formatElapsed(runs()[0]?.elapsedSeconds ?? 0)}`
-          : `ultracode ⠋ ${runs().length} runs`}
-      </text>
-    </Show>
-  )
+  createEffect(() => {
+    const rs = runs()
+    if (!node) {return}
+    let content = ""
+    const run = rs[0]
+    if (rs.length === 1 && run) {
+      content = `ultracode ⠋ ${run.phase ? `${run.phase} · ` : ""}${run.done}/${run.total} ${formatElapsed(run.elapsedSeconds ?? 0)}`
+    } else if (rs.length > 1) {
+      content = `ultracode ⠋ ${rs.length} runs`
+    }
+    node.content = content
+    node.requestRender?.()
+    props.api.renderer.requestRender?.()
+  })
+
+  return <text fg={theme().textMuted} ref={(r: TextNode) => (node = r)} />
 }
 
 // eslint-disable-next-line require-await -- TuiPlugin is declared async by the host contract.
@@ -131,4 +158,6 @@ const tui: TuiPlugin = async (api) => {
   })
 }
 
-export default { id: "ultraopen", tui }
+const plugin = { id: "ultraopen", tui }
+
+export default plugin

@@ -15,10 +15,10 @@ import { DEFAULT_CONCURRENCY } from "./script/limits.js"
  */
 
 /** Sessions this engine created. The recursion guard's in-memory layer, and the abort roster. */
-const engineSessions = new Set<string>()
+const engineSessions = new Set<string>(),
 
 /** Child session id -> the run that owns it, so aborts and budget roll up correctly. */
-const sessionToRun = new Map<string, string>()
+ sessionToRun = new Map<string, string>()
 
 let semaphore = new Semaphore(DEFAULT_CONCURRENCY)
 
@@ -36,7 +36,7 @@ export const registry = {
    */
   configureConcurrency(limit: number): void {
     const clamped = Semaphore.clamp(limit)
-    if (clamped === semaphore.limit) return
+    if (clamped === semaphore.limit) {return}
     semaphore.resize(clamped)
   },
 
@@ -63,7 +63,7 @@ export const registry = {
   sessionsOf(runId: string): string[] {
     const out: string[] = []
     for (const [sessionID, id] of sessionToRun) {
-      if (id === runId) out.push(sessionID)
+      if (id === runId) {out.push(sessionID)}
     }
     return out
   },

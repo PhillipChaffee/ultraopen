@@ -7,13 +7,13 @@ const diag = (source: string) => {
   try {
     parse(source)
   } catch (error) {
-    if (error instanceof WorkflowScriptError) return error.diagnostic
+    if (error instanceof WorkflowScriptError) {return error.diagnostic}
     throw error
   }
   throw new Error("expected parse to throw")
-}
+},
 
-const metaOf = (literalSource: string) => parse(`export const meta = ${literalSource}\n`).meta
+ metaOf = (literalSource: string) => parse(`export const meta = ${literalSource}\n`).meta
 
 describe("literal walk rejections", () => {
   test.each([
@@ -120,8 +120,8 @@ describe("meta shape validation", () => {
 
 describe("export blanking", () => {
   test("blanks `export { ... }` list form and `export default`", () => {
-    const src = `export const meta = { name: 'x', description: 'y' }\nconst a = 1\nexport default a\nexport { a }\n`
-    const { body } = parse(src)
+    const src = `export const meta = { name: 'x', description: 'y' }\nconst a = 1\nexport default a\nexport { a }\n`,
+     { body } = parse(src)
     expect(body).not.toContain("export")
     expect(body.length).toBe(src.length)
     expect(body.split("\n").length).toBe(src.split("\n").length)

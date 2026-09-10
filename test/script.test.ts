@@ -4,19 +4,21 @@ import { run } from "../src/server/script/sandbox.js"
 import { WorkflowScriptError } from "../src/server/script/errors.js"
 import { MAX_SCRIPT_CHARS } from "../src/server/script/limits.js"
 
-const META = `export const meta = { name: 'x', description: 'y' }\n`
+const META = `export const meta = { name: 'x', description: 'y' }\n`,
 
-const diag = (fn: () => unknown) => {
+ diag = (fn: () => unknown) => {
   try {
     fn()
-  } catch (err) {
-    if (err instanceof WorkflowScriptError) return err.diagnostic
-    throw err
+  } catch (error) {
+    if (error instanceof WorkflowScriptError) {
+      return error.diagnostic
+    }
+    throw error
   }
   throw new Error("expected the call to throw")
-}
+},
 
-const noopGlobals = {
+ noopGlobals = {
   agent: () => {},
   parallel: () => {},
   pipeline: () => {},
@@ -116,8 +118,8 @@ describe("parse — pure-literal meta", () => {
       "const confirmed = results.flat().filter(Boolean).filter(f => f.verdict?.isReal)",
       "return { confirmed }",
       "",
-    ].join("\n")
-    const { meta } = parse(src)
+    ].join("\n"),
+     { meta } = parse(src)
     expect(meta.name).toBe("review-changes")
     expect(meta.phases?.map((p) => p.title)).toEqual(["Review", "Verify"])
   })
@@ -175,8 +177,8 @@ describe("parse — determinism lint", () => {
 
 describe("parse — export blanking preserves offsets", () => {
   test("line numbers are unchanged after blanking", () => {
-    const src = `${META}\n\nconst x = 1\n`
-    const { body } = parse(src)
+    const src = `${META}\n\nconst x = 1\n`,
+     { body } = parse(src)
     expect(body.length).toBe(src.length)
     expect(body.split("\n").length).toBe(src.split("\n").length)
     expect(body).not.toContain("export")
@@ -184,8 +186,8 @@ describe("parse — export blanking preserves offsets", () => {
 
   test("a TRAILING export is also blanked", () => {
     // Without this, the literal walk passes and AsyncFunction throws an opaque syntax error.
-    const src = `${META}export function helper() { return 1 }\n`
-    const { body } = parse(src)
+    const src = `${META}export function helper() { return 1 }\n`,
+     { body } = parse(src)
     expect(body).not.toContain("export")
     expect(body.length).toBe(src.length)
   })
@@ -193,7 +195,7 @@ describe("parse — export blanking preserves offsets", () => {
 
 describe("parse — limits", () => {
   test("an oversized script is rejected explicitly", () => {
-    const d = diag(() => parse(META + "//" + "x".repeat(MAX_SCRIPT_CHARS)))
+    const d = diag(() => parse(`${META  }//${  "x".repeat(MAX_SCRIPT_CHARS)}`))
     expect(d.kind).toBe("LimitError")
     expect(d.message).toContain(String(MAX_SCRIPT_CHARS))
   })
@@ -263,9 +265,9 @@ describe("sandbox — runtime traps", () => {
   })
 
   test("injected globals are callable and args is passed through", async () => {
-    const { body } = parse(`${META}log('hi'); return args.value\n`)
-    const seen: string[] = []
-    const result = await run(body, { ...noopGlobals, log: (m: string) => seen.push(m), args: { value: 99 } })
+    const { body } = parse(`${META}log('hi'); return args.value\n`),
+     seen: string[] = [],
+     result = await run(body, { ...noopGlobals, log: (m: string) => seen.push(m), args: { value: 99 } })
     expect(result).toBe(99)
     expect(seen).toEqual(["hi"])
   })

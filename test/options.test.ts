@@ -2,11 +2,11 @@ import { describe, expect, test } from "bun:test"
 import { resolveOptions } from "../src/server/options.js"
 import { MAX_CONCURRENCY, MIN_CONCURRENCY } from "../src/server/script/limits.js"
 
-const DEFAULT_CONCURRENCY = 8
-const DEFAULT_AGENT_DEADLINE_MS = 15 * 60 * 1000
-const DEFAULT_EFFORT_PREFERENCE = ["xhigh", "max", "high", "medium", "low"]
+const DEFAULT_CONCURRENCY = 8,
+ DEFAULT_AGENT_DEADLINE_MS = 15 * 60 * 1000,
+ DEFAULT_EFFORT_PREFERENCE = ["xhigh", "max", "high", "medium", "low"],
 
-const DEFAULTS = {
+ DEFAULTS = {
   concurrency: DEFAULT_CONCURRENCY,
   ultracode: false,
   agentDeadlineMs: DEFAULT_AGENT_DEADLINE_MS,
@@ -112,8 +112,8 @@ describe("resolveOptions — effortPreference", () => {
 
 describe("resolveOptions — returns a fresh copy", () => {
   test("mutating a primitive field on one result does not affect a later call", () => {
-    const first = resolveOptions({})
-    const second = resolveOptions({})
+    const first = resolveOptions({}),
+     second = resolveOptions({})
     expect(first).not.toBe(second)
 
     first.concurrency = 999
@@ -126,12 +126,12 @@ describe("resolveOptions — returns a fresh copy", () => {
   })
 
   test("mutating one result's user-supplied effortPreference array does not affect a later call", () => {
-    const first = resolveOptions({ effortPreference: ["high", "low"] })
-    const second = resolveOptions({ effortPreference: ["high", "low"] })
+    const first = resolveOptions({ effortPreference: ["high", "low"] }),
+     second = resolveOptions({ effortPreference: ["high", "low"] }),
 
     // `stringArray` always runs the input through `.filter()`, which allocates a new array even
     // when every entry survives — so two calls with equal-looking input never share a backing array.
-    const mutableEffort = first.effortPreference as string[]
+     mutableEffort = first.effortPreference as string[]
     mutableEffort.push("mutated")
 
     expect(second.effortPreference).toEqual(["high", "low"])
@@ -144,8 +144,8 @@ describe("resolveOptions — returns a fresh copy", () => {
   // and mutating it (e.g. via an unsafe `as string[]` cast past the `readonly` type) would corrupt
   // every future call's defaults, including `DEFAULTS` itself, for the process's lifetime.
   test("the default effortPreference array is shared by reference across calls, not copied", () => {
-    const first = resolveOptions({})
-    const second = resolveOptions({})
+    const first = resolveOptions({}),
+     second = resolveOptions({})
     expect(first.effortPreference).toBe(second.effortPreference)
   })
 })

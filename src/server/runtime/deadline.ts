@@ -19,7 +19,7 @@ export class DeadlineExceededError extends Error {
   }
 }
 
-export type DeadlineOptions = {
+export interface DeadlineOptions {
   ms: number
   label: string
   /** Invoked exactly once if the deadline fires, before the returned promise rejects. */
@@ -51,8 +51,8 @@ export async function withDeadline<T>(work: Promise<T>, options: DeadlineOptions
     },
   }
 
-  let handle: unknown
-  let fired = false
+  let handle: unknown,
+   fired = false
 
   const timeout = new Promise<never>((_resolve, reject) => {
     handle = timers.setTimeout(() => {

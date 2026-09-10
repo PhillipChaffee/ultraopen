@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { WORKFLOW_TOOL } from "../src/server/bridge/permission.js"
-import { installConfig, type MutableConfig } from "../src/server/ultracode/config.js"
+import { installConfig } from "../src/server/ultracode/config.js"
+import type { MutableConfig } from "../src/server/ultracode/config.js"
 
 /** Narrows an installed block for property inspection — the schema types these fields as `unknown`. */
 function asRecord(value: unknown): Record<string, unknown> {

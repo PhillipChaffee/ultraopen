@@ -1,0 +1,30 @@
+name: Security
+
+# zizmor audits the GitHub Actions workflow files themselves (template injection, credential
+# persistence, excessive permissions). CodeQL code scanning is not an option here: it requires
+# a public repo or paid GitHub Code Security, and this repo is private.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  zizmor:
+    name: zizmor audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      # The explicit `docker run` form instead of `uses: docker://` keeps the audit independent
+      # of action-input plumbing and pins nothing to a third-party action tag.
+      - name: Run zizmor
+        run: docker run --rm -v "$PWD:/repo" ghcr.io/zizmorcore/zizmor:latest /repo

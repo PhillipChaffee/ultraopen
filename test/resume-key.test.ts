@@ -46,8 +46,8 @@ describe("canonicalOptions", () => {
   })
 
   test("is insensitive to schema property order", () => {
-    const a = canonicalOptions({ schema: { type: "object", required: ["x"] } })
-    const b = canonicalOptions({ schema: { required: ["x"], type: "object" } })
+    const a = canonicalOptions({ schema: { type: "object", required: ["x"] } }),
+     b = canonicalOptions({ schema: { required: ["x"], type: "object" } })
     expect(a).toBe(b)
   })
 })

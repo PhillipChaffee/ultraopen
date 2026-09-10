@@ -1,11 +1,12 @@
 import { describe, expect, test } from "bun:test"
 import { ProgressWriter } from "../src/server/resume/progress.js"
-import { RunPoller, activeRuns, dataRoot, formatElapsed, glyph, summarize, toView, type RunView } from "../src/tui/data.js"
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises"
+import { RunPoller, activeRuns, dataRoot, formatElapsed, glyph, summarize, toView } from "../src/tui/data.js"
+import type { RunView } from "../src/tui/data.js"
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-const writer = (writes: Array<{ path: string; body: string }>) =>
+const writer = (writes: { path: string; body: string }[]) =>
   new ProgressWriter({
     runId: "wf_abc123",
     workflow: "demo",
@@ -56,8 +57,8 @@ describe("ProgressWriter", () => {
   })
 
   test("writes only when something changed", async () => {
-    const writes: Array<{ path: string; body: string }> = []
-    const progress = writer(writes)
+    const writes: { path: string; body: string }[] = [],
+     progress = writer(writes)
 
     await progress.flush()
     expect(writes.length).toBe(0)
@@ -87,13 +88,13 @@ describe("ProgressWriter", () => {
     // Regression: flush() returned immediately when a write was in flight, without rescheduling.
     // If the skipped event was the run's LAST, its final state never reached disk and the TUI
     // showed an agent as running after it had finished.
-    let releaseWrite: (() => void) | undefined
-    let resolveSecond!: () => void
+    let releaseWrite: (() => void) | undefined,
+     resolveSecond!: () => void
     const secondWrite = new Promise<void>((resolve) => {
       resolveSecond = resolve
-    })
-    const writes: string[] = []
-    const progress = new ProgressWriter({
+    }),
+     writes: string[] = [],
+     progress = new ProgressWriter({
       runId: "wf_abc123",
       workflow: "d",
       sessionID: "s",
@@ -106,7 +107,7 @@ describe("ProgressWriter", () => {
           })
         }
         writes.push(body)
-        if (writes.length === 2) resolveSecond()
+        if (writes.length === 2) {resolveSecond()}
       },
     })
 
@@ -139,8 +140,8 @@ describe("ProgressWriter", () => {
   })
 
   test("writes into the run directory", async () => {
-    const writes: Array<{ path: string; body: string }> = []
-    const progress = writer(writes)
+    const writes: { path: string; body: string }[] = [],
+     progress = writer(writes)
     progress.apply({ type: "log", message: "x" }, 1)
     await progress.flush()
     expect(writes[0]?.path).toContain(join("ultraopen", "wf_abc123", "progress.json"))
@@ -230,7 +231,7 @@ const seed = async (
 ): Promise<void> => {
   await mkdir(join(root, runId), { recursive: true })
   await writeFile(join(root, runId, "manifest.json"), JSON.stringify(manifest), "utf8")
-  if (progress) await writeFile(join(root, runId, "progress.json"), JSON.stringify(progress), "utf8")
+  if (progress) {await writeFile(join(root, runId, "progress.json"), JSON.stringify(progress), "utf8")}
 }
 
 describe("activeRuns", () => {
@@ -257,7 +258,8 @@ describe("activeRuns", () => {
     await seed(root, "wf_a", { status: "running", sessionID: "s1" }, { runId: "wf_a", startedAt: 0 })
     await writeFile(join(root, "wf_bad", "manifest.json").replace("wf_bad/", ""), "x").catch(() => undefined)
 
-    expect((await activeRuns({ root, sessionID: "s1", now: 0 })).length).toBe(1)
+    const result = await activeRuns({ root, sessionID: "s1", now: 0 })
+    expect(result.length).toBe(1)
   })
 
   test("returns nothing when the root does not exist", async () => {
@@ -268,7 +270,8 @@ describe("activeRuns", () => {
     const root = await mkdtemp(join(tmpdir(), "ultraopen-tui-"))
     await seed(root, "wf_zzz", { status: "running", sessionID: "s1" }, { runId: "wf_zzz", startedAt: 0 })
     await seed(root, "wf_aaa", { status: "running", sessionID: "s1" }, { runId: "wf_aaa", startedAt: 0 })
-    expect((await activeRuns({ root, sessionID: "s1", now: 0 })).map((run) => run.runId)).toEqual(["wf_aaa", "wf_zzz"])
+    const result = await activeRuns({ root, sessionID: "s1", now: 0 })
+    expect(result.map((run) => run.runId)).toEqual(["wf_aaa", "wf_zzz"])
     await rm(root, { recursive: true, force: true })
   })
 })
@@ -288,9 +291,9 @@ describe("default write path", () => {
   test("writes a real file when no writer is injected", async () => {
     // The tests above inject a fake writer, which would leave the real file path untested — the
     // one part that actually has to work for the TUI to see anything.
-    const base = await mkdtemp(join(tmpdir(), "ultraopen-pw-"))
-    const env = { XDG_DATA_HOME: base } as NodeJS.ProcessEnv
-    const dir = join(base, "opencode", "tool-output", "ultraopen", "wf_real01")
+    const base = await mkdtemp(join(tmpdir(), "ultraopen-pw-")),
+     env = { XDG_DATA_HOME: base } as NodeJS.ProcessEnv,
+     dir = join(base, "opencode", "tool-output", "ultraopen", "wf_real01")
     await mkdir(dir, { recursive: true })
 
     const progress = new ProgressWriter({
@@ -312,8 +315,8 @@ describe("default write path", () => {
 
 /** A controllable timer, so poller tests are instant and deterministic. */
 const fakeTimers = () => {
-  const pending: Array<() => void> = []
-  const cleared: unknown[] = []
+  const pending: (() => void)[] = [],
+   cleared: unknown[] = []
   return {
     api: {
       setInterval: (fn: () => void) => {
@@ -325,7 +328,10 @@ const fakeTimers = () => {
       },
     },
     tick: () => {
-      for (const fn of pending.slice()) fn()
+      const snapshot = [...pending]
+      for (const fn of snapshot) {
+        fn()
+      }
     },
     cleared,
   }
@@ -336,8 +342,8 @@ describe("RunPoller", () => {
     // The default timer arrows are the only path the fake-timer tests never reach. A fast real
     // interval proves ticks fire, and that no tick lands after unsubscribe — i.e. cleanup is
     // real, not a no-op.
-    const root = "/definitely/not/here"
-    const poller = new RunPoller({ root: () => root, pollMs: 5 })
+    const root = "/definitely/not/here",
+     poller = new RunPoller({ root: () => root, pollMs: 5 })
     let calls = 0
     const unsubscribe = poller.subscribe(() => "s1", () => {
       calls++
@@ -360,12 +366,12 @@ describe("RunPoller", () => {
     const root = await mkdtemp(join(tmpdir(), "ultraopen-poll-"))
     await seed(root, "wf_a", { status: "running", sessionID: "s1" }, { runId: "wf_a", startedAt: 0 })
     await seed(root, "wf_b", { status: "running", sessionID: "s2" }, { runId: "wf_b", startedAt: 0 })
-    const timers = fakeTimers()
-    const poller = new RunPoller({ root: () => root, pollMs: 1000, timers: timers.api })
+    const timers = fakeTimers(),
+     poller = new RunPoller({ root: () => root, pollMs: 1000, timers: timers.api }),
 
-    const mine: RunView[][] = []
-    const other: RunView[][] = []
-    const unsub1 = poller.subscribe(() => "s1", (runs) => mine.push(runs))
+     mine: RunView[][] = [],
+     other: RunView[][] = [],
+     unsub1 = poller.subscribe(() => "s1", (runs) => mine.push(runs))
     // The immediate refresh fires at subscribe time.
     await Bun.sleep(5)
     const unsub2 = poller.subscribe(() => "s2", (runs) => other.push(runs))
@@ -375,8 +381,8 @@ describe("RunPoller", () => {
     expect(other.at(-1)?.map((run) => run.runId)).toEqual(["wf_b"])
 
     // One interval fires once; BOTH subscribers get fresh data from that single directory pass.
-    const mineBefore = mine.length
-    const otherBefore = other.length
+    const mineBefore = mine.length,
+     otherBefore = other.length
     timers.tick()
     await Bun.sleep(5)
     expect(mine.length).toBe(mineBefore + 1)

@@ -12,7 +12,7 @@
 import { rename, rm } from "node:fs/promises"
 import { join } from "node:path"
 
-const OUT = "dist"
+const OUT = "dist",
 
 /**
  * Left unbundled at runtime.
@@ -20,7 +20,7 @@ const OUT = "dist"
  * The TUI runtime shares the host's module instances: a bundled second copy of solid-js would give
  * the plugin its own reactive owner graph, and its components would never update.
  */
-const EXTERNAL = [
+ EXTERNAL = [
   "solid-js",
   "solid-js/*",
   "@opentui/core",
@@ -44,7 +44,7 @@ for (const [entry, name] of [
   })
 
   if (!result.success) {
-    for (const log of result.logs) console.error(log)
+    for (const log of result.logs) {console.error(log)}
     process.exit(1)
   }
 

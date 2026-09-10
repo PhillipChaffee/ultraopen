@@ -9,14 +9,14 @@
 
 export type ModeSource = "agent" | "keyword" | "command" | "option"
 
-export type ModeState = {
+export interface ModeState {
   active: boolean
   source: ModeSource
   /** Message id at which the mode was switched on, so earlier turns are not retroactively decorated. */
   fromMessageID?: string | undefined
 }
 
-const sessions = new Map<string, ModeState>()
+const sessions = new Map<string, ModeState>(),
 
 /**
  * Sessions where the user has told the agent NOT to fan out.
@@ -24,7 +24,7 @@ const sessions = new Map<string, ModeState>()
  * Spec §1.6: an explicit instruction beats the mode. Ultracode's raised reasoning effort still
  * applies, but the standing opt-in reverts to ask-first.
  */
-const demoted = new Set<string>()
+ demoted = new Set<string>()
 
 /**
  * Project-level default, from the plugin-options tuple.
@@ -65,8 +65,8 @@ export const mode = {
    */
   isActive(sessionID: string, agentName?: string): boolean {
     const state = sessions.get(sessionID)
-    if (state) return state.active
-    if (agentName === "ultracode") return true
+    if (state) {return state.active}
+    if (agentName === "ultracode") {return true}
     return defaultOn
   },
 

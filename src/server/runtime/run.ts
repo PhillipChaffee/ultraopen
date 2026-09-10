@@ -1,19 +1,22 @@
 import { fail } from "../script/errors.js"
 import { DEFAULT_AGENT_DEADLINE_MS, MAX_AGENTS_PER_RUN } from "../script/limits.js"
 import { registry } from "../singleton.js"
-import { type NullReason } from "../bridge/spawn.js"
+import type { NullReason } from "../bridge/spawn.js"
 import { spawnStructured } from "../bridge/structured.js"
-import { Journal, type JournalEntry } from "../resume/journal.js"
+import { Journal } from "../resume/journal.js"
+import type { JournalEntry } from "../resume/journal.js"
 import { toJournalEntry, toReplayedEntry, tryReplay } from "../resume/replay.js"
 import { stableStringify } from "../resume/key.js"
-import { breakScope, nextCallIdentity, rootScope, withScope, type Scope } from "../resume/scope.js"
-import { assertWithinBudget, makeBudget, type Budget } from "./budget.js"
+import { breakScope, nextCallIdentity, rootScope, withScope } from "../resume/scope.js"
+import type { Scope } from "../resume/scope.js"
+import { assertWithinBudget, makeBudget } from "./budget.js"
+import type { Budget } from "./budget.js"
 import { createWorktree } from "../bridge/isolation.js"
 import type { Ruleset } from "../bridge/permission.js"
 import type { OpencodeClient } from "../types.js"
 
 /** Options a script may pass to `agent()`. Mirrors the Workflow spec's opts bag. */
-export type AgentOptions = {
+export interface AgentOptions {
   label?: string
   phase?: string
   schema?: Record<string, unknown>
@@ -25,7 +28,7 @@ export type AgentOptions = {
 }
 
 /** One agent's outcome, recorded so partial coverage can never read as full coverage. */
-export type AgentRecord = {
+export interface AgentRecord {
   index: number
   label: string
   phase: string | undefined
@@ -44,7 +47,7 @@ export type ProgressEvent =
   | { type: "phase"; title: string }
   | { type: "log"; message: string }
 
-export type RunOptions = {
+export interface RunOptions {
   runId: string
   client: OpencodeClient
   parentSessionID: string
@@ -65,11 +68,15 @@ export type RunOptions = {
   deadlineMs?: number | undefined
   signal?: AbortSignal | undefined
   onProgress?: ((event: ProgressEvent) => void) | undefined
+  /** Called with each journal entry the moment it is recorded — incremental flush, not endRun. */
+  onJournal?: ((entry: JournalEntry) => void) | undefined
   /** Journal entries from a previous run, indexed as replay candidates. */
   previousEntries?: readonly JournalEntry[] | undefined
   /** The run this one resumes, recorded on replayed entries so they are distinguishable. */
   resumedFrom?: string | undefined
-  /** Root chain seed — the script hash, so any edit invalidates everything. */
+  /** Root chain seed. Callers seed it from the args hash: `args` is invisible to the per-call
+   * chain but can change every result, so a change must invalidate everything — while script
+   * edits stay incrementally replayable (see tool/workflow.ts). */
   resumeSeed?: string | undefined
   /** Output-token ceiling for the run, or null for none. */
   budgetTotal?: number | null | undefined
@@ -96,7 +103,7 @@ export class Run {
   readonly #rootScope: Scope
   readonly #resumedFrom: string | undefined
   readonly #budget: Budget
-  readonly #worktrees: Array<() => Promise<void>> = []
+  readonly #worktrees: (() => Promise<void>)[] = []
 
   constructor(options: RunOptions) {
     this.#options = options
@@ -108,7 +115,7 @@ export class Run {
     // and nothing replays against a program that no longer exists.
     this.#rootScope = rootScope(options.resumeSeed ?? "root")
     this.#budget = makeBudget({ total: options.budgetTotal ?? null, spent: () => this.outputTokens })
-    if (options.previousEntries) this.#journal.loadPrevious(options.previousEntries)
+    if (options.previousEntries) {this.#journal.loadPrevious(options.previousEntries)}
   }
 
   /** The `budget` global handed to the script. */
@@ -181,18 +188,20 @@ export class Run {
     // nondeterminism the scoped chain exists to remove.
     const index = this.#spawned
     this.#spawned++
-    const identity = nextCallIdentity(prompt, options, this.#rootScope)
+    const identity = nextCallIdentity(prompt, options, this.#rootScope),
 
-    const label = options.label ?? deriveLabel(prompt, index)
-    const phase = options.phase ?? this.#currentPhase
-    const schemaHash = options.schema ? stableStringify(options.schema) : undefined
+     label = options.label ?? deriveLabel(prompt, index),
+     phase = options.phase ?? this.#currentPhase,
+     schemaHash = options.schema ? stableStringify(options.schema) : undefined,
 
     // Replay before spending anything. `forceLive` covers the sticky break: once a call in this
     // scope has missed, every later call in it must run live, because their upstream context
     // changed and a cached result belongs to a different execution.
-    const hit = tryReplay(this.#journal, identity, schemaHash)
+     hit = tryReplay(this.#journal, identity, schemaHash)
     if (hit) {
-      this.#journal.record(toReplayedEntry(hit.entry, label, phase, this.#resumedFrom))
+      const replayed = toReplayedEntry(hit.entry, label, phase, this.#resumedFrom)
+      this.#journal.record(replayed)
+      this.#options.onJournal?.(replayed)
       this.#options.onProgress?.({ type: "agent-end", index, label, phase, ok: true })
       // Replayed spend counts as if paid, or a budget-guarded loop takes a different number of
       // trips on resume and the script's own control flow diverges.
@@ -200,7 +209,7 @@ export class Run {
       return hit.value
     }
     // A miss breaks the scope for everything after it.
-    if (!identity.forceLive) breakScope(this.#rootScope)
+    if (!identity.forceLive) {breakScope(this.#rootScope)}
 
     this.#options.onProgress?.({ type: "agent-start", index, label, phase })
 
@@ -214,12 +223,12 @@ export class Run {
       if (this.#options.signal?.aborted) {
         fail({ kind: "RuntimeError", message: "The run was aborted before this agent could start." })
       }
-      const model = this.#options.resolveModel?.(options.model)
-      const worktree =
+      const model = this.#options.resolveModel?.(options.model),
+       worktree =
         options.isolation === "worktree" && this.#options.worktreeRoot
           ? await createWorktree({ worktreeRoot: this.#options.worktreeRoot, label, onNote: this.log })
           : undefined
-      if (worktree) this.#worktrees.push(worktree.release)
+      if (worktree) {this.#worktrees.push(worktree.release)}
       const outcome = await spawnStructured(this.#options.client, {
         prompt,
         runId: this.runId,
@@ -235,9 +244,9 @@ export class Run {
         ...pick("deadlineMs", this.#options.deadlineMs ?? DEFAULT_AGENT_DEADLINE_MS),
         ...pick("signal", this.#options.signal),
         ...pick("directory", worktree?.directory),
-      })
+      }),
 
-      const record: AgentRecord = outcome.ok
+       record: AgentRecord = outcome.ok
         ? {
             index,
             label,
@@ -259,17 +268,20 @@ export class Run {
 
       this.records.push(record)
 
-      const value = outcome.ok ? (options.schema ? outcome.structured : outcome.text) : undefined
-      this.#journal.record(
-        toJournalEntry({
-          identity,
-          label,
-          phase,
-          schemaHash,
-          outputTokens: record.outputTokens,
-          ...(outcome.ok ? { ok: true, value } : { ok: false, reason: outcome.reason, detail: outcome.detail }),
-        }),
-      )
+      let value: unknown = undefined
+      if (outcome.ok) {
+        value = options.schema ? outcome.structured : outcome.text
+      }
+      const entry = toJournalEntry({
+        identity,
+        label,
+        phase,
+        schemaHash,
+        outputTokens: record.outputTokens,
+        ...(outcome.ok ? { ok: true, value } : { ok: false, reason: outcome.reason, detail: outcome.detail }),
+      })
+      this.#journal.record(entry)
+      this.#options.onJournal?.(entry)
 
       this.#options.onProgress?.({
         type: "agent-end",
@@ -280,7 +292,7 @@ export class Run {
         ...pick("sessionID", outcome.sessionID),
       })
 
-      if (!outcome.ok) return null
+      if (!outcome.ok) {return null}
       return value
     } finally {
       release()
@@ -337,7 +349,7 @@ function pick<K extends string, V>(key: K, value: V | undefined): Record<K, V> |
  * fallback here by keeping prompts' first lines free of anything they would not store.
  */
 function deriveLabel(prompt: string, index: number): string {
-  const firstLine = prompt.trim().split("\n", 1)[0] ?? ""
-  const trimmed = firstLine.slice(0, 48).trim()
+  const firstLine = prompt.trim().split("\n", 1)[0] ?? "",
+   trimmed = firstLine.slice(0, 48).trim()
   return trimmed === "" ? `agent:${index}` : trimmed
 }

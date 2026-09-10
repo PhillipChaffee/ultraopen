@@ -12,14 +12,14 @@ import type { ProgressEvent } from "../runtime/run.js"
  * the TUI is not necessarily the process running the workflow.
  */
 
-export type AgentProgress = {
+export interface AgentProgress {
   index: number
   label: string
   phase?: string | undefined
   status: "running" | "done" | "failed"
 }
 
-export type ProgressSnapshot = {
+export interface ProgressSnapshot {
   runId: string
   workflow: string
   sessionID: string
@@ -100,9 +100,9 @@ export class ProgressWriter {
       }
       case "agent-end": {
         const agent = this.snapshot.agents.find((entry) => entry.index === event.index)
-        if (agent) agent.status = event.ok ? "done" : "failed"
+        if (agent) {agent.status = event.ok ? "done" : "failed"}
         // A replayed call never emits agent-start, so record it here rather than losing it.
-        else this.snapshot.agents.push({ index: event.index, label: event.label, phase: event.phase, status: event.ok ? "done" : "failed" })
+        else {this.snapshot.agents.push({ index: event.index, label: event.label, phase: event.phase, status: event.ok ? "done" : "failed" })}
         break
       }
     }
@@ -117,7 +117,7 @@ export class ProgressWriter {
    * is by definition disposable — the authoritative record is the journal.
    */
   async flush(): Promise<void> {
-    if (!this.#dirty || this.#writing) return
+    if (!this.#dirty || this.#writing) {return}
     this.#writing = true
     this.#dirty = false
     try {
@@ -128,7 +128,7 @@ export class ProgressWriter {
       this.#writing = false
       // An event folded in while a write was in flight marked #dirty and was skipped by the
       // guard above; without this re-check the last event of a run would never reach disk.
-      if (this.#dirty) void this.flush()
+      if (this.#dirty) {void this.flush()}
     }
   }
 }

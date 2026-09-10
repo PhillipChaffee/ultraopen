@@ -67,8 +67,8 @@ export function lintDeterminism(ast: acorn.Program): void {
     }
 
     if (node.type === "MemberExpression" && !node.computed && node.object.type === "Identifier") {
-      const property = node.property.type === "Identifier" ? node.property.name : ""
-      const target = `${node.object.name}.${property}`
+      const property = node.property.type === "Identifier" ? node.property.name : "",
+       target = `${node.object.name}.${property}`
       if (target === "Date.now") {
         fail({
           kind: "DeterminismError",

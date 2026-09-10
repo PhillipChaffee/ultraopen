@@ -6,7 +6,7 @@ import { WORKFLOW_TOOL } from "../bridge/permission.js"
  * Only the keys this installer touches are modelled. The hook receives the LIVE cached object, and
  * its return value is discarded — mutation is the only channel.
  */
-export type MutableConfig = {
+export interface MutableConfig {
   agent?: Record<string, unknown>
   command?: Record<string, unknown>
   permission?: Record<string, unknown> | string
@@ -91,7 +91,7 @@ function installCommand(config: MutableConfig): void {
  * would throw at runtime or shred the user's setting.
  */
 function installPermission(config: MutableConfig): void {
-  if (typeof config.permission === "string") return
+  if (typeof config.permission === "string") {return}
   config.permission ??= {}
   config.permission[WORKFLOW_TOOL] ??= "ask"
 }
@@ -108,13 +108,13 @@ function installPermission(config: MutableConfig): void {
 function installPrimaryTools(config: MutableConfig): void {
   config.experimental ??= {}
   const current = config.experimental.primary_tools ?? []
-  if (!current.includes(WORKFLOW_TOOL)) config.experimental.primary_tools = [...current, WORKFLOW_TOOL]
+  if (!current.includes(WORKFLOW_TOOL)) {config.experimental.primary_tools = [...current, WORKFLOW_TOOL]}
 }
 
 /** Publishes the bundled workflow-authoring skill so the model can read the scripting reference. */
 function installSkillsPath(config: MutableConfig, skillsPath: string | undefined): void {
-  if (!skillsPath) return
+  if (!skillsPath) {return}
   config.skills ??= {}
   const current = config.skills.paths ?? []
-  if (!current.includes(skillsPath)) config.skills.paths = [...current, skillsPath]
+  if (!current.includes(skillsPath)) {config.skills.paths = [...current, skillsPath]}
 }

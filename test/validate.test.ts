@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test"
 import { validate } from "../src/server/bridge/validate.js"
 
-const ok = (value: unknown, schema: Record<string, unknown>) => validate(value, schema).valid
-const errorsOf = (value: unknown, schema: Record<string, unknown>): string[] => {
+const ok = (value: unknown, schema: Record<string, unknown>) => validate(value, schema).valid,
+ errorsOf = (value: unknown, schema: Record<string, unknown>): string[] => {
   const result = validate(value, schema)
   return result.valid ? [] : result.errors
 }

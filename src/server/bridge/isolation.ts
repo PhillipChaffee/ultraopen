@@ -19,13 +19,13 @@ const run = promisify(execFile)
  * opencode ships a Node build.
  */
 
-export type Worktree = {
+export interface Worktree {
   directory: string
   /** Removes the worktree. Non-fatal on failure — see remove(). */
   release: () => Promise<void>
 }
 
-export type WorktreeOptions = {
+export interface WorktreeOptions {
   /** Repository root to branch from. */
   worktreeRoot: string
   /** Distinguishes concurrent worktrees within a run. */
@@ -72,8 +72,8 @@ export async function createWorktree(options: WorktreeOptions): Promise<Worktree
     // No .catch(): the queue promise is only ever settled by its own resolve(), so it cannot
     // reject, and an unreachable handler here would be untestable defensive code.
     await previous
-    const base = await mkdtemp(join(tmpdir(), "ultraopen-wt-"))
-    const directory = join(base, options.label.replaceAll(/[^\w.-]/gu, "-").slice(0, 40) || "agent")
+    const base = await mkdtemp(join(tmpdir(), "ultraopen-wt-")),
+     directory = join(base, options.label.replaceAll(/[^\w.-]/gu, "-").slice(0, 40) || "agent")
 
     // --detach avoids creating a branch per agent, which would otherwise accumulate and need
     // cleaning up separately from the worktree itself.

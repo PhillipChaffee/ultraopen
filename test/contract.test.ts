@@ -35,7 +35,7 @@ describe("contract selection", () => {
       { schema: { type: "object" } },
       { agentType: "explore", schema: { type: "object" } },
     ]
-    for (const options of combinations) expect(subagentContract(options)).toBeTruthy()
+    for (const options of combinations) {expect(subagentContract(options)).toBeTruthy()}
   })
 })
 

@@ -18,12 +18,12 @@ import { execFileSync } from "node:child_process"
 import { rmSync } from "node:fs"
 import { join } from "node:path"
 
-const root = join(import.meta.dirname, "..", "..")
-const outdir = join(root, "dist-test")
+const root = join(import.meta.dirname, "..", ".."),
+ outdir = join(root, "dist-test")
 
-let parse
-let run
-let WorkflowScriptError
+let parse,
+ run,
+ WorkflowScriptError
 
 before(async () => {
   execFileSync(
@@ -56,8 +56,8 @@ after(() => {
   rmSync(outdir, { recursive: true, force: true })
 })
 
-const META = "export const meta = { name: 'x', description: 'y' }\n"
-const globals = {
+const META = "export const meta = { name: 'x', description: 'y' }\n",
+ globals = {
   agent: () => {},
   parallel: () => {},
   pipeline: () => {},
@@ -66,8 +66,8 @@ const globals = {
   args: { value: 5 },
   budget: { total: null, spent: () => 0, remaining: () => Number.POSITIVE_INFINITY },
   workflow: () => {},
-}
-const exec = (source) => run(parse(META + source).body, globals)
+},
+ exec = (source) => run(parse(META + source).body, globals)
 
 describe("sandbox parity on Node", () => {
   test("executes a body and returns its value", async () => {
@@ -94,6 +94,7 @@ describe("sandbox parity on Node", () => {
     // `global` is Node's host global; unshadowed, `global.Date.now()` bypassed every trap.
     assert.equal(await run("return typeof global\n", globals), "undefined")
     // Node has no `self`; the shadow must be harmless there too.
+    // oxlint-disable-next-line unicorn/prefer-global-this -- the alias shadowing is exactly what this asserts
     assert.equal(typeof self, "undefined")
     await assert.rejects(() => run("return require('node:fs')\n", globals), /is not available/u)
   })

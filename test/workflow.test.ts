@@ -13,8 +13,8 @@ import { join } from "node:path"
  * The tool persists a manifest, journal, result and script per run. Without this the suite writes
  * real artifacts into the user's opencode data directory — ~27 stray run folders per `bun test`.
  */
-let dataHome: string
-let savedDataHome: string | undefined
+let dataHome: string,
+ savedDataHome: string | undefined
 
 beforeAll(async () => {
   dataHome = await mkdtemp(join(tmpdir(), "ultraopen-testdata-"))
@@ -23,15 +23,15 @@ beforeAll(async () => {
 })
 
 afterAll(async () => {
-  if (savedDataHome === undefined) delete process.env["XDG_DATA_HOME"]
-  else process.env["XDG_DATA_HOME"] = savedDataHome
+  if (savedDataHome === undefined) {delete process.env["XDG_DATA_HOME"]}
+  else {process.env["XDG_DATA_HOME"] = savedDataHome}
   await rm(dataHome, { recursive: true, force: true })
 })
 
 
-const META = "export const meta = { name: 'demo', description: 'a demo workflow' }\n"
+const META = "export const meta = { name: 'demo', description: 'a demo workflow' }\n",
 
-const client = {
+ client = {
   session: {
     create: () => Promise.resolve({ data: { id: "child" } }),
     get: () => Promise.resolve({ data: { id: "child" } }),
@@ -39,9 +39,9 @@ const client = {
     abort: () => Promise.resolve({}),
     prompt: () => Promise.resolve({ data: { info: {}, parts: [] } }),
   },
-} as unknown as OpencodeClient
+} as unknown as OpencodeClient,
 
-const base = { client, sessionID: "parent", runId: "wf_test" }
+ base = { client, sessionID: "parent", runId: "wf_test" }
 
 beforeEach(() => {
   registry.resetForTests()
@@ -49,8 +49,8 @@ beforeEach(() => {
 
 describe("source resolution", () => {
   test("scriptPath is read through the injected reader", async () => {
-    const reads: string[] = []
-    const result = await execute(
+    const reads: string[] = [],
+     result = await execute(
       { scriptPath: "/runs/demo.js", dryRun: true },
       {
         ...base,
@@ -96,26 +96,28 @@ describe("nested workflow()", () => {
     // Validation is synchronous for exactly this reason: an async function would turn it into a
     // rejected promise that an un-awaited try/catch silently misses.
     const script = `${META}try { workflow('other') } catch (e) { return 'caught' }\nreturn 'not caught'\n`
-    expect((await execute({ script, dryRun: true }, base)).value).toBe("caught")
+    const result = await execute({ script, dryRun: true }, base)
+    expect(result.value).toBe("caught")
   })
 
   test("runs a saved workflow by name and prefixes its narration", async () => {
-    const named = { helper: `export const meta = { name: 'helper', description: 'h' }\nlog('inner')\nreturn 42\n` }
-    const script = `${META}return await workflow('helper')\n`
-    const result = await execute({ script, dryRun: true }, { ...base, named })
+    const named = { helper: `export const meta = { name: 'helper', description: 'h' }\nlog('inner')\nreturn 42\n` },
+     script = `${META}return await workflow('helper')\n`,
+     result = await execute({ script, dryRun: true }, { ...base, named })
     expect(result.value).toBe(42)
     expect(result.logs.some((line) => line.startsWith("▸ helper:"))).toBe(true)
   })
 
   test("accepts an inline { script } reference", async () => {
     const script = `${META}return await workflow({ script: "export const meta = { name: 'x', description: 'y' }\\nreturn 7\\n" })\n`
-    expect((await execute({ script, dryRun: true }, base)).value).toBe(7)
+    const result = await execute({ script, dryRun: true }, base)
+    expect(result.value).toBe(7)
   })
 
   test("nesting is ONE level only", async () => {
     // Unbounded depth would make the agent count unbounded with it.
-    const inner = `export const meta = { name: 'inner', description: 'i' }\nreturn await workflow('deeper')\n`
-    const script = `${META}return await workflow({ script: ${JSON.stringify(inner)} })\n`
+    const inner = `export const meta = { name: 'inner', description: 'i' }\nreturn await workflow('deeper')\n`,
+     script = `${META}return await workflow({ script: ${JSON.stringify(inner)} })\n`
     await expect(execute({ script, dryRun: true }, base)).rejects.toThrow(/one level only/u)
   })
 
@@ -128,27 +130,30 @@ describe("nested workflow()", () => {
 describe("budget", () => {
   test("total is null when no target was set, which every documented loop guards on", async () => {
     const script = `${META}return { total: budget.total, remaining: budget.remaining() }\n`
-    const result = (await execute({ script, dryRun: true }, base)).value as Record<string, unknown>
+    const outcome = await execute({ script, dryRun: true }, base)
+    const result = outcome.value as Record<string, unknown>
     expect(result["total"]).toBeNull()
     expect(result["remaining"]).toBe(Number.POSITIVE_INFINITY)
   })
 
   test("spent() reports real output tokens", async () => {
     const script = `${META}return budget.spent()\n`
-    expect((await execute({ script, dryRun: true }, base)).value).toBe(0)
+    const result = await execute({ script, dryRun: true }, base)
+    expect(result.value).toBe(0)
   })
 })
 
 describe("args", () => {
   test("args reaches the script verbatim", async () => {
-    const script = `${META}return args.items.map(x => x * 2)\n`
-    const result = await execute({ script, args: { items: [1, 2, 3] }, dryRun: true }, base)
+    const script = `${META}return args.items.map(x => x * 2)\n`,
+     result = await execute({ script, args: { items: [1, 2, 3] }, dryRun: true }, base)
     expect(result.value).toEqual([2, 4, 6])
   })
 
   test("args is undefined when not supplied", async () => {
     const script = `${META}return typeof args\n`
-    expect((await execute({ script, dryRun: true }, base)).value).toBe("undefined")
+    const result = await execute({ script, dryRun: true }, base)
+    expect(result.value).toBe("undefined")
   })
 })
 
@@ -158,8 +163,8 @@ describe("renderFailure", () => {
       kind: "MetaError",
       message: "bad meta",
       location: { line: 2, column: 4 },
-    })
-    const out = renderFailure(error, "line one\nline two\n")
+    }),
+     out = renderFailure(error, "line one\nline two\n")
     expect(out).toContain("MetaError: bad meta")
     expect(out).toContain("^")
   })

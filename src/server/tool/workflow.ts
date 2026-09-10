@@ -2,7 +2,8 @@ import { WorkflowScriptError, render } from "../script/errors.js"
 import { parse } from "../script/parse.js"
 import { run as runSandbox } from "../script/sandbox.js"
 import { parallel, pipeline } from "../runtime/combinators.js"
-import { Run, type AgentOptions, type ProgressEvent } from "../runtime/run.js"
+import { Run } from "../runtime/run.js"
+import type { AgentOptions, ProgressEvent } from "../runtime/run.js"
 import { subagentContract } from "../bridge/contract.js"
 import { makeResolvers } from "../bridge/models.js"
 import { argsHash } from "../resume/key.js"
@@ -12,7 +13,7 @@ import { registry } from "../singleton.js"
 import type { Ruleset } from "../bridge/permission.js"
 import type { OpencodeClient } from "../types.js"
 
-export type WorkflowArgs = {
+export interface WorkflowArgs {
   script?: string
   scriptPath?: string
   args?: unknown
@@ -27,7 +28,7 @@ export type WorkflowArgs = {
   description?: string
 }
 
-export type WorkflowContext = {
+export interface WorkflowContext {
   client: OpencodeClient
   sessionID: string
   runId: string
@@ -42,6 +43,8 @@ export type WorkflowContext = {
   deadlineMs?: number | undefined
   signal?: AbortSignal | undefined
   onProgress?: ((event: ProgressEvent) => void) | undefined
+  /** Receives each journal entry as it is recorded; the tool layer flushes it to disk. */
+  onJournal?: ((entry: JournalEntry) => void) | undefined
   /** Reads a persisted script for `scriptPath`. Injected so the engine stays filesystem-free. */
   readScript?: ((path: string) => Promise<string>) | undefined
   /** Journal entries from the run being resumed. */
@@ -58,12 +61,12 @@ export type WorkflowContext = {
   named?: Record<string, string> | undefined
 }
 
-export type WorkflowResult = {
+export interface WorkflowResult {
   runId: string
   meta: { name: string; description: string }
   value: unknown
   agentCount: number
-  nulls: Array<{ label: string; reason: string; detail: string }>
+  nulls: { label: string; reason: string; detail: string }[]
   logs: string[]
   outputTokens: number
   /** This run's journal, for persistence and for a follow-up resume. */
@@ -102,7 +105,7 @@ export async function execute(args: WorkflowArgs, context: WorkflowContext): Pro
   return await runPrepared(prepared, args, context)
 }
 
-export type PreparedWorkflow = { source: string; meta: ReturnType<typeof parse>["meta"]; body: string }
+export interface PreparedWorkflow { source: string; meta: ReturnType<typeof parse>["meta"]; body: string }
 
 /**
  * Resolves and parses the script WITHOUT running it.
@@ -113,8 +116,8 @@ export type PreparedWorkflow = { source: string; meta: ReturnType<typeof parse>[
  */
 export async function prepare(args: WorkflowArgs, context: WorkflowContext): Promise<PreparedWorkflow> {
   assertNotNested(context.sessionID)
-  const source = await resolveSource(args, context)
-  const parsed = parse(source)
+  const source = await resolveSource(args, context),
+   parsed = parse(source)
   return { source, meta: parsed.meta, body: parsed.body }
 }
 
@@ -123,17 +126,17 @@ async function runPrepared(
   args: WorkflowArgs,
   context: WorkflowContext,
 ): Promise<WorkflowResult> {
-  const parsed = prepared
+  const parsed = prepared,
 
   // Notes can arrive both before the Run exists (catalog fetch) and during the script
   // (per-model downgrades, emitted lazily when an agent first asks for an effort). Buffer until
   // the Run is available, then redirect straight to its log — draining once up front would
   // silently discard every note raised after the script starts, which is most of them.
-  const sink: { emit?: (note: string) => void } = {}
-  const buffered: string[] = []
-  const note = (message: string): void => {
-    if (sink.emit) sink.emit(message)
-    else buffered.push(message)
+   sink: { emit?: (note: string) => void } = {},
+   buffered: string[] = [],
+   note = (message: string): void => {
+    if (sink.emit) {sink.emit(message)}
+    else {buffered.push(message)}
   }
 
   // Read the provider catalog once per run so `effort` resolves against each model's REAL variant
@@ -173,6 +176,7 @@ async function runPrepared(
     ...optional("deadlineMs", context.deadlineMs),
     ...optional("signal", context.signal),
     ...optional("onProgress", context.onProgress),
+    ...optional("onJournal", context.onJournal),
   })
 
   // dryRun exercises the whole engine — parse, sandbox, combinators, control flow — for zero
@@ -189,7 +193,7 @@ async function runPrepared(
 
   // Redirect first, then flush: anything raised while the script runs must land in the log too.
   sink.emit = run.log
-  for (const message of buffered) run.log(message)
+  for (const message of buffered) {run.log(message)}
 
   try {
     // The sandbox runs INSIDE the root resume scope, so every agent() call — including those
@@ -247,7 +251,7 @@ async function runPrepared(
  * ruleset entirely, or a config edit. Failing loudly is correct.
  */
 function assertNotNested(sessionID: string): void {
-  if (!registry.owns(sessionID)) return
+  if (!registry.owns(sessionID)) {return}
   throw new WorkflowScriptError({
     kind: "RuntimeError",
     message: "workflow() cannot be called from inside a workflow subagent.",
@@ -266,7 +270,7 @@ async function resolveSource(args: WorkflowArgs, context: WorkflowContext): Prom
     }
     return await context.readScript(args.scriptPath)
   }
-  if (args.script) return args.script
+  if (args.script) {return args.script}
   throw new WorkflowScriptError({
     kind: "RuntimeError",
     message: "A workflow needs a `script` or a `scriptPath`.",
@@ -312,30 +316,48 @@ async function runNested(
   context: WorkflowContext,
   parentRun: Run,
 ): Promise<unknown> {
-  const child = await execute(
+  let child: Awaited<ReturnType<typeof execute>>
+  try {
+    child = await execute(
       { script: source, args: childArgs },
-    {
-      ...context,
-      depth: (context.depth ?? 0) + 1,
-      // The child's spend counts against the parent's ceiling.
-      budgetTotal: parentRun.budget.total,
-    },
-  )
+      {
+        ...context,
+        depth: (context.depth ?? 0) + 1,
+        // The child's spend counts against the parent's ceiling.
+        budgetTotal: parentRun.budget.total,
+      },
+    )
+  } catch (error) {
+    // The child inherited the parent's onJournal, so its entries were incrementally flushed
+    // into the parent's journal FILE. They must also reach the parent's in-memory journal,
+    // or the parent's endRun rewrite would erase what the flush wrote — leaving a
+    // crash-resume richer than a clean-run resume.
+    mergeNestedJournal(error instanceof WorkflowRunError ? error.partial.journal : undefined, parentRun)
+    throw error
+  }
+  mergeNestedJournal(child.journal, parentRun)
 
   // The spec marks a nested run's agents with a "▸ name" prefix so they are distinguishable in the
   // parent's narration.
-  for (const line of child.logs) parentRun.log(`▸ ${child.meta.name}: ${line}`)
+  for (const line of child.logs) {parentRun.log(`▸ ${child.meta.name}: ${line}`)}
   return child.value
+}
+
+/** Fold the nested run's entries into the parent's journal, preserving record order on disk. */
+function mergeNestedJournal(entries: readonly JournalEntry[] | undefined, parentRun: Run): void {
+  for (const entry of entries ?? []) {
+    parentRun.journal.record(entry)
+  }
 }
 
 function resolveNamed(nameOrRef: unknown, context: WorkflowContext): string {
   if (typeof nameOrRef === "object" && nameOrRef !== null && "script" in nameOrRef) {
-    const script = (nameOrRef as { script?: unknown }).script
-    if (typeof script === "string") return script
+    const {script} = (nameOrRef as { script?: unknown })
+    if (typeof script === "string") {return script}
   }
   if (typeof nameOrRef === "string") {
     const found = context.named?.[nameOrRef]
-    if (found) return found
+    if (found) {return found}
     throw new WorkflowScriptError({
       kind: "RuntimeError",
       message: `No saved workflow named "${nameOrRef}".`,
@@ -354,13 +376,15 @@ function optional<K extends string, V>(key: K, value: V | undefined): Record<K, 
 
 /** Renders a failure for the model, with the caret line when the script is available. */
 export function renderFailure(error: unknown, source?: string, runId?: string): string {
-  const body =
-    error instanceof WorkflowScriptError
-      ? render(error.diagnostic, source)
-      : error instanceof Error
-        ? error.message
-        : String(error)
-  if (runId === undefined) return body
+  let body: string
+  if (error instanceof WorkflowScriptError) {
+    body = render(error.diagnostic, source)
+  } else if (error instanceof Error) {
+    body = error.message
+  } else {
+    body = String(error)
+  }
+  if (runId === undefined) {return body}
   // A failed run is the main candidate for a resume; naming it makes that recoverable.
   return `${body}\n\n<run id="${runId}" dir="${runDir(runId)}" />`
 }
