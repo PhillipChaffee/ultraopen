@@ -28,6 +28,8 @@ export interface JournalEntry {
   /** Set when this entry was itself replayed, so a replayed empty is distinguishable. */
   replayed?: boolean
   sourceRunId?: string | undefined
+  /** 1 = first attempt; 2+ = a restart after a deadline kill, same key by design. */
+  attempt?: number | undefined
 }
 
 export interface Manifest {

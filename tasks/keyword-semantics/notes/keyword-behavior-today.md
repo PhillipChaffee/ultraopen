@@ -1,0 +1,8 @@
+# Keyword behavior today
+
+- `mode.ts` holds the keyword logic. `mentionsKeyword` uses the regex `/\bultracode\b/iu`. The comment there says a path like `src/ultracode.ts` does trigger, and that this is deliberate. The reasoning: a false negative is worse than a false positive, the cost is one turn at higher effort, and guessing at intent is fragile. With the sticky mode, the cost of a path match is the whole session. That is the reason for the change.
+- `mode.enable` stores `fromMessageID`. The reminder decorates every user message from that message id onward, to keep the prompt cache prefix byte stable. A one-shot mode must not leave that anchor behind. Clean the state after the turn, or store a different shape for one-shot. Record the chosen shape in this file.
+- The chat message hook calls `mode.enable` only when the source is not already the keyword (`hooks.ts`). Re-mentioning must not move the reminder start. The one-shot path reuses this rule.
+- `requestsNoFanOut` handles "don't fan out". It demotes the standing opt-in and keeps the raised effort. This epic does not touch it.
+- Human-origin gating from Claude Code: the keyword fires only on human-typed input, not on `-p` prompts, SDK sends, scheduled tasks, webhooks, or relayed pull request comments. opencode gives the hook no origin stamp on the message. This part is an upstream gap. If a future opencode release adds an origin field, record it here and add the gate.
+- The demote regex is deliberately narrow. A false positive would silently disable a feature the user turned on. Keep the narrowness.

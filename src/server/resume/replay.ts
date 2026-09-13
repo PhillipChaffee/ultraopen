@@ -44,6 +44,8 @@ export type OutcomeRecord = {
   phase: string | undefined
   schemaHash: string | undefined
   outputTokens: number
+  /** 1 = first attempt; 2+ = a restart after a deadline kill. Display/forensics only. */
+  attempt?: number | undefined
 } & ({ ok: true; value: unknown } | { ok: false; reason: NullReason; detail: string })
 
 /** Builds the journal entry for a live call. */
@@ -57,6 +59,7 @@ export function toJournalEntry(input: OutcomeRecord): JournalEntry {
     phase: input.phase,
     schemaHash: input.schemaHash,
     outputTokens: input.outputTokens,
+    ...(input.attempt === undefined ? {} : { attempt: input.attempt }),
   }
 
   // The VALUE is copied, never a pointer to the child session: deleting a parent session

@@ -115,3 +115,27 @@ describe("registry.semaphore", () => {
     expect(registry.semaphore.active).toBe(0)
   })
 })
+
+describe("registry.touchActivity / lastActivity", () => {
+  test("a registered session records and reads back its last activity", () => {
+    registry.register("s1", "run-a")
+    expect(registry.lastActivity("s1")).toBe(0)
+    registry.touchActivity("s1", 1234)
+    expect(registry.lastActivity("s1")).toBe(1234)
+    // A later touch overwrites — the idle deadline reads the LATEST stamp.
+    registry.touchActivity("s1", 5678)
+    expect(registry.lastActivity("s1")).toBe(5678)
+  })
+
+  test("an unregistered session is never touched and reads as zero", () => {
+    registry.touchActivity("outsider", 1234)
+    expect(registry.lastActivity("outsider")).toBe(0)
+  })
+
+  test("forget clears the session's activity stamp", () => {
+    registry.register("s1", "run-a")
+    registry.touchActivity("s1", 1234)
+    registry.forget("s1")
+    expect(registry.lastActivity("s1")).toBe(0)
+  })
+})

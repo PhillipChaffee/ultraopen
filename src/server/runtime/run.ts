@@ -1,5 +1,5 @@
 import { fail } from "../script/errors.js"
-import { DEFAULT_AGENT_DEADLINE_MS, MAX_AGENTS_PER_RUN } from "../script/limits.js"
+import { DEFAULT_AGENT_DEADLINE_MS, DEFAULT_AGENT_IDLE_MS, MAX_AGENTS_PER_RUN, MAX_AGENT_RESTARTS } from "../script/limits.js"
 import { registry } from "../singleton.js"
 import type { NullReason } from "../bridge/spawn.js"
 import { spawnStructured } from "../bridge/structured.js"
@@ -66,6 +66,8 @@ export interface RunOptions {
   /** Contract text appended to the child's system prompt (PromptInput.system appends). */
   subagentContract?: ((opts: AgentOptions) => string | undefined) | undefined
   deadlineMs?: number | undefined
+  /** Inactivity bound per agent; 0 disables it. Idle resets on observed child progress. */
+  idleMs?: number | undefined
   signal?: AbortSignal | undefined
   onProgress?: ((event: ProgressEvent) => void) | undefined
   /** Called with each journal entry the moment it is recorded — incremental flush, not endRun. */
@@ -229,7 +231,7 @@ export class Run {
           ? await createWorktree({ worktreeRoot: this.#options.worktreeRoot, label, onNote: this.log })
           : undefined
       if (worktree) {this.#worktrees.push(worktree.release)}
-      const outcome = await spawnStructured(this.#options.client, {
+      const spawnOptions = {
         prompt,
         runId: this.runId,
         parentSessionID: this.#options.parentSessionID,
@@ -242,35 +244,77 @@ export class Run {
         ...pick("system", this.#options.subagentContract?.(options)),
         ...pick("inheritedPermission", this.#options.inheritedPermission),
         ...pick("deadlineMs", this.#options.deadlineMs ?? DEFAULT_AGENT_DEADLINE_MS),
+        ...pick("idleMs", this.#options.idleMs ?? DEFAULT_AGENT_IDLE_MS),
         ...pick("signal", this.#options.signal),
         ...pick("directory", worktree?.directory),
-      }),
+      }
+      let outcome = await spawnStructured(this.#options.client, spawnOptions)
 
-       record: AgentRecord = outcome.ok
+      // An IDLE kill is a stall, and a fresh attempt usually finishes fast — so the agent restarts
+      // in place, reusing the permit this call already holds. Re-acquiring would deadlock at
+      // concurrency 1; the budget is re-asserted per attempt, per the no-shortcut rule. A
+      // wall-clock kill is NEVER restarted: it means the agent produced continuously for the
+      // whole ceiling, and a fresh attempt would just re-pay hours of work. Aborts are never
+      // restarted (that fights the user), and schema misses belong to the structured ladder.
+      let attempt = 1
+      while (
+        !outcome.ok &&
+        outcome.reason === "idle-deadline" &&
+        attempt <= MAX_AGENT_RESTARTS &&
+        !this.#options.signal?.aborted
+      ) {
+        // The failed attempt's entry lands BEFORE the retry, so the forensics survive a crash
+        // mid-restart and the newest ok entry per key wins replay.
+        const failedEntry = toJournalEntry({
+          identity,
+          label,
+          phase,
+          schemaHash,
+          outputTokens: 0,
+          attempt,
+          ok: false,
+          reason: outcome.reason,
+          detail: outcome.detail,
+        })
+        this.#journal.record(failedEntry)
+        this.#options.onJournal?.(failedEntry)
+        assertWithinBudget(this.#budget)
+        attempt++
+        this.log(`"${label}" hit its deadline and is being restarted (attempt ${attempt})`)
+        outcome = await spawnStructured(this.#options.client, spawnOptions)
+      }
+
+      // A parent abort that lands during a stall can win the race as a deadline kill; report it
+      // as what it was, or the failures list misattributes the user's own interrupt.
+      const finalOutcome = !outcome.ok && outcome.reason === "deadline" && this.#options.signal?.aborted
+        ? { ...outcome, reason: "aborted" as const, detail: "parent aborted" }
+        : outcome
+
+      const record: AgentRecord = finalOutcome.ok
         ? {
             index,
             label,
             phase,
             ok: true,
-            outputTokens: outputTokensOf(outcome.info),
-            ...pick("sessionID", outcome.sessionID),
+            outputTokens: outputTokensOf(finalOutcome.info),
+            ...pick("sessionID", finalOutcome.sessionID),
           }
         : {
             index,
             label,
             phase,
             ok: false,
-            reason: outcome.reason,
-            detail: outcome.detail,
+            reason: finalOutcome.reason,
+            detail: finalOutcome.detail,
             outputTokens: 0,
-            ...pick("sessionID", outcome.sessionID),
+            ...pick("sessionID", finalOutcome.sessionID),
           }
 
       this.records.push(record)
 
       let value: unknown = undefined
-      if (outcome.ok) {
-        value = options.schema ? outcome.structured : outcome.text
+      if (finalOutcome.ok) {
+        value = options.schema ? finalOutcome.structured : finalOutcome.text
       }
       const entry = toJournalEntry({
         identity,
@@ -278,7 +322,8 @@ export class Run {
         phase,
         schemaHash,
         outputTokens: record.outputTokens,
-        ...(outcome.ok ? { ok: true, value } : { ok: false, reason: outcome.reason, detail: outcome.detail }),
+        attempt,
+        ...(finalOutcome.ok ? { ok: true, value } : { ok: false, reason: finalOutcome.reason, detail: finalOutcome.detail }),
       })
       this.#journal.record(entry)
       this.#options.onJournal?.(entry)
@@ -288,11 +333,11 @@ export class Run {
         index,
         label,
         phase,
-        ok: outcome.ok,
-        ...pick("sessionID", outcome.sessionID),
+        ok: finalOutcome.ok,
+        ...pick("sessionID", finalOutcome.sessionID),
       })
 
-      if (!outcome.ok) {return null}
+      if (!finalOutcome.ok) {return null}
       return value
     } finally {
       release()

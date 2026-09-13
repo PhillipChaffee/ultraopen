@@ -8,7 +8,8 @@ import { Run } from "../src/server/runtime/run.js"
 import type { ProgressEvent, RunOptions } from "../src/server/runtime/run.js"
 import type { JournalEntry } from "../src/server/resume/journal.js"
 import { registry } from "../src/server/singleton.js"
-import { MAX_AGENTS_PER_RUN } from "../src/server/script/limits.js"
+import { MAX_AGENTS_PER_RUN, MAX_AGENT_RESTARTS } from "../src/server/script/limits.js"
+import { chainKey } from "../src/server/resume/key.js"
 
 import type {
   AssistantErrorName,
@@ -434,13 +435,151 @@ describe("Run.agent — deadline propagation", () => {
     // withDeadline is unit-tested in deadline.test.ts; this proves Run actually forwards
     // deadlineMs through spawnStructured so a hung agent cannot hold a permit forever.
     const { client } = makeClient({ prompt: () => new Promise(() => {}) }),
-     run = makeRun(client, { deadlineMs: 10 }),
+     run = makeRun(client, { deadlineMs: 10, idleMs: 0 }),
 
      result = await run.agent("hung")
     expect(result).toBeNull()
     const nullRecord = run.nulls[0]
     if (!nullRecord) {throw new Error("expected a null record")}
     expect(nullRecord.reason).toBe("deadline")
+  })
+
+  test("an agent with no progress is killed by the idle limit even with the wall clock disabled", async () => {
+    // idleMs: 20 with deadlineMs: 0 isolates the idle path end-to-end through Run — a stalled
+    // agent dies at the inactivity bound, not the wall clock.
+    const { client } = makeClient({ prompt: () => new Promise(() => {}) }),
+     run = makeRun(client, { deadlineMs: 0, idleMs: 20 }),
+
+     result = await run.agent("stalled")
+    expect(result).toBeNull()
+    expect(run.nulls[0]?.reason).toBe("idle-deadline")
+    expect(run.nulls[0]?.detail).toMatch(/made no progress/u)
+  })
+})
+
+describe("Run.agent — stall auto-restart (idle kills only)", () => {
+  test("an idle-deadline null is restarted and a later attempt succeeds", async () => {
+    // First prompt hangs (the stall), second attempt answers. The failed attempt is journaled
+    // before the retry so the forensics survive a crash mid-restart.
+    let calls = 0
+    const { client } = makeClient({
+      prompt: () => {
+        calls++
+        return calls === 1 ? new Promise(() => {}) : Promise.resolve({ data: { info: baseInfo({ outputTokens: 5 }), parts: [textPart("recovered")] } })
+      },
+    }),
+     journal: JournalEntry[] = [],
+     run = makeRun(client, { deadlineMs: 0, idleMs: 10, onJournal: (entry) => journal.push(entry) }),
+
+     result = await run.agent("flaky stall")
+    expect(result).toBe("recovered")
+    expect(run.nulls.length).toBe(0)
+    expect(run.records.length).toBe(1)
+    expect(run.records[0]?.ok).toBe(true)
+
+    // Both attempts share one key; attempt numbers ascend; the ok entry is last.
+    expect(journal.length).toBe(2)
+    expect(journal[0]?.status).toBe("null")
+    expect(journal[0]?.attempt).toBe(1)
+    expect(journal[1]?.status).toBe("ok")
+    expect(journal[1]?.attempt).toBe(2)
+    expect(journal[0]?.key).toBe(journal[1]?.key)
+  })
+
+  test("restarts stop at MAX_AGENT_RESTARTS and the final null is reported once", async () => {
+    const { client, promptCalls } = makeClient({ prompt: () => new Promise(() => {}) }),
+     journal: JournalEntry[] = [],
+     run = makeRun(client, { deadlineMs: 0, idleMs: 10, onJournal: (entry) => journal.push(entry) }),
+
+     result = await run.agent("always stalls")
+    expect(result).toBeNull()
+    // Initial attempt + MAX_AGENT_RESTARTS restarts, each journaled under the same key.
+    expect(promptCalls.length).toBe(1 + MAX_AGENT_RESTARTS)
+    expect(journal.length).toBe(1 + MAX_AGENT_RESTARTS)
+    expect(new Set(journal.map((entry) => entry.key)).size).toBe(1)
+    expect(journal.map((entry) => entry.attempt)).toEqual([1, 2, 3, 4])
+    expect(journal.every((entry) => entry.reason === "idle-deadline")).toBe(true)
+    // Only the final outcome becomes an AgentRecord — intermediate failures must not read as
+    // extra nulls in the failures list.
+    expect(run.nulls.length).toBe(1)
+    expect(run.nulls[0]?.reason).toBe("idle-deadline")
+  })
+
+  test("a prompt-failed null is NOT restarted", async () => {
+    // Only deadline kills restart; transport errors belong to opencode's own retry loop.
+    const { client, promptCalls } = makeClient({
+      prompt: () => Promise.resolve({ error: { name: "APIError" } }),
+    }),
+     journal: JournalEntry[] = [],
+     run = makeRun(client, { deadlineMs: 0, idleMs: 10, onJournal: (entry) => journal.push(entry) }),
+
+     result = await run.agent("transport error")
+    expect(result).toBeNull()
+    expect(promptCalls.length).toBe(1)
+    expect(journal.length).toBe(1)
+    expect(journal[0]?.reason).toBe("prompt-failed")
+  })
+
+  test("a wall-clock kill is NEVER restarted", async () => {
+    // The wall clock bounds pathology: an agent killed after continuous production must not get
+    // a brand-new ceiling and re-pay hours of work. Only idle kills restart.
+    const { client, promptCalls } = makeClient({ prompt: () => new Promise(() => {}) }),
+     run = makeRun(client, { deadlineMs: 10, idleMs: 0, onJournal: () => {} }),
+
+     result = await run.agent("pathologically productive")
+    expect(result).toBeNull()
+    expect(promptCalls.length).toBe(1)
+    expect(run.nulls[0]?.reason).toBe("deadline")
+  })
+
+  test("a parent abort is never restarted", async () => {
+    const { client, promptCalls } = makeClient({ prompt: () => new Promise(() => {}) }),
+     run = makeRun(client, { deadlineMs: 10, idleMs: 0, signal: AbortSignal.timeout(5) }),
+     result = await run.agent("parent aborted")
+    // The abort either lands before start (null without a spawn) or mid-flight; either way the
+    // deadline restart loop must not fire on top of it.
+    expect(result).toBeNull()
+    expect(promptCalls.length).toBeLessThanOrEqual(1)
+  })
+
+  test("the newest ok entry wins replay after a restart", async () => {
+    // A resumed run indexes only ok entries; the retried attempt's entry (attempt 2) must be the
+    // one replayed, not the failed attempt 1 — which loadPrevious skips entirely.
+    // The key must be the one agent() actually derives for this call: the root scope's chain
+    // seeded with the run's default resumeSeed ("root"), advanced by this prompt.
+    const key = chainKey("root", "restarted", {}),
+     okEntry: JournalEntry = {
+      type: "result",
+      key,
+      scopePath: "root",
+      ordinal: 0,
+      label: "restarted",
+      status: "ok",
+      value: "recovered",
+      outputTokens: 5,
+      attempt: 2,
+    },
+     nullEntry: JournalEntry = {
+      type: "result",
+      key,
+      scopePath: "root",
+      ordinal: 0,
+      label: "restarted",
+      status: "null",
+      reason: "deadline",
+      detail: "abandoned",
+      outputTokens: 0,
+      attempt: 1,
+    },
+     journal: JournalEntry[] = [],
+     run = makeRun(makeClient().client, { onJournal: (entry) => journal.push(entry), previousEntries: [nullEntry, okEntry] }),
+
+     result = await run.agent("restarted")
+    expect(result).toBe("recovered")
+    expect(run.records[0]?.replayed).toBe(true)
+    // A replay records no journal entry of its own beyond the replayed marker entry.
+    expect(journal.length).toBe(1)
+    expect(journal[0]?.replayed).toBe(true)
   })
 })
 

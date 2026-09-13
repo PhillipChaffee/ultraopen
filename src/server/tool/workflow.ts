@@ -41,6 +41,8 @@ export interface WorkflowContext {
   /** The session's default model, used to resolve effort against the right variant set. */
   defaultModel?: string | undefined
   deadlineMs?: number | undefined
+  /** Inactivity bound per agent; 0 disables it. Idle resets on observed child progress. */
+  idleMs?: number | undefined
   signal?: AbortSignal | undefined
   onProgress?: ((event: ProgressEvent) => void) | undefined
   /** Receives each journal entry as it is recorded; the tool layer flushes it to disk. */
@@ -174,6 +176,7 @@ async function runPrepared(
     ...optional("resolveVariant", resolvers.resolveVariant),
     ...optional("inheritedPermission", context.inheritedPermission),
     ...optional("deadlineMs", context.deadlineMs),
+    ...optional("idleMs", context.idleMs),
     ...optional("signal", context.signal),
     ...optional("onProgress", context.onProgress),
     ...optional("onJournal", context.onJournal),

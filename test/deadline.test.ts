@@ -145,3 +145,150 @@ describe("withDeadline", () => {
     await expect(promise).rejects.toThrow(DeadlineExceededError)
   })
 })
+
+/**
+ * A clock-aware fake: `now` is injectable, so the idle re-arm arithmetic (remaining =
+ * idle - (now - lastProgress)) is deterministic without real waits. Built standalone rather than
+ * spread from fakeTimers — spreading would snapshot the `size` getter into a static number.
+ */
+function idleTimers() {
+  let clock = 0,
+   next = 1
+  const pending = new Map<number, { fn: () => void; ms: number }>()
+  return {
+    api: {
+      setTimeout: (fn: () => void, ms: number) => {
+        const id = next++
+        pending.set(id, { fn, ms })
+        return id
+      },
+      clearTimeout: (handle: unknown) => {
+        pending.delete(handle as number)
+      },
+      now: () => clock,
+    },
+    advance: (ms: number) => {
+      clock += ms
+    },
+    fireAll: () => {
+      // Snapshot then clear: a fired callback may schedule another timer, which must not run
+      // in this same pass.
+      const due = [...pending.values()]
+      pending.clear()
+      for (const entry of due) {entry.fn()}
+    },
+    get size() {
+      return pending.size
+    },
+  }
+}
+
+describe("withDeadline — idle bound", () => {
+  test("rejects with the idle message when no progress is observed", async () => {
+    const timers = idleTimers(),
+     promise = withDeadline(new Promise(() => {}), {
+      ms: 0,
+      idleMs: 1000,
+      activity: () => 0,
+      label: "stalled",
+      timers: timers.api,
+    })
+    timers.advance(1000)
+    timers.fireAll()
+    await expect(promise).rejects.toThrow(DeadlineExceededError)
+    await expect(promise).rejects.toThrow(/made no progress/u)
+    await expect(promise).rejects.toThrow(/\b1s/u)
+  })
+
+  test("re-arms when progress lands inside the window, then fires when activity stops", async () => {
+    const timers = idleTimers()
+    let touchedAt = 0
+    const promise = withDeadline(new Promise(() => {}), {
+      ms: 0,
+      idleMs: 1000,
+      activity: () => touchedAt,
+      label: "a",
+      timers: timers.api,
+    })
+    // The timer was armed at t=0 for 1000. Progress lands at t=300, so the fire at t=1000 must
+    // re-arm for the remaining 700 rather than fire.
+    timers.advance(1000)
+    touchedAt = 300
+    timers.fireAll()
+    await Promise.resolve()
+    expect(timers.size).toBe(1)
+    // No further progress: the re-armed timer fires at t=1700 and the idle bound rejects.
+    timers.advance(700)
+    timers.fireAll()
+    await expect(promise).rejects.toThrow(/made no progress/u)
+  })
+
+  test("does not arm the idle bound without an activity probe", async () => {
+    const timers = idleTimers()
+    await withDeadline(Promise.resolve(1), { ms: 5000, idleMs: 1000, label: "a", timers: timers.api })
+    // Only the wall clock was armed and cleared; no idle timer ever existed.
+    expect(timers.size).toBe(0)
+  })
+
+  test("ms 0 disables the wall clock so the idle bound stands alone", async () => {
+    const timers = idleTimers(),
+     promise = withDeadline(new Promise(() => {}), {
+      ms: 0,
+      idleMs: 1000,
+      activity: () => 0,
+      label: "a",
+      timers: timers.api,
+    })
+    expect(timers.size).toBe(1)
+    timers.advance(1000)
+    timers.fireAll()
+    await expect(promise).rejects.toThrow(/made no progress/u)
+  })
+
+  test("a settled call clears both timers", async () => {
+    const timers = idleTimers()
+    await withDeadline(Promise.resolve(1), {
+      ms: 5000,
+      idleMs: 1000,
+      activity: () => 0,
+      label: "a",
+      timers: timers.api,
+    })
+    expect(timers.size).toBe(0)
+  })
+
+  test("onTimeout fires on idle expiry so the child is actually aborted", async () => {
+    const timers = idleTimers()
+    let aborted = false
+    const promise = withDeadline(new Promise(() => {}), {
+      ms: 0,
+      idleMs: 1000,
+      activity: () => 0,
+      label: "a",
+      timers: timers.api,
+      onTimeout: () => {
+        aborted = true
+      },
+    })
+    timers.advance(1000)
+    timers.fireAll()
+    await expect(promise).rejects.toThrow(DeadlineExceededError)
+    await Promise.resolve()
+    expect(aborted).toBe(true)
+  })
+
+  test("an idle-bound rejection arriving later does not become unhandled", async () => {
+    // The idle promise is raced but may settle after the work already won; it must not leak.
+    const timers = idleTimers()
+    await withDeadline(Promise.resolve(1), {
+      ms: 0,
+      idleMs: 1000,
+      activity: () => 0,
+      label: "a",
+      timers: timers.api,
+    })
+    timers.advance(1000)
+    timers.fireAll()
+    await Promise.resolve()
+  })
+})

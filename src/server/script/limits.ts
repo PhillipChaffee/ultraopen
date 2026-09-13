@@ -27,14 +27,36 @@ export const MIN_CONCURRENCY = 1
 export const MAX_CONCURRENCY = 32
 
 /**
- * Wall-clock ceiling for a single agent() call.
+ * Inactivity bound for a single agent() call.
  *
- * MANDATORY, not optional. opencode retries provider failures with no attempt cap, and on the
- * ordinary headers-present path the backoff is capped only by RETRY_MAX_DELAY (~24.8 days).
- * Combined with the plugin client's `req.timeout = false`, one rate-limited agent would pin a
- * concurrency permit forever — and budget() is token-based, so it cannot see idle retry sleep.
+ * The PRIMARY runaway backstop, and the one that catches the real failure mode: a stalled provider
+ * produces no events, so the idle timer fires within minutes of the stall instead of waiting out a
+ * wall clock. opencode retries provider failures with no attempt cap (see DEFAULT_AGENT_DEADLINE_MS
+ * for the arithmetic), and an idle agent is exactly the shape a retry storm takes.
  */
-export const DEFAULT_AGENT_DEADLINE_MS = 15 * 60 * 1000
+export const DEFAULT_AGENT_IDLE_MS = 5 * 60 * 1000
+
+/**
+ * Wall-clock ceiling for a single agent() call, generous because real workflow agents legitimately
+ * run for hours (Claude Code has no per-agent ceiling at all).
+ *
+ * MANDATORY as a pathology bound, not a productivity bound: it exists so an agent that keeps
+ * emitting events forever without finishing cannot hold a concurrency permit indefinitely.
+ * `0` disables it entirely; the idle limit then remains as the sole backstop.
+ */
+export const DEFAULT_AGENT_DEADLINE_MS = 4 * 60 * 60 * 1000
+
+/** Max automatic restarts of one agent after a deadline kill. Bounds the restart loop. */
+export const MAX_AGENT_RESTARTS = 3
+
+/**
+ * The largest delay the platform's timers honour.
+ *
+ * Node clamps setTimeout delays above 2^31-1 ms down to ~1ms, so a value past this would make
+ * every bound fire almost instantly — the exact inverse of a user setting a huge ceiling to
+ * disable it. Options are clamped here rather than trusted.
+ */
+export const MAX_TIMER_MS = 2_147_483_647
 
 /**
  * Effort variants in descending PREFERENCE — which to reach for first when nothing specific was
