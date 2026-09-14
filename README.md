@@ -121,9 +121,9 @@ ultraopen only tries to be the right tool when the work already happens in openc
 - **`ultracode` mode** — raises reasoning effort and makes fan-out the default. Four ways in: the
   `ultracode` agent, the keyword, `/ultracode`, or a project config flag.
 - **Live progress** — the three TUI surfaces above, served by one shared poller.
-- **Safety rails** — a recursion guard (a nested `workflow()` runs one level only), a wall-clock
-  deadline per agent, a global concurrency cap, an orphan reaper that releases subagents left by
-  a killed server, and retention pruning of finished run directories.
+- **Safety rails** — a recursion guard (a nested `workflow()` runs one level only), an inactivity
+  deadline plus a wall-clock ceiling per agent, a global concurrency cap, an orphan reaper that
+  releases subagents left by a killed server, and retention pruning of finished run directories.
 
 | Global | Behavior |
 | --- | --- |
@@ -142,7 +142,9 @@ ultraopen only tries to be the right tool when the work already happens in openc
 | Items per `pipeline`/`parallel` call | 4,096 |
 | Script size | 512 KiB |
 | Concurrency | 1–32 (default 8) |
-| Per-agent deadline | 15 min default |
+| Per-agent inactivity limit | 5 min without progress (resets on any child event) |
+| Per-agent wall clock | 4 h default, `0` disables |
+| Stall auto-restart | up to 3 restarts per agent after a deadline kill |
 
 `agent()` accepts `label`, `phase`, `schema`, `model`, `effort`, `agentType`, `isolation`,
 `disallowedTools`.
@@ -179,7 +181,11 @@ above.
    ```
    - `concurrency` — global cap on live agents. Default 8, clamped to 1–32, 0 rejected.
    - `ultracode` or `mode: "ultracode"` — enable `ultracode` effort mode. Default off.
-   - `agentDeadlineMs` — wall-clock deadline per agent. Default 15 min.
+   - `agentDeadlineMs` — wall-clock ceiling per agent, in milliseconds. Default 4 h; `0` disables
+     it (real agents legitimately run for hours; the wall clock only bounds pathology).
+   - `agentIdleMs` — inactivity limit per agent, in milliseconds. Default 5 min; the timer resets
+     whenever the child makes progress. A stalled agent is killed at the idle limit and restarted
+     up to 3 times.
    - `effortPreference` — the effort ladder tried in order. Default
      `["xhigh", "max", "high", "medium", "low"]`.
 
@@ -213,7 +219,7 @@ Working end to end:
 - per-model effort resolution
 - resume across processes (journal replay returns the recorded values)
 - nested `workflow({ script })`
-- the per-agent deadline option
+- the per-agent idle limit and wall clock
 - all four ultracode activation surfaces
 - the three TUI progress surfaces
 
@@ -223,6 +229,13 @@ Known gaps the e2e probes confirmed:
   pass `{ script }` inline)
 - `agent()`'s `isolation: "worktree"` option is inert in the live wiring (`worktreeRoot` is
   never passed)
+- schema-forced agents (`schema:` on `agent()`) can fail against Together with an empty
+  `APIError` when ANY tool in the session's toolset carries a `$ref` in its JSON Schema (some
+  MCP servers do — Obsidian's `vault_patch` does). Together's grammar compiler misresolves
+  `$ref` pointers under the string form of `tool_choice: "required"` that opencode sends for
+  `format` calls; the identical request succeeds with the object form. Workaround: disable the
+  offending MCP server, or run those agents schema-less. Full bisect and the candidate
+  upstream fixes live in `tasks/upstream-fixes/notes/transcript-echo.md`.
 
 Each probe carries a `bun run check`-clean implementation note in the suites.
 

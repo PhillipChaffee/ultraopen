@@ -3,13 +3,15 @@ import { resolveOptions } from "../src/server/options.js"
 import { MAX_CONCURRENCY, MIN_CONCURRENCY } from "../src/server/script/limits.js"
 
 const DEFAULT_CONCURRENCY = 8,
- DEFAULT_AGENT_DEADLINE_MS = 15 * 60 * 1000,
- DEFAULT_EFFORT_PREFERENCE = ["xhigh", "max", "high", "medium", "low"],
+  DEFAULT_AGENT_DEADLINE_MS = 4 * 60 * 60 * 1000,
+  DEFAULT_AGENT_IDLE_MS = 5 * 60 * 1000,
+  DEFAULT_EFFORT_PREFERENCE = ["xhigh", "max", "high", "medium", "low"],
 
  DEFAULTS = {
   concurrency: DEFAULT_CONCURRENCY,
   ultracode: false,
   agentDeadlineMs: DEFAULT_AGENT_DEADLINE_MS,
+  agentIdleMs: DEFAULT_AGENT_IDLE_MS,
   effortPreference: DEFAULT_EFFORT_PREFERENCE,
 }
 
@@ -74,10 +76,30 @@ describe("resolveOptions — agentDeadlineMs", () => {
     expect(resolveOptions({ agentDeadlineMs: 5000 }).agentDeadlineMs).toBe(5000)
   })
 
-  const invalidDeadlines: unknown[] = [0, -1, Number.NaN, Number.POSITIVE_INFINITY, "5000", true, null, {}]
+  // 0 is a MEANINGFUL value for the wall clock: it disables the bound, so the idle limit stands
+  // alone. Only negatives and non-numbers fall back to the default.
+  test("honours 0 as disabled", () => {
+    expect(resolveOptions({ agentDeadlineMs: 0 }).agentDeadlineMs).toBe(0)
+  })
+
+  const invalidDeadlines: unknown[] = [-1, Number.NaN, Number.POSITIVE_INFINITY, "5000", true, null, {}]
 
   test.each(invalidDeadlines)("falls back to the default for %p", (input) => {
     expect(resolveOptions({ agentDeadlineMs: input }).agentDeadlineMs).toBe(DEFAULT_AGENT_DEADLINE_MS)
+  })
+})
+
+describe("resolveOptions — agentIdleMs", () => {
+  test("honours a positive number", () => {
+    expect(resolveOptions({ agentIdleMs: 1000 }).agentIdleMs).toBe(1000)
+  })
+
+  // 0 is NOT honoured for the idle bound: an inactivity limit of zero would kill every agent the
+  // instant no progress was observed in a poll tick, which is a hang shaped like a guard.
+  const invalidIdle: unknown[] = [0, -1, Number.NaN, Number.POSITIVE_INFINITY, "5000", true, null, {}]
+
+  test.each(invalidIdle)("falls back to the default for %p", (input) => {
+    expect(resolveOptions({ agentIdleMs: input }).agentIdleMs).toBe(DEFAULT_AGENT_IDLE_MS)
   })
 })
 
@@ -119,10 +141,12 @@ describe("resolveOptions — returns a fresh copy", () => {
     first.concurrency = 999
     first.ultracode = true
     first.agentDeadlineMs = 1
+    first.agentIdleMs = 1
 
     expect(second.concurrency).toBe(DEFAULT_CONCURRENCY)
     expect(second.ultracode).toBe(false)
     expect(second.agentDeadlineMs).toBe(DEFAULT_AGENT_DEADLINE_MS)
+    expect(second.agentIdleMs).toBe(DEFAULT_AGENT_IDLE_MS)
   })
 
   test("mutating one result's user-supplied effortPreference array does not affect a later call", () => {

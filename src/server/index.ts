@@ -137,6 +137,21 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
     "shell.env": (hookInput: { sessionID?: string }, output: ShellEnvOutput): void => {
       if (hookInput.sessionID && registry.owns(hookInput.sessionID)) {output.env[ACTIVE_ENV] = "1"}
     },
+
+    /**
+     * Feeds the idle deadline's activity map.
+     *
+     * Every live message update touches the emitting child's last-activity stamp. Bus events are
+     * the only progress signal that covers schema'd children: `format` poisons the REST message
+     * listing, but part events are emitted live regardless. Touching is scoped to engine-owned
+     * sessions, so the user's own sessions never inflate the map.
+     */
+    event: (hookInput: { event?: { type?: string; properties?: { part?: { sessionID?: string }; info?: { sessionID?: string } } } }): void => {
+      const event = hookInput?.event
+      if (event?.type !== "message.part.updated" && event?.type !== "message.updated") {return}
+      const sessionID = event.properties?.part?.sessionID ?? event.properties?.info?.sessionID
+      if (sessionID !== undefined) {registry.touchActivity(sessionID)}
+    },
   }
 
   if (!nested) {
@@ -159,6 +174,7 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
             sessionID: context.sessionID,
             runId,
             deadlineMs: options.agentDeadlineMs,
+            idleMs: options.agentIdleMs,
             // Makes the schema-advertised `scriptPath` real: persisted scripts under the run
             // directory can be re-run by path.
             readScript: (path: string) => readFile(path, "utf8"),
@@ -244,7 +260,11 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
               onProgress: (event) => {
                 progress.apply(event, Date.now())
                 void progress.flush()
-                if (event.type === "agent-start") {void persistChildren()}
+                // Persist on agent-start AND on log lines: a stall restart spawns a NEW child
+                // session without an agent-start, and a killed server must leave the reaper a
+                // list that includes it. persistChildren no-ops when the list is unchanged, so
+                // narration-heavy runs cost no extra writes.
+                if (event.type === "agent-start" || event.type === "log") {void persistChildren()}
               },
               onJournal: flush,
               ...(resume && resume.entries.length > 0

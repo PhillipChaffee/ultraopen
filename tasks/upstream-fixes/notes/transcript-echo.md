@@ -1,0 +1,30 @@
+# Transcript echo facts
+
+- The README lists the echo under cosmetic limitations: the transcript renderer echoes a tool call's raw arguments, so a `workflow` call displays its full script.
+- The script is also part of the message history. An inline script uses context window space until compaction. Claude Code has the same property. Only the display differs: Claude Code collapses the display of tool calls.
+- Mitigation today: keep the script in a file and pass `scriptPath`. The tool schema supports it. The async-runs epic makes `scriptPath` even more natural, because the persisted script of a past run can be passed back by path.
+- Upstream repository: github.com/anomalyco/opencode. The render code lives in the TUI host. Look at how the transcript renders tool-call parts, and add a collapse above a size threshold with an expand action.
+- Second upstream item, from the approval epic: check whether the permission dialog renders the `metadata` that the ask call passes. If it does not, add that finding here as a second upstream item.
+
+## Format poisoning scope (2026-09-14, verified against opencode source)
+
+- Who writes `format`: ONLY a caller that passes it on the prompt body. Regular subagents (`tool/task.ts`) never pass format; title and summary generation never do; compaction only COPIES an existing format forward (`compaction.ts:478`). So regular opencode subagents never use structured output and never get poisoned — the `StructuredOutput` tool + `toolChoice: "required"` machinery only activates when a prompt carries `format`.
+- The poisoning is therefore scoped to sessions that received a format prompt = ultraopen's schema'd child agents (and any other SDK/plugin caller passing format).
+- The failure is on READ-BACK: `GET /session/:id/message` returns 400 `BadRequest — Expected OutputFormatJsonSchema, got {...}` while re-validating the stored user message's `format` — even a stored `{"type":"text"}` 400s, so the read-path union decode disagrees with the write path. The user message schema itself declares `format` (schema/src/v1/session.ts:338), so this is a response-validation bug, not a schema gap.
+- Who is hurt: the opencode TUI transcript of a schema'd child session, `opencode export <sessionID>`, and the `opencode run` replay/turn-summary paths — all read messages through this endpoint. The parent session is fine.
+- Compaction copies format forward, so the poison survives compaction within the session — consistent with ultraopen's own "format must be resent every turn" workaround (spawn.ts:121-123).
+- What the fix must not do: remove the text. The user and the model may need to copy the script. Collapse with an expand action, not deletion.
+
+## Schema-forced calls fail with a Together grammar error (2026-09-14, ROOT CAUSE: tool_choice form + $ref pointer base)
+
+Bisected with direct Together API calls (no opencode) replaying the captured failing request:
+
+- ROOT CAUSE: Together's grammar compiler mishandles `$ref` JSON Pointers ONLY on the string form of `tool_choice: "required"` — that path union-compiles ALL tool schemas and resolves `$ref` pointers against the wrong base, so the legal pointer `#/properties/destination/properties/parent/anyOf/0` (from the Obsidian MCP `vault_patch` tool) reports "does not exist" and the whole request 400s. With the OBJECT form of tool_choice (`{"type":"function","function":{"name":...}}`), Together compiles only the named tool's grammar, resolves the same `$ref`s correctly, and the IDENTICAL request succeeds (V5, V8).
+- The full captured 102-tool request: string required -> 400 grammar error; object choice on StructuredOutput -> 200 with tool_calls. Same tools, same schema.
+- The `$ref` itself is spec-valid: draft-07 §8.3 resolves fragment-only refs against the schema document root (RFC 6901); the tool parameters object is the document root, `destination` IS a root-level property, and the pointer target exists. Verified against json-schema.org draft-07 spec sections 5, 8.2, 8.3.
+- Not an MCP configuration problem: the schema is legal; 1 of 102 tools uses `$ref`; Together's own docs document string `"required"` as supported and document no `$ref` limitation anywhere (structured-outputs and function-calling best-practices pages checked 2026-09-14).
+- Trigger chain: `format` -> opencode sets STRING-form `tool_choice: "required"` (prompt.ts:1285) -> Together union grammar over all ~102 tools -> pointer misresolution -> 400 start_generation_failed on every schema-forced call.
+- Fix owners: Together — pointer base bug in the string-required union grammar path (undocumented behavior). opencode — one-line sidestep available: send the OBJECT form (`{"type":"function","function":{"name":"StructuredOutput"}}`) for format calls, which scopes the grammar to the schema tool and avoids compiling other tools' schemas entirely. Not verified upstream yet; recorded here as the candidate fix.
+- Fix owners: Together — pointer base bug in the string-required union grammar path (undocumented behavior). opencode — one-line sidestep available: send the OBJECT form (`{"type":"function","function":{"name":"StructuredOutput"}}`) for format calls, which scopes the grammar to the schema tool and avoids compiling other tools' schemas entirely. Not verified upstream yet; recorded here as the candidate fix.
+- SECOND SYMPTOM (2026-09-14): string `"required"` does not reliably enforce the tool call even when it does not crash. With a `$defs`-ref schema or a minimal no-system-prompt request, Together returned 200 with `finish_reason=length` and `tool_calls=0` — the model answered in prose until the token cap, despite "required" being documented as "the model must call at least one tool". The OBJECT form enforced correctly in every run (`finish_reason=tool_calls`). So the string form is broken in two ways: crashes with property-tree `$ref`s, and unreliable enforcement otherwise. Both point at the same opencode fix.
+- User-side workaround: none needed in config — the Obsidian MCP server's schema is legal. (Disabling Obsidian also works, but the object-form tool_choice fix makes the schema irrelevant.)

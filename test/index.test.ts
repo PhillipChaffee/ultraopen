@@ -468,3 +468,57 @@ describe("ultracode hooks are wired", () => {
     expect(mode.isActive("brand-new-session")).toBe(true)
   })
 })
+
+/** A message.part.updated event naming one session, the shape the event hook actually receives. */
+const partEvent = (sessionID: string): { event: { type: string; properties: Record<string, unknown> } } => ({
+  event: { type: "message.part.updated", properties: { part: { sessionID } } },
+})
+
+describe("idle-deadline activity feed (event hook)", () => {
+  beforeEach(() => {
+    registry.resetForTests()
+  })
+
+  test("the hook is registered", () => {
+    const hooks = ultraopen({ client: stubClient })
+    expect(typeof hooks["event"]).toBe("function")
+  })
+
+  test("a part update for an engine-owned session touches its activity", () => {
+    const hooks = ultraopen({ client: stubClient }),
+     onEvent = hooks["event"] as (input: unknown) => void
+    registry.register("child-1", "run-1")
+    onEvent(partEvent("child-1"))
+    expect(registry.lastActivity("child-1")).toBeGreaterThan(0)
+  })
+
+  test("the user's own sessions are never touched", () => {
+    const hooks = ultraopen({ client: stubClient }),
+     onEvent = hooks["event"] as (input: unknown) => void
+    onEvent(partEvent("user-session"))
+    expect(registry.lastActivity("user-session")).toBe(0)
+  })
+
+  test("message.updated events are also recognised", () => {
+    const hooks = ultraopen({ client: stubClient }),
+     onEvent = hooks["event"] as (input: unknown) => void
+    registry.register("child-1", "run-1")
+    onEvent({ event: { type: "message.updated", properties: { info: { sessionID: "child-1" } } } })
+    expect(registry.lastActivity("child-1")).toBeGreaterThan(0)
+  })
+
+  test("an unrelated event type is ignored", () => {
+    const hooks = ultraopen({ client: stubClient }),
+     onEvent = hooks["event"] as (input: unknown) => void
+    registry.register("child-1", "run-1")
+    expect(() => onEvent({ event: { type: "session.idle", properties: {} } })).not.toThrow()
+    expect(registry.lastActivity("child-1")).toBe(0)
+  })
+
+  test("a malformed payload never throws", () => {
+    const hooks = ultraopen({ client: stubClient }),
+     onEvent = hooks["event"] as (input: unknown) => void
+    expect(() => onEvent({})).not.toThrow()
+    expect(() => onEvent({ event: { type: "message.part.updated", properties: { part: {} } } })).not.toThrow()
+  })
+})

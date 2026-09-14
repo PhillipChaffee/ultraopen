@@ -1,6 +1,6 @@
 import { DeadlineExceededError, withDeadline } from "../runtime/deadline.js"
 import { registry } from "../singleton.js"
-import { DEFAULT_AGENT_DEADLINE_MS } from "../script/limits.js"
+import { DEFAULT_AGENT_DEADLINE_MS, DEFAULT_AGENT_IDLE_MS } from "../script/limits.js"
 import { childRuleset } from "./permission.js"
 import type { Ruleset } from "./permission.js"
 import type { AssistantInfo, CreateSessionBody, OpencodeClient, PromptBody, PromptResponse } from "../types.js"
@@ -8,6 +8,7 @@ import type { AssistantInfo, CreateSessionBody, OpencodeClient, PromptBody, Prom
 /** Why an agent produced no usable result. Surfaced per-agent so partial coverage is never silent. */
 export type NullReason =
   | "aborted"
+  | "idle-deadline"
   | "deadline"
   | "schema-failed"
   | "context-overflow"
@@ -35,6 +36,8 @@ export interface SpawnOptions {
   disallowedTools?: readonly string[] | undefined
   label: string
   deadlineMs?: number | undefined
+  /** Inactivity bound for the child; 0 disables it. Idle resets on observed child progress. */
+  idleMs?: number | undefined
   signal?: AbortSignal | undefined
   /** Working directory for an isolated agent. Routes the child session at its own worktree. */
   directory?: string | undefined
@@ -125,6 +128,10 @@ export async function promptChild(
 
      response = await withDeadline(client.session.prompt({ path: { id: sessionID }, body: promptBody }), {
       ms: options.deadlineMs ?? DEFAULT_AGENT_DEADLINE_MS,
+      // The registry's activity map is fed by the plugin's `event` hook; Bus part events are the
+      // only progress signal that covers schema'd children (format poisons the REST listing).
+      idleMs: options.idleMs ?? DEFAULT_AGENT_IDLE_MS,
+      activity: () => registry.lastActivity(sessionID),
       label: options.label,
       onTimeout: abortChild,
     })
@@ -135,7 +142,15 @@ export async function promptChild(
     return interpret(response.data, sessionID, options.schema !== undefined)
   } catch (error) {
     if (error instanceof DeadlineExceededError) {
-      return { ok: false, reason: "deadline", detail: error.message, sessionID }
+      // The two kill shapes are distinguished because only an idle kill restarts: a wall-clock
+      // kill means the agent produced continuously for the whole ceiling, and a fresh attempt
+      // would just re-pay hours of work against a brand-new ceiling.
+      return {
+        ok: false,
+        reason: error.kind === "idle" ? "idle-deadline" : "deadline",
+        detail: error.message,
+        sessionID,
+      }
     }
     if (options.signal?.aborted) {
       return { ok: false, reason: "aborted", detail: "parent aborted", sessionID }

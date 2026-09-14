@@ -1,4 +1,4 @@
-import { MAX_CONCURRENCY, MIN_CONCURRENCY } from "./script/limits.js"
+import { MAX_CONCURRENCY, MAX_TIMER_MS, MIN_CONCURRENCY } from "./script/limits.js"
 
 /**
  * Plugin options, supplied via the tuple form in opencode.json:
@@ -14,8 +14,10 @@ export interface UltraopenOptions {
   concurrency: number
   /** When true, ultracode's standing opt-in applies from the first turn in this project. */
   ultracode: boolean
-  /** Wall-clock ceiling for a single agent, in milliseconds. */
+  /** Wall-clock ceiling for a single agent, in milliseconds. 0 disables it; the idle limit remains. */
   agentDeadlineMs: number
+  /** Inactivity bound for a single agent, in milliseconds. The timer resets on child progress. */
+  agentIdleMs: number
   /** Effort preference, highest first. Resolved against each model's real variant map. */
   effortPreference: readonly string[]
 }
@@ -23,7 +25,8 @@ export interface UltraopenOptions {
 const DEFAULTS: UltraopenOptions = {
   concurrency: 8,
   ultracode: false,
-  agentDeadlineMs: 15 * 60 * 1000,
+  agentDeadlineMs: 4 * 60 * 60 * 1000,
+  agentIdleMs: 5 * 60 * 1000,
   effortPreference: ["xhigh", "max", "high", "medium", "low"],
 }
 
@@ -40,7 +43,8 @@ export function resolveOptions(raw: unknown): UltraopenOptions {
   return {
     concurrency: clampConcurrency(input["concurrency"]),
     ultracode: input["ultracode"] === true || input["mode"] === "ultracode",
-    agentDeadlineMs: positiveNumber(input["agentDeadlineMs"]) ?? DEFAULTS.agentDeadlineMs,
+    agentDeadlineMs: clampTimeout(input["agentDeadlineMs"], DEFAULTS.agentDeadlineMs, true),
+    agentIdleMs: clampTimeout(input["agentIdleMs"], DEFAULTS.agentIdleMs, false),
     effortPreference: stringArray(input["effortPreference"]) ?? DEFAULTS.effortPreference,
   }
 }
@@ -56,9 +60,16 @@ function clampConcurrency(value: unknown): number {
   return Math.min(MAX_CONCURRENCY, Math.max(MIN_CONCURRENCY, Math.floor(value)))
 }
 
-function positiveNumber(value: unknown): number | undefined {
-  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {return undefined}
-  return value
+/**
+ * Validates a timer option into [allowZero ? 0 : 1, MAX_TIMER_MS].
+ *
+ * Values above MAX_TIMER_MS are clamped, never honoured: the platform's timers clamp delays past
+ * 2^31-1 ms down to ~1ms, so "a huge ceiling to disable the bound" would otherwise invert into
+ * every agent dying almost instantly.
+ */
+function clampTimeout(value: unknown, fallback: number, allowZero: boolean): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < (allowZero ? 0 : 1)) {return fallback}
+  return Math.min(MAX_TIMER_MS, value)
 }
 
 function stringArray(value: unknown): string[] | undefined {

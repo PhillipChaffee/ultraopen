@@ -18,7 +18,10 @@ import { DEFAULT_CONCURRENCY } from "./script/limits.js"
 const engineSessions = new Set<string>(),
 
 /** Child session id -> the run that owns it, so aborts and budget roll up correctly. */
- sessionToRun = new Map<string, string>()
+ sessionToRun = new Map<string, string>(),
+
+/** Child session id -> epoch ms of its last observed activity, for the idle deadline. */
+ lastActivityAt = new Map<string, number>()
 
 let semaphore = new Semaphore(DEFAULT_CONCURRENCY)
 
@@ -48,6 +51,24 @@ export const registry = {
   forget(sessionID: string): void {
     engineSessions.delete(sessionID)
     sessionToRun.delete(sessionID)
+    lastActivityAt.delete(sessionID)
+  },
+
+  /**
+   * Records observed progress for an engine-owned child.
+   *
+   * Fed by the plugin's `event` hook (`message.part.updated` / `message.updated`), which is the
+   * only progress signal that covers schema'd children — `format` poisons the REST message
+   * listing, but the Bus emits part events live regardless. The idle deadline reads this map.
+   */
+  touchActivity(sessionID: string, at = Date.now()): void {
+    if (!engineSessions.has(sessionID)) {return}
+    lastActivityAt.set(sessionID, at)
+  },
+
+  /** Epoch ms of the child's last observed activity, 0 when never touched. */
+  lastActivity(sessionID: string): number {
+    return lastActivityAt.get(sessionID) ?? 0
   },
 
   /** True when the engine created this session — used to scope hooks and block recursion. */
@@ -76,6 +97,7 @@ export const registry = {
   resetForTests(): void {
     engineSessions.clear()
     sessionToRun.clear()
+    lastActivityAt.clear()
     semaphore = new Semaphore(DEFAULT_CONCURRENCY)
   },
 }
