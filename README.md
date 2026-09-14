@@ -229,6 +229,13 @@ Known gaps the e2e probes confirmed:
   pass `{ script }` inline)
 - `agent()`'s `isolation: "worktree"` option is inert in the live wiring (`worktreeRoot` is
   never passed)
+- schema-forced agents (`schema:` on `agent()`) can fail against Together with an empty
+  `APIError` when ANY tool in the session's toolset carries a `$ref` in its JSON Schema (some
+  MCP servers do — Obsidian's `vault_patch` does). Together's grammar compiler misresolves
+  `$ref` pointers under the string form of `tool_choice: "required"` that opencode sends for
+  `format` calls; the identical request succeeds with the object form. Workaround: disable the
+  offending MCP server, or run those agents schema-less. Full bisect and the candidate
+  upstream fixes live in `tasks/upstream-fixes/notes/transcript-echo.md`.
 
 Each probe carries a `bun run check`-clean implementation note in the suites.
 
