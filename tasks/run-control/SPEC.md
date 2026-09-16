@@ -1,6 +1,6 @@
 # Epic: run-control
 
-Status: not started
+Status: partial 2026-09-16 (T1 control channel, T2 pause/resume, T3 per-agent stop, T6 token counts shipped; T4 manual restart keys, T5 TUI selection, T7 detail view deferred)
 Estimate: 9 to 12 focused days
 Depends on: the control channel is the foundation. The keyboard resume and the drill-down build on it
 
@@ -51,10 +51,12 @@ Negative:
 
 ## Task list
 
-- [ ] T1 Control channel: the server watches a control file in the run directory. Files: `src/server/runtime/run.ts`, `src/server/resume/store.ts` (or a new module). Estimate 1 day.
-- [ ] T2 Pause and resume on the concurrency gate. Files: `src/server/runtime/semaphore.ts`, `src/server/runtime/run.ts`. Estimate 1 day.
-- [ ] T3 Per-agent stop: a signal map per agent, wired to the bridge abort. Files: `src/server/runtime/run.ts`, `src/server/bridge/spawn.ts`. Estimate 1 day.
+- [x] T1 Control channel: the server watches `control.jsonl` in the run directory (one JSON command per line; a memory cursor skips consumed sequences; malformed lines ignored). Files: `src/server/runtime/control.ts` (new), `src/server/runtime/run.ts` (`handleControl`), `src/server/index.ts` (the per-run watcher, cleared at settle). Estimate 1 day. (Open question resolved: the TUI writes the FILE — the file channel is proven by the progress pattern and needs no client.)
+- [x] T2 Pause and resume on the concurrency gate. Files: `src/server/runtime/semaphore.ts`, `src/server/runtime/run.ts`. Estimate 1 day. (Pause holds new acquisitions; in-flight permits are never revoked; resume drains FIFO.)
+- [x] T3 Per-agent stop: a per-agent AbortController combined with the run signal into the bridge options; stopping one agent aborts exactly its child. Files: `src/server/runtime/run.ts` (`agentSignal`, `handleControl`). Estimate 1 day.
+- [ ] T4 Restart-in-place manual keys: the journal machinery ships (auto-restart, PR #17); the control command exists and is parsed, and currently logs that it is not implemented — the in-flight path (synthetic idle-deadline abort) and the finished/failed path (journal restart) land with T5. Estimate 1 day.
+- [ ] T5 TUI selection, key handling, and imperative rendering: NOT STARTED (highest risk; needs the live keyboard spike the render-limit notes prescribe). Files: `src/tui/index.tsx`, `src/tui/data.ts`. Estimate 2 to 3 days.
 - [ ] T4 Restart in place, first slice shipped 2026-09-13: a `deadline` null auto-restarts the agent up to 3 times, reusing the held concurrency permit and re-asserting budget per attempt. Each attempt appends its own journal entry with the same key and an `attempt` field; the newest `ok` entry wins replay. Remaining for the full task: manual/TUI restart keys via the control channel (T1/T5). Files: `src/server/runtime/run.ts`, `src/server/resume/key.ts`. Estimate 1 to 2 days.
 - [ ] T5 TUI selection, key handling, and imperative rendering. Files: `src/tui/index.tsx`, `src/tui/data.ts`. Estimate 2 to 3 days. Highest risk in this epic.
-- [ ] T6 Token counts per agent in the sidebar. Files: `src/server/runtime/run.ts`, `src/tui/data.ts`. Estimate 1 to 1.5 days.
+- [x] T6 Token counts per agent in the sidebar. Files: `src/server/runtime/run.ts` (agent-end events carry outputTokens), `src/server/resume/progress.ts` (snapshot rows), `src/tui/data.ts` (`agentRowText` renders `· 1.3k`). Estimate 1 to 1.5 days.
 - [ ] T7 Detail view with tool calls. Files: `src/tui/index.tsx`, `src/tui/data.ts`. Estimate 2 to 3 days. Read the open question in the notes first.

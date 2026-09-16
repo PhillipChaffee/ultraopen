@@ -154,3 +154,52 @@ describe("Semaphore.resize", () => {
     expect(sem.limit).toBe(MAX_CONCURRENCY)
   })
 })
+
+describe("Semaphore — pause and resume", () => {
+  test("pause blocks new acquisitions; in-flight permits are untouched", async () => {
+    const gate = new Semaphore(2)
+    const permits = [await gate.acquire(), await gate.acquire()]
+    gate.pause()
+    expect(gate.paused).toBe(true)
+    let acquired = false
+    void gate.acquire().then((release) => {
+      acquired = true
+      return release
+    })
+    await Promise.resolve()
+    expect(acquired).toBe(false)
+    // In-flight permits are never revoked by the pause.
+    expect(gate.active).toBe(2)
+    // Resume opens the drain, but a waiter is admitted only when a permit is
+    // RELEASED — in-flight work is never revoked.
+    permits.at(0)?.()
+    gate.resume()
+    await Bun.sleep(1)
+    expect(gate.paused).toBe(false)
+    expect(acquired).toBe(true)
+    permits.at(1)?.()
+  })
+
+  test("a paused gate queues in FIFO order; resume releases in order", async () => {
+    const gate = new Semaphore(1)
+    const first = await gate.acquire()
+    gate.pause()
+    const order: number[] = []
+    const waiters = [gate.acquire().then((r) => {order.push(1); return r()}), gate.acquire().then((r) => {order.push(2); return r()})]
+    first()
+    gate.resume()
+    await Promise.all(waiters)
+    expect(order).toEqual([1, 2])
+  })
+
+  test("resume with nothing queued is a no-op that does not oversubscribe", async () => {
+    const gate = new Semaphore(1)
+    const permit = await gate.acquire()
+    gate.pause()
+    gate.resume()
+    gate.resume()
+    expect(gate.active).toBe(1)
+    permit()
+    expect(gate.active).toBe(0)
+  })
+})

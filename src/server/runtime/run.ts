@@ -1,6 +1,7 @@
 import { fail } from "../script/errors.js"
 import { DEFAULT_AGENT_DEADLINE_MS, DEFAULT_AGENT_IDLE_MS, LARGE_RUN_AGENTS, LARGE_RUN_PROJECTED_TOKENS, MAX_AGENTS_PER_RUN, MAX_AGENT_RESTARTS } from "../script/limits.js"
 import { registry } from "../singleton.js"
+import type { ControlAction, ControlCommand } from "./control.js"
 import type { NullReason } from "../bridge/spawn.js"
 import { spawnStructured } from "../bridge/structured.js"
 import { Journal } from "../resume/journal.js"
@@ -43,7 +44,7 @@ export interface AgentRecord {
 
 export type ProgressEvent =
   | { type: "agent-start"; index: number; label: string; phase: string | undefined; sessionID?: string }
-  | { type: "agent-end"; index: number; label: string; phase: string | undefined; ok: boolean; sessionID?: string }
+  | { type: "agent-end"; index: number; label: string; phase: string | undefined; ok: boolean; outputTokens?: number; sessionID?: string }
   | { type: "phase"; title: string }
   | { type: "log"; message: string }
 
@@ -101,6 +102,8 @@ export class Run {
   #currentPhase: string | undefined
   #spawned = 0
   #largeRunWarned = false
+  /** One controller per in-flight agent, so a stop-agent can abort exactly one child. */
+  readonly #agentControllers = new Map<number, AbortController>()
   readonly #options: RunOptions
   readonly #journal: Journal
   readonly #rootScope: Scope
@@ -137,6 +140,56 @@ export class Run {
 
   get currentPhase(): string | undefined {
     return this.#currentPhase
+  }
+
+  /**
+   * Runs one control command from the TUI's control file.
+   *
+   * Unknown or unsupported actions are logged, never a crash. Every action here
+   * is safe to run twice (the cursor skips consumed sequences; a crash between
+   * consume and acknowledge replays a safe action).
+   */
+  handleControl(command: ControlCommand): void {
+    const who = command.target === undefined ? "" : ` (agent ${command.target})`
+    switch (command.action) {
+      case "pause": {
+        registry.semaphore.pause()
+        this.log("control: run paused — in-flight agents finish, no new agent starts.")
+        break
+      }
+      case "resume": {
+        registry.semaphore.resume()
+        this.log("control: run resumed.")
+        break
+      }
+      case "stop-run": {
+        this.log("control: stop requested — aborting every in-flight agent.")
+        void this.abortAll()
+        break
+      }
+      case "stop-agent": {
+        const controller = command.target === undefined ? undefined : this.#agentControllers.get(command.target)
+        if (!controller) {
+          this.log(`control: stop-agent ${command.target ?? ""} — no in-flight agent with that index; ignored.`)
+          break
+        }
+        controller.abort()
+        this.log(`control: agent ${command.target} stopped — its siblings are untouched.`)
+        break
+      }
+      case "restart-agent": {
+        // The manual key lands with the TUI selection slice (run-control T5);
+        // the in-flight mechanism exists — a synthetic idle-deadline abort —
+        // but the finished/failed agent path needs the journal restart first.
+        this.log(`control: restart-agent${who} is not implemented yet; the automatic restart after an idle kill is the supported path.`)
+        break
+      }
+    }
+  }
+
+  /** The control commands this run accepts, exposed for the watcher's dispatch. */
+  get controlActions(): readonly ControlAction[] {
+    return ["pause", "resume", "stop-run", "stop-agent", "restart-agent"]
   }
 
   /**
@@ -232,7 +285,7 @@ export class Run {
       const replayed = toReplayedEntry(hit.entry, label, phase, this.#resumedFrom)
       this.#journal.record(replayed)
       this.#options.onJournal?.(replayed)
-      this.#options.onProgress?.({ type: "agent-end", index, label, phase, ok: true })
+      this.#options.onProgress?.({ type: "agent-end", index, label, phase, ok: true, outputTokens: hit.outputTokens })
       this.maybeWarnLargeRun()
       // Replayed spend counts as if paid, or a budget-guarded loop takes a different number of
       // trips on resume and the script's own control flow diverges.
@@ -242,6 +295,10 @@ export class Run {
     // A miss breaks the scope for everything after it.
     if (!identity.forceLive) {breakScope(this.#rootScope)}
 
+    // One controller per in-flight agent, so a stop-agent aborts exactly one
+    // child and leaves its siblings untouched.
+    const agentController = new AbortController()
+    this.#agentControllers.set(index, agentController)
     this.#options.onProgress?.({ type: "agent-start", index, label, phase })
     this.maybeWarnLargeRun()
 
@@ -275,7 +332,7 @@ export class Run {
         ...pick("inheritedPermission", this.#options.inheritedPermission),
         ...pick("deadlineMs", this.#options.deadlineMs ?? DEFAULT_AGENT_DEADLINE_MS),
         ...pick("idleMs", this.#options.idleMs ?? DEFAULT_AGENT_IDLE_MS),
-        ...pick("signal", this.#options.signal),
+        ...pick("signal", agentSignal(this.#options.signal, this.#agentControllers, index)),
         ...pick("directory", worktree?.directory),
       }
       let outcome = await spawnStructured(this.#options.client, spawnOptions)
@@ -364,6 +421,7 @@ export class Run {
         label,
         phase,
         ok: finalOutcome.ok,
+        ...pick("outputTokens", this.records.at(-1)?.outputTokens),
         ...pick("sessionID", finalOutcome.sessionID),
       })
       this.maybeWarnLargeRun()
@@ -372,6 +430,7 @@ export class Run {
       return value
     } finally {
       release()
+      this.#agentControllers.delete(index)
     }
   }
 
@@ -414,6 +473,21 @@ function outputTokensOf(info: { tokens?: { output?: number } }): number {
 /** Includes a key only when the value is present, which `exactOptionalPropertyTypes` requires. */
 function pick<K extends string, V>(key: K, value: V | undefined): Record<K, V> | Record<string, never> {
   return value === undefined ? {} : ({ [key]: value } as Record<K, V>)
+}
+
+/**
+ * The signal the bridge sees for one agent: the run's own signal AND the
+ * per-agent controller, combined. Aborting either aborts exactly this child.
+ */
+function agentSignal(runSignal: AbortSignal | undefined, controllers: Map<number, AbortController>, index: number): AbortSignal | undefined {
+  const controller = controllers.get(index)
+  if (controller === undefined) {return runSignal}
+  if (runSignal === undefined) {return controller.signal}
+  const combined = new AbortController()
+  const forward = (): void => combined.abort()
+  runSignal.addEventListener("abort", forward, { once: true })
+  controller.signal.addEventListener("abort", forward, { once: true })
+  return combined.signal
 }
 
 /**

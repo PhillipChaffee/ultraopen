@@ -13,6 +13,7 @@ import { MAX_CONCURRENCY, MIN_CONCURRENCY } from "../script/limits.js"
 export class Semaphore {
   #limit: number
   #active = 0
+  #paused = false
   readonly #waiters: Waiter[] = []
 
   constructor(limit: number) {
@@ -42,10 +43,35 @@ export class Semaphore {
     return this.#waiters.length
   }
 
+  /** True while the gate is paused: queued acquisitions hold until resume. */
+  get paused(): boolean {
+    return this.#paused
+  }
+
+  /**
+   * Holds NEW acquisitions; in-flight permits are never revoked.
+   *
+   * Pause does not clear the queue — resume releases it in FIFO order, so
+   * unstarted work resumes exactly where it queued.
+   */
+  pause(): void {
+    this.#paused = true
+  }
+
+  resume(): void {
+    if (!this.#paused) {return}
+    this.#paused = false
+    this.#drain()
+  }
+
   /** Resolves when a permit is available. The returned function releases it exactly once. */
   async acquire(signal?: AbortSignal): Promise<() => void> {
     if (signal?.aborted) {throw abortedError()}
-    if (this.#active < this.#limit) {
+    if (this.#paused && this.#active >= this.#limit) {
+      // Fall through to the queue below; #drain stays closed while paused, so
+      // the waiter holds until resume. An active==limit gate would queue anyway.
+    }
+    if (!this.#paused && this.#active < this.#limit) {
       this.#active++
       return this.#releaser()
     }
@@ -100,7 +126,7 @@ export class Semaphore {
   }
 
   #drain(): void {
-    while (this.#active < this.#limit && this.#waiters.length > 0) {
+    while (!this.#paused && this.#active < this.#limit && this.#waiters.length > 0) {
       const next = this.#waiters.shift()
       if (!next) {continue}
       this.#active++

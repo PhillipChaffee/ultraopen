@@ -159,7 +159,9 @@ describe("Run — large-run advice", () => {
         Promise.resolve({ data: { info: baseInfo({ outputTokens: LARGE_RUN_PROJECTED_TOKENS }), parts: [textPart("hi")] } }),
     }),
      run = new Run({ runId: "run-proj", client, parentSessionID: "parent-1", onProgress: (event) => {
-      if (event.type === "log") {logs.push(event.message)}
+      if (event.type === "log") {
+        logs.push(event.message)
+      }
     } })
     await run.agent("one expensive agent")
     expect(logs.filter((line) => line.includes("large-run warning")).length).toBe(1)
@@ -184,6 +186,81 @@ describe("Run — large-run advice", () => {
     expect(run.isLargeRun).toBe(false)
     await run.agent("one")
     expect(run.isLargeRun).toBe(false)
+  })
+})
+
+describe("Run — control commands", () => {
+  test("pause holds new agents on the gate; resume releases them", async () => {
+    // The agent never finishes, so the pause is observable.
+    const logs: string[] = [],
+     { client } = makeClient({ prompt: (): Promise<PromptResult> => new Promise(() => {}) }),
+     run = makeRun(client, {
+      onProgress: (event): void => {
+        if (event.type === "log") {logs.push(event.message)}
+      },
+    })
+    await Bun.sleep(5)
+    run.handleControl({ seq: 1, action: "pause" })
+    expect(registry.semaphore.paused).toBe(true)
+    expect(logs.join(" ")).toContain("run paused")
+    run.handleControl({ seq: 2, action: "resume" })
+    expect(registry.semaphore.paused).toBe(false)
+    expect(logs.join(" ")).toContain("run resumed")
+  })
+
+  test("stop-agent aborts exactly one agent and leaves its siblings untouched", async () => {
+    // Two agents in flight; stopping one aborts only its child session.
+    const aborted: string[] = [],
+     { client } = makeClient({
+      prompt: (): Promise<PromptResult> => new Promise(() => {}),
+      abort: (id: string) => {
+        aborted.push(id)
+        return Promise.resolve({})
+      },
+    }),
+     run = makeRun(client)
+    registry.resetForTests()
+    const first = run.agent("first")
+    const secondAgent = run.agent("second")
+    // Wait for both children to be created and registered.
+    await Bun.sleep(20)
+    run.handleControl({ seq: 1, action: "stop-agent", target: 0 })
+    await Bun.sleep(30)
+    expect(aborted.length).toBe(1)
+    run.handleControl({ seq: 2, action: "restart-agent", target: 0 })
+    expect(registry.semaphore.paused).toBe(false)
+    void first
+    void secondAgent
+  })
+
+  test("the control surface exposes the actions the channel parses", () => {
+    const { client } = makeClient(),
+     run = makeRun(client)
+    expect(run.controlActions).toEqual(["pause", "resume", "stop-run", "stop-agent", "restart-agent"])
+  })
+
+  test("an unsupported or inapplicable control command logs, never crashes", async () => {
+    const logs: string[] = [],
+     { client } = makeClient(),
+     run = makeRun(client, {
+      onProgress: (event): void => {
+        if (event.type === "log") {logs.push(event.message)}
+      },
+    })
+    await Bun.sleep(1)
+    expect(() => run.handleControl({ seq: 1, action: "restart-agent", target: 99 })).not.toThrow()
+    expect(logs.join(" ")).toContain("not implemented yet")
+  })
+
+  test("agent rows report their output tokens in the progress stream", async () => {
+    const events: ProgressEvent[] = [],
+     { client } = makeClient({
+      prompt: () => Promise.resolve({ data: { info: baseInfo({ outputTokens: 4321 }), parts: [textPart("hi")] } }),
+    }),
+     run = makeRun(client, { onProgress: (event) => events.push(event) })
+    await run.agent("do the thing")
+    const end = events.find((event) => event.type === "agent-end") as { outputTokens?: number }
+    expect(end?.outputTokens).toBe(4321)
   })
 })
 

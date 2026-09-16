@@ -17,6 +17,8 @@ export interface AgentProgress {
   label: string
   phase?: string | undefined
   status: "running" | "done" | "failed"
+  /** The agent's output-token spend, once its call has settled. */
+  outputTokens?: number | undefined
 }
 
 export interface ProgressSnapshot {
@@ -99,10 +101,24 @@ export class ProgressWriter {
         break
       }
       case "agent-end": {
+        const tokens = typeof (event as { outputTokens?: unknown }).outputTokens === "number"
+          ? (event as { outputTokens: number }).outputTokens
+          : undefined
         const agent = this.snapshot.agents.find((entry) => entry.index === event.index)
-        if (agent) {agent.status = event.ok ? "done" : "failed"}
+        if (agent) {
+          agent.status = event.ok ? "done" : "failed"
+          if (tokens !== undefined) {agent.outputTokens = tokens}
+        }
         // A replayed call never emits agent-start, so record it here rather than losing it.
-        else {this.snapshot.agents.push({ index: event.index, label: event.label, phase: event.phase, status: event.ok ? "done" : "failed" })}
+        else {
+          this.snapshot.agents.push({
+            index: event.index,
+            label: event.label,
+            phase: event.phase,
+            status: event.ok ? "done" : "failed",
+            ...(tokens === undefined ? {} : { outputTokens: tokens }),
+          })
+        }
         break
       }
     }

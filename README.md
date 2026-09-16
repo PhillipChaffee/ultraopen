@@ -141,6 +141,11 @@ ultraopen only tries to be the right tool when the work already happens in openc
   releases subagents left by a killed server, retention pruning of finished run directories, and a
   large-run advisory: when a run crosses the scheduled-agent or projected-token thresholds, the
   run log, the result, and the strip badge all say so — advice only, nothing stops.
+- **Run control (in progress)** — the control channel ships: a run's directory accepts
+  `control.jsonl` commands (`pause`, `resume`, `stop-run`, `stop-agent`, `restart-agent`),
+  the gate pauses new agents while in-flight work finishes, and `stop-agent` aborts exactly one
+  child. Agent rows show output-token spend. The TUI keys for selection/restart and the drill-down
+  detail view are the next slice (recorded in `tasks/run-control/SPEC.md`).
 - **Approval prompt** — the prompt names the real workflow (not the ignored title), its
   description and phases, and the run id. The script is persisted to the run directory **before**
   the prompt appears, so you can open `<run dir>/script.js` and read exactly what will run before
