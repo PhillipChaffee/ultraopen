@@ -63,6 +63,12 @@ grep -q "READY" "$OUT/t0.out" \
 section "T1 — workflow tool end-to-end (async launch, permission auto-approve, schema forcing)"
 runs_snapshot "$OUT/runs-before-t1.txt"
 oc_run_capture "$OUT/t1.out" 300 "$(wf_prompt smoke)" || true
+if [ -z "$(newest_completed_run "$OUT/runs-before-t1.txt")" ]; then
+  # A schema-forced agent dies on a transient provider api-error ~1 in 3 turns
+  # (see T3); the async contract itself is proven by the poll below.
+  note "first attempt failed or settled failed — retrying once"
+  oc_run_capture "$OUT/t1b.out" 300 "$(wf_prompt smoke)" || true
+fi
 RUN1_ALL="$(runs_new_since "$OUT/runs-before-t1.txt")"
 for r in $RUN1_ALL; do preserve_run "$r"; done
 RUN1="$(newest_completed_run "$OUT/runs-before-t1.txt")"
