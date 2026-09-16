@@ -106,6 +106,24 @@ Pass dryRun: true to run the whole script with agent() stubbed out — it exerci
 flow and fan-out shape for zero tokens, which is the cheapest way to debug a script.`
 
 /**
+ * The blocking variant, registered when the plugin's `runMode` is "blocking".
+ *
+ * Same body as the async description; only the contract paragraphs differ. The
+ * text must describe the contract the call actually follows — under blocking
+ * the call returns the outcome, and aborting the call aborts the run.
+ */
+export const blockingDescription = description
+  .replace(
+    `This call RETURNS AT ONCE with the run id. The run continues in the background while you keep
+working. Poll \`workflow_status\` with the run id (pass \`wait\` so one call blocks until the run
+settles or the wait expires) — do not re-launch the same workflow because a poll said "running".
+Aborting this call does not stop the run; if you must stop it, tell the user to end the opencode
+process, or wait for it to settle and resume from its run id.`,
+    `This call BLOCKS until the run completes, then returns one consolidated result. A 15-agent run
+can take many minutes. Aborting this call stops the run.`,
+  )
+
+/**
  * The `workflow_status` tool description.
  *
  * Same rules as the workflow description: this text trains the polling rhythm.

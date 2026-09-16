@@ -11,15 +11,15 @@ import {
   runDetached,
   settlePromiseOf,
 } from "../src/server/tool/background.js"
-import { readManifest } from "../src/server/resume/store.js"
-import { beginRun } from "../src/server/resume/persist.js"
-import { executeStatus } from "../src/server/tool/status.js"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 /** A task whose own failure path is itself broken — the harness must still record it. */
 const BROKEN_TASK = (): Promise<void> => Promise.reject(new Error("the failure path itself broke"))
+
+/** Records that the harness's escape hatch fired; index.ts supplies the real one. */
+const ESCAPE_RECORDER = (_error: unknown): Promise<void> => Promise.resolve()
 
 const manifest = (over: Partial<Parameters<typeof isLiveAnywhere>[0]> = {}) => ({
   runId: "wf_bgtarget1",
@@ -66,7 +66,7 @@ describe("launch-gating registry", () => {
 
   test("entries are scoped per session and dropped on settle", async () => {
     registerPending("wf_bg000005", "s1")
-    await runDetached({ runId: "wf_bg000005", manifest: undefined, task: async () => {} })
+    await runDetached({ runId: "wf_bg000005", task: async () => {}, onEscapedRejection: ESCAPE_RECORDER })
     expect(activeRunForSession("s1")).toBeUndefined()
     expect(activeRunForSession("s2")).toBeUndefined()
   })
@@ -131,7 +131,7 @@ describe("runDetached", () => {
 
   test("clears the launch-gating state and the settle handle when the task resolves", async () => {
     registerPending("wf_bg000100", "s1")
-    const pending = runDetached({ runId: "wf_bg000100", manifest: undefined, task: async () => {} })
+    const pending = runDetached({ runId: "wf_bg000100", task: async () => {}, onEscapedRejection: ESCAPE_RECORDER })
     // The handle must exist while the task is in flight.
     expect(settlePromiseOf("wf_bg000100")).toBeDefined()
     await pending
@@ -141,23 +141,28 @@ describe("runDetached", () => {
     await settlePromiseOf("wf_bg000100")
   })
 
-  test("an escaping rejection from the task persists a failure instead of vanishing", async () => {
-    // The task was supposed to capture its own outcome; if its failure path
-    // itself breaks, the harness must still leave an observable record.
-    const opening = await beginRun({ runId: "wf_bg000101", sessionID: "s1", source: "export const meta = {name:'x',description:'x'}", args: undefined, bootId: "b" })
-    await runDetached({ runId: "wf_bg000101", manifest: opening, task: BROKEN_TASK })
-    const settled = await readManifest("wf_bg000101")
-    expect(settled?.status).toBe("failed")
-    const report = await executeStatus({ runId: "wf_bg000101" })
-    expect(report.status).toBe("failed")
-    expect(report.failure?.message).toContain("the failure path itself broke")
+  test("an escaping rejection routes to the caller's degraded settle", async () => {
+    // The task was supposed to capture its own outcome; an escaping rejection
+    // means that capture itself broke, so the harness must hand the error to
+    // the caller's callback (which owns the flush chain) instead of dropping it.
+    const seen: unknown[] = []
+    await runDetached({
+      runId: "wf_bg000101",
+      task: BROKEN_TASK,
+      onEscapedRejection: (error): Promise<void> => {
+        seen.push(error)
+        return Promise.resolve()
+      },
+    })
+    expect(seen.length).toBe(1)
+    expect((seen[0] as Error).message).toContain("the failure path itself broke")
   })
 
   test("a settled run's children are dropped from the engine registry", async () => {
     registerPending("wf_bg000102", "s1")
     const { registry } = await import("../src/server/singleton.js")
     registry.register("child-a", "wf_bg000102")
-    await runDetached({ runId: "wf_bg000102", manifest: undefined, task: async () => {} })
+    await runDetached({ runId: "wf_bg000102", task: async () => {}, onEscapedRejection: ESCAPE_RECORDER })
     expect(registry.owns("child-a")).toBe(false)
   })
 })
@@ -177,7 +182,7 @@ describe("runDetached — unwritable disk", () => {
     const savedXDG = process.env["XDG_DATA_HOME"]
     process.env["XDG_DATA_HOME"] = "/dev/null/nope"
     try {
-      await runDetached({ runId: "wf_bg000200", manifest: undefined, task: BROKEN_TASK })
+      await runDetached({ runId: "wf_bg000200", task: BROKEN_TASK, onEscapedRejection: ESCAPE_RECORDER })
       expect(activeRunForSession("s1")).toBeUndefined()
     } finally {
       if (savedXDG === undefined) {delete process.env["XDG_DATA_HOME"]}

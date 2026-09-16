@@ -91,11 +91,6 @@ describe("executeStatus — inputs", () => {
     await expect(executeStatus({ runId: "wf_missing01" }, depsWithoutFiles)).rejects.toThrow(/Checked \/fake\/opencode\/tool-output\/ultraopen\/wf_missing01/u)
   })
 
-  test("wait is clamped to the 300-second cap", () => {
-    expect(MAX_WAIT_SECONDS).toBe(300)
-    // A wait above the cap behaves like the cap; the wait-path tests below pin
-    // the polling and expiry behavior itself.
-  })
 })
 
 describe("executeStatus — running, completed, failed", () => {
@@ -200,6 +195,14 @@ describe("executeStatus — derivations", () => {
     expect(again.outputTokens).toBe(107)
   })
 
+  test("a live phase with no journal entries yet still appears in the phase list", async () => {
+    // A phase reaches the journal only when an agent in it completes; the live
+    // snapshot's phase must surface before that, or a just-entered phase reads
+    // as "(none)" for the whole first leg of the run.
+    const report = await executeStatus({ runId: RUN }, deps({ "journal.jsonl": "" }))
+    expect(report.phases).toEqual(["Verify"])
+  })
+
   test("phase names come from the journal in first-seen order, plus the live phase", async () => {
     const journal = [
       entry({ phase: "Find" }),
@@ -248,6 +251,22 @@ describe("executeStatus — derivations", () => {
 
 describe("executeStatus — wait loop", () => {
   const sleeps: number[] = []
+
+  test("wait is clamped to the 300-second cap on the high side", async () => {
+    // A 1000-second ask must sleep for exactly the capped 300 s, not the ask —
+    // `wait` is model-supplied input and this clamp is its only bound.
+    expect(MAX_WAIT_SECONDS).toBe(300)
+    const report = await executeStatus({ runId: RUN, wait: 1000 }, depsWithClock())
+    expect(report.status).toBe("running")
+    expect(clock).toBe(300_000)
+  })
+
+  test("a negative wait collapses to the first snapshot with zero sleeps", async () => {
+    const report = await executeStatus({ runId: RUN, wait: -5 }, depsWithClock())
+    expect(report.status).toBe("running")
+    expect(sleeps.length).toBe(0)
+    expect(clock).toBe(0)
+  })
 
   const depsWithClock = (over: Record<string, string> = {}) => ({
     ...deps(over),

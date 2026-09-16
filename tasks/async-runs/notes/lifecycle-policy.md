@@ -14,10 +14,13 @@ The detached design changes what can end a run. Decide these points before task 
   the launch phase only. A parent-turn interrupt leaves the run untouched.
 - One live run per launching session: a second `workflow` call from a session
   with a pending or running detached run is REFUSED with a message naming the
-  active run id and its directory. Refused rather than queued because the
-  process-wide semaphore already serializes spawns, and a queue with no
-  progress surface reads as a hang. Nested `workflow()` calls are unaffected:
-  they never pass through the tool.
+  active run id and its directory. The gate covers BOTH contracts — a blocking
+  call from the same session is refused too, since mixed contracts would put
+  two agent-spending runs in one session. `dryRun` is exempt: it is free,
+  stubbed, and the standard way to debug a script mid-run. Refused rather than
+  queued because the process-wide semaphore already serializes spawns, and a
+  queue with no progress surface reads as a hang. Nested `workflow()` calls are
+  unaffected: they never pass through the tool.
 - Resume into a live run is refused from ANY session: when the target run id is
   registered live, or its manifest says `running` with a live pid, the launch
   is refused and the caller is pointed at `workflow_status`. Two Run instances

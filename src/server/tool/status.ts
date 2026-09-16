@@ -1,6 +1,7 @@
 import { parseJournal } from "../resume/journal.js"
 import type { Manifest } from "../resume/journal.js"
-import { isSafeRunId, runDir } from "../resume/store.js"
+import { artifactPaths, isSafeRunId, runDir } from "../resume/store.js"
+import type { ProgressSnapshot } from "../resume/progress.js"
 import { isProcessAlive } from "./background.js"
 
 /**
@@ -61,8 +62,7 @@ export async function executeStatus(args: StatusArgs, deps: StatusDeps = {}): Pr
   const env = deps.env,
    now = deps.now ?? (() => Date.now()),
    sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => {setTimeout(resolve, ms)})),
-   isAlive = deps.isAlive ?? isProcessAlive,
-   readFile = deps.readFile ?? defaultReadFile
+   isAlive = deps.isAlive ?? isProcessAlive
 
   // The id is model-supplied input and joins into a filesystem path below, so a
   // malformed id is rejected before any read: an unknown run, never a traversal.
@@ -70,38 +70,33 @@ export async function executeStatus(args: StatusArgs, deps: StatusDeps = {}): Pr
     throw new Error(unknownRunMessage(String(args.runId), env))
   }
 
-  const dir = runDir(args.runId, env),
+  // The artifact layout is the store's contract, not this module's: paths come
+  // from the module that writes them, so a writer-side change can never
+  // silently strand this reader.
+  const paths = artifactPaths(args.runId, env),
+   dir = paths.dir,
+   readFile = deps.readFile ?? defaultReadFile,
    readJson = async <T>(path: string): Promise<T | undefined> => {
     try {return JSON.parse(await readFile(path)) as T} catch {return undefined}
    },
-   manifestPath = `${dir}/manifest.json`,
-   progressPath = `${dir}/progress.json`,
-   journalPath = `${dir}/journal.jsonl`,
-   resultPath = `${dir}/result.json`,
    cap = Math.min(MAX_WAIT_SECONDS, Math.max(0, args.wait ?? 0)),
    deadline = now() + cap * 1000
 
   for (;;) {
-    const manifest = await readJson<Manifest>(manifestPath),
-     progress = await readJson<ProgressFile>(progressPath)
+    const manifest = await readJson<Manifest>(paths.manifestPath),
+     progress = await readJson<ProgressSnapshot>(paths.progressPath)
 
     if (manifest === undefined && progress === undefined) {
       throw new Error(unknownRunMessage(args.runId, env))
     }
 
-    const entries = await parseJournalSafe(await readFile(journalPath).catch(() => ""))
-    const report = await buildSnapshot({ args, manifest, progress, entries, deps, isAlive, dir, resultPath, readFile })
+    const entries = await parseJournalSafe(await readFile(paths.journalPath).catch(() => ""))
+    const report = await buildSnapshot({ args, manifest, progress, entries, deps, isAlive, dir, resultPath: paths.resultPath, failurePath: paths.failurePath, readFile })
     const settled = report.status !== "running" || deps.signal?.aborted === true || now() >= deadline
     if (settled) {return report}
     const remaining = deadline - now()
     await sleep(Math.min(POLL_INTERVAL_MS, Math.max(1, remaining)))
   }
-}
-
-interface ProgressFile {
-  phase?: string | undefined
-  agents?: { status: string }[] | undefined
-  logs?: string[] | undefined
 }
 
 interface JournalLine {
@@ -115,15 +110,16 @@ interface JournalLine {
 async function buildSnapshot(input: {
   args: StatusArgs
   manifest: Manifest | undefined
-  progress: ProgressFile | undefined
+  progress: ProgressSnapshot | undefined
   entries: JournalLine[]
   deps: StatusDeps
   isAlive: (pid: number) => boolean
   dir: string
   resultPath: string
+  failurePath: string
   readFile: (path: string) => Promise<string>
 }): Promise<StatusReport> {
-  const { args, manifest, progress, entries, deps, isAlive, dir, resultPath, readFile } = input
+  const { args, manifest, progress, entries, deps, isAlive, dir, resultPath, failurePath, readFile } = input
 
   // A run still marked `running` whose owning process is gone will never
   // settle: report it orphaned so the model stops polling and looks at resume.
@@ -167,7 +163,7 @@ async function buildSnapshot(input: {
     try {report.value = JSON.parse(await input.readFile(resultPath))} catch {report.value = undefined}
   }
   if (status === "failed" || status === "orphaned") {
-    const failurePath = `${dir}/failure.txt`
+    // failure.txt lives beside the other artifacts; the path is the store's contract.
     let persisted: string | undefined
     try {
       const text = await readFile(failurePath)
@@ -192,7 +188,7 @@ async function buildSnapshot(input: {
  * done. `running: 0` there is honest — without a snapshot nothing can be
  * observed running.
  */
-function countAgents(progress: ProgressFile | undefined, entries: JournalLine[]): StatusReport["agents"] {
+function countAgents(progress: ProgressSnapshot | undefined, entries: JournalLine[]): StatusReport["agents"] {
   if (progress?.agents !== undefined) {
     const agents = progress.agents
     const running = agents.filter((entry) => entry.status === "running").length,

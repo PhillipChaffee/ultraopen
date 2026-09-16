@@ -174,3 +174,42 @@ describe("resolveOptions — returns a fresh copy", () => {
     expect(first.effortPreference).toBe(second.effortPreference)
   })
 })
+
+
+describe("resolveOptions — runMode", () => {
+  test("defaults to background", () => {
+    expect(resolveOptions({}).runMode).toBe("background")
+  })
+
+  test("an explicit blocking option wins over the default", () => {
+    expect(resolveOptions({ runMode: "blocking" }).runMode).toBe("blocking")
+  })
+
+  test("option values are normalized, so near-misses still take effect", () => {
+    expect(resolveOptions({ runMode: "Blocking" }).runMode).toBe("blocking")
+    expect(resolveOptions({ runMode: " background " }).runMode).toBe("background")
+  })
+
+  test("an unrecognized value falls back to the default, never throws", () => {
+    // resolveOptions' charter: bad values surface NOW as a documented default,
+    // not as a throw that breaks config loading.
+    expect(resolveOptions({ runMode: "sync" }).runMode).toBe("background")
+  })
+
+  test("ULTRAOPEN_WORKFLOW_SYNC=1 forces blocking OVER an explicit option", () => {
+    // The env var is the kill switch: a stale config value must not be able to
+    // hold the process open against it.
+    process.env["ULTRAOPEN_WORKFLOW_SYNC"] = "1"
+    try {
+      expect(resolveOptions({ runMode: "background" }).runMode).toBe("blocking")
+      expect(resolveOptions({ runMode: "bogus" }).runMode).toBe("blocking")
+      expect(resolveOptions(undefined).runMode).toBe("blocking")
+    } finally {
+      delete process.env["ULTRAOPEN_WORKFLOW_SYNC"]
+    }
+  })
+
+  test("the env var absent, an explicit background option stays background", () => {
+    expect(resolveOptions({ runMode: "background" }).runMode).toBe("background")
+  })
+})

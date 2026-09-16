@@ -139,9 +139,9 @@ keep typing while the run works. In one-shot `opencode run` the process exits ri
 turn, so keep the turn alive by polling until the run settles — an unsettled run dies with the
 process (its completed agents survive on disk and a later `resumeFromRunId` replays them). If you
 need the old synchronous behavior, set the plugin option `"runMode": "blocking"` or the env
-`ULTRAOPEN_WORKFLOW_SYNC=1`; `dryRun` always waits. One live run per session: a second launch is
-refused with the active run id, and resuming a run that is still executing is refused for the same
-reason — two engines would write one journal. Until the run-control epic lands there is no stop
+`ULTRAOPEN_WORKFLOW_SYNC=1`; `dryRun` always waits. One live run per session (both contracts; `dryRun` is exempt — it is free and spawns nothing): a
+second launch is refused with the active run id, and resuming a run that is still executing is
+refused for the same reason — two engines would write one journal. Until the run-control epic lands there is no stop
 tool: to stop a run, end the opencode process; finished agents are preserved for resume.
 
 | Global | Behavior |

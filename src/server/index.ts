@@ -11,7 +11,7 @@ import type { WorkflowArgs, WorkflowContext } from "./tool/workflow.js"
 import { WORKFLOW_TOOL, STATUS_TOOL } from "./bridge/permission.js"
 import { asClient } from "./types.js"
 import type { OpencodeClient } from "./types.js"
-import { description, statusDescription } from "./tool/description.js"
+import { description, blockingDescription, statusDescription } from "./tool/description.js"
 import {
   activeRunForSession,
   isLiveAnywhere,
@@ -21,8 +21,17 @@ import {
 } from "./tool/background.js"
 import { executeStatus } from "./tool/status.js"
 import type { StatusArgs } from "./tool/status.js"
+import {
+  renderResult,
+  renderLaunch,
+  renderRefusal,
+  renderResumeRefusal,
+  renderStatus,
+  workflowArgsSchema,
+  statusArgsSchema,
+} from "./tool/render.js"
 import { beginRun, endRun, loadResume } from "./resume/persist.js"
-import { readManifest, runDir, writeManifest, flushJournalEntry, writeFailure } from "./resume/store.js"
+import { isSafeRunId, readManifest, writeManifest, flushJournalEntry, writeFailure } from "./resume/store.js"
 import type { JournalEntry, Manifest } from "./resume/journal.js"
 import { onChatMessage, onChatParams, onMessagesTransform } from "./ultracode/hooks.js"
 import { mode } from "./ultracode/mode.js"
@@ -168,7 +177,7 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
   if (!nested) {
     hooks["tool"] = {
       [WORKFLOW_TOOL]: {
-        description,
+        description: options.runMode === "blocking" ? blockingDescription : description,
         args: workflowArgsSchema(),
         execute: (args: WorkflowArgs, context: ToolContext): Promise<string> =>
           launchWorkflow(args, context, options, client, bootId),
@@ -235,13 +244,17 @@ async function launchWorkflow(
     ...(!background && context.abort ? { signal: context.abort } : {}),
   }
 
-  // Launch-gating state is registered SYNCHRONOUSLY, before the first await, so
-  // two calls from one session in the same tick cannot both pass the refusal
-  // check (the check-then-act race). Every early return below must drop it.
-  if (background) {
+  // One live run per session, for BOTH contracts (see lifecycle-policy.md): a
+  // blocking call inside a turn serializes itself anyway, but mixed contracts
+  // would put two agent-spending runs in one session. dryRun is exempt — it is
+  // free, stubbed, and the standard way to debug a script mid-run. Launch-gating
+  // state is registered SYNCHRONOUSLY, before the first await, so two calls from
+  // one session in the same tick cannot both pass the refusal check (the
+  // check-then-act race). Every early return below must drop it.
+  if (args.dryRun !== true) {
     const active = activeRunForSession(context.sessionID)
     if (active) {return renderRefusal(active)}
-    registerPending(runId, context.sessionID)
+    if (background) {registerPending(runId, context.sessionID)}
   }
 
   // Incremental journal flush: one line per entry as it is recorded, so a process
@@ -253,7 +266,6 @@ async function launchWorkflow(
   const flush = (entry: JournalEntry): void => {
     flushChain = flushChain.then(() => flushJournalEntry(runId, entry))
   }
-  const settleFlushes = (): Promise<void> => flushChain
 
   try {
     // Parse BEFORE asking, so the permission prompt names the real workflow and can show
@@ -284,10 +296,16 @@ async function launchWorkflow(
     // or another) is refused first: two writers on one journal would interleave
     // appends and race the endRun rewrite.
     if (args.resumeFromRunId) {
+      // The id is model-supplied input and joins into a filesystem path below,
+      // exactly like the status tool's runId: rejected before any read.
+      if (!isSafeRunId(args.resumeFromRunId)) {
+        dropPending(runId)
+        return renderResumeRefusal(args.resumeFromRunId, undefined)
+      }
       const source = await readManifest(args.resumeFromRunId)
       if (source && isLiveAnywhere(source, bootId)) {
         dropPending(runId)
-        return renderResumeRefusal(source)
+        return renderResumeRefusal(source.runId, source.pid)
       }
     }
     const resume = args.resumeFromRunId
@@ -312,6 +330,33 @@ async function launchWorkflow(
         "Nothing was executed and no tokens were spent."
     }
 
+    /**
+     * The ONE settle protocol for both contracts: join the flush chain, close
+     * the manifest, and persist failure text when there is any. Extracted
+     * because the ordering (flushes settle BEFORE the endRun rewrite, so the
+     * settled write can never race a floating append) is crash-safety, not
+     * style — the escaped-rejection fallback below must obey it too.
+     */
+    const settleRun = async (outcome: {
+      status: "completed" | "failed"
+      entries: readonly JournalEntry[]
+      value: unknown
+      childSessionIDs: string[]
+      failureText?: string | undefined
+    }): Promise<void> => {
+      // The chain variable is read live: appends queued before this await are
+      // included, however long the chain grew.
+      await flushChain
+      await endRun(manifest, outcome)
+      if (outcome.failureText !== undefined) {
+        // Best-effort like every persistence here: a failed write must not
+        // lose the settle itself.
+        try {await writeFailure(runId, outcome.failureText)} catch {
+          // Best-effort: a failed write must not lose the settle itself.
+        }
+      }
+    }
+
     const progress = new ProgressWriter({
       runId,
       workflow: prepared.meta.name,
@@ -328,7 +373,9 @@ async function launchWorkflow(
       const sessions = runRegistry.sessionsOf(runId)
       if (sessions.length === persistedChildren) {return}
       persistedChildren = sessions.length
-      await writeManifest(runId, { ...manifest, childSessionIDs: sessions }).catch(() => undefined)
+      try {await writeManifest(runId, { ...manifest, childSessionIDs: sessions })} catch {
+        // Crash safety is best-effort: a failed manifest rewrite must not stall the run.
+      }
     }
 
     const executeContext = {
@@ -349,7 +396,7 @@ async function launchWorkflow(
     }
 
     if (!background) {
-      return await runBlocking(args, { runId, manifest, resume, executeContext, settleFlushes })
+      return await runBlocking(args, { runId, manifest, resume, executeContext, settleRun })
     }
 
     // Detached: the run outlives this tool call. The task fully captures its own
@@ -357,12 +404,10 @@ async function launchWorkflow(
     // waiting on it anymore.
     void runDetached({
       runId,
-      manifest,
       task: async (): Promise<void> => {
         try {
           const result = await execute(args, executeContext)
-          await settleFlushes()
-          await endRun(manifest, {
+          await settleRun({
             status: "completed",
             entries: result.journal,
             value: result.value,
@@ -372,19 +417,27 @@ async function launchWorkflow(
           })
         } catch (error) {
           const partial = error instanceof WorkflowRunError ? error.partial : undefined
-          await settleFlushes()
-          await endRun(manifest, {
+          await settleRun({
             status: "failed",
             entries: partial?.journal ?? [],
             value: null,
             childSessionIDs: partial?.childSessionIDs ?? [],
+            failureText: renderFailure(error instanceof WorkflowRunError ? error.cause : error, args.script, runId),
           })
-          await writeFailure(
-            runId,
-            renderFailure(error instanceof WorkflowRunError ? error.cause : error, args.script, runId),
-          ).catch(() => undefined)
         }
       },
+      // Last resort: the task above is contractually self-capturing, so an
+      // escaping rejection means its own failure path broke. Route through the
+      // same settle protocol — including the flush join — so the degraded
+      // record still follows the crash-safety ordering.
+      onEscapedRejection: (error): Promise<void> =>
+        settleRun({
+          status: "failed",
+          entries: [],
+          value: null,
+          childSessionIDs: [],
+          failureText: renderFailure(error, args.script, runId),
+        }),
     })
 
     return renderLaunch(prepared.meta.name, runId)
@@ -396,12 +449,21 @@ async function launchWorkflow(
   }
 }
 
+/** The shared settle protocol's signature; see settleRun inside launchWorkflow. */
+type SettleRun = (outcome: {
+  status: "completed" | "failed"
+  entries: readonly JournalEntry[]
+  value: unknown
+  childSessionIDs: string[]
+  failureText?: string | undefined
+}) => Promise<void>
+
 interface BlockingRun {
   runId: string
   manifest: Manifest
   resume: { entries: JournalEntry[]; argsChanged: boolean } | undefined
   executeContext: Parameters<typeof execute>[1]
-  settleFlushes: () => Promise<void>
+  settleRun: SettleRun
 }
 
 /**
@@ -412,11 +474,10 @@ interface BlockingRun {
  * path.
  */
 async function runBlocking(args: WorkflowArgs, run: BlockingRun): Promise<string> {
-  const { runId, manifest, resume, executeContext, settleFlushes } = run
+  const { runId, resume, executeContext, settleRun } = run
   try {
     const result = await execute(args, executeContext)
-    await settleFlushes()
-    await endRun(manifest, {
+    await settleRun({
       status: "completed",
       entries: result.journal,
       value: result.value,
@@ -430,153 +491,15 @@ async function runBlocking(args: WorkflowArgs, run: BlockingRun): Promise<string
     })
   } catch (error) {
     const partial = error instanceof WorkflowRunError ? error.partial : undefined
-    await settleFlushes()
-    await endRun(manifest, {
+    await settleRun({
       status: "failed",
       entries: partial?.journal ?? [],
       value: null,
       childSessionIDs: partial?.childSessionIDs ?? [],
+      // The blocking contract renders the failure as the tool result, the way
+      // the pre-async tool did; failure.txt is the detached contract's channel.
     })
     return renderFailure(error instanceof WorkflowRunError ? error.cause : error, args.script, runId)
-  }
-}
-
-/**
- * Renders the result for the model.
- *
- * Returns the FULL text with the summary first, deliberately uncapped: opencode already pipes
- * plugin tool output through its truncation layer, which spills the whole value to a file the
- * agent is pre-authorised to read and hands back the path. Pre-capping here would stop that spill
- * from ever firing and silently lose the tail.
- */
-function renderResult(
-  result: Awaited<ReturnType<typeof execute>>,
-  resume?: { resumed: number; argsChanged: boolean },
-): string {
-  const lines = [
-    `<result workflow="${result.meta.name}" run="${result.runId}" agents="${result.agentCount}">`,
-    typeof result.value === "string" ? result.value : JSON.stringify(result.value, null, 2),
-    "</result>",
-  ]
-
-  // Never let partial coverage read as full coverage.
-  if (result.nulls.length > 0) {
-    lines.push(
-      "",
-      `<failures count="${result.nulls.length}" of="${result.agentCount}">`,
-      ...result.nulls.map((entry) => `  ${entry.label}: ${entry.reason}${entry.detail ? ` — ${entry.detail}` : ""}`),
-      "</failures>",
-    )
-  }
-
-  if (result.logs.length > 0) {
-    lines.push("", "<log>", ...result.logs.map((line) => `  ${line}`), "</log>")
-  }
-
-  // A replayed run must never read as a fresh one — the whole point of recording replays is that
-  // a cached empty and a fresh empty look identical otherwise.
-  if (resume?.argsChanged === true) {
-    lines.push("", "<resume note=\"args changed since the previous run, so nothing was replayed\" />")
-  }
-
-  const replayed = result.journal.filter((entry) => entry.replayed === true).length
-  lines.push(
-    "",
-    `<usage agents="${result.agentCount}" failed="${result.nulls.length}" replayed="${replayed}" ` +
-      `output_tokens="${result.outputTokens}" run_dir="${runDir(result.runId)}" />`,
-  )
-  return lines.join("\n")
-}
-
-/**
- * The launch result of a background run.
- *
- * Deliberately carries NO outcome: the run has not settled, and a second result
- * surface for one run is how a model ends up trusting a stale snapshot. The
- * value arrives through `workflow_status` — and the poll before the turn ends
- * also keeps a one-shot host's turn alive long enough for the run to settle.
- */
-function renderLaunch(workflow: string, runId: string): string {
-  return [
-    `<workflow-launched run="${runId}" workflow="${workflow}" dir="${runDir(runId)}">`,
-    "The run is executing in the background; this message does not contain its outcome.",
-    `Poll workflow_status(runId: "${runId}", wait: 120) until the status is not "running" to get the final value or the failure. Before ending your turn, poll until the run settles.`,
-    "</workflow-launched>",
-  ].join("\n")
-}
-
-/** Names the run that already occupies this session, so the model polls instead of relaunching. */
-function renderRefusal(active: { runId: string; status: string }): string {
-  return [
-    "<workflow-refused>",
-    `This session already has a workflow run in flight (${active.status}): run id ${active.runId}, directory ${runDir(active.runId)}.`,
-    `Poll workflow_status(runId: "${active.runId}", wait: 120) for its progress and final value instead of launching another.`,
-    "</workflow-refused>",
-  ].join("\n")
-}
-
-/** A resume whose source run is still owned by a live process must not start a second writer. */
-function renderResumeRefusal(source: Manifest): string {
-  return [
-    "<workflow-refused>",
-    `Run ${source.runId} is still executing (started by process ${source.pid}); resuming it now would run two engines against one journal.`,
-    `Poll workflow_status(runId: "${source.runId}", wait: 120) and wait for it to settle, then resume.`,
-    "</workflow-refused>",
-  ].join("\n")
-}
-
-/** The status tool's report, for the model. Same uncapped stance as renderResult. */
-function renderStatus(report: Awaited<ReturnType<typeof executeStatus>>): string {
-  const lines = [
-    `<workflow-status run="${report.runId}" status="${report.status}" dir="${report.dir}">`,
-    `agents total=${report.agents.total} running=${report.agents.running} done=${report.agents.done} failed=${report.agents.failed}`,
-    `output_tokens=${report.outputTokens}`,
-    `phases: ${report.phases.length > 0 ? report.phases.join(", ") : "(none)"}`,
-  ]
-  if (report.phase !== undefined) {lines.push(`current phase: ${report.phase}`)}
-  if (report.status === "completed") {
-    lines.push("", typeof report.value === "string" ? report.value : JSON.stringify(report.value, null, 2))
-  }
-  if (report.failure !== undefined) {
-    lines.push("", `<failure dir="${report.failure.dir}">`, report.failure.message, "</failure>")
-  }
-  if (report.logs.length > 0) {
-    lines.push("", "<log>", ...report.logs.map((line) => `  ${line}`), "</log>")
-  }
-  lines.push("</workflow-status>")
-  return lines.join("\n")
-}
-
-/**
- * The tools' argument schemas, as plain JSON-Schema-ish records.
- *
- * `title` and `description` are accepted and IGNORED, exactly as the spec specifies — a model
- * trained on Claude Code passes them, and rejecting them would surface as a validation error
- * instead of the documented silent ignore.
- */
-function workflowArgsSchema(): Record<string, unknown> {
-  return {
-    script: { type: "string", description: "The workflow script. Must begin with `export const meta = {...}`." },
-    scriptPath: { type: "string", description: "Path to a persisted script. Takes precedence over `script`." },
-    args: { description: "Value exposed to the script as the global `args`. Pass real JSON, not a JSON string." },
-    resumeFromRunId: {
-      type: "string",
-      description: "Resume a previous run from this directory's data: unchanged agent calls replay from its journal instantly, and the first changed call onward runs live. Refused while the source run is still executing.",
-    },
-    dryRun: { type: "boolean", description: "Run the script with agent() stubbed out, for zero tokens. Always waits for the result." },
-    background: {
-      type: "boolean",
-      description: "Launch detached and return the run id at once (the default), or wait for the final result. dryRun always waits.",
-    },
-    title: { type: "string", description: "Ignored." },
-    description: { type: "string", description: "Ignored." },
-  }
-}
-
-function statusArgsSchema(): Record<string, unknown> {
-  return {
-    runId: { type: "string", description: "The run id from the workflow launch result." },
-    wait: { type: "number", description: "Seconds to wait for the run to settle before returning (max 300). Prefer one long wait over many short polls." },
   }
 }
 

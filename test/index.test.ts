@@ -359,7 +359,6 @@ describe("model and effort wiring", () => {
      output = await tool?.execute({ script, background: false }, { sessionID: "parent" })
 
     // The model has no xhigh, so the request is downgraded — and the run log SAYS so, rather than
-    // silently applying no extra thinking at all., so the request is downgraded — and the run log SAYS so, rather than
     // silently applying no extra thinking at all.
     expect(output).toContain("<log>")
     expect(output).toContain("unsupported")
@@ -686,6 +685,30 @@ describe("background launch contract", () => {
     expect(output).toContain("<result")
   })
 
+  test("a blocking launch while a detached run is live is refused too", async () => {
+    // One live run per session covers BOTH contracts; only dryRun is exempt
+    // (it is free and stubbed, the standard mid-run debugging tool).
+    const tool = toolOf(ultraopen({ client: hangingClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const first = await tool.execute({ script: `${META}await agent('a')\nreturn 1\n`, background: true }, { sessionID: "parent" })
+    expect(first).toContain("<workflow-launched")
+    const blocking = await tool.execute({ script: `${META}return 2\n`, background: false }, { sessionID: "parent" })
+    expect(blocking).toContain("<workflow-refused>")
+    // dryRun stays allowed while a run is live: it spawns nothing.
+    const dry = await tool.execute({ script: `${META}return 3\n`, dryRun: true }, { sessionID: "parent" })
+    expect(dry).toContain("<result")
+  })
+
+  test("the blocking contract's description describes blocking", () => {
+    // The description is model-training text: under the blocking contract it
+    // must not teach a polling rhythm for a result the call already returns.
+    const tool = toolOf(ultraopen({ client: stubClient }, { runMode: "blocking" }))
+    expect(tool?.description).toContain("BLOCKS until the run completes")
+    expect(tool?.description).not.toContain("RETURNS AT ONCE")
+    const backgroundTool = toolOf(ultraopen({ client: stubClient }))
+    expect(backgroundTool?.description).toContain("RETURNS AT ONCE")
+  })
+
   test("the blocking option restores the pre-async contract", async () => {
     const tool = toolOf(ultraopen({ client: stubClient }, { runMode: "blocking" }))
     if (!tool) {throw new Error("tool was not registered")}
@@ -819,7 +842,8 @@ describe("background launch contract — unwritable run directory", () => {
     expect(output).toContain("could not be started")
     expect(output).not.toContain("<workflow-launched")
     // The launch-gating entry is dropped: the session can launch again.
-    process.env["XDG_DATA_HOME"] = savedXDG
+    if (savedXDG === undefined) {delete process.env["XDG_DATA_HOME"]}
+    else {process.env["XDG_DATA_HOME"] = savedXDG}
     const second = await tool.execute({ script: `${META}return 1\n`, dryRun: true }, { sessionID: "parent" })
     expect(second).toContain("<result")
   })

@@ -62,16 +62,19 @@ export function resolveOptions(raw: unknown): UltraopenOptions {
 /**
  * Resolves the launch contract.
  *
- * `ULTRAOPEN_WORKFLOW_SYNC=1` forces the blocking contract regardless of the
- * option: a one-line kill switch that restores the pre-async behavior without a
- * config edit, for hosts that exit the process right after the turn.
+ * `ULTRAOPEN_WORKFLOW_SYNC=1` forces the blocking contract REGARDLESS of the
+ * option — it is the one-line kill switch, so a stale config value must not be
+ * able to hold the process open against it. An unrecognized option value falls
+ * back to this env/default order rather than throwing; plugin options come from
+ * a user-edited JSON file and a hard throw would break config loading.
  */
 export const SYNC_ENV = "ULTRAOPEN_WORKFLOW_SYNC"
 
 function resolveRunMode(value: unknown): "background" | "blocking" {
-  if (typeof value === "string" && value === "blocking") {return "blocking"}
-  if (typeof value === "string" && value === "background") {return "background"}
-  return process.env[SYNC_ENV] === "1" ? "blocking" : DEFAULTS.runMode
+  if (process.env[SYNC_ENV] === "1") {return "blocking"}
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : undefined
+  if (normalized === "blocking" || normalized === "background") {return normalized}
+  return DEFAULTS.runMode
 }
 
 /**

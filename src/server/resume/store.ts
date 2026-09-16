@@ -39,6 +39,7 @@ export interface RunArtifacts {
   dir: string
   journalPath: string
   manifestPath: string
+  progressPath: string
   resultPath: string
   scriptPath: string
   failurePath: string
@@ -50,6 +51,7 @@ export function artifactPaths(runId: string, env?: NodeJS.ProcessEnv): RunArtifa
     dir,
     journalPath: join(dir, "journal.jsonl"),
     manifestPath: join(dir, "manifest.json"),
+    progressPath: join(dir, "progress.json"),
     resultPath: join(dir, "result.json"),
     scriptPath: join(dir, "script.js"),
     failurePath: join(dir, "failure.txt"),
