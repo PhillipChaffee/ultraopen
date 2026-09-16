@@ -270,12 +270,11 @@ Known gaps the e2e probes confirmed:
 Each probe carries a `bun run check`-clean implementation note in the suites.
 
 Cosmetic limitations (upstream): the transcript renderer echoes a tool call's raw arguments, so
-a `workflow` call displays its full script (visible in the first screenshot above); the
-failed-agent glyph shares its line's muted color instead of the error color (single-node
-imperative rendering); and an open sidebar renders one
-blank line when no runs are active. The progress
-surfaces (strip, sidebar, prompt status) are
-where live state shows.
+a `workflow` call displays its full script (visible in the first screenshot above); and an open
+sidebar renders one blank line when no runs are active. The progress surfaces (strip, sidebar,
+prompt status) are where live state shows: failed agents carry the theme's error color on their
+glyph plus the failure reason, a half-failed run shows a failed count while live, and an
+interrupted run (its process died) shows a once-per-boot resume hint in the strip.
 
 <a id="development"></a>
 

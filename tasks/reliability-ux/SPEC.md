@@ -1,6 +1,6 @@
 # Epic: reliability-ux
 
-Status: not started
+Status: done 2026-09-16 (T1-T3; T4 deferred, see below)
 Estimate: 2 to 3 focused days
 Depends on: nothing hard. The failure display shares the render pattern with run-control, so read that epic's notes.
 
@@ -45,7 +45,7 @@ Negative:
 
 ## Task list
 
-- [ ] T1 Error color for the failed glyph. Files: `src/tui/index.tsx`. Estimate 0.5 day. Fall back to a text marker if the color node fails.
-- [ ] T2 Failed count in the strip. Files: `src/tui/data.ts`, `src/tui/index.tsx`, and the progress writer if it needs a counter. Estimate 0.5 day.
-- [ ] T3 Interrupted-run hint. Files: `src/server/resume/reaper.ts`, `src/tui/data.ts`, `src/tui/index.tsx`. Estimate 1 day.
-- [ ] T4 Session-level hint, optional. A synthetic note in the message transform names the interrupted run for the model. Files: `src/server/ultracode/hooks.ts`. Estimate 0.5 day. Decide with the owner whether the model needs this or the TUI hint is enough.
+- [x] T1 Error color for the failed glyph. Files: `src/tui/index.tsx`. Estimate 0.5 day. (Implemented via the library's rich-text path: a statically-mounted parent <text> whose children are pre-created renderables, mutated imperatively per poll — the failed glyph gets `theme.error`. If the child API drifts, the render degrades to the spec's documented fallback: strong ✗ markers plus the summary's failed count. test/e2e/visual.sh V2c asserts the distinct SGR color and the markers.)
+- [x] T2 Failed count in the strip. Files: `src/tui/data.ts`, `src/tui/index.tsx`, and the progress writer if it needs a counter. Estimate 0.5 day. (No writer change needed: `progress.json` agents carry live status, and `summarize` already renders `· N failed`; visual.sh V2c asserts it with one failed agent in flight.)
+- [x] T3 Interrupted-run hint. Files: `src/server/resume/reaper.ts`, `src/tui/data.ts`, `src/tui/index.tsx`. Estimate 1 day. (Decision: the reaper writes `interrupted.txt` per orphaned run — one marker per run, the once-only driver. The TUI reads all markers in ONE directory pass at boot and caches them, so startup cost does not grow with old runs. Display is once per boot, in the strip, and names the run id and the resume path.)
+- [ ] T4 Session-level hint, optional. A synthetic note in the message transform names the interrupted run for the model. Files: `src/server/ultracode/hooks.ts`. Estimate 0.5 day. Decide with the owner whether the model needs this or the TUI hint is enough. DEFERRED: the model already sees an orphaned run through `workflow_status`, whose orphaned status carries a resume pointer — a second injection surface would duplicate that. Revisit if live use shows the model missing orphaned runs.
