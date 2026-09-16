@@ -8,3 +8,18 @@
 - The `$ARGUMENTS` template must stay a non-empty string in every installed command. The command service calls the hint builder eagerly, and a missing template takes down every command in the directory, including `/init` (`ultracode/config.ts`, installCommand comment).
 - Claude Code namespaces plugin workflows as `/plugin:name`. Not applicable here. One plugin, one namespace.
 - Validation on scan: parse the file, check the meta block. A file that fails validation is skipped with a log line, never a crash.
+## Decisions recorded (2026-09-16)
+
+- Directories: `<config>/ultraopen/workflows` (user; `$OPENCODE_CONFIG_DIR` else
+  `~/.config/opencode`), the `workflowPaths` option, and the project's
+  `.opencode/ultraopen/workflows`. Precedence, strongest last: user, custom,
+  project. The project wins a name collision because it is the most specific.
+- The RUN path scans per call (capped at 200 files; a cap overflow is noted, not
+  an error). The /workflow-<name> commands come from one synchronous scan at
+  plugin load, because the config hook may not await; a saved file gains its
+  command on the next start.
+- Command ids are `workflow-<name>`; a name matching `^[\w-]+$` only — anything
+  else is skipped, so a hostile file name cannot become a command id.
+- A broken file is skipped by the per-call scan with a note (surfaced in the
+  tool result's `<scan-notes>` block) and silently loses its command until it
+  parses. The plugin load never crashes on a bad directory or file.

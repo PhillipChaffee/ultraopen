@@ -848,3 +848,105 @@ describe("background launch contract — unwritable run directory", () => {
     expect(second).toContain("<result")
   })
 })
+
+describe("saved workflows (context.named)", () => {
+  let configHome: string
+
+  beforeEach(() => {
+    registry.resetForTests()
+    background.resetForTests()
+    mode.resetForTests()
+  })
+
+  test("a saved workflow in the config directory runs by name", async () => {
+    const { mkdtemp: mkTemp, mkdir, rm: fsRm, writeFile } = await import("node:fs/promises"),
+      { tmpdir: osTmpdir } = await import("node:os"),
+      { join: cfgJoin } = await import("node:path")
+    configHome = await mkTemp(cfgJoin(osTmpdir(), "ultraopen-saved-"))
+    const saved = process.env["OPENCODE_CONFIG_DIR"]
+    process.env["OPENCODE_CONFIG_DIR"] = configHome
+    try {
+      const dir = cfgJoin(configHome, "ultraopen", "workflows")
+      await mkdir(dir, { recursive: true })
+      await writeFile(
+        cfgJoin(dir, "deploy-check.js"),
+        "export const meta = { name: 'deploy-check', description: 'Deploy gate' }\nreturn 'saved-value'\n",
+      )
+      const tool = toolOf(ultraopen({ client: stubClient }))
+      if (!tool) {throw new Error("tool was not registered")}
+      const output = await tool.execute(
+        { script: `${META}return await workflow('deploy-check')\n`, background: false },
+        { sessionID: "parent" },
+      )
+      expect(output).toContain("saved-value")
+    } finally {
+      if (saved === undefined) {delete process.env["OPENCODE_CONFIG_DIR"]}
+      else {process.env["OPENCODE_CONFIG_DIR"] = saved}
+      await fsRm(configHome, { recursive: true, force: true })
+    }
+  })
+
+  test("a broken saved file is skipped with a note and never breaks the call", async () => {
+    const { mkdtemp: mkTemp, mkdir, rm: fsRm, writeFile } = await import("node:fs/promises"),
+      { tmpdir: osTmpdir } = await import("node:os"),
+      { join: cfgJoin } = await import("node:path")
+    configHome = await mkTemp(cfgJoin(osTmpdir(), "ultraopen-saved-"))
+    const saved = process.env["OPENCODE_CONFIG_DIR"]
+    process.env["OPENCODE_CONFIG_DIR"] = configHome
+    try {
+      const dir = cfgJoin(configHome, "ultraopen", "workflows")
+      await mkdir(dir, { recursive: true })
+      await writeFile(cfgJoin(dir, "broken.js"), "const x: string[] = []\n")
+      const tool = toolOf(ultraopen({ client: stubClient }))
+      if (!tool) {throw new Error("tool was not registered")}
+      const output = await tool.execute({ script: `${META}return 1\n`, dryRun: true }, { sessionID: "parent" })
+      expect(output).toContain("<result")
+      expect(output).toContain("<scan-notes>")
+      expect(output).toContain("broken.js")
+    } finally {
+      if (saved === undefined) {delete process.env["OPENCODE_CONFIG_DIR"]}
+      else {process.env["OPENCODE_CONFIG_DIR"] = saved}
+      await fsRm(configHome, { recursive: true, force: true })
+    }
+  })
+
+  test("one /workflow-<name> command per saved workflow, template keeping $ARGUMENTS", async () => {
+    const { mkdtemp: mkTemp, mkdir, rm: fsRm, writeFile } = await import("node:fs/promises"),
+      { tmpdir: osTmpdir } = await import("node:os"),
+      { join: cfgJoin } = await import("node:path")
+    configHome = await mkTemp(cfgJoin(osTmpdir(), "ultraopen-cmds-"))
+    const saved = process.env["OPENCODE_CONFIG_DIR"]
+    process.env["OPENCODE_CONFIG_DIR"] = configHome
+    try {
+      const dir = cfgJoin(configHome, "ultraopen", "workflows")
+      await mkdir(dir, { recursive: true })
+      await writeFile(
+        cfgJoin(dir, "deploy-check.js"),
+        "export const meta = { name: 'deploy-check', description: 'Deploy gate' }\nreturn 1\n",
+      )
+      const config: MutableConfig = {}
+      ;(ultraopen({ client: stubClient })["config"] as (c: MutableConfig) => void)(config)
+      const commands = config.command ?? {}
+      const installed = commands["workflow-deploy-check"] as { description?: string; template?: string } | undefined
+      expect(installed?.description).toBe("Deploy gate")
+      expect(installed?.template).toContain("$ARGUMENTS")
+      expect(installed?.template?.length ?? 0).toBeGreaterThan(0)
+      // A /workflow-resume command exists out of the box.
+      expect((commands["workflow-resume"] as { template?: string } | undefined)?.template).toContain("$ARGUMENTS")
+      expect((commands["workflow-resume"] as { template?: string } | undefined)?.template).toContain("resumeFromRunId")
+    } finally {
+      if (saved === undefined) {delete process.env["OPENCODE_CONFIG_DIR"]}
+      else {process.env["OPENCODE_CONFIG_DIR"] = saved}
+      await fsRm(configHome, { recursive: true, force: true })
+    }
+  })
+
+  test("a name with a path separator cannot become a command id", async () => {
+    // Guard-rail check on the command installer itself: hostile file names
+    // (a readdir only yields real files, but the contract is explicit).
+    const config: MutableConfig = {}
+    const { installConfig } = await import("../src/server/ultracode/config.js")
+    installConfig(config, { workflowCommands: [{ name: "../evil", description: undefined }] })
+    expect(config.command?.["workflow-../evil"]).toBeUndefined()
+  })
+})

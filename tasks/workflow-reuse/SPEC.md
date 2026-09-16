@@ -1,6 +1,6 @@
 # Epic: workflow-reuse
 
-Status: not started
+Status: done 2026-09-16
 Estimate: 1.5 to 2.5 focused days
 Depends on: nothing
 
@@ -44,7 +44,20 @@ Negative:
 
 ## Task list
 
-- [ ] T1 Scanner and `context.named`. Files: `src/server/tool/named.ts` (new), `src/server/index.ts`, `src/server/options.ts` (a `workflowPaths` option). Estimate 1 day.
-- [ ] T2 Slash command per saved workflow. Files: `src/server/ultracode/config.ts` (the installCommand pattern). Estimate 0.5 day.
-- [ ] T3 The `/workflow-resume` command. Files: `src/server/ultracode/config.ts`, the command hook in `src/server/index.ts`. Estimate 0.5 day.
-- [ ] T4 Tests and the README known-gaps rewrite. Files: `test/`, `README.md`. Estimate 0.5 day.
+- [x] T1 Scanner and `context.named`. Files: `src/server/tool/named.ts` (new), `src/server/index.ts`, `src/server/options.ts` (a `workflowPaths` option). Estimate 1 day.
+- [x] T2 Slash command per saved workflow. Files: `src/server/ultracode/config.ts` (the installCommand pattern). Estimate 0.5 day.
+- [x] T3 The `/workflow-resume` command. Files: `src/server/ultracode/config.ts`, the command hook in `src/server/index.ts`. Estimate 0.5 day. (No hook needed beyond registration: the command is a template prompt; the model calls the tool with `resumeFromRunId`.)
+- [x] T4 Tests and the README known-gaps rewrite. Files: `test/named.test.ts` (new), `test/index.test.ts`, `test/e2e/technical.sh`, `README.md`. Estimate 0.5 day. (The e2e named-form probe is inverted: T5a saves a workflow in the scratch project and expects a completed run; T5b keeps the unknown-name error probe.)
+
+## Recorded decisions
+
+- Default directories: `<opencode config dir>/ultraopen/workflows` (user) and
+  `<project>/.opencode/ultraopen/workflows` (project; wins on collision).
+  `workflowPaths` adds custom dirs, relative ones resolved against the project.
+  Order, strongest last: user, custom, project.
+- The run path scans per tool call. The /workflow-<name> commands are built from
+  a synchronous scan at plugin load (the config hook is synchronous by
+  contract), so a file saved mid-session runs by name at once but gains its
+  command on the next start.
+- The named form is a sandbox GLOBAL, not a tool argument — slash commands wrap
+  it in a one-line script. Names are bare keys; a path separator is rejected.

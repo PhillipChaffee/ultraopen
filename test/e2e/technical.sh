@@ -177,24 +177,35 @@ else
   bad "no completed run dir" "see $OUT/t4.out"
 fi
 
-section "T5 — named-workflow form (evidence probe: expected to fail)"
-runs_snapshot "$OUT/runs-before-t5.txt"
-oc_run_capture "$OUT/t5.out" 300 "$(wf_prompt named)" || true
-if [ -z "$(newest_run "$OUT/runs-before-t5.txt")" ]; then
-  note "first attempt produced no run — retrying once"
-  oc_run_capture "$OUT/t5b.out" 300 "$(wf_prompt named)" || true
-fi
+section "T5a — saved workflow runs by name (context.named is wired)"
+# A saved workflow in the scratch project's .opencode/ultraopen/workflows must
+# run by name through the named form of workflow().
+mkdir -p "$SCRATCH/project/.opencode/ultraopen/workflows"
+cat > "$SCRATCH/project/.opencode/ultraopen/workflows/probe.js" <<'PROBE'
+export const meta = { name: 'probe', description: 'Saved workflow probe' }
+return 'SAVED-WORKFLOW-RAN'
+PROBE
+runs_snapshot "$OUT/runs-before-t5a.txt"
+oc_run_capture "$OUT/t5a.out" 300 "$(wf_prompt named)" || true
 RUN5="$(newest_run "$OUT/runs-before-t5.txt")"
 if [ -n "$RUN5" ]; then
   preserve_run "$RUN5"
-  assert_run_failed "$RUN5"
-  if grep -qi "no saved workflow" "$OUT/t5.out"; then
-    note "evidence: named form throws 'No saved workflow' — context.named never populated (see triage)"
+  if [ "$(manifest_status "$RUN5")" = "completed" ]; then
+    ok "saved workflow ran by name (named form no longer throws)"
   else
-    note "run failed without the named-form message — inspect $OUT/$RUN5 and $OUT/t5.out"
+    bad "named form did not complete" "manifest $(manifest_status "$RUN5") — inspect $OUT/$RUN5 and $OUT/t5a.out"
   fi
 else
-  bad "named-form probe produced no run dir" "see $OUT/t5.out"
+  bad "named-form probe produced no run dir" "see $OUT/t5a.out"
+fi
+
+section "T5b — unknown workflow name still gives the clear error"
+runs_snapshot "$OUT/runs-before-t5b.txt"
+oc_run_capture "$OUT/t5b.out" 300 "$(wf_prompt named 'The workflow name to call is definitely-not-saved.')" || true
+if grep -qiE "no saved workflow|not a saved" "$OUT/t5b.out"; then
+  ok "unknown name gives the clear error naming the suggestion"
+else
+  note "unknown-name error wording not visible in $OUT/t5b.out — inspect"
 fi
 
 section "T6 — isolation: worktree (evidence probe)"

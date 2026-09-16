@@ -118,6 +118,12 @@ ultraopen only tries to be the right tool when the work already happens in openc
 - **`workflow_status` tool** — reads one run's live state from disk: status, phase, agent counts,
   token total, last logs, and (once settled) the final value or the failure text. Read-only, and
   it works across processes and after a crash, because the run directory is the source of truth.
+- **Saved workflows** — a directory of named scripts runs by name: `workflow('deploy-check')` inside
+  any script, one `/workflow-<name>` command per saved file, and `/workflow-resume <runId>` to
+  replay a past run. Default directories: `<config>/ultraopen/workflows` and the project's
+  `.opencode/ultraopen/workflows` (which wins on a name collision); `workflowPaths` adds more.
+  Scanned per call, so a file saved mid-session runs at once (its slash command appears on the
+  next start).
 - **Schema-forced output** — `agent(prompt, { schema })` returns a validated object; invalid
   output retries up to three attempts in the same session.
 - **Resume** — `resumeFromRunId` replays unchanged calls instantly; the first edited call and
@@ -251,8 +257,6 @@ Working end to end:
 
 Known gaps the e2e probes confirmed:
 
-- the named-workflow form of `workflow()` always throws (`context.named` is never populated —
-  pass `{ script }` inline)
 - `agent()`'s `isolation: "worktree"` option is inert in the live wiring (`worktreeRoot` is
   never passed)
 - schema-forced agents (`schema:` on `agent()`) can fail against Together with an empty
