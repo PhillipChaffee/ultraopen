@@ -1,4 +1,5 @@
 import { readFile, readdir, unlink } from "node:fs/promises"
+import { LARGE_RUN_AGENTS } from "../server/script/limits.js"
 import { join } from "node:path"
 
 /**
@@ -177,8 +178,11 @@ export function formatElapsed(seconds: number): string {
 /** One-line summary, used by the compact surfaces. */
 export function summarize(run: RunView): string {
   const phase = run.phase ? `${run.phase} ` : "",
-   failed = run.failed > 0 ? ` · ${run.failed} failed` : ""
-  return `${run.workflow} · ${phase}${run.done}/${run.total} · ${formatElapsed(run.elapsedSeconds)}${failed}`
+   failed = run.failed > 0 ? ` · ${run.failed} failed` : "",
+   // Advice only: a run this large is worth a look at the fan-out. Same
+   // threshold as the server's own warning, so both surfaces agree.
+   large = run.total >= LARGE_RUN_AGENTS ? " · large run" : ""
+  return `${run.workflow} · ${phase}${run.done}/${run.total} · ${formatElapsed(run.elapsedSeconds)}${failed}${large}`
 }
 
 /** Status glyph for an agent row. */

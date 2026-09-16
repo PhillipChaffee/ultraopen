@@ -1,4 +1,5 @@
 import { runDir } from "../resume/store.js"
+import { LARGE_RUN_AGENTS } from "../script/limits.js"
 import type { WorkflowResult } from "./workflow.js"
 import type { StatusReport } from "./status.js"
 
@@ -44,6 +45,12 @@ export function renderResult(result: WorkflowResult, resume?: { resumed: number;
   // a cached empty and a fresh empty look identical otherwise.
   if (resume?.argsChanged === true) {
     lines.push("", "<resume note=\"args changed since the previous run, so nothing was replayed\" />")
+  }
+
+  // Advice, never a stop: a run this large is worth a second look at the
+  // fan-out, and the note names the constants' threshold.
+  if (result.agentCount >= LARGE_RUN_AGENTS) {
+    lines.push("", `<large-run agents="${result.agentCount}" threshold="${LARGE_RUN_AGENTS}" />`)
   }
 
   const replayed = result.journal.filter((entry) => entry.replayed === true).length

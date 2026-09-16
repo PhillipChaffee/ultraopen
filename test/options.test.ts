@@ -16,6 +16,8 @@ const DEFAULT_CONCURRENCY = 8,
   runMode: "background" as const,
   keywordBehavior: "one-shot" as const,
   workflowPaths: [] as string[],
+  budgetTokens: null as number | null,
+  sizeGuideline: undefined as string | undefined,
 }
 
 describe("resolveOptions — non-object input", () => {
@@ -213,5 +215,36 @@ describe("resolveOptions — runMode", () => {
 
   test("the env var absent, an explicit background option stays background", () => {
     expect(resolveOptions({ runMode: "background" }).runMode).toBe("background")
+  })
+})
+
+describe("resolveOptions — budgetTokens", () => {
+  test("unset means no ceiling (today's behavior)", () => {
+    expect(resolveOptions({}).budgetTokens).toBeNull()
+    expect(resolveOptions({ budgetTokens: undefined }).budgetTokens).toBeNull()
+  })
+
+  test("a positive number is honoured and floored", () => {
+    expect(resolveOptions({ budgetTokens: 100_000 }).budgetTokens).toBe(100_000)
+    expect(resolveOptions({ budgetTokens: 100.9 }).budgetTokens).toBe(100)
+  })
+
+  test("an invalid value means NO ceiling, never a surprise cap", () => {
+    // A mistyped ceiling must not trade an uncapped run for a surprise limit.
+    for (const bad of [0, -5, "100000", Number.NaN, Number.POSITIVE_INFINITY, true]) {
+      expect(resolveOptions({ budgetTokens: bad as unknown }).budgetTokens).toBeNull()
+    }
+  })
+})
+
+describe("resolveOptions — sizeGuideline", () => {
+  test("unset omits the advice", () => {
+    expect(resolveOptions({}).sizeGuideline).toBeUndefined()
+  })
+
+  test("a non-empty string is honoured; blanks are omitted", () => {
+    expect(resolveOptions({ sizeGuideline: "keep runs under 10 agents" }).sizeGuideline).toBe("keep runs under 10 agents")
+    expect(resolveOptions({ sizeGuideline: "   " }).sizeGuideline).toBeUndefined()
+    expect(resolveOptions({ sizeGuideline: 42 as unknown }).sizeGuideline).toBeUndefined()
   })
 })

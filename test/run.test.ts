@@ -8,7 +8,7 @@ import { Run } from "../src/server/runtime/run.js"
 import type { ProgressEvent, RunOptions } from "../src/server/runtime/run.js"
 import type { JournalEntry } from "../src/server/resume/journal.js"
 import { registry } from "../src/server/singleton.js"
-import { MAX_AGENTS_PER_RUN, MAX_AGENT_RESTARTS } from "../src/server/script/limits.js"
+import { LARGE_RUN_AGENTS, LARGE_RUN_PROJECTED_TOKENS, MAX_AGENTS_PER_RUN, MAX_AGENT_RESTARTS } from "../src/server/script/limits.js"
 import { chainKey } from "../src/server/resume/key.js"
 
 import type {
@@ -127,6 +127,65 @@ function makeRun(
 ): Run {
   return new Run({ runId: "run-1", client, parentSessionID: "parent-1", ...overrides })
 }
+
+describe("Run — large-run advice", () => {
+  test("fires once when the scheduled count crosses the threshold, and never again", async () => {
+    // ADVICE ONLY: it must not stop or fail anything — the run continues.
+    const logs: string[] = [],
+     { client } = makeClient({
+      prompt: () => Promise.resolve({ data: { info: baseInfo({ outputTokens: 10 }), parts: [textPart("hi")] } }),
+    }),
+     run = new Run({
+      runId: "run-large",
+      client,
+      parentSessionID: "parent-1",
+      onProgress: (event) => {
+        if (event.type === "log") {logs.push(event.message)}
+      },
+    })
+    for (let i = 0; i < LARGE_RUN_AGENTS + 2; i++) {
+      await run.agent(`agent ${i}`)
+    }
+    const warnings = logs.filter((line) => line.includes("large-run warning"))
+    expect(warnings.length).toBe(1)
+    expect(warnings[0]).toContain(`${LARGE_RUN_AGENTS} agents scheduled`)
+    expect(warnings[0]).toContain("check the script's fan-out")
+  })
+
+  test("fires from the token projection too, below the agent count", async () => {
+    const logs: string[] = [],
+     { client } = makeClient({
+      prompt: () =>
+        Promise.resolve({ data: { info: baseInfo({ outputTokens: LARGE_RUN_PROJECTED_TOKENS }), parts: [textPart("hi")] } }),
+    }),
+     run = new Run({ runId: "run-proj", client, parentSessionID: "parent-1", onProgress: (event) => {
+      if (event.type === "log") {logs.push(event.message)}
+    } })
+    await run.agent("one expensive agent")
+    expect(logs.filter((line) => line.includes("large-run warning")).length).toBe(1)
+  })
+
+  test("stays silent well below both thresholds", async () => {
+    const logs: string[] = [],
+     { client } = makeClient({
+      prompt: () => Promise.resolve({ data: { info: baseInfo({ outputTokens: 10 }), parts: [textPart("hi")] } }),
+    }),
+     run = makeRun(client)
+    await run.agent("one")
+    await run.agent("two")
+    expect(logs.filter((line) => line.includes("large-run warning")).length).toBe(0)
+  })
+
+  test("isLargeRun reflects the thresholds for the result note", async () => {
+    const { client } = makeClient({
+      prompt: () => Promise.resolve({ data: { info: baseInfo({ outputTokens: 10 }), parts: [textPart("hi")] } }),
+    }),
+     run = makeRun(client)
+    expect(run.isLargeRun).toBe(false)
+    await run.agent("one")
+    expect(run.isLargeRun).toBe(false)
+  })
+})
 
 describe("Run.agent — happy path", () => {
   test("returns the last text part's text when no schema", async () => {

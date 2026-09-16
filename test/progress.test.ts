@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import { ProgressWriter } from "../src/server/resume/progress.js"
+import { LARGE_RUN_AGENTS } from "../src/server/script/limits.js"
 import { RunPoller, activeRuns, agentRowText, dataRoot, formatElapsed, glyph, hintLine, loadAllRuns, loadFailedReasons, loadInterruptedRuns, summarize, toView } from "../src/tui/data.js"
 import type { RunView } from "../src/tui/data.js"
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
@@ -521,5 +522,25 @@ describe("interrupted-run hints", () => {
     await mkdir(empty, { recursive: true })
     await writeFile(join(empty, "interrupted.txt"), "")
     expect(await loadInterruptedRuns(root)).toEqual([])
+  })
+})
+
+describe("large-run badge in the strip summary", () => {
+  test("a run at or above the threshold is flagged as a large run", () => {
+    const view = toView(
+      {
+        runId: "wf_a",
+        workflow: "demo",
+        startedAt: 0,
+        agents: Array.from({ length: LARGE_RUN_AGENTS }, (_, i) => ({ index: i, label: `a${i}`, status: "done" as const })),
+      },
+      60_000,
+    )
+    expect(summarize(view)).toContain("· large run")
+  })
+
+  test("a small run carries no badge", () => {
+    const view = toView({ runId: "wf_a", workflow: "demo", startedAt: 0, agents: [{ index: 0, label: "a", status: "running" }] }, 0)
+    expect(summarize(view)).not.toContain("large run")
   })
 })

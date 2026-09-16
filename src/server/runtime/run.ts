@@ -1,5 +1,5 @@
 import { fail } from "../script/errors.js"
-import { DEFAULT_AGENT_DEADLINE_MS, DEFAULT_AGENT_IDLE_MS, MAX_AGENTS_PER_RUN, MAX_AGENT_RESTARTS } from "../script/limits.js"
+import { DEFAULT_AGENT_DEADLINE_MS, DEFAULT_AGENT_IDLE_MS, LARGE_RUN_AGENTS, LARGE_RUN_PROJECTED_TOKENS, MAX_AGENTS_PER_RUN, MAX_AGENT_RESTARTS } from "../script/limits.js"
 import { registry } from "../singleton.js"
 import type { NullReason } from "../bridge/spawn.js"
 import { spawnStructured } from "../bridge/structured.js"
@@ -100,6 +100,7 @@ export class Run {
 
   #currentPhase: string | undefined
   #spawned = 0
+  #largeRunWarned = false
   readonly #options: RunOptions
   readonly #journal: Journal
   readonly #rootScope: Scope
@@ -136,6 +137,33 @@ export class Run {
 
   get currentPhase(): string | undefined {
     return this.#currentPhase
+  }
+
+  /**
+   * Fires the large-run advice once, when the run crosses the advisory thresholds.
+   *
+   * ADVICE ONLY — it never pauses or stops anything. Both numbers come from
+   * constants so the result note and the strip badge agree on the definition.
+   * The token projection uses the observed average of COMPLETED agents: early
+   * in a run it under-counts, which is the honest direction for advice.
+   */
+  maybeWarnLargeRun(): void {
+    if (this.#largeRunWarned) {return}
+    if (this.#spawned < LARGE_RUN_AGENTS && this.#projectedTokens() < LARGE_RUN_PROJECTED_TOKENS) {return}
+    this.#largeRunWarned = true
+    const projection = this.#projectedTokens() > 0 ? `, projected output ≈ ${this.#projectedTokens()} tokens` : ""
+    this.log(`large-run warning: ${this.#spawned} agents scheduled${projection} — check the script's fan-out if this is larger than intended.`)
+  }
+
+  #projectedTokens(): number {
+    // The run's actual spend so far: the only number that cannot lie. The
+    // average-per-agent refinement adds noise for no advisory value.
+    return this.outputTokens
+  }
+
+  /** True when the run crossed the large-run advisory thresholds. */
+  get isLargeRun(): boolean {
+    return this.#spawned >= LARGE_RUN_AGENTS || this.#projectedTokens() >= LARGE_RUN_PROJECTED_TOKENS
   }
 
   /** Agents that produced no usable result, with the reason for each. */
@@ -205,6 +233,7 @@ export class Run {
       this.#journal.record(replayed)
       this.#options.onJournal?.(replayed)
       this.#options.onProgress?.({ type: "agent-end", index, label, phase, ok: true })
+      this.maybeWarnLargeRun()
       // Replayed spend counts as if paid, or a budget-guarded loop takes a different number of
       // trips on resume and the script's own control flow diverges.
       this.records.push({ index, label, phase, ok: true, outputTokens: hit.outputTokens, replayed: true })
@@ -214,6 +243,7 @@ export class Run {
     if (!identity.forceLive) {breakScope(this.#rootScope)}
 
     this.#options.onProgress?.({ type: "agent-start", index, label, phase })
+    this.maybeWarnLargeRun()
 
     // The permit is held only for the spawn itself. Combinators deliberately do NOT gate, or a
     // parallel() nested in a pipeline() stage would deadlock behind its own outer item.
@@ -336,6 +366,7 @@ export class Run {
         ok: finalOutcome.ok,
         ...pick("sessionID", finalOutcome.sessionID),
       })
+      this.maybeWarnLargeRun()
 
       if (!finalOutcome.ok) {return null}
       return value

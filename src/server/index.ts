@@ -11,7 +11,7 @@ import type { WorkflowArgs, WorkflowContext } from "./tool/workflow.js"
 import { WORKFLOW_TOOL, STATUS_TOOL } from "./bridge/permission.js"
 import { asClient } from "./types.js"
 import type { OpencodeClient } from "./types.js"
-import { description, blockingDescription, statusDescription } from "./tool/description.js"
+import { description, blockingDescription, statusDescription, withSizeAdvice } from "./tool/description.js"
 import {
   activeRunForSession,
   isLiveAnywhere,
@@ -32,7 +32,7 @@ import {
 } from "./tool/render.js"
 import { listSavedWorkflows, scanNamedWorkflows } from "./tool/named.js"
 import { beginRun, endRun, loadResume } from "./resume/persist.js"
-import { isSafeRunId, readManifest, writeManifest, flushJournalEntry, writeFailure } from "./resume/store.js"
+import { ensureRunDir, isSafeRunId, readManifest, writeManifest, writeScript, flushJournalEntry, writeFailure } from "./resume/store.js"
 import type { JournalEntry, Manifest } from "./resume/journal.js"
 import { onChatMessage, onChatParams, onMessagesTransform } from "./ultracode/hooks.js"
 import { mode } from "./ultracode/mode.js"
@@ -191,7 +191,7 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
   if (!nested) {
     hooks["tool"] = {
       [WORKFLOW_TOOL]: {
-        description: options.runMode === "blocking" ? blockingDescription : description,
+        description: toolDescription(options),
         args: workflowArgsSchema(),
         execute: (args: WorkflowArgs, context: ToolContext): Promise<string> =>
           launchWorkflow(args, context, options, client, bootId, input.directory),
@@ -212,6 +212,13 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
   }
 
   return hooks
+}
+
+/** The tool description for this instance's contract and configured size advice. */
+function toolDescription(options: UltraopenOptions): string {
+  const base = options.runMode === "blocking" ? blockingDescription : description
+  if (options.sizeGuideline === undefined) {return base}
+  return withSizeAdvice(base, options.sizeGuideline)
 }
 
 /**
@@ -252,11 +259,12 @@ async function launchWorkflow(
     // directory can be re-run by path.
     readScript: (path: string) => readFile(path, "utf8"),
     ...(defaultModel === undefined ? {} : { defaultModel }),
+    ...(options.budgetTokens === null ? {} : { budgetTotal: options.budgetTokens }),
     // The detached run must NOT take the tool call's signal: a parent-turn
     // interrupt would otherwise kill the run it just launched. The signal is a
     // launch-phase concern; only the blocking contract still threads it into
     // the Run, where aborting the call and aborting the run are the same act.
-    ...(!background && context.abort ? { signal: context.abort } : {}),
+    ...(background || !context.abort ? {} : { signal: context.abort }),
   }
 
   // Saved workflows resolve from disk on every call: a file saved mid-session
@@ -298,6 +306,15 @@ async function launchWorkflow(
     // without running anything. Using the tool's `title` argument here instead would be
     // wrong twice over: it is documented as ignored, and the model usually omits it.
     const prepared = await prepare(args, workflowContext)
+
+    // Persist the script BEFORE the ask, so the user can open the real file
+    // while the prompt is on screen. beginRun writes it again (same bytes) when
+    // the run starts; an approved run therefore cannot desync. The run
+    // directory must exist for the write — created here, best-effort like the
+    // write itself: a failed write must not block the prompt, and a failure
+    // here resurfaces through beginRun's friendly launch-failure message.
+    await ensureRunDir(runId).catch(() => undefined)
+    await writeScript(runId, prepared.source).catch(() => undefined)
 
     // `always` is scoped to this workflow's name rather than "*": an "always" grant is
     // stored instance-wide, so approving once with "*" would permanently disable the
