@@ -3,6 +3,7 @@ import { mentionsKeyword, mode, requestsNoFanOut } from "../src/server/ultracode
 import { decorate, REMINDER_MARKER, ULTRACODE_DEMOTED, ULTRACODE_ON } from "../src/server/ultracode/reminders.js"
 import type { MessageLike } from "../src/server/ultracode/reminders.js"
 import { onChatMessage, onChatParams, onMessagesTransform } from "../src/server/ultracode/hooks.js"
+import type { MessagesTransformOutput } from "../src/server/ultracode/hooks.js"
 import { registry } from "../src/server/singleton.js"
 
 beforeEach(() => {
@@ -21,9 +22,16 @@ describe("keyword detection", () => {
     ["ULTRACODE please", true],
     ["let's ultracode it", true],
     ["ultracoded output", false],
-    // `/` and `.` are word boundaries, so a filename mention matches. Accepted: the cost is one
-    // turn at higher effort, and it is visible rather than silent.
-    ["src/ultracode.ts", true],
+    // A filename names a FILE, not a request to fan out: a stray mention raising
+    // the spend of every later message was the review's top-ranked danger.
+    ["src/ultracode.ts", false],
+    ["ultracode.ts", false],
+    ["check pkg/ultracode/config.ts", false],
+    ["my.ultracode-backup", false],
+    // Sentence punctuation stays a trigger: the filter must not eat real asks.
+    ["Use ultracode.", true],
+    ["Ultracode", true],
+    ["do the audit with ultracode!", true],
     ["nothing special", false],
   ])("%p -> %p", (text, expected) => {
     expect(mentionsKeyword(text)).toBe(expected)
@@ -180,19 +188,48 @@ describe("chat.message hook", () => {
     expect(mode.isDemoted("s1")).toBe(true)
   })
 
-  test("re-mentioning the keyword while active does NOT move the reminder toggle point", () => {
-    // The reminder is ephemeral and re-injected from `fromMessageID` each turn; overwriting it
-    // with each new mention drops earlier messages' reminders and breaks the cache prefix.
+  test("one-shot: a new user turn expires the previous keyword turn", () => {
+    // A keyword fans out exactly the task that said it. The NEXT user message
+    // starts with the keyword state gone, so the plain follow-up behaves
+    // normally — no reminder, no effort raise, no fan-out.
     const first = chatOutput("ultracode this")
     first.message.id = "m1"
     onChatMessage({ sessionID: "s1" }, first)
-    const stateBefore = mode.get("s1")
-    expect(stateBefore?.fromMessageID).toBe("m1")
+    expect(mode.isActive("s1")).toBe(true)
+
+    const next = chatOutput("now something ordinary")
+    next.message.id = "m2"
+    onChatMessage({ sessionID: "s1" }, next)
+    expect(mode.isActive("s1")).toBe(false)
+    expect(mode.get("s1")).toBeUndefined()
+  })
+
+  test("one-shot: re-mentioning the keyword re-arms for the NEW task", () => {
+    const first = chatOutput("ultracode this")
+    first.message.id = "m1"
+    onChatMessage({ sessionID: "s1" }, first)
+    expect(mode.get("s1")?.fromMessageID).toBe("m1")
+
+    const again = chatOutput("more ultracode please")
+    again.message.id = "m2"
+    onChatMessage({ sessionID: "s1" }, again)
+    expect(mode.get("s1")?.fromMessageID).toBe("m2")
+  })
+
+  test("session behavior reproduces the old sticky semantics exactly", () => {
+    // Characterization of the pre-one-shot behaviour: one mention keeps the mode
+    // across later turns, and a re-mention never moves the reminder toggle.
+    mode.setKeywordBehavior("session")
+    const first = chatOutput("ultracode this")
+    first.message.id = "m1"
+    onChatMessage({ sessionID: "s1" }, first)
+    expect(mode.get("s1")?.fromMessageID).toBe("m1")
 
     const again = chatOutput("more ultracode please")
     again.message.id = "m2"
     onChatMessage({ sessionID: "s1" }, again)
     expect(mode.get("s1")?.fromMessageID).toBe("m1")
+    expect(mode.isActive("s1")).toBe(true)
   })
 
   test("mentioning the keyword while disabled by a command DOES re-enable", () => {
@@ -304,5 +341,60 @@ describe("chat.params hook", () => {
     expect(() =>
       onChatParams({ sessionID: "s1", model: { variants: { xhigh: {} } } }, {}, { resolveVariant: () => "xhigh" }),
     ).not.toThrow()
+  })
+})
+
+describe("one-shot keyword — reminder and effort do not leak", () => {
+  beforeEach(() => {
+    mode.resetForTests()
+    registry.resetForTests()
+  })
+
+  test("the turn after a keyword turn carries no reminder", () => {
+    // A one-shot keyword leaves no reminder behind: the next turn must not be
+    // decorated, or the standing fan-out would silently continue.
+    const first = chatOutput("ultracode this")
+    first.message.id = "m1"
+    onChatMessage({ sessionID: "s1" }, first)
+
+    const next = chatOutput("something ordinary")
+    next.message.id = "m2"
+    onChatMessage({ sessionID: "s1" }, next)
+
+    const output: MessagesTransformOutput = {
+      messages: [{ info: { id: "m2", role: "user", sessionID: "s1" }, parts: [] as unknown[] }],
+    }
+    expect(onMessagesTransform(output)).toBe(0)
+    expect(output.messages[0]?.parts?.length ?? 0).toBe(0)
+  })
+
+  test("the turn after a keyword turn gets no effort raise either", () => {
+    const first = chatOutput("ultracode this")
+    onChatMessage({ sessionID: "s1" }, first, { resolveVariant: () => "high" })
+    expect(first.message?.model?.variant).toBe("high")
+
+    const next = chatOutput("something ordinary")
+    onChatMessage({ sessionID: "s1" }, next, { resolveVariant: () => "high" })
+    expect(next.message?.model?.variant).toBeUndefined()
+  })
+
+  test("a keyword turn followed by a keyword turn re-arms cleanly (no double reminder)", () => {
+    const first = chatOutput("ultracode: audit the diff")
+    first.message.id = "m1"
+    onChatMessage({ sessionID: "s1" }, first)
+
+    const second = chatOutput("ultracode this too")
+    second.message.id = "m2"
+    onChatMessage({ sessionID: "s1" }, second)
+    expect(mode.isActive("s1")).toBe(true)
+
+    // The decorate path stays idempotent on the re-armed turn.
+    const output: MessagesTransformOutput = {
+      messages: [{ info: { id: "m2", role: "user", sessionID: "s1" }, parts: [] as unknown[] }],
+    }
+    const added = onMessagesTransform(output)
+    expect(output.messages[0]?.parts?.length ?? 0).toBe(1)
+    expect(added).toBe(1)
+    expect(onMessagesTransform(output)).toBe(0)
   })
 })

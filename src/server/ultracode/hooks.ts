@@ -44,6 +44,11 @@ export function onChatMessage(
   // fan out again is how a run turns into a fork bomb.
   if (registry.owns(input.sessionID)) {return}
 
+  // One-shot keyword turn boundary: a keyword fans out exactly the task that
+  // said it, so when the NEXT user message arrives, what the keyword started is
+  // finished. `/ultracode` and the plugin option are deliberately untouched.
+  if (mode.getKeywordBehavior() === "one-shot") {mode.expireKeyword(input.sessionID)}
+
   const text = (output.parts ?? [])
     .filter((part) => part.type === "text" && typeof part.text === "string")
     .map((part) => part.text ?? "")

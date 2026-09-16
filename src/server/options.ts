@@ -26,6 +26,11 @@ export interface UltraopenOptions {
    * final result, for one-shot hosts that kill the process after the turn.
    */
   runMode: "background" | "blocking"
+  /**
+   * How a plain `ultracode` keyword mention behaves. `one-shot` (default) fans
+   * out exactly the task that said it; `session` keeps the old sticky behaviour.
+   */
+  keywordBehavior: "one-shot" | "session"
 }
 
 const DEFAULTS: UltraopenOptions = {
@@ -35,6 +40,7 @@ const DEFAULTS: UltraopenOptions = {
   agentIdleMs: 5 * 60 * 1000,
   effortPreference: ["xhigh", "max", "high", "medium", "low"],
   runMode: "background",
+  keywordBehavior: "one-shot",
 }
 
 /**
@@ -56,7 +62,15 @@ export function resolveOptions(raw: unknown): UltraopenOptions {
     agentIdleMs: clampTimeout(input["agentIdleMs"], DEFAULTS.agentIdleMs, false),
     effortPreference: stringArray(input["effortPreference"]) ?? DEFAULTS.effortPreference,
     runMode: resolveRunMode(input["runMode"]),
+    keywordBehavior: resolveKeywordBehavior(input["keywordBehavior"]),
   }
+}
+
+/** Validates the keyword behaviour; an unrecognized value falls back, never throws. */
+function resolveKeywordBehavior(value: unknown): "one-shot" | "session" {
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : undefined
+  if (normalized === "one-shot" || normalized === "session") {return normalized}
+  return "one-shot"
 }
 
 /**
