@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { WORKFLOW_TOOL } from "../src/server/bridge/permission.js"
+import { STATUS_TOOL, WORKFLOW_TOOL } from "../src/server/bridge/permission.js"
 import { installConfig } from "../src/server/ultracode/config.js"
 import type { MutableConfig } from "../src/server/ultracode/config.js"
 
@@ -17,7 +17,7 @@ describe("installConfig — agent", () => {
     expect(agent["mode"]).toBe("primary")
     expect(typeof agent["description"]).toBe("string")
     expect((agent["description"] as string).length).toBeGreaterThan(0)
-    expect(agent["permission"]).toEqual({ [WORKFLOW_TOOL]: "ask" })
+    expect(agent["permission"]).toEqual({ [WORKFLOW_TOOL]: "ask", [STATUS_TOOL]: "allow" })
     expect(agent["options"]).toEqual({ ultracode: true })
   })
 
@@ -93,6 +93,13 @@ describe("installConfig — permission", () => {
     expect(asRecord(config.permission)[WORKFLOW_TOOL]).toBe("ask")
   })
 
+  test("the read-only status tool defaults to 'allow' so polling never prompts", () => {
+    const config: MutableConfig = {}
+    installConfig(config, {})
+
+    expect(asRecord(config.permission)[STATUS_TOOL]).toBe("allow")
+  })
+
   test("an existing permission.workflow value is not overwritten", () => {
     const config: MutableConfig = { permission: { [WORKFLOW_TOOL]: "allow" } }
     installConfig(config, {})
@@ -113,20 +120,21 @@ describe("installConfig — permission", () => {
 })
 
 describe("installConfig — experimental.primary_tools", () => {
-  test("on an empty config, experimental.primary_tools contains WORKFLOW_TOOL", () => {
+  test("on an empty config, experimental.primary_tools contains WORKFLOW_TOOL and STATUS_TOOL", () => {
     // Both `experimental` and `primary_tools` are optional in the schema, so an optional-chained
     // `.push()` would be a silent no-op on the overwhelmingly common default config.
     const config: MutableConfig = {}
     installConfig(config, {})
 
     expect(config.experimental?.primary_tools).toContain(WORKFLOW_TOOL)
+    expect(config.experimental?.primary_tools).toContain(STATUS_TOOL)
   })
 
   test("an existing primary_tools array is preserved and appended to", () => {
     const config: MutableConfig = { experimental: { primary_tools: ["foo"] } }
     installConfig(config, {})
 
-    expect(config.experimental?.primary_tools).toEqual(["foo", WORKFLOW_TOOL])
+    expect(config.experimental?.primary_tools).toEqual(["foo", WORKFLOW_TOOL, STATUS_TOOL])
   })
 
   test("calling installConfig twice does not duplicate the primary_tools entry", () => {

@@ -19,6 +19,9 @@ export type Ruleset = PermissionRule[]
 /** The tool id this plugin registers. Bare, with no namespace — plugin tools are not prefixed. */
 export const WORKFLOW_TOOL = "workflow"
 
+/** The read-only companion tool. Same registration rules as WORKFLOW_TOOL. */
+export const STATUS_TOOL = "workflow_status"
+
 /**
  * The tool opencode injects when a prompt carries `format: {type:"json_schema"}`.
  *
@@ -30,6 +33,8 @@ export const STRUCTURED_OUTPUT_TOOL = "StructuredOutput"
 const CHILD_DENIED_TOOLS = [
   // Recursion: without this a subagent can start its own fan-out.
   WORKFLOW_TOOL,
+  // Read-only, but children have no business polling the parent's run.
+  STATUS_TOOL,
   // The built-in subagent spawner — a child spawning children escapes our counter and budget.
   "task",
   // The shared task list is per-conversation; a child writing it corrupts the parent's.

@@ -60,12 +60,23 @@ grep -q "READY" "$OUT/t0.out" \
   && ok "model answered in scratch env" \
   || { bad "model did not answer in scratch env" "see $OUT/t0.out — auth symlink or provider config broken; aborting"; finish; exit 1; }
 
-section "T1 — workflow tool end-to-end (load, permission auto-approve, schema forcing)"
+section "T1 — workflow tool end-to-end (async launch, permission auto-approve, schema forcing)"
 runs_snapshot "$OUT/runs-before-t1.txt"
 oc_run_capture "$OUT/t1.out" 300 "$(wf_prompt smoke)" || true
 RUN1_ALL="$(runs_new_since "$OUT/runs-before-t1.txt")"
 for r in $RUN1_ALL; do preserve_run "$r"; done
 RUN1="$(newest_completed_run "$OUT/runs-before-t1.txt")"
+if grep -q "<workflow-launched" "$OUT/t1.out" \
+  && grep -q 'workflow="e2e-smoke"' "$OUT/t1.out"; then
+  ok "launch result names the run and workflow (async contract)"
+else
+  bad "no workflow-launched result" "the tool must return the run id at once — see $OUT/t1.out"
+fi
+if grep -q "workflow-status\|workflow_status" "$OUT/t1.out"; then
+  ok "model polled workflow_status in the same turn"
+else
+  note "no workflow_status poll visible in $OUT/t1.out — check the prompt compliance"
+fi
 if [ -n "$RUN1" ]; then
   ok "run dir created: $RUN1"
   RUN1_ATTEMPTS="$(printf '%s' "$RUN1_ALL" | grep -c . || true)"
@@ -224,6 +235,30 @@ if [ -n "$RUN8" ]; then
   fi
 else
   bad "ultracode turn produced no run dir" "see $OUT/t8.json"
+fi
+
+section "T9 — background launch + status delivery (value arrives only via workflow_status)"
+# The launch result must not carry the outcome; the final value reaches the
+# model only through a workflow_status poll, and the run settles before the
+# one-shot process exits because the turn kept polling.
+runs_snapshot "$OUT/runs-before-t9.txt"
+oc_run_capture "$OUT/t9.out" 300 "$(wf_prompt ping)" || true
+RUN9="$(newest_run "$OUT/runs-before-t9.txt")"
+if [ -n "$RUN9" ]; then
+  preserve_run "$RUN9"
+  grep -q "<workflow-launched" "$OUT/t9.out" && ok "T9 launch result present" || bad "T9 no launch result" "see $OUT/t9.out"
+  # The word the agent was told to produce can only reach the model's reply
+  # through a workflow_status poll — the launch result never carries it.
+  if grep -qE "PING|workflow-status.*completed" "$OUT/t9.out"; then
+    ok "final value delivered through the status poll"
+  else
+    note "T9 value did not surface in the reply — inspect $OUT/t9.out and $RUN9"
+  fi
+  [ "$(manifest_status "$RUN9")" = "completed" ] || [ "$(manifest_status "$RUN9")" = "failed" ] \
+    && ok "T9 run settled (status: $(manifest_status "$RUN9"))" \
+    || bad "T9 run never settled" "manifest still $(manifest_status "$RUN9") after the turn"
+else
+  bad "T9 produced no run dir" "see $OUT/t9.out"
 fi
 
 [ -f "$DATA_ROOT/log/opencode.log" ] && cp "$DATA_ROOT/log/opencode.log" "$OUT/server.log" 2>/dev/null || true

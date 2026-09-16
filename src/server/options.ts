@@ -20,6 +20,12 @@ export interface UltraopenOptions {
   agentIdleMs: number
   /** Effort preference, highest first. Resolved against each model's real variant map. */
   effortPreference: readonly string[]
+  /**
+   * Launch contract for the `workflow` tool. `background` returns the run id at
+   * once and the run continues in the server process; `blocking` waits for the
+   * final result, for one-shot hosts that kill the process after the turn.
+   */
+  runMode: "background" | "blocking"
 }
 
 const DEFAULTS: UltraopenOptions = {
@@ -28,6 +34,7 @@ const DEFAULTS: UltraopenOptions = {
   agentDeadlineMs: 4 * 60 * 60 * 1000,
   agentIdleMs: 5 * 60 * 1000,
   effortPreference: ["xhigh", "max", "high", "medium", "low"],
+  runMode: "background",
 }
 
 /**
@@ -37,7 +44,9 @@ const DEFAULTS: UltraopenOptions = {
  * bad value here would otherwise surface much later as a hang or a silently ignored setting.
  */
 export function resolveOptions(raw: unknown): UltraopenOptions {
-  if (typeof raw !== "object" || raw === null) {return { ...DEFAULTS }}
+  if (typeof raw !== "object" || raw === null) {
+    return { ...DEFAULTS, runMode: resolveRunMode(undefined) }
+  }
   const input = raw as Record<string, unknown>
 
   return {
@@ -46,7 +55,23 @@ export function resolveOptions(raw: unknown): UltraopenOptions {
     agentDeadlineMs: clampTimeout(input["agentDeadlineMs"], DEFAULTS.agentDeadlineMs, true),
     agentIdleMs: clampTimeout(input["agentIdleMs"], DEFAULTS.agentIdleMs, false),
     effortPreference: stringArray(input["effortPreference"]) ?? DEFAULTS.effortPreference,
+    runMode: resolveRunMode(input["runMode"]),
   }
+}
+
+/**
+ * Resolves the launch contract.
+ *
+ * `ULTRAOPEN_WORKFLOW_SYNC=1` forces the blocking contract regardless of the
+ * option: a one-line kill switch that restores the pre-async behavior without a
+ * config edit, for hosts that exit the process right after the turn.
+ */
+export const SYNC_ENV = "ULTRAOPEN_WORKFLOW_SYNC"
+
+function resolveRunMode(value: unknown): "background" | "blocking" {
+  if (typeof value === "string" && value === "blocking") {return "blocking"}
+  if (typeof value === "string" && value === "background") {return "background"}
+  return process.env[SYNC_ENV] === "1" ? "blocking" : DEFAULTS.runMode
 }
 
 /**

@@ -1,4 +1,4 @@
-import { WORKFLOW_TOOL } from "../bridge/permission.js"
+import { STATUS_TOOL, WORKFLOW_TOOL } from "../bridge/permission.js"
 
 /**
  * The mutable config object opencode hands to a plugin's `config` hook.
@@ -54,7 +54,7 @@ function installAgent(config: MutableConfig): void {
   config.agent["ultracode"] = {
     description: ULTRACODE_DESCRIPTION,
     mode: "primary",
-    permission: { [WORKFLOW_TOOL]: "ask" },
+    permission: { [WORKFLOW_TOOL]: "ask", [STATUS_TOOL]: "allow" },
     options: { ultracode: true },
     ...existing,
   }
@@ -94,6 +94,9 @@ function installPermission(config: MutableConfig): void {
   if (typeof config.permission === "string") {return}
   config.permission ??= {}
   config.permission[WORKFLOW_TOOL] ??= "ask"
+  // Read-only: polls the run directory on disk. Prompting for it would train
+  // the model to avoid polling, which is how a background run gets lost.
+  config.permission[STATUS_TOOL] ??= "allow"
 }
 
 /**
@@ -108,7 +111,11 @@ function installPermission(config: MutableConfig): void {
 function installPrimaryTools(config: MutableConfig): void {
   config.experimental ??= {}
   const current = config.experimental.primary_tools ?? []
-  if (!current.includes(WORKFLOW_TOOL)) {config.experimental.primary_tools = [...current, WORKFLOW_TOOL]}
+  const next = [...current]
+  for (const tool of [WORKFLOW_TOOL, STATUS_TOOL]) {
+    if (!next.includes(tool)) {next.push(tool)}
+  }
+  config.experimental.primary_tools = next
 }
 
 /** Publishes the bundled workflow-authoring skill so the model can read the scripting reference. */

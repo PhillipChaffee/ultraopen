@@ -1,7 +1,9 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test"
 import { ultraopen } from "../src/server/index.js"
 import { registry } from "../src/server/singleton.js"
-import { WORKFLOW_TOOL } from "../src/server/bridge/permission.js"
+import * as background from "../src/server/tool/background.js"
+import { STATUS_TOOL, WORKFLOW_TOOL } from "../src/server/bridge/permission.js"
+import { executeStatus } from "../src/server/tool/status.js"
 import { mode } from "../src/server/ultracode/mode.js"
 import type { MutableConfig } from "../src/server/ultracode/config.js"
 import { ensureRunDir, readJournal, readManifest, writeScript } from "../src/server/resume/store.js"
@@ -63,6 +65,7 @@ let savedEnv: string | undefined
 
 beforeEach(() => {
   registry.resetForTests()
+  background.resetForTests()
   mode.resetForTests()
   savedEnv = process.env["ULTRAOPEN_ACTIVE"]
   delete process.env["ULTRAOPEN_ACTIVE"]
@@ -258,7 +261,7 @@ describe("tool execution", () => {
     // surface errors at runtime (verified live before this was wired).
     await ensureRunDir("wf_pathdemo01", undefined)
     const paths = await writeScript("wf_pathdemo01", `${META}return 'from disk'\n`)
-    expect(await run({ scriptPath: paths })).toContain("from disk")
+    expect(await run({ scriptPath: paths, background: false })).toContain("from disk")
   })
 
   test("a failed run persists its PARTIAL journal so a resume can replay what succeeded", async () => {
@@ -267,7 +270,7 @@ describe("tool execution", () => {
     const tool = toolOf(ultraopen({ client: stubClient }))
     if (!tool) {throw new Error("tool was not registered")}
     const script = `${META}await agent('succeeds')\nthrow new Error('script blew up')\n`,
-     output = await tool.execute({ script }, { sessionID: "parent" })
+     output = await tool.execute({ script, background: false }, { sessionID: "parent" })
     expect(output).toContain("script blew up")
 
     // Find the run id from the tool's rendered failure — the journal is keyed by run.
@@ -287,7 +290,7 @@ describe("tool execution", () => {
     const tool = toolOf(ultraopen({ client: stubClient }))
     if (!tool) {throw new Error("tool was not registered")}
     const script = `${META}await agent('a')\nreturn 'done'\n`,
-     output = await tool.execute({ script }, { sessionID: "parent" }),
+     output = await tool.execute({ script, background: false }, { sessionID: "parent" }),
      runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1]
     expect(runId).toBeDefined()
     const manifest = await readManifest(runId ?? "", undefined)
@@ -301,12 +304,12 @@ describe("tool execution", () => {
     if (!tool) {throw new Error("tool was not registered")}
     const script = `${META}await agent('a')\nreturn 'ok'\n`,
 
-     first = await tool.execute({ script, args: { topic: "one" } }, { sessionID: "parent" }),
+     first = await tool.execute({ script, args: { topic: "one" }, background: false }, { sessionID: "parent" }),
      runId = first.match(/run="(?<runId>[^"]+)"/u)?.[1]
     expect(runId).toBeDefined()
 
     const second = await tool.execute(
-      { script, args: { topic: "two" }, resumeFromRunId: runId },
+      { script, args: { topic: "two" }, resumeFromRunId: runId, background: false },
       { sessionID: "parent" },
     )
     expect(second).toContain('args changed since the previous run')
@@ -322,7 +325,7 @@ describe("tool execution", () => {
     const failing = { session: { ...stubClient.session, create: () => Promise.resolve({ error: "nope" }) } },
      tool = toolOf(ultraopen({ client: failing })),
      output = await tool?.execute(
-      { script: `${META}await parallel([() => agent('a'), () => agent('b')])\nreturn 'done'\n` },
+      { script: `${META}await parallel([() => agent('a'), () => agent('b')])\nreturn 'done'\n`, background: false },
       { sessionID: "parent" },
     )
     expect(output).toContain("<failures")
@@ -353,9 +356,10 @@ describe("model and effort wiring", () => {
   test("reads the session's default model and resolves effort against ITS variants", async () => {
     const tool = toolOf(ultraopen({ client: catalogClient })),
      script = `${META}await agent('x', { effort: 'xhigh' })\nreturn 'done'\n`,
-     output = await tool?.execute({ script }, { sessionID: "parent" })
+     output = await tool?.execute({ script, background: false }, { sessionID: "parent" })
 
     // The model has no xhigh, so the request is downgraded — and the run log SAYS so, rather than
+    // silently applying no extra thinking at all., so the request is downgraded — and the run log SAYS so, rather than
     // silently applying no extra thinking at all.
     expect(output).toContain("<log>")
     expect(output).toContain("unsupported")
@@ -371,7 +375,7 @@ describe("model and effort wiring", () => {
       session: catalogClient.session,
     },
      tool = toolOf(ultraopen({ client: failing })),
-     output = await tool?.execute({ script: `${META}return 'fine'\n` }, { sessionID: "parent" })
+     output = await tool?.execute({ script: `${META}return 'fine'\n`, background: false }, { sessionID: "parent" })
     expect(output).toContain("fine")
   })
 
@@ -520,5 +524,303 @@ describe("idle-deadline activity feed (event hook)", () => {
      onEvent = hooks["event"] as (input: unknown) => void
     expect(() => onEvent({})).not.toThrow()
     expect(() => onEvent({ event: { type: "message.part.updated", properties: { part: {} } } })).not.toThrow()
+  })
+})
+
+/**
+ * A client whose child prompt never settles: the launch phase completes, the run
+ * itself stays in flight — the state every background-contract test needs.
+ */
+const hangingClient = {
+  config: stubClient.config,
+  session: { ...stubClient.session, prompt: () => new Promise(() => {}) },
+}
+
+describe("background launch contract", () => {
+  const statusToolOf = (hooks: Record<string, unknown>): ToolDef | undefined => {
+    const tools = hooks["tool"] as Record<string, ToolDef> | undefined
+    return tools?.[STATUS_TOOL]
+  }
+  const settle = background.settlePromiseOf
+
+  test("registers workflow_status next to workflow, with a read-only shape", () => {
+    const hooks = ultraopen({ client: stubClient })
+    const status = statusToolOf(hooks)
+    expect(status).toBeDefined()
+    expect(Object.keys(status?.args ?? {})).toContain("runId")
+    expect(Object.keys(status?.args ?? {})).toContain("wait")
+    expect(status?.description).toContain("wait")
+  })
+
+  test("the launch result names the run and says NOTHING about the outcome", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 'SECRET-VALUE'\n`, background: true },
+      { sessionID: "parent" },
+    )
+    expect(output).toContain("<workflow-launched")
+    expect(output).toContain("workflow_status")
+    expect(output).not.toContain("<result")
+    expect(output).not.toContain("SECRET-VALUE")
+    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1]
+    expect(runId).toBeDefined()
+    await settle(runId ?? "")
+  })
+
+  test("the manifest is on disk BEFORE the tool call returns", async () => {
+    const tool = toolOf(ultraopen({ client: hangingClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute({ script: `${META}await agent('a')\nreturn 1\n`, background: true }, { sessionID: "parent" })
+    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
+    const manifest = await readManifest(runId, undefined)
+    // The launch result names a run id that workflow_status must resolve; a run
+    // whose manifest lands late would be unfindable between return and beginRun.
+    expect(manifest?.status).toBe("running")
+    expect(manifest?.sessionID).toBe("parent")
+    expect(manifest?.bootId).toBeDefined()
+  })
+
+  test("a second launch from the same session is refused while one is live", async () => {
+    const tool = toolOf(ultraopen({ client: hangingClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const first = await tool.execute({ script: `${META}await agent('a')\nreturn 1\n`, background: true }, { sessionID: "parent" })
+    expect(first).toContain("<workflow-launched")
+    const second = await tool.execute({ script: `${META}return 2\n`, background: true }, { sessionID: "parent" })
+    expect(second).toContain("<workflow-refused>")
+    expect(second).toContain("workflow_status")
+    // The refused call never created a run directory of its own.
+    expect(second.match(/run="(?<runId>[^"]+)"/u)?.[1]).toBeUndefined()
+  })
+
+  test("two launches from one session in the same tick: exactly one succeeds", async () => {
+    // The refusal check and the registration are order-sensitive; both calls
+    // must not be able to pass the check before either registers.
+    const tool = toolOf(ultraopen({ client: hangingClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const [a, b] = await Promise.all([
+      tool.execute({ script: `${META}await agent('a')\nreturn 1\n`, background: true }, { sessionID: "parent" }),
+      tool.execute({ script: `${META}await agent('b')\nreturn 2\n`, background: true }, { sessionID: "parent" }),
+    ])
+    const launched = [a, b].filter((output) => output.includes("<workflow-launched"))
+    const refused = [a, b].filter((output) => output.includes("<workflow-refused>"))
+    expect(launched.length).toBe(1)
+    expect(refused.length).toBe(1)
+  })
+
+  test("a background run settles after the tool call returned", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute({ script: `${META}await agent('a')\nreturn 'done'\n`, background: true }, { sessionID: "parent" })
+    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
+    await settle(runId)
+    const manifest = await readManifest(runId, undefined)
+    expect(manifest?.status).toBe("completed")
+    const entries = await readJournal(runId)
+    expect(entries.length).toBe(1)
+    expect(entries[0]?.status).toBe("ok")
+  })
+
+  test("aborting the tool call's signal does not abort the detached run", async () => {
+    // The parent turn being interrupted must not kill the run it just launched:
+    // the detached Run deliberately never sees the tool call's abort signal.
+    const controller = new AbortController(),
+      tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 'ok'\n`, background: true },
+      { sessionID: "parent", abort: controller.signal },
+    )
+    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
+    controller.abort()
+    await settle(runId)
+    // The run's own end-of-script cleanup aborts children as always; what must
+    // NOT happen is a signal-driven abort mid-run killing the agent's prompt.
+    const settledManifest = await readManifest(runId, undefined)
+    expect(settledManifest?.status).toBe("completed")
+  })
+
+  test("resuming a run that is still executing is refused", async () => {
+    // Two Run instances on one journal would interleave appends and race the
+    // endRun rewrite; the live run must settle (or die) before a resume starts.
+    const tool = toolOf(ultraopen({ client: hangingClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const first = await tool.execute({ script: `${META}await agent('a')\nreturn 1\n`, background: true }, { sessionID: "other" })
+    const liveRunId = first.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
+    const second = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 2\n`, background: false, resumeFromRunId: liveRunId },
+      { sessionID: "parent" },
+    )
+    expect(second).toContain("<workflow-refused>")
+    expect(second).toContain("still executing")
+  })
+
+  test("a parse failure in the background contract does not leave a pending launch behind", async () => {
+    const tool = toolOf(ultraopen({ client: hangingClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute({ script: `${META}const x: string[] = []\n`, background: true }, { sessionID: "parent" })
+    expect(output).toContain("ParseError")
+    // The session is free to launch again.
+    const second = await tool.execute({ script: `${META}return 1\n`, dryRun: true }, { sessionID: "parent" })
+    expect(second).toContain("<result")
+  })
+
+  test("a rejected permission ask drops the pending launch", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}return 1\n`, background: true },
+      { sessionID: "parent", ask: () => Promise.reject(new Error("user said no")) },
+    )
+    expect(output).toContain("user said no")
+    // The session must be free to launch again after the rejection.
+    const second = await tool.execute({ script: `${META}return 1\n`, background: true }, { sessionID: "parent" })
+    expect(second).toContain("<workflow-launched")
+    await settle(second.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? "")
+  })
+
+  test("dryRun always waits for its result even in background mode", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute({ script: `${META}return 1\n`, dryRun: true, background: true }, { sessionID: "parent" })
+    expect(output).toContain("<result")
+  })
+
+  test("the blocking option restores the pre-async contract", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }, { runMode: "blocking" }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute({ script: `${META}await agent('a')\nreturn 'blocking-value'\n` }, { sessionID: "parent" })
+    expect(output).toContain("<result")
+    expect(output).toContain("blocking-value")
+  })
+
+  test("the status tool reads the settled run from disk", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute({ script: `${META}await agent('a')\nreturn 'the-value'\n`, background: true }, { sessionID: "parent" })
+    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
+    await settle(runId)
+    const status = statusToolOf(ultraopen({ client: stubClient }))
+    if (!status) {throw new Error("status tool was not registered")}
+    const report = await status.execute({ runId }, { sessionID: "parent" })
+    expect(report).toContain(`status="completed"`)
+    expect(report).toContain("the-value")
+    expect(report).toContain("agents total=1 running=0 done=1 failed=0")
+  })
+
+  test("an unknown run id is a clear error, not a crash", async () => {
+    const status = statusToolOf(ultraopen({ client: stubClient }))
+    if (!status) {throw new Error("status tool was not registered")}
+    const report = await status.execute({ runId: "wf_missing000" }, { sessionID: "parent" })
+    expect(report).toContain("No run found")
+    expect(report).not.toContain("throw")
+    // A malformed id never reaches a path join.
+    const traversal = await status.execute({ runId: "../../etc" }, { sessionID: "parent" })
+    expect(traversal).toContain("No run found")
+  })
+
+  test("a failed background run persists its failure text for the status tool", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}await agent('a')\nthrow new Error('boom mid-run')\n`, background: true },
+      { sessionID: "parent" },
+    )
+    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
+    await settle(runId)
+    const status = statusToolOf(ultraopen({ client: stubClient }))
+    if (!status) {throw new Error("status tool was not registered")}
+    const report = await status.execute({ runId }, { sessionID: "parent" })
+    expect(report).toContain(`status="failed"`)
+    expect(report).toContain("boom mid-run")
+    expect(report).toContain("<failure")
+  })
+
+  test("the launch result never leaks the outcome even on failure", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}await agent('a')\nthrow new Error('soon-boom')\n`, background: true },
+      { sessionID: "parent" },
+    )
+    expect(output).toContain("<workflow-launched")
+    expect(output).not.toContain("soon-boom")
+    await settle(output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? "")
+  })
+
+  test("ULTRAOPEN_WORKFLOW_SYNC restores the blocking contract without config", async () => {
+    // The kill switch must work with NO options object at all: one env var.
+    process.env["ULTRAOPEN_WORKFLOW_SYNC"] = "1"
+    try {
+      const tool = toolOf(ultraopen({ client: stubClient }))
+      if (!tool) {throw new Error("tool was not registered")}
+      const output = await tool.execute({ script: `${META}return 'sync-value'\n` }, { sessionID: "parent" })
+      expect(output).toContain("<result")
+      expect(output).toContain("sync-value")
+    } finally {
+      delete process.env["ULTRAOPEN_WORKFLOW_SYNC"]
+    }
+  })
+
+  test("the status report carries the run's log lines", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}log('hello from the run')\nawait agent('a')\nreturn 1\n`, background: true },
+      { sessionID: "parent" },
+    )
+    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
+    await settle(runId)
+    const status = statusToolOf(ultraopen({ client: stubClient }))
+    if (!status) {throw new Error("status tool was not registered")}
+    const report = await status.execute({ runId }, { sessionID: "parent" })
+    expect(report).toContain("<log>")
+    expect(report).toContain("hello from the run")
+  })
+
+  test("executeStatus can be driven directly against real run artifacts", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 'probe-value'\n`, background: true },
+      { sessionID: "parent" },
+    )
+    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
+    await settle(runId)
+    const report = await executeStatus({ runId }, { bootId: "other-boot" })
+    expect(report.status).toBe("completed")
+    expect(report.value).toBe("probe-value")
+    expect(report.outputTokens).toBe(0)
+  })
+})
+
+describe("background launch contract — unwritable run directory", () => {
+  let savedXDG: string | undefined
+
+  beforeEach(() => {
+    registry.resetForTests()
+    background.resetForTests()
+    mode.resetForTests()
+    savedXDG = process.env["XDG_DATA_HOME"]
+    // mkdir under /dev/null can never succeed, so beginRun cannot open the run
+    // directory — the launch must refuse instead of starting an unobservable run.
+    process.env["XDG_DATA_HOME"] = "/dev/null/nope"
+  })
+
+  afterEach(() => {
+    if (savedXDG === undefined) {delete process.env["XDG_DATA_HOME"]}
+    else {process.env["XDG_DATA_HOME"] = savedXDG}
+  })
+
+  test("a beginRun failure aborts the launch instead of starting an unreportable run", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute({ script: `${META}return 1\n`, background: true }, { sessionID: "parent" })
+    expect(output).toContain("could not be started")
+    expect(output).not.toContain("<workflow-launched")
+    // The launch-gating entry is dropped: the session can launch again.
+    process.env["XDG_DATA_HOME"] = savedXDG
+    const second = await tool.execute({ script: `${META}return 1\n`, dryRun: true }, { sessionID: "parent" })
+    expect(second).toContain("<result")
   })
 })

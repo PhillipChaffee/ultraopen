@@ -13,6 +13,7 @@ const DEFAULT_CONCURRENCY = 8,
   agentDeadlineMs: DEFAULT_AGENT_DEADLINE_MS,
   agentIdleMs: DEFAULT_AGENT_IDLE_MS,
   effortPreference: DEFAULT_EFFORT_PREFERENCE,
+  runMode: "background" as const,
 }
 
 describe("resolveOptions — non-object input", () => {

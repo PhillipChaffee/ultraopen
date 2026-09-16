@@ -8,8 +8,6 @@
  * limited to what opencode actually does — see NOTICE:
  *   - `Workflow({...})` -> `workflow({...})`, the opencode tool id
  *   - "the Agent tool" -> "the task tool"
- *   - the async task-id contract is rewritten as blocking, because opencode exposes no
- *     background-job route to a plugin
  */
 export const description = `Execute a workflow script that orchestrates multiple subagents deterministically.
 
@@ -19,9 +17,11 @@ write. Only the LLM steps vary between runs. That property is what buys the thre
 are for: comprehensiveness (decompose and cover in parallel), confidence (independent perspectives
 and adversarial checks before committing), and scale (work one context window cannot hold).
 
-This call BLOCKS until the run completes, then returns one consolidated result. A 15-agent run can
-take many minutes. That matches the intended rhythm anyway: scout inline first to discover the
-work-list, then fan out over it, and read each result before deciding the next phase.
+This call RETURNS AT ONCE with the run id. The run continues in the background while you keep
+working. Poll \`workflow_status\` with the run id (pass \`wait\` so one call blocks until the run
+settles or the wait expires) — do not re-launch the same workflow because a poll said "running".
+Aborting this call does not stop the run; if you must stop it, tell the user to end the opencode
+process, or wait for it to settle and resume from its run id.
 
 ## When to use it
 
@@ -104,3 +104,20 @@ Scale to what was asked. "Find any bugs" warrants a few finders and a single ver
 
 Pass dryRun: true to run the whole script with agent() stubbed out — it exercises parsing, control
 flow and fan-out shape for zero tokens, which is the cheapest way to debug a script.`
+
+/**
+ * The `workflow_status` tool description.
+ *
+ * Same rules as the workflow description: this text trains the polling rhythm.
+ * Without the `wait` guidance the model polls in a tight loop or abandons runs
+ * that would have settled seconds later.
+ */
+export const statusDescription = `Read the live state of one workflow run from disk.
+
+Pass the runId from the workflow launch result. Pass wait (seconds, up to 300) to block the call
+until the run settles or the wait expires — prefer one long wait over many short polls. The report
+carries: status (running, completed, failed, or orphaned), the phase names seen so far, agent
+counts (total, running, done, failed), the run's output token total, the last log lines, and, when
+the run has settled, the final value (completed) or the failure text (failed, orphaned). A run
+whose owning process died reports orphaned with a pointer at resume. This tool is read-only and
+never spawns anything.`

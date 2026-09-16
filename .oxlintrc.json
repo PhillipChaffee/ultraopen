@@ -103,6 +103,17 @@
   "overrides": [
     {
       "files": [
+        "src/server/index.ts"
+      ],
+      "rules": {
+        "import/max-dependencies": [
+          "error",
+          { "max": 20 }
+        ]
+      }
+    },
+    {
+      "files": [
         "test/**/*.ts",
         "test/**/*.mjs"
       ],

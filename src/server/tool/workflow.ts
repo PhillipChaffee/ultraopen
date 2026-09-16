@@ -20,6 +20,12 @@ export interface WorkflowArgs {
   resumeFromRunId?: string
   dryRun?: boolean
   /**
+   * Launch detached and return the run id at once. Undefined falls back to the
+   * plugin's `runMode` option; dryRun always waits regardless. Ignored by the
+   * engine itself — this is a tool-layer contract switch.
+   */
+  background?: boolean
+  /**
    * Accepted and ignored, exactly as the spec specifies. A model trained on Claude Code passes
    * these; rejecting them would surface as a schema validation error instead of the documented
    * silent ignore.
