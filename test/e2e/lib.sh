@@ -332,6 +332,27 @@ open(dir_ + "/progress.json", "w").write(json.dumps(progress))
 PYEOF
 }
 
+# Fabricate an interrupted (orphaned) run with the reaper's marker, as if a
+# crash happened and a later boot reaped it. Drives the once-per-boot hint.
+synth_orphan() { # synth_orphan RUNID SESSIONID WORKFLOW
+  local run_id="$1" session_id="$2" workflow="$3"
+  local dir="$RUN_ROOT/$run_id"
+  local now; now="$(date +%s000)"
+  mkdir -p "$dir"
+  python3 - "$dir" "$run_id" "$session_id" "$workflow" "$now" <<'PYEOF'
+import json, sys
+dir_, run_id, session_id, workflow, now = sys.argv[1:6]
+manifest = {"runId": run_id, "bootId": "dead-boot", "pid": 0, "sessionID": session_id,
+            "sourceHash": "synthetic", "argsHash": "synthetic", "status": "orphaned",
+            "childSessionIDs": [], "startedAt": int(now)}
+progress = {"runId": run_id, "workflow": workflow, "sessionID": session_id,
+            "agents": [], "logs": [], "startedAt": int(now), "updatedAt": int(now)}
+open(dir_ + "/manifest.json", "w").write(json.dumps(manifest))
+open(dir_ + "/progress.json", "w").write(json.dumps(progress))
+open(dir_ + "/interrupted.txt", "w").write(run_id)
+PYEOF
+}
+
 synth_finish() { # flip a synthetic run to a terminal status so surfaces drop it
   python3 - "$RUN_ROOT/$1" "$2" <<'PYEOF'
 import json, sys

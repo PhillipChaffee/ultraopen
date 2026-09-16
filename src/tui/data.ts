@@ -1,4 +1,4 @@
-import { readFile, readdir } from "node:fs/promises"
+import { readFile, readdir, unlink } from "node:fs/promises"
 import { join } from "node:path"
 
 /**
@@ -17,6 +17,8 @@ export interface AgentRow {
   label: string
   phase?: string | undefined
   status: "running" | "done" | "failed"
+  /** Why the agent failed, from the journal's latest null entry for its key. */
+  reason?: string | undefined
 }
 
 export interface RunView {
@@ -92,7 +94,46 @@ async function loadRun(dir: string, now: number): Promise<RunView | undefined> {
   if (view.sessionID === "" && typeof manifest["sessionID"] === "string") {
     view.sessionID = manifest["sessionID"]
   }
+  // Failure reasons live in the journal, not the progress snapshot; a half-failed
+  // run must explain itself right in the sidebar, with no new server code.
+  if (view.failed > 0) {
+    const reasons = await loadFailedReasons(dir)
+    for (const agent of view.agents) {
+      if (agent.status === "failed") {agent.reason = reasons.get(agent.label)}
+    }
+  }
   return view
+}
+
+/**
+ * Reads a run journal and maps each failed agent's label to its latest reason.
+ *
+ * One agent can appear several times (a stall restart writes another entry for
+ * the same key); the newest entry wins. Best-effort: a missing, torn, or
+ * hand-edited journal yields an empty map, never a throw.
+ */
+export async function loadFailedReasons(dir: string): Promise<Map<string, string>> {
+  let text: string
+  try {
+    text = await readFile(join(dir, "journal.jsonl"), "utf8")
+  } catch {
+    return new Map()
+  }
+  const reasons = new Map<string, string>()
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim()
+    if (trimmed === "") {continue}
+    try {
+      const entry = JSON.parse(trimmed) as { label?: unknown; status?: unknown; reason?: unknown }
+      if (entry.status !== "null" || typeof entry.label !== "string" || typeof entry.reason !== "string") {
+        continue
+      }
+      reasons.set(entry.label, entry.reason)
+    } catch {
+      // A torn tail line is the crash mode of a mid-write kill; skip it.
+    }
+  }
+  return reasons
 }
 
 /** Shapes a raw snapshot for display, tolerating a partially-written file. */
@@ -146,6 +187,80 @@ export function glyph(status: AgentRow["status"]): string {
   if (status === "failed") {return "✗"}
   return "⠋"
 }
+
+/** One agent row's text: glyph, label, and the failure reason when there is one. */
+export const INTERRUPTED_MARKER = "interrupted.txt"
+
+/**
+ * One directory pass for interrupted-run hints.
+ *
+ * Called once per TUI boot and cached, so startup cost is one readdir pass no
+ * matter how many old runs exist. A run hints when its directory holds the
+ * reaper's marker — which only orphaning writes, so completed and failed runs
+ * never hint. Best-effort: a missing or malformed marker is skipped, never a
+ * startup failure.
+ */
+export async function loadInterruptedRuns(root: string): Promise<InterruptedHint[]> {
+  let names: string[]
+  try {
+    names = await readdir(root)
+  } catch {
+    return []
+  }
+
+  const hints: InterruptedHint[] = []
+  for (const name of names) {
+    let marker: string
+    try {
+      marker = await readFile(join(root, name, INTERRUPTED_MARKER), "utf8")
+    } catch {
+      continue
+    }
+    if (marker.trim() === "") {continue}
+    const manifest = await readJson(join(root, name, "manifest.json"))
+    // The manifest carries no workflow name; the progress snapshot does, and a
+    // synthetic run may have neither — the run id alone is still a usable hint.
+    const progress = await readJson(join(root, name, "progress.json"))
+    let workflowName = "workflow"
+    if (typeof progress?.["workflow"] === "string") {workflowName = progress["workflow"]}
+    else if (typeof manifest?.["workflow"] === "string") {workflowName = manifest["workflow"] as string}
+    hints.push({
+      runId: typeof manifest?.["runId"] === "string" ? (manifest["runId"] as string) : name,
+      workflow: workflowName,
+    })
+  }
+  return hints
+}
+
+/** The hint line: names the run and the way back. */
+export function hintLine(hint: InterruptedHint): string {
+  return `interrupted: ${hint.workflow} (${hint.runId}) — ask to resume it`
+}
+
+/**
+ * Consumes a displayed hint's marker.
+ *
+ * The once-only behavior is per RUN, not per boot: the first boot that displays
+ * a hint removes its marker, so a second start shows nothing. The orphaned
+ * manifest itself persists until the run is resumed or retention prunes it —
+ * what is consumed is the HINT, not the record. Best-effort: a failed delete
+ * only means the hint shows one more boot.
+ */
+export async function consumeInterruptedMarker(root: string, runId: string): Promise<void> {
+  await unlink(join(root, runId, INTERRUPTED_MARKER)).catch(() => undefined)
+}
+
+export function agentRowText(agent: AgentRow): string {
+  const reason = agent.status === "failed" && agent.reason ? ` — ${agent.reason}` : ""
+  return `${glyph(agent.status)} ${agent.label}${reason}`
+}
+
+export interface InterruptedHint {
+  runId: string
+  workflow: string
+}
+
+/** The marker the reaper writes into a run directory when it releases it. */
 
 export type RunsListener = (runs: RunView[]) => void
 

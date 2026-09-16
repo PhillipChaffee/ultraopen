@@ -1,10 +1,14 @@
-import { describe, expect, test } from "bun:test"
+import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import { ProgressWriter } from "../src/server/resume/progress.js"
-import { RunPoller, activeRuns, dataRoot, formatElapsed, glyph, summarize, toView } from "../src/tui/data.js"
+import { RunPoller, activeRuns, agentRowText, dataRoot, formatElapsed, glyph, hintLine, loadAllRuns, loadFailedReasons, loadInterruptedRuns, summarize, toView } from "../src/tui/data.js"
 import type { RunView } from "../src/tui/data.js"
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+
+/** A null journal entry, for reason-derivation fixtures. */
+const nullEntry = (label: string, reason: string): string =>
+  JSON.stringify({ type: "result", key: `k-${label}`, label, status: "null", reason, outputTokens: 0 })
 
 const writer = (writes: { path: string; body: string }[]) =>
   new ProgressWriter({
@@ -400,5 +404,122 @@ describe("RunPoller", () => {
     expect(other.length).toBe(otherBefore + 1)
 
     await rm(root, { recursive: true, force: true })
+  })
+})
+
+describe("failed reasons from the journal", () => {
+  let root: string
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "ultraopen-tui-"))
+  })
+
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true })
+  })
+
+  test("maps each failed agent's label to its LATEST reason", async () => {
+    const dir = join(root, "wf_reasons1")
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, "journal.jsonl"), [
+      nullEntry("a", "deadline"),
+      nullEntry("b", "api-error"),
+      // A stall restart appends another entry for the same key; the newest wins.
+      nullEntry("a", "api-error"),
+      JSON.stringify({ type: "result", key: "k-ok", label: "c", status: "ok", outputTokens: 1 }),
+      "{torn",
+    ].join("\n"))
+    const reasons = await loadFailedReasons(dir)
+    expect(reasons.get("a")).toBe("api-error")
+    expect(reasons.get("b")).toBe("api-error")
+    expect(reasons.get("c")).toBeUndefined()
+  })
+
+  test("a missing or torn journal yields an empty map, never a throw", async () => {
+    const missing = await loadFailedReasons(join(root, "missing"))
+    expect(missing.size).toBe(0)
+    const dir = join(root, "wf_torn")
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, "journal.jsonl"), "not json at all\n")
+    const torn = await loadFailedReasons(dir)
+    expect(torn.size).toBe(0)
+  })
+
+  test("loadRun attaches the reason to failed agent rows", async () => {
+    const dir = join(root, "wf_attach")
+    await mkdir(dir, { recursive: true })
+    await writeFile(
+      join(dir, "manifest.json"),
+      JSON.stringify({ runId: "wf_reasons1", bootId: "b", pid: 1, sessionID: "s1", status: "running", startedAt: 0 }),
+    )
+    await writeFile(
+      join(dir, "progress.json"),
+      JSON.stringify({ runId: "wf_reasons1", workflow: "demo", sessionID: "s1", startedAt: 0, agents: [{ index: 0, label: "probe", status: "failed" }] }),
+    )
+    await writeFile(
+      join(dir, "journal.jsonl"),
+      `${JSON.stringify({ type: "result", key: "k", label: "probe", status: "null", reason: "deadline", outputTokens: 0 })}\n`,
+    )
+    const views = await loadAllRuns(root, 60_000)
+    const first = views[0]?.agents[0]
+    expect(first?.reason).toBe("deadline")
+  })
+})
+
+describe("agentRowText", () => {
+  test("failed rows carry the reason; other rows do not", () => {
+    expect(agentRowText({ index: 0, label: "a", status: "failed", reason: "deadline" })).toBe("✗ a — deadline")
+    expect(agentRowText({ index: 0, label: "a", status: "failed" })).toBe("✗ a")
+    expect(agentRowText({ index: 0, label: "a", status: "done" })).toBe("✓ a")
+  })
+})
+
+describe("interrupted-run hints", () => {
+  let root: string
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "ultraopen-hints-"))
+  })
+
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true })
+  })
+
+  test("a marker file yields a hint with the run id and workflow", async () => {
+    const dir = join(root, "wf_orphan01")
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, "interrupted.txt"), "wf_orphan01")
+    await writeFile(
+      join(dir, "progress.json"),
+      JSON.stringify({ runId: "wf_orphan01", workflow: "research", sessionID: "s" }),
+    )
+    const hints = await loadInterruptedRuns(root)
+    expect(hints).toEqual([{ runId: "wf_orphan01", workflow: "research" }])
+    expect(hintLine(hints[0]!)).toBe("interrupted: research (wf_orphan01) — ask to resume it")
+  })
+
+  test("runs without a marker never hint (completed and failed stay silent)", async () => {
+    const done = join(root, "wf_done0001")
+    await mkdir(done, { recursive: true })
+    await writeFile(join(done, "manifest.json"), JSON.stringify({ runId: "wf_done0001", status: "completed" }))
+    expect(await loadInterruptedRuns(root)).toEqual([])
+  })
+
+  test("a missing or malformed marker or manifest never blocks the read", async () => {
+    const broken = join(root, "wf_broken1")
+    await mkdir(broken, { recursive: true })
+    await writeFile(join(broken, "interrupted.txt"), "wf_broken1")
+    await writeFile(join(broken, "progress.json"), "not json\n")
+    const hints = await loadInterruptedRuns(root)
+    // The run id falls back to the directory name when nothing else parses.
+    expect(hints).toEqual([{ runId: "wf_broken1", workflow: "workflow" }])
+    expect(await loadInterruptedRuns(join(root, "nope"))).toEqual([])
+  })
+
+  test("an empty marker is not a hint", async () => {
+    const empty = join(root, "wf_empty01")
+    await mkdir(empty, { recursive: true })
+    await writeFile(join(empty, "interrupted.txt"), "")
+    expect(await loadInterruptedRuns(root)).toEqual([])
   })
 })

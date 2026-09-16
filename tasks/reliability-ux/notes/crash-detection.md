@@ -6,3 +6,15 @@
 - `pruneRuns` runs after the reaper so a fresh orphan is not deleted mid-sweep. Keep that order when you touch the load sequence.
 - The hint must survive restarts until the user acts. A marker file per run drives the once-only behavior. Retention pruning removes old runs, and the hint dies with them.
 - What the reaper does not do: it does not resume anything. The resume stays a model action with `resumeFromRunId`. The hint only points at it.
+## Decision recorded (2026-09-16)
+
+- The reaper writes `interrupted.txt` (containing the run id) into the run
+  directory when it marks a run orphaned. One marker per run, best-effort.
+- The TUI reads every marker in one directory pass at boot and caches the
+  hints; display is once per boot (an in-memory shown set), in the bottom
+  strip. The marker persists until the run is resumed (a resume writes a NEW
+  run id; the orphaned one is pruned by retention) or retention removes it.
+- The manifest's orphaned status was NOT used as the hint source: the marker
+  file is explicit, survives manifest edits, and gives the reaper→TUI channel
+  the spec asked for.
+- prunesRuns order untouched: the reaper still runs before the pruner.

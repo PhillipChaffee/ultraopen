@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
-import { chmod, mkdtemp, rm } from "node:fs/promises"
+import { chmod, mkdtemp, readFile, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { defaultProcessAlive, newBootId, pruneRuns, reapOrphans } from "../src/server/resume/reaper.js"
@@ -70,10 +70,11 @@ describe("newBootId", () => {
 })
 
 describe("reapOrphans", () => {
-  const seed = async (overrides: Partial<Manifest> = {}): Promise<void> => {
+  const seed = async (overrides: Partial<Manifest> = {}): Promise<Manifest> => {
     const entry = manifest(overrides)
     await ensureRunDir(entry.runId, env)
     await writeManifest(entry.runId, entry, env)
+    return entry
   }
 
   test("aborts every child of a run abandoned by a dead process", async () => {
@@ -85,6 +86,29 @@ describe("reapOrphans", () => {
      result = await reapOrphans(client, "current-boot", { env, isProcessAlive: DEAD })
     expect(aborted).toEqual(["child-1", "child-2"])
     expect(result).toEqual({ runs: 1, sessions: 2, failures: 0, live: 0 })
+  })
+
+  test("leaves an interrupted marker the TUI reads, so the next start hints", async () => {
+    const { client } = makeClient()
+    const entry = await seed({ pid: 424_242 })
+    await reapOrphans(client, "current-boot", { env, isProcessAlive: DEAD })
+    const marker = await readFile(join(env["XDG_DATA_HOME"] ?? "", "opencode", "tool-output", "ultraopen", entry.runId, "interrupted.txt"), "utf8")
+    expect(marker).toBe(entry.runId)
+  })
+
+  test("a run skipped for a live owner leaves no marker", async () => {
+    const { client } = makeClient()
+    await seed({ pid: 424_242 })
+    await reapOrphans(client, "current-boot", { env, isProcessAlive: () => true })
+    const markerPath = join(env["XDG_DATA_HOME"] ?? "", "opencode", "tool-output", "ultraopen")
+    // No directory holds a marker: nothing was reaped.
+    const dirs = await readdir(markerPath).catch((): string[] => [])
+    let markers = 0
+    for (const name of dirs) {
+      const files = await readdir(join(markerPath, name)).catch((): string[] => [])
+      if (files.includes("interrupted.txt")) {markers++}
+    }
+    expect(markers).toBe(0)
   })
 
   test("marks the run orphaned so a later start does not sweep it again", async () => {

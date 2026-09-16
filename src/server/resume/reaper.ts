@@ -1,4 +1,5 @@
-import { readdir, rm } from "node:fs/promises"
+import { readdir, rm, writeFile } from "node:fs/promises"
+import { join } from "node:path"
 import { dataRoot, findOrphans, readManifest, runDir, writeManifest } from "./store.js"
 import type { OpencodeClient } from "../types.js"
 
@@ -95,6 +96,14 @@ export async function reapOrphans(
         manifest.runId,
         { ...manifest, status: "orphaned", endedAt: manifest.endedAt ?? 0 },
         options.env,
+      ).catch(ignore)
+      // And leave a marker the TUI reads, so the next start shows a resume hint
+      // for exactly this run. Only orphaning writes it, which is why completed
+      // and failed runs never hint.
+      await writeFile(
+        join(runDir(manifest.runId, options.env), "interrupted.txt"),
+        manifest.runId,
+        "utf8",
       ).catch(ignore)
     }
 
