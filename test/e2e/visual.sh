@@ -190,6 +190,25 @@ PYEOF
     note "color check inconclusive — inspect $OUT/frame-05-escape.txt"
   fi
   frame 05-failed-glyph
+
+  section "V2c2 — large-run badge in the strip summary (advice only)"
+  # The badge threshold is a constant shared with the server's own warning;
+  # 20 synthetic agents cross it. ADVICE ONLY: the run continues normally.
+  python3 - "$RUN_ROOT/wf_synth_a" <<'PYL'
+import json, sys, time
+d = sys.argv[1]
+now = int(time.time() * 1000)
+manifest = json.load(open(d + "/manifest.json"))
+manifest["status"] = "running"
+progress = {"runId": manifest["runId"], "workflow": "e2e-visual", "sessionID": manifest["sessionID"],
+            "phase": "Verify",
+            "agents": [{"index": i, "label": f"bulk:{i}", "status": "done"} for i in range(20)],
+            "logs": [], "startedAt": int(now), "updatedAt": int(now)}
+open(d + "/progress.json", "w").write(json.dumps(progress))
+PYL
+  assert_pane_contains "large-run badge in the summary" "· large run" 5
+  frame 05b-large-run
+
   synth_run wf_synth_b "$SID" e2e-other Probe "beta:one" "running"
   assert_pane_contains "prompt status collapses to run count" "ultracode ⠋ 2 runs" 5
   assert_pane_contains "strip lists both runs" "ultracode · e2e-other" 5

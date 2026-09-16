@@ -950,3 +950,62 @@ describe("saved workflows (context.named)", () => {
     expect(config.command?.["workflow-../evil"]).toBeUndefined()
   })
 })
+
+describe("safety rails — budget, size advice, script before ask", () => {
+  test("budgetTokens reaches the run's budget ceiling", async () => {
+    // The budget global is what makes a guarded loop terminate; an option that
+    // never reached the engine would be documentation, not a ceiling.
+    const tool = toolOf(ultraopen({ client: stubClient }, { budgetTokens: 50 }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}return { total: budget.total, remaining: budget.remaining() }\n`, dryRun: true, background: false },
+      { sessionID: "parent" },
+    )
+    expect(output).toContain('"total": 50')
+  })
+
+  test("no budgetTokens means an uncapped budget", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}return { capped: budget.total !== null }\n`, dryRun: true, background: false },
+      { sessionID: "parent" },
+    )
+    expect(output).toContain('"capped": false')
+  })
+
+  test("sizeGuideline appends the advice to the tool description", () => {
+    const withAdvice = toolOf(ultraopen({ client: stubClient }, { sizeGuideline: "keep runs under 8 agents" }))
+    expect(withAdvice?.description).toContain("Size guidance for this project")
+    expect(withAdvice?.description).toContain("keep runs under 8 agents")
+    // Unset means the line is absent entirely.
+    const without = toolOf(ultraopen({ client: stubClient }))
+    expect(without?.description).not.toContain("Size guidance for this project")
+  })
+
+  test("the script lands in the run directory before the ask resolves", async () => {
+    // The user can open the real file while the prompt is on screen.
+    const tool = toolOf(ultraopen({ client: hangingClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const asked: unknown[] = []
+    const output = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 1\n`, background: true },
+      {
+        sessionID: "parent",
+        ask: (request: unknown) => {
+          asked.push(request)
+          return Promise.resolve()
+        },
+      },
+    )
+    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
+    expect(asked.length).toBe(1)
+    // The script must already be readable when the ask resolves: read it now.
+    const source = await import("node:fs/promises").then((fs) =>
+      fs.readFile(join(process.env["XDG_DATA_HOME"] ?? "", "opencode", "tool-output", "ultraopen", runId, "script.js"), "utf8"),
+    )
+    expect(source).toContain("await agent('a')")
+    // The detached task never settles here (the client hangs); the launch-gating
+    // state is reset by the suite's beforeEach, not by the run settling.
+  })
+})

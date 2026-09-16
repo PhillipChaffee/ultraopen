@@ -33,6 +33,15 @@ export interface UltraopenOptions {
   keywordBehavior: "one-shot" | "session"
   /** Extra directories of saved workflow scripts, most specific last. */
   workflowPaths: readonly string[]
+  /**
+   * Output-token ceiling for one workflow run, shared by nested runs. Null
+   * means no ceiling — today's behavior. Invalid values mean null rather than
+   * the default, because silently capping an uncapped user is worse than not
+   * capping them.
+   */
+  budgetTokens: number | null
+  /** Size advice appended to the tool description; unset omits the line entirely. */
+  sizeGuideline: string | undefined
 }
 
 const DEFAULTS: UltraopenOptions = {
@@ -44,6 +53,8 @@ const DEFAULTS: UltraopenOptions = {
   runMode: "background",
   keywordBehavior: "one-shot",
   workflowPaths: [],
+  budgetTokens: null,
+  sizeGuideline: undefined,
 }
 
 /**
@@ -65,12 +76,28 @@ export function resolveOptions(raw: unknown): UltraopenOptions {
     agentIdleMs: clampTimeout(input["agentIdleMs"], DEFAULTS.agentIdleMs, false),
     effortPreference: stringArray(input["effortPreference"]) ?? DEFAULTS.effortPreference,
     workflowPaths: stringArray(input["workflowPaths"]) ?? DEFAULTS.workflowPaths,
+    budgetTokens: resolveBudgetTokens(input["budgetTokens"]),
+    sizeGuideline: typeof input["sizeGuideline"] === "string" && input["sizeGuideline"].trim() !== ""
+      ? input["sizeGuideline"] as string
+      : DEFAULTS.sizeGuideline,
     runMode: resolveRunMode(input["runMode"]),
     keywordBehavior: resolveKeywordBehavior(input["keywordBehavior"]),
   }
 }
 
-/** Validates the keyword behaviour; an unrecognized value falls back, never throws. */
+/**
+ * Validates the output-token ceiling.
+ *
+ * Only a positive finite number is honoured; anything else means "no ceiling".
+ * An invalid value deliberately does NOT fall back to a default cap: a user who
+ * mistyped would otherwise trade an uncapped run for a surprise limit.
+ */
+function resolveBudgetTokens(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {return DEFAULTS.budgetTokens}
+  return Math.floor(value)
+}
+
+/** Validates the size advice; an unset or non-string value omits the line. */
 function resolveKeywordBehavior(value: unknown): "one-shot" | "session" {
   const normalized = typeof value === "string" ? value.trim().toLowerCase() : undefined
   if (normalized === "one-shot" || normalized === "session") {return normalized}

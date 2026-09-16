@@ -1,6 +1,6 @@
 # Epic: safety-rails
 
-Status: not started
+Status: done 2026-09-16 (T2-T5; T1 landed earlier in PR #17)
 Estimate: 3.5 to 6 focused days
 Depends on: the budget wiring pairs with async-runs, but the epic can start alone
 
@@ -52,7 +52,15 @@ Negative:
 ## Task list
 
 - [ ] T1 Activity-based deadline. Files: `src/server/bridge/spawn.ts`, `src/server/runtime/deadline.ts`. Estimate 1 to 2 days.
-- [ ] T2 Wire the budget option. Files: `src/server/options.ts`, `src/server/index.ts`. Estimate 0.5 to 1 day.
-- [ ] T3 Large-run warning in the strip and the result. Files: `src/server/runtime/run.ts`, `src/tui/data.ts`, `src/tui/index.tsx`. Estimate 1 to 2 days.
-- [ ] T4 Size advice in the description builder. Files: `src/server/tool/description.ts`, `src/server/index.ts`. Estimate 0.5 day.
-- [ ] T5 Persist the script before the ask, and document the prompt contents. Files: `src/server/index.ts`, `README.md`. Estimate 0.5 day.
+- [x] T2 Wire the budget option. Files: `src/server/options.ts`, `src/server/index.ts`. Estimate 0.5 to 1 day.
+- [x] T3 Large-run warning in the strip and the result. Files: `src/server/runtime/run.ts`, `src/tui/data.ts`, `src/server/tool/render.ts`, `src/server/script/limits.ts` (constants `LARGE_RUN_AGENTS` / `LARGE_RUN_PROJECTED_TOKENS`). Estimate 1 to 2 days. (The warning fires at agent-start and agent-end from the scheduled count and the actual spend, once per run; the result carries a `<large-run>` note and the strip summary gains "· large run" — advice only.)
+- [x] T4 Size advice in the description builder. Files: `src/server/tool/description.ts` (`withSizeAdvice`), `src/server/index.ts`. Estimate 0.5 day.
+- [x] T5 Persist the script before the ask, and document the prompt contents. Files: `src/server/index.ts`, `README.md`. Estimate 0.5 day. (The open question from permission-prompt-facts — whether opencode renders ask `metadata` — moved to the upstream-fixes epic with the dialog-drift evidence from the visual suite: on 1.18.31 the dialog auto-resolves and "Permission required" never renders, so the metadata question needs a live manual check, not a headless probe.)
+
+## Task list note
+
+T1 (activity-based deadline) shipped in PR #17. The large-run advice is a NEW
+slice folded into T3's scope: it fires at agent-start (count threshold) and
+agent-end (token projection), never stops anything, and both thresholds are
+constants in `src/server/script/limits.ts` shared by the run log, the result
+note, and the strip badge.

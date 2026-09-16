@@ -50,6 +50,18 @@ export const DEFAULT_AGENT_DEADLINE_MS = 4 * 60 * 60 * 1000
 export const MAX_AGENT_RESTARTS = 3
 
 /**
+ * Where a run crosses from "fan-out" into "large run", and the advice fires.
+ *
+ * ADVICE, never a stop: the warning names the scheduled count and the projected
+ * output tokens, and the run continues. Both thresholds are constants so the
+ * advice line, the result note and the strip badge all agree on the definition.
+ */
+export const LARGE_RUN_AGENTS = 20
+
+/** Projected output tokens at which the same warning fires, even below the agent count. */
+export const LARGE_RUN_PROJECTED_TOKENS = 500_000
+
+/**
  * The largest delay the platform's timers honour.
  *
  * Node clamps setTimeout delays above 2^31-1 ms down to ~1ms, so a value past this would make

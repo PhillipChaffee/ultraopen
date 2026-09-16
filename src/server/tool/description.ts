@@ -106,6 +106,18 @@ Pass dryRun: true to run the whole script with agent() stubbed out — it exerci
 flow and fan-out shape for zero tokens, which is the cheapest way to debug a script.`
 
 /**
+ * Appends the configured size advice to a tool description.
+ *
+ * The advice is the USER'S text, appended under its own heading — Claude Code
+ * ships a size guideline that shapes the scripts the model writes, and this is
+ * the same channel. Unset means the line is absent entirely, byte-for-byte the
+ * unmodified description.
+ */
+export function withSizeAdvice(base: string, guideline: string): string {
+  return `${base}\n\n## Size guidance for this project\n\n${guideline.trim()}`
+}
+
+/**
  * The blocking variant, registered when the plugin's `runMode` is "blocking".
  *
  * Same body as the async description; only the contract paragraphs differ. The

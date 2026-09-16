@@ -138,7 +138,13 @@ ultraopen only tries to be the right tool when the work already happens in openc
 - **Live progress** — the three TUI surfaces above, served by one shared poller.
 - **Safety rails** — a recursion guard (a nested `workflow()` runs one level only), an inactivity
   deadline plus a wall-clock ceiling per agent, a global concurrency cap, an orphan reaper that
-  releases subagents left by a killed server, and retention pruning of finished run directories.
+  releases subagents left by a killed server, retention pruning of finished run directories, and a
+  large-run advisory: when a run crosses the scheduled-agent or projected-token thresholds, the
+  run log, the result, and the strip badge all say so — advice only, nothing stops.
+- **Approval prompt** — the prompt names the real workflow (not the ignored title), its
+  description and phases, and the run id. The script is persisted to the run directory **before**
+  the prompt appears, so you can open `<run dir>/script.js` and read exactly what will run before
+  approving. `always` is scoped per workflow name.
 
 ### The launch contract
 
@@ -215,8 +221,14 @@ above.
    - `agentIdleMs` — inactivity limit per agent, in milliseconds. Default 5 min; the timer resets
      whenever the child makes progress. A stalled agent is killed at the idle limit and restarted
      up to 3 times.
-   - `keywordBehavior` — how a plain `ultracode` mention behaves: `"one-shot"` (default) fans out
+   - `keywordBehavior` — how a plain `ultracode` keyword mention behaves: `"one-shot"` (default) fans out
      only that task; `"session"` keeps the mode on for the rest of the session.
+  - `budgetTokens` — an output-token ceiling for one workflow run, shared by nested runs. Once the
+     spend reaches it, further `agent()` calls throw and the nulls list explains why. Unset means
+     no ceiling.
+  - `sizeGuideline` — size advice appended to the tool description (the same channel as Claude
+     Code's size guideline): write what a right-sized run looks like for this project, e.g.
+     "keep runs under 10 agents; prefer pipeline stages over wide parallel() bursts".
   - `effortPreference` — the effort ladder tried in order. Default
      `["xhigh", "max", "high", "medium", "low"]`.
 
