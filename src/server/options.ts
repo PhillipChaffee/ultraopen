@@ -31,6 +31,8 @@ export interface UltraopenOptions {
    * out exactly the task that said it; `session` keeps the old sticky behaviour.
    */
   keywordBehavior: "one-shot" | "session"
+  /** Extra directories of saved workflow scripts, most specific last. */
+  workflowPaths: readonly string[]
 }
 
 const DEFAULTS: UltraopenOptions = {
@@ -41,6 +43,7 @@ const DEFAULTS: UltraopenOptions = {
   effortPreference: ["xhigh", "max", "high", "medium", "low"],
   runMode: "background",
   keywordBehavior: "one-shot",
+  workflowPaths: [],
 }
 
 /**
@@ -61,6 +64,7 @@ export function resolveOptions(raw: unknown): UltraopenOptions {
     agentDeadlineMs: clampTimeout(input["agentDeadlineMs"], DEFAULTS.agentDeadlineMs, true),
     agentIdleMs: clampTimeout(input["agentIdleMs"], DEFAULTS.agentIdleMs, false),
     effortPreference: stringArray(input["effortPreference"]) ?? DEFAULTS.effortPreference,
+    workflowPaths: stringArray(input["workflowPaths"]) ?? DEFAULTS.workflowPaths,
     runMode: resolveRunMode(input["runMode"]),
     keywordBehavior: resolveKeywordBehavior(input["keywordBehavior"]),
   }

@@ -30,6 +30,7 @@ import {
   workflowArgsSchema,
   statusArgsSchema,
 } from "./tool/render.js"
+import { listSavedWorkflows, scanNamedWorkflows } from "./tool/named.js"
 import { beginRun, endRun, loadResume } from "./resume/persist.js"
 import { isSafeRunId, readManifest, writeManifest, flushJournalEntry, writeFailure } from "./resume/store.js"
 import type { JournalEntry, Manifest } from "./resume/journal.js"
@@ -80,6 +81,15 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
   mode.setDefault(options.ultracode)
   mode.setKeywordBehavior(options.keywordBehavior)
 
+  // One sync scan at load builds the /workflow-<name> commands. The RUN path
+  // rescans per tool call (a file saved mid-session runs at once); only the
+  // command surface waits for the next start, because the config hook is
+  // synchronous by contract.
+  const savedWorkflows = listSavedWorkflows({
+    workflowPaths: options.workflowPaths,
+    directory: input.directory,
+  })
+
   // One boot id per process. Runs still marked `running` under a DIFFERENT boot id belonged to a
   // process that died, and their subagents are still alive and billing — opencode never cascades
   // an abort to plain parentID children. Swept in the background so plugin init is never blocked
@@ -101,7 +111,10 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
      */
     config: (config: MutableConfig): void => {
       // Resolved from this module's own location so it works from node_modules or a file spec.
-      installConfig(config, { skillsPath: join(import.meta.dirname, "..", "skills") })
+      installConfig(config, {
+        skillsPath: join(import.meta.dirname, "..", "skills"),
+        workflowCommands: savedWorkflows,
+      })
     },
 
     /**
@@ -181,7 +194,7 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
         description: options.runMode === "blocking" ? blockingDescription : description,
         args: workflowArgsSchema(),
         execute: (args: WorkflowArgs, context: ToolContext): Promise<string> =>
-          launchWorkflow(args, context, options, client, bootId),
+          launchWorkflow(args, context, options, client, bootId, input.directory),
       },
       [STATUS_TOOL]: {
         description: statusDescription,
@@ -217,6 +230,7 @@ async function launchWorkflow(
   options: UltraopenOptions,
   client: OpencodeClient,
   bootId: string,
+  projectDirectory: string | undefined,
 ): Promise<string> {
   const background = args.dryRun !== true && (args.background ?? options.runMode === "background"),
    runId = `wf_${randomUUID().replaceAll("-", "").slice(0, 12)}`,
@@ -244,6 +258,16 @@ async function launchWorkflow(
     // the Run, where aborting the call and aborting the run are the same act.
     ...(!background && context.abort ? { signal: context.abort } : {}),
   }
+
+  // Saved workflows resolve from disk on every call: a file saved mid-session
+  // runs by name at once, and no cached map can drift from what is on disk.
+  const scanNotes: string[] = [],
+   named = await scanNamedWorkflows({
+    workflowPaths: options.workflowPaths,
+    directory: projectDirectory,
+    onNote: (note) => scanNotes.push(note),
+  }),
+   scanNoteLines = scanNotes.length > 0 ? ["", "<scan-notes>", ...scanNotes, "</scan-notes>"] : []
 
   // One live run per session, for BOTH contracts (see lifecycle-policy.md): a
   // blocking call inside a turn serializes itself anyway, but mixed contracts
@@ -381,6 +405,7 @@ async function launchWorkflow(
 
     const executeContext = {
       ...workflowContext,
+      ...(Object.keys(named).length > 0 ? { named } : {}),
       onProgress: (event: Parameters<ProgressWriter["apply"]>[0]) => {
         progress.apply(event, Date.now())
         void progress.flush()
@@ -397,7 +422,8 @@ async function launchWorkflow(
     }
 
     if (!background) {
-      return await runBlocking(args, { runId, manifest, resume, executeContext, settleRun })
+      const result = await runBlocking(args, { runId, manifest, resume, executeContext, settleRun })
+      return [result, ...scanNoteLines].join("\n")
     }
 
     // Detached: the run outlives this tool call. The task fully captures its own
@@ -441,7 +467,7 @@ async function launchWorkflow(
         }),
     })
 
-    return renderLaunch(prepared.meta.name, runId)
+    return [renderLaunch(prepared.meta.name, runId), ...scanNoteLines].join("\n")
   } catch (error) {
     // Reached only by the launch phase itself: a parse failure or a rejected
     // permission ask. The run never went live, so the pending entry is dropped.

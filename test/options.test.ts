@@ -15,6 +15,7 @@ const DEFAULT_CONCURRENCY = 8,
   effortPreference: DEFAULT_EFFORT_PREFERENCE,
   runMode: "background" as const,
   keywordBehavior: "one-shot" as const,
+  workflowPaths: [] as string[],
 }
 
 describe("resolveOptions — non-object input", () => {

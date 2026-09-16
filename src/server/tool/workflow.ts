@@ -365,6 +365,15 @@ function resolveNamed(nameOrRef: unknown, context: WorkflowContext): string {
     if (typeof script === "string") {return script}
   }
   if (typeof nameOrRef === "string") {
+    // A name is a bare lookup key, never a path: a separator means the caller
+    // misunderstood the surface, and the scanner never produces such names.
+    if (nameOrRef.includes("/") || nameOrRef.includes("\\")) {
+      throw new WorkflowScriptError({
+        kind: "RuntimeError",
+        message: `A workflow name cannot contain a path separator: "${nameOrRef}".`,
+        suggestions: ["Save the script under a configured workflow directory and reference it by bare name."],
+      })
+    }
     const found = context.named?.[nameOrRef]
     if (found) {return found}
     throw new WorkflowScriptError({

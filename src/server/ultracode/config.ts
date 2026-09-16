@@ -26,12 +26,82 @@ const ULTRACODE_DESCRIPTION =
  * not-yet-mutated config, permanently caching an agent list without `ultracode` for that
  * instance's lifetime.
  */
-export function installConfig(config: MutableConfig, options: { skillsPath?: string | undefined }): void {
+export function installConfig(
+  config: MutableConfig,
+  options: {
+    skillsPath?: string | undefined
+    /** Saved workflows found on disk; one /workflow-<name> command each. */
+    workflowCommands?: readonly { name: string; description: string | undefined }[] | undefined
+  },
+): void {
   installAgent(config)
   installCommand(config)
+  installWorkflowCommands(config, options.workflowCommands ?? [])
   installPermission(config)
   installPrimaryTools(config)
   installSkillsPath(config, options.skillsPath)
+}
+
+/**
+ * The /workflow-resume command: reruns a past run with its journal replayed.
+ *
+ * Static rather than per-run: one command covers every run id, and the run
+ * directory path is the model's to discover from a launch result or a
+ * workflow_status report.
+ */
+function installResumeCommand(config: MutableConfig): void {
+  config.command ??= {}
+  const existing = (config.command["workflow-resume"] as Record<string, unknown> | undefined) ?? {}
+  config.command["workflow-resume"] = {
+    description: "Resume a previous workflow run from its journal.",
+    template:
+      "Resume a workflow run. $ARGUMENTS is the run id (wf_…) from a launch result or a workflow_status report. " +
+      "Call the workflow tool with resumeFromRunId set to that id and scriptPath set to the script.js inside its run directory " +
+      "(the launch result and workflow_status both report the directory; if the run id is missing, list the most recent wf_* " +
+      "directories under the opencode data directory's tool-output/ultraopen and ask which one to resume). " +
+      "Then poll workflow_status(runId, { wait: 120 }) until it settles and reply with the final value or the failure.",
+    ...existing,
+  }
+}
+
+/**
+ * Registers one slash command per saved workflow, following the installCommand pattern.
+ *
+ * The template MUST be a non-empty string and MUST keep `$ARGUMENTS`: the
+ * command service calls the hint builder eagerly, and a missing template takes
+ * out every command in the directory, including `/init`. The model is told to
+ * wrap the named form in a tiny script — the named form is a GLOBAL inside the
+ * sandbox, not a tool argument — and to poll workflow_status until the run
+ * settles, so the launch result's run id is not mistaken for an outcome.
+ */
+function installWorkflowCommands(
+  config: MutableConfig,
+  saved: readonly { name: string; description: string | undefined }[],
+): void {
+  installResumeCommand(config)
+
+  // One slash command per saved workflow. The template MUST be a non-empty
+  // string keeping $ARGUMENTS (the command service builds hints eagerly; a
+  // missing template takes out every command in the directory, /init included).
+
+  for (const workflow of saved) {
+    // Command ids are bare keys; a name with anything but letters, digits, `_`
+    // and `-` would make an unusable (or hostile) command id.
+    if (!/^[\w-]+$/u.test(workflow.name)) {continue}
+    config.command ??= {}
+    const id = `workflow-${workflow.name}`,
+     existing = (config.command[id] as Record<string, unknown> | undefined) ?? {}
+    config.command[id] = {
+      description: workflow.description ?? `Run the saved workflow "${workflow.name}".`,
+      template:
+        `Call the workflow tool with a script that is exactly:\n` +
+        `export const meta = { name: 'saved-${workflow.name}', description: 'Saved workflow ${workflow.name}' }\n` +
+        `await workflow('${workflow.name}')\n` +
+        `Pass the user's request as the tool's args when it names inputs for the workflow ($ARGUMENTS). ` +
+        `The tool returns a run id, not the outcome: poll workflow_status(runId, { wait: 120 }) until it settles and reply with the final value or the failure.`,
+      ...existing,
+    }
+  }
 }
 
 /**
