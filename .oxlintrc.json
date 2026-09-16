@@ -108,7 +108,7 @@
       "rules": {
         "import/max-dependencies": [
           "error",
-          { "max": 22 }
+          { "max": 23 }
         ]
       }
     },

@@ -1,4 +1,6 @@
 import type { Manifest } from "../resume/journal.js"
+import { endRun } from "../resume/persist.js"
+import { writeFailure } from "../resume/store.js"
 import { registry } from "../singleton.js"
 
 /**
@@ -89,8 +91,17 @@ export function isLiveAnywhere(manifest: Manifest, observerBootId: string): bool
 
 export async function runDetached(options: {
   runId: string
+  manifest: Manifest | undefined
   task: () => Promise<void>
-  onEscapedRejection: (error: unknown) => Promise<void>
+  /**
+   * A settle the CALLER owns — it can join the flush chain, which this module
+   * cannot see. The degraded outcome is recorded even though the escaping
+   * rejection means the caller's own failure path broke. Optional: the module
+   * itself already persists the degraded record.
+   */
+  onEscapedRejection?: ((error: unknown) => Promise<void>) | undefined
+  /** Renders the error for failure.txt when the caller's settle cannot. */
+  renderFailure: (error: unknown, source?: string, runId?: string) => string
 }): Promise<void> {
   promote(options.runId)
   const promise = (async () => {
@@ -98,9 +109,12 @@ export async function runDetached(options: {
       await options.task()
     } catch (error) {
       // The task was contractually self-capturing; an escaping rejection means
-      // its own failure path broke. The caller's callback — which can settle the
-      // flush chain — records the degraded failed state.
-      await options.onEscapedRejection(error)
+      // its own failure path broke. Persist the degraded record HERE (this
+      // module cannot settle the flush chain), and let the caller's callback
+      // add whatever more it can.
+      await writeFailure(options.runId, options.renderFailure(error)).catch(() => undefined)
+      await endRun(options.manifest, { status: "failed", entries: [], value: null, childSessionIDs: [] })
+      await options.onEscapedRejection?.(error)
     } finally {
       detached.delete(options.runId)
       settling.delete(options.runId)

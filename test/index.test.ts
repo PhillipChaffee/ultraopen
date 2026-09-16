@@ -801,6 +801,16 @@ describe("background launch contract", () => {
     expect(report).toContain("hello from the run")
   })
 
+  test("a malformed resume id is refused before any path join", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}return 1\n`, resumeFromRunId: "../../etc", background: false },
+      { sessionID: "parent" },
+    )
+    expect(output).toContain("not a valid run id")
+  })
+
   test("executeStatus can be driven directly against real run artifacts", async () => {
     const tool = toolOf(ultraopen({ client: stubClient }))
     if (!tool) {throw new Error("tool was not registered")}

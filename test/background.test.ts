@@ -21,6 +21,9 @@ const BROKEN_TASK = (): Promise<void> => Promise.reject(new Error("the failure p
 /** Records that the harness's escape hatch fired; index.ts supplies the real one. */
 const ESCAPE_RECORDER = (_error: unknown): Promise<void> => Promise.resolve()
 
+/** A stand-in renderFailure; background.ts only forwards it. */
+const FAKE_RENDER: (error: unknown) => string = String
+
 const manifest = (over: Partial<Parameters<typeof isLiveAnywhere>[0]> = {}) => ({
   runId: "wf_bgtarget1",
   bootId: "boot-a",
@@ -66,7 +69,7 @@ describe("launch-gating registry", () => {
 
   test("entries are scoped per session and dropped on settle", async () => {
     registerPending("wf_bg000005", "s1")
-    await runDetached({ runId: "wf_bg000005", task: async () => {}, onEscapedRejection: ESCAPE_RECORDER })
+    await runDetached({ runId: "wf_bg000005", manifest: undefined, task: async () => {}, renderFailure: FAKE_RENDER, onEscapedRejection: ESCAPE_RECORDER })
     expect(activeRunForSession("s1")).toBeUndefined()
     expect(activeRunForSession("s2")).toBeUndefined()
   })
@@ -131,7 +134,7 @@ describe("runDetached", () => {
 
   test("clears the launch-gating state and the settle handle when the task resolves", async () => {
     registerPending("wf_bg000100", "s1")
-    const pending = runDetached({ runId: "wf_bg000100", task: async () => {}, onEscapedRejection: ESCAPE_RECORDER })
+    const pending = runDetached({ runId: "wf_bg000100", manifest: undefined, task: async () => {}, renderFailure: FAKE_RENDER, onEscapedRejection: ESCAPE_RECORDER })
     // The handle must exist while the task is in flight.
     expect(settlePromiseOf("wf_bg000100")).toBeDefined()
     await pending
@@ -148,7 +151,9 @@ describe("runDetached", () => {
     const seen: unknown[] = []
     await runDetached({
       runId: "wf_bg000101",
+      manifest: undefined,
       task: BROKEN_TASK,
+      renderFailure: FAKE_RENDER,
       onEscapedRejection: (error): Promise<void> => {
         seen.push(error)
         return Promise.resolve()
@@ -162,7 +167,7 @@ describe("runDetached", () => {
     registerPending("wf_bg000102", "s1")
     const { registry } = await import("../src/server/singleton.js")
     registry.register("child-a", "wf_bg000102")
-    await runDetached({ runId: "wf_bg000102", task: async () => {}, onEscapedRejection: ESCAPE_RECORDER })
+    await runDetached({ runId: "wf_bg000102", manifest: undefined, task: async () => {}, renderFailure: FAKE_RENDER, onEscapedRejection: ESCAPE_RECORDER })
     expect(registry.owns("child-a")).toBe(false)
   })
 })
@@ -182,7 +187,7 @@ describe("runDetached — unwritable disk", () => {
     const savedXDG = process.env["XDG_DATA_HOME"]
     process.env["XDG_DATA_HOME"] = "/dev/null/nope"
     try {
-      await runDetached({ runId: "wf_bg000200", task: BROKEN_TASK, onEscapedRejection: ESCAPE_RECORDER })
+      await runDetached({ runId: "wf_bg000200", manifest: undefined, task: BROKEN_TASK, renderFailure: FAKE_RENDER, onEscapedRejection: ESCAPE_RECORDER })
       expect(activeRunForSession("s1")).toBeUndefined()
     } finally {
       if (savedXDG === undefined) {delete process.env["XDG_DATA_HOME"]}

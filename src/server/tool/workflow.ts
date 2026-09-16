@@ -3,6 +3,7 @@ import { parse } from "../script/parse.js"
 import { run as runSandbox } from "../script/sandbox.js"
 import { parallel, pipeline } from "../runtime/combinators.js"
 import { Run } from "../runtime/run.js"
+import type { ControlCommand } from "../runtime/control.js"
 import type { AgentOptions, ProgressEvent } from "../runtime/run.js"
 import { subagentContract } from "../bridge/contract.js"
 import { makeResolvers } from "../bridge/models.js"
@@ -67,6 +68,12 @@ export interface WorkflowContext {
   depth?: number | undefined
   /** Saved workflows, resolved by name. */
   named?: Record<string, string> | undefined
+  /**
+   * Called once when the Run is ready to accept control commands (the
+   * run-control channel). The tool layer uses it to start the file watcher;
+   * the callback receives the dispatch that feeds `Run.handleControl`.
+   */
+  registerControl?: ((dispatch: (command: ControlCommand) => void) => void) | undefined
 }
 
 export interface WorkflowResult {
@@ -186,7 +193,11 @@ async function runPrepared(
     ...optional("signal", context.signal),
     ...optional("onProgress", context.onProgress),
     ...optional("onJournal", context.onJournal),
+    ...optional("registerControl", context.registerControl),
   })
+
+  // The control channel: hand the Run's dispatch to the tool layer's watcher.
+  context.registerControl?.((command: ControlCommand) => run.handleControl(command))
 
   // dryRun exercises the whole engine — parse, sandbox, combinators, control flow — for zero
   // tokens, which is what makes iterating on a script cheap. It still counts the calls, so the

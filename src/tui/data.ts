@@ -20,6 +20,8 @@ export interface AgentRow {
   status: "running" | "done" | "failed"
   /** Why the agent failed, from the journal's latest null entry for its key. */
   reason?: string | undefined
+  /** The agent's output-token spend, from the progress snapshot. */
+  outputTokens?: number | undefined
 }
 
 export interface RunView {
@@ -255,8 +257,34 @@ export async function consumeInterruptedMarker(root: string, runId: string): Pro
 }
 
 export function agentRowText(agent: AgentRow): string {
-  const reason = agent.status === "failed" && agent.reason ? ` — ${agent.reason}` : ""
-  return `${glyph(agent.status)} ${agent.label}${reason}`
+  const reason = agent.status === "failed" && agent.reason ? ` — ${agent.reason}` : "",
+   tokens = typeof agent.outputTokens === "number" && agent.outputTokens > 0 ? ` · ${formatTokens(agent.outputTokens)}` : ""
+  return `${glyph(agent.status)} ${agent.label}${reason}${tokens}`
+}
+
+/** Compact token count: `1.2k`, `345`, `1.1m`. */
+export function formatTokens(tokens: number): string {
+  if (tokens >= 1_000_000) {return `${Math.round((tokens / 1_000_000) * 10) / 10}m`}
+  if (tokens >= 1000) {return `${Math.round((tokens / 1000) * 10) / 10}k`}
+  return String(tokens)
+}
+
+/**
+ * Writes one control command into a run's control file (the run-control
+ * channel: TUI writes, server reads). The sequence number must exceed every
+ * command already in the file; the caller derives it from the current line
+ * count. Best-effort: a failed write surfaces nowhere — the next attempt
+ * rewrites the whole file.
+ */
+export async function writeControlCommand(
+  runDir: string,
+  command: { action: string; target?: number | undefined },
+  seq: number,
+): Promise<void> {
+  const { appendFile } = await import("node:fs/promises")
+  const { action, target } = command
+  const line = JSON.stringify({ seq, action, ...(target === undefined ? {} : { target }) })
+  await appendFile(`${runDir}/control.jsonl`, `${line}\n`, "utf8")
 }
 
 export interface InterruptedHint {

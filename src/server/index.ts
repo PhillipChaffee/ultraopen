@@ -19,6 +19,9 @@ import {
   dropPending,
   runDetached,
 } from "./tool/background.js"
+
+import { watchControl } from "./runtime/control.js"
+import type { ControlCommand } from "./runtime/control.js"
 import { executeStatus } from "./tool/status.js"
 import type { StatusArgs } from "./tool/status.js"
 import {
@@ -32,7 +35,7 @@ import {
 } from "./tool/render.js"
 import { listSavedWorkflows, scanNamedWorkflows } from "./tool/named.js"
 import { beginRun, endRun, loadResume } from "./resume/persist.js"
-import { ensureRunDir, isSafeRunId, readManifest, writeManifest, writeScript, flushJournalEntry, writeFailure } from "./resume/store.js"
+import { ensureRunDir, isSafeRunId, readManifest, runDir, writeManifest, writeScript, flushJournalEntry, writeFailure } from "./resume/store.js"
 import type { JournalEntry, Manifest } from "./resume/journal.js"
 import { onChatMessage, onChatParams, onMessagesTransform } from "./ultracode/hooks.js"
 import { mode } from "./ultracode/mode.js"
@@ -386,6 +389,7 @@ async function launchWorkflow(
       childSessionIDs: string[]
       failureText?: string | undefined
     }): Promise<void> => {
+      stopControl?.()
       // The chain variable is read live: appends queued before this await are
       // included, however long the chain grew.
       await flushChain
@@ -393,8 +397,10 @@ async function launchWorkflow(
       if (outcome.failureText !== undefined) {
         // Best-effort like every persistence here: a failed write must not
         // lose the settle itself.
-        try {await writeFailure(runId, outcome.failureText)} catch {
-          // Best-effort: a failed write must not lose the settle itself.
+        try {
+          await writeFailure(runId, outcome.failureText)
+        } catch {
+          // Nothing better is knowable on a failed write; the manifest still closed.
         }
       }
     }
@@ -420,6 +426,10 @@ async function launchWorkflow(
       }
     }
 
+    // The run-control channel: a per-run watcher reads the TUI's control file
+    // and dispatches to the Run; cleared when the run settles.
+    let stopControl: (() => void) | undefined
+
     const executeContext = {
       ...workflowContext,
       ...(Object.keys(named).length > 0 ? { named } : {}),
@@ -433,6 +443,9 @@ async function launchWorkflow(
         if (event.type === "agent-start" || event.type === "log") {void persistChildren()}
       },
       onJournal: flush,
+      registerControl: (dispatch: (command: ControlCommand) => void): void => {
+        stopControl = watchControl({ runId, runDir: runDir(runId), dispatch, onNote: (note) => progress.apply({ type: "log", message: note }, Date.now()) })
+      },
       ...(resume && resume.entries.length > 0
         ? { previousEntries: resume.entries, resumedFrom: args.resumeFromRunId }
         : {}),
@@ -448,6 +461,7 @@ async function launchWorkflow(
     // waiting on it anymore.
     void runDetached({
       runId,
+      manifest,
       task: async (): Promise<void> => {
         try {
           const result = await execute(args, executeContext)
@@ -474,14 +488,7 @@ async function launchWorkflow(
       // escaping rejection means its own failure path broke. Route through the
       // same settle protocol — including the flush join — so the degraded
       // record still follows the crash-safety ordering.
-      onEscapedRejection: (error): Promise<void> =>
-        settleRun({
-          status: "failed",
-          entries: [],
-          value: null,
-          childSessionIDs: [],
-          failureText: renderFailure(error, args.script, runId),
-        }),
+      renderFailure,
     })
 
     return [renderLaunch(prepared.meta.name, runId), ...scanNoteLines].join("\n")
