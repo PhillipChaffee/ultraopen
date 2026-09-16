@@ -14,6 +14,7 @@ const DEFAULT_CONCURRENCY = 8,
   agentIdleMs: DEFAULT_AGENT_IDLE_MS,
   effortPreference: DEFAULT_EFFORT_PREFERENCE,
   runMode: "background" as const,
+  keywordBehavior: "one-shot" as const,
 }
 
 describe("resolveOptions — non-object input", () => {

@@ -124,7 +124,11 @@ ultraopen only tries to be the right tool when the work already happens in openc
   everything after it in the same scope runs live. Failed runs keep their partial journal, so a
   resume only redoes the unfinished work.
 - **`ultracode` mode** — raises reasoning effort and makes fan-out the default. Four ways in: the
-  `ultracode` agent, the keyword, `/ultracode`, or a project config flag.
+  `ultracode` agent, the keyword, `/ultracode`, or a project config flag. The keyword is one-shot:
+  it fans out exactly the task that said it, and the next task behaves normally unless you say it
+  again — a filename mention (`src/ultracode.ts`) never triggers at all. `/ultracode` and the
+  `ultracode` agent keep the standing mode for the session. Set `"keywordBehavior": "session"` to
+  restore the old sticky keyword.
 - **Live progress** — the three TUI surfaces above, served by one shared poller.
 - **Safety rails** — a recursion guard (a nested `workflow()` runs one level only), an inactivity
   deadline plus a wall-clock ceiling per agent, a global concurrency cap, an orphan reaper that
@@ -205,7 +209,9 @@ above.
    - `agentIdleMs` — inactivity limit per agent, in milliseconds. Default 5 min; the timer resets
      whenever the child makes progress. A stalled agent is killed at the idle limit and restarted
      up to 3 times.
-   - `effortPreference` — the effort ladder tried in order. Default
+   - `keywordBehavior` — how a plain `ultracode` mention behaves: `"one-shot"` (default) fans out
+     only that task; `"session"` keeps the mode on for the rest of the session.
+  - `effortPreference` — the effort ladder tried in order. Default
      `["xhigh", "max", "high", "medium", "low"]`.
 
 <a id="authoring"></a>

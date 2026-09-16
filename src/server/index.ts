@@ -78,6 +78,7 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
 
   registry.configureConcurrency(options.concurrency)
   mode.setDefault(options.ultracode)
+  mode.setKeywordBehavior(options.keywordBehavior)
 
   // One boot id per process. Runs still marked `running` under a DIFFERENT boot id belonged to a
   // process that died, and their subagents are still alive and billing — opencode never cascades

@@ -16,6 +16,16 @@ export interface ModeState {
   fromMessageID?: string | undefined
 }
 
+/**
+ * How a keyword mention behaves, from the plugin-options tuple.
+ *
+ * `one-shot` (the default) fans out exactly the task that mentioned the keyword;
+ * the next task behaves normally unless the keyword is said again. `session`
+ * reproduces the old sticky behaviour, where one mention raised the spend of
+ * every later message in silence — kept for anyone who prefers it.
+ */
+export type KeywordBehavior = "one-shot" | "session"
+
 const sessions = new Map<string, ModeState>(),
 
 /**
@@ -34,10 +44,34 @@ const sessions = new Map<string, ModeState>(),
  */
 let defaultOn = false
 
+/** How a keyword mention behaves; set once at plugin init from the options tuple. */
+let keywordBehavior: KeywordBehavior = "one-shot"
+
 export const mode = {
   /** Sets the project-level default from plugin options. */
   setDefault(active: boolean): void {
     defaultOn = active
+  },
+
+  /** Sets the keyword behaviour from plugin options. */
+  setKeywordBehavior(behavior: KeywordBehavior): void {
+    keywordBehavior = behavior
+  },
+
+  getKeywordBehavior(): KeywordBehavior {
+    return keywordBehavior
+  },
+
+  /**
+   * Ends a keyword turn.
+   *
+   * Removes keyword-sourced state so the NEXT task behaves normally. `/ultracode`
+   * and the plugin option are deliberately untouched: the one-shot applies only
+   * to what the keyword itself started.
+   */
+  expireKeyword(sessionID: string): void {
+    const state = sessions.get(sessionID)
+    if (state?.source === "keyword") {sessions.delete(sessionID)}
   },
 
   /** Turns the mode on for a session. Later sources overwrite earlier ones. */
@@ -83,20 +117,24 @@ export const mode = {
     sessions.clear()
     demoted.clear()
     defaultOn = false
+    keywordBehavior = "one-shot"
   },
 }
 
 /**
  * Detects the one-shot keyword.
  *
- * Word-boundary matched, so "ultracoded" does not trigger it. A path like `src/ultracode.ts` DOES
- * — `/` and `.` are word boundaries — and that is left alone deliberately: it matches the upstream
- * behaviour, the cost is a single turn at higher effort, and it is visible rather than silent.
- * Trying to exclude filenames would mean guessing at intent, and a false NEGATIVE (the keyword
- * quietly doing nothing) is the worse failure.
+ * Word-boundary matched, so "ultracoded" does not trigger it. Path mentions do
+ * not trigger either: `src/ultracode.ts` or `ultracode.ts` names a FILE, and a
+ * review-ranked danger is one stray mention raising the spend of every later
+ * message — a filename is the likeliest accidental match. Sentence punctuation
+ * stays a trigger: `Use ultracode.` ends with a period, and a period followed by
+ * anything other than a word character is punctuation, not an extension. A false
+ * NEGATIVE (the keyword quietly doing nothing) is the worse failure, so the
+ * filter is narrow: path separators around the word, and a `.ext` suffix.
  */
 export function mentionsKeyword(text: string): boolean {
-  return /\bultracode\b/iu.test(text)
+  return /(?<![\w/\\-])ultracode(?![\w/\\-])(?<!\.[\w-])(?!\.[\w-])/iu.test(text)
 }
 
 /**

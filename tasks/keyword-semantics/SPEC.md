@@ -1,6 +1,6 @@
 # Epic: keyword-semantics
 
-Status: not started
+Status: done 2026-09-16
 Estimate: 0.5 to 1 focused day
 Depends on: a design decision, recorded below. The owner approved the reversal on 2026-09-12.
 
@@ -46,6 +46,6 @@ Negative:
 
 ## Task list
 
-- [ ] T1 Path-aware regex. Files: `src/server/ultracode/mode.ts`. Estimate 0.25 day.
-- [ ] T2 One-shot state and cleanup. Files: `src/server/ultracode/mode.ts`, `src/server/ultracode/hooks.ts`. Estimate 0.5 day.
-- [ ] T3 Option, docs, and tests. Files: `src/server/options.ts`, `README.md`, `test/ultracode.test.ts`. Estimate 0.25 to 0.5 day.
+- [x] T1 Path-aware regex. Files: `src/server/ultracode/mode.ts`. Estimate 0.25 day.
+- [x] T2 One-shot state and cleanup. Files: `src/server/ultracode/mode.ts`, `src/server/ultracode/hooks.ts`. Estimate 0.5 day. (Cleanup point: `onChatMessage` expires the keyword state when the NEXT user message arrives — the transform hook re-reads messages every step of the current turn, so the state must survive until the turn's end, and the next chat.message is the exact boundary.)
+- [x] T3 Option, docs, and tests. Files: `src/server/options.ts`, `README.md`, `test/ultracode.test.ts`. Estimate 0.25 to 0.5 day.
