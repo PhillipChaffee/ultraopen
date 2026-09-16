@@ -244,7 +244,11 @@ tui_http_prompt() { # tui_http_prompt TEXT
 # Compose a prompt that makes the model call the workflow tool with a fixture
 # script verbatim. Extra instructions (e.g. resumeFromRunId) go in $2.
 wf_prompt() { # wf_prompt FIXTURE [EXTRA]
-  printf 'Call the workflow tool now. Pass no scriptPath and no args. %s Use this script exactly, unchanged:\n\n%s\n\nThen reply with the workflow result.' \
+  # The async contract: the tool returns the run id at once, so the model must
+  # poll workflow_status with wait until the run settles BEFORE ending the turn
+  # — a one-shot `opencode run` exits (process.exit) after the turn, taking an
+  # unsettled run with it.
+  printf 'Call the workflow tool now. Pass no scriptPath and no args. %s Use this script exactly, unchanged:\n\n%s\n\nThe tool returns a launch result with a run id, not the outcome. Then call workflow_status with that run id and wait=120 (repeat the call if it says running). When the status is completed or failed, reply with what workflow_status reported — the value or the failure. Never end your turn while the run is unsettled.' \
     "${2:-}" "$(cat "$E2E_DIR/fixtures/$1.js")"
 }
 

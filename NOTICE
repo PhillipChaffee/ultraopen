@@ -8,5 +8,6 @@ The tool description and the workflow-authoring reference adapt wording from Cla
 is kept close to the original deliberately: the model reads it at runtime and writes different code
 as a result, so it is part of the implementation rather than documentation — paraphrasing it would
 change what the tool does. Adaptations are limited to what opencode actually does, chiefly
-`Workflow({...})` becoming `workflow({...})`, "the Agent tool" becoming "the task tool", and the
-asynchronous task-id contract rewritten as blocking.
+`Workflow({...})` becoming `workflow({...})`, "the Agent tool" becoming "the task tool", and
+`workflow_status` being a disk-only read of the run directory where the original tracks background
+tasks in memory.

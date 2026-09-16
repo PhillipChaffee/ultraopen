@@ -20,6 +20,12 @@ export interface UltraopenOptions {
   agentIdleMs: number
   /** Effort preference, highest first. Resolved against each model's real variant map. */
   effortPreference: readonly string[]
+  /**
+   * Launch contract for the `workflow` tool. `background` returns the run id at
+   * once and the run continues in the server process; `blocking` waits for the
+   * final result, for one-shot hosts that kill the process after the turn.
+   */
+  runMode: "background" | "blocking"
 }
 
 const DEFAULTS: UltraopenOptions = {
@@ -28,6 +34,7 @@ const DEFAULTS: UltraopenOptions = {
   agentDeadlineMs: 4 * 60 * 60 * 1000,
   agentIdleMs: 5 * 60 * 1000,
   effortPreference: ["xhigh", "max", "high", "medium", "low"],
+  runMode: "background",
 }
 
 /**
@@ -37,7 +44,9 @@ const DEFAULTS: UltraopenOptions = {
  * bad value here would otherwise surface much later as a hang or a silently ignored setting.
  */
 export function resolveOptions(raw: unknown): UltraopenOptions {
-  if (typeof raw !== "object" || raw === null) {return { ...DEFAULTS }}
+  if (typeof raw !== "object" || raw === null) {
+    return { ...DEFAULTS, runMode: resolveRunMode(undefined) }
+  }
   const input = raw as Record<string, unknown>
 
   return {
@@ -46,7 +55,26 @@ export function resolveOptions(raw: unknown): UltraopenOptions {
     agentDeadlineMs: clampTimeout(input["agentDeadlineMs"], DEFAULTS.agentDeadlineMs, true),
     agentIdleMs: clampTimeout(input["agentIdleMs"], DEFAULTS.agentIdleMs, false),
     effortPreference: stringArray(input["effortPreference"]) ?? DEFAULTS.effortPreference,
+    runMode: resolveRunMode(input["runMode"]),
   }
+}
+
+/**
+ * Resolves the launch contract.
+ *
+ * `ULTRAOPEN_WORKFLOW_SYNC=1` forces the blocking contract REGARDLESS of the
+ * option — it is the one-line kill switch, so a stale config value must not be
+ * able to hold the process open against it. An unrecognized option value falls
+ * back to this env/default order rather than throwing; plugin options come from
+ * a user-edited JSON file and a hard throw would break config loading.
+ */
+export const SYNC_ENV = "ULTRAOPEN_WORKFLOW_SYNC"
+
+function resolveRunMode(value: unknown): "background" | "blocking" {
+  if (process.env[SYNC_ENV] === "1") {return "blocking"}
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : undefined
+  if (normalized === "blocking" || normalized === "background") {return normalized}
+  return DEFAULTS.runMode
 }
 
 /**

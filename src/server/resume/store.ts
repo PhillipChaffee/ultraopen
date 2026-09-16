@@ -39,8 +39,10 @@ export interface RunArtifacts {
   dir: string
   journalPath: string
   manifestPath: string
+  progressPath: string
   resultPath: string
   scriptPath: string
+  failurePath: string
 }
 
 export function artifactPaths(runId: string, env?: NodeJS.ProcessEnv): RunArtifacts {
@@ -49,8 +51,10 @@ export function artifactPaths(runId: string, env?: NodeJS.ProcessEnv): RunArtifa
     dir,
     journalPath: join(dir, "journal.jsonl"),
     manifestPath: join(dir, "manifest.json"),
+    progressPath: join(dir, "progress.json"),
     resultPath: join(dir, "result.json"),
     scriptPath: join(dir, "script.js"),
+    failurePath: join(dir, "failure.txt"),
   }
 }
 
@@ -148,6 +152,19 @@ export async function writeScript(runId: string, source: string, env?: NodeJS.Pr
   const paths = artifactPaths(runId, env)
   await writeFile(paths.scriptPath, source, "utf8")
   return paths.scriptPath
+}
+
+/**
+ * Persists a failed run's rendered failure text.
+ *
+ * In the blocking contract the failure reached the model as the tool result; a
+ * detached run outlives that call, so the text must land on disk for the status
+ * tool to surface. Best-effort like everything here.
+ */
+export async function writeFailure(runId: string, text: string, env?: NodeJS.ProcessEnv): Promise<string> {
+  const paths = artifactPaths(runId, env)
+  await writeFile(paths.failurePath, text, "utf8")
+  return paths.failurePath
 }
 
 /**

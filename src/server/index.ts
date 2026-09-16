@@ -2,30 +2,50 @@ import { randomUUID } from "node:crypto"
 import { readFile } from "node:fs/promises"
 import { join } from "node:path"
 import { resolveOptions } from "./options.js"
+import type { UltraopenOptions } from "./options.js"
 import { registry, registry as runRegistry } from "./singleton.js"
 import { installConfig } from "./ultracode/config.js"
 import type { MutableConfig } from "./ultracode/config.js"
 import { execute, prepare, renderFailure, WorkflowRunError } from "./tool/workflow.js"
-import type { WorkflowArgs } from "./tool/workflow.js"
-import { WORKFLOW_TOOL } from "./bridge/permission.js"
+import type { WorkflowArgs, WorkflowContext } from "./tool/workflow.js"
+import { WORKFLOW_TOOL, STATUS_TOOL } from "./bridge/permission.js"
 import { asClient } from "./types.js"
-import { description } from "./tool/description.js"
+import type { OpencodeClient } from "./types.js"
+import { description, blockingDescription, statusDescription } from "./tool/description.js"
+import {
+  activeRunForSession,
+  isLiveAnywhere,
+  registerPending,
+  dropPending,
+  runDetached,
+} from "./tool/background.js"
+import { executeStatus } from "./tool/status.js"
+import type { StatusArgs } from "./tool/status.js"
+import {
+  renderResult,
+  renderLaunch,
+  renderRefusal,
+  renderResumeRefusal,
+  renderStatus,
+  workflowArgsSchema,
+  statusArgsSchema,
+} from "./tool/render.js"
 import { beginRun, endRun, loadResume } from "./resume/persist.js"
+import { isSafeRunId, readManifest, writeManifest, flushJournalEntry, writeFailure } from "./resume/store.js"
 import type { JournalEntry, Manifest } from "./resume/journal.js"
 import { onChatMessage, onChatParams, onMessagesTransform } from "./ultracode/hooks.js"
 import { mode } from "./ultracode/mode.js"
 import { resolveEffort } from "./bridge/effort.js"
 import { newBootId, pruneRuns, reapOrphans } from "./resume/reaper.js"
-import { runDir, writeManifest, flushJournalEntry } from "./resume/store.js"
 import { ProgressWriter } from "./resume/progress.js"
 
 /**
  * The ultraopen server plugin.
  *
- * Registers the `workflow` tool and installs ultracode's activation surfaces. The TUI half is a
- * SEPARATE entry (`./tui`) with its own default export: opencode throws
- * `must default export either server() or tui(), not both` if one module exports both, and TUI
- * plugins are read only from tui.json, never from opencode.json's `plugin` array.
+ * Registers the `workflow` and `workflow_status` tools and installs ultracode's activation
+ * surfaces. The TUI half is a SEPARATE entry (`./tui`) with its own default export: opencode
+ * throws `must default export either server() or tui(), not both` if one module exports both, and
+ * TUI plugins are read only from tui.json, never from opencode.json's `plugin` array.
  */
 
 interface ToolContext {
@@ -157,145 +177,20 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
   if (!nested) {
     hooks["tool"] = {
       [WORKFLOW_TOOL]: {
-        description,
+        description: options.runMode === "blocking" ? blockingDescription : description,
         args: workflowArgsSchema(),
-        execute: async (args: WorkflowArgs, context: ToolContext): Promise<string> => {
-          const runId = `wf_${randomUUID().replaceAll("-", "").slice(0, 12)}`,
-          // The session's default model, so `effort` resolves against ITS variant set rather
-          // than a guess. A failure here is non-fatal: effort simply goes unapplied, and the run
-          // log says so.
-           defaultModel = await client.config
-            ?.get?.()
-            .then((response) => response.data?.model)
-            .catch(() => undefined),
-
-           workflowContext = {
-            client,
-            sessionID: context.sessionID,
-            runId,
-            deadlineMs: options.agentDeadlineMs,
-            idleMs: options.agentIdleMs,
-            // Makes the schema-advertised `scriptPath` real: persisted scripts under the run
-            // directory can be re-run by path.
-            readScript: (path: string) => readFile(path, "utf8"),
-            ...(defaultModel === undefined ? {} : { defaultModel }),
-            ...(context.abort ? { signal: context.abort } : {}),
-          }
-
-          let manifest: Manifest | undefined
-
-          // Incremental journal flush: one line per entry as it is recorded, so a process
-          // killed mid-run keeps every completed agent for resume. Flushes are CHAINED
-          // (appends stay in record order and never interleave) and joined before endRun,
-          // so the settled rewrite can never race a floating append. The store-level flush
-          // never rejects — a disk failure must not lose a live run. Declared outside the
-          // try so the failure path can settle the chain too.
-          let flushChain: Promise<void> = Promise.resolve()
-          const flush = (entry: JournalEntry): void => {
-            flushChain = flushChain.then(() => flushJournalEntry(runId, entry))
-          }
-          // Never rejects: flushJournalEntry cannot reject (its contract, pinned by store tests),
-            // so the chain resolves once every queued append has settled.
-            const settleFlushes = (): Promise<void> => flushChain
-
+        execute: (args: WorkflowArgs, context: ToolContext): Promise<string> =>
+          launchWorkflow(args, context, options, client, bootId),
+      },
+      [STATUS_TOOL]: {
+        description: statusDescription,
+        args: statusArgsSchema(),
+        execute: async (args: StatusArgs, context: ToolContext): Promise<string> => {
           try {
-            // Parse BEFORE asking, so the permission prompt names the real workflow and can show
-            // what it intends to do. `meta` is a pure literal specifically so it can be read
-            // without running anything. Using the tool's `title` argument here instead would be
-            // wrong twice over: it is documented as ignored, and the model usually omits it.
-            const prepared = await prepare(args, workflowContext)
-
-            // `always` is scoped to this workflow's name rather than "*": an "always" grant is
-            // stored instance-wide, so approving once with "*" would permanently disable the
-            // prompt for every workflow in the directory.
-            await context.ask?.({
-              permission: WORKFLOW_TOOL,
-              patterns: [prepared.meta.name],
-              always: [prepared.meta.name],
-              metadata: {
-                runId,
-                name: prepared.meta.name,
-                description: prepared.meta.description,
-                phases: prepared.meta.phases?.map((phase) => phase.title) ?? [],
-                dryRun: args.dryRun === true,
-              },
-            })
-
-            // Resume BEFORE the run starts, so replayed calls never spawn anything.
-            const resume = args.resumeFromRunId
-              ? await loadResume(args.resumeFromRunId, args.args, context.sessionID)
-              : undefined
-
-
-
-            manifest = await beginRun({
-              runId,
-              sessionID: context.sessionID,
-              source: prepared.source,
-              args: args.args,
-              bootId,
-            })
-
-            const progress = new ProgressWriter({
-              runId,
-              workflow: prepared.meta.name,
-              sessionID: context.sessionID,
-              startedAt: Date.now(),
-            })
-
-            // Crash safety: the manifest's child list is updated as sessions appear, so a server
-            // killed mid-run still leaves the reaper a list of children to abort. Written per
-            // agent-start (not per event) to keep the I/O bounded by agent count.
-            let persistedChildren = -1
-            const persistChildren = async (): Promise<void> => {
-              if (!manifest) {return}
-              const sessions = runRegistry.sessionsOf(runId)
-              if (sessions.length === persistedChildren) {return}
-              persistedChildren = sessions.length
-              await writeManifest(runId, { ...manifest, childSessionIDs: sessions }).catch(() => undefined)
-            }
-
-            const result = await execute(args, {
-              ...workflowContext,
-              onProgress: (event) => {
-                progress.apply(event, Date.now())
-                void progress.flush()
-                // Persist on agent-start AND on log lines: a stall restart spawns a NEW child
-                // session without an agent-start, and a killed server must leave the reaper a
-                // list that includes it. persistChildren no-ops when the list is unchanged, so
-                // narration-heavy runs cost no extra writes.
-                if (event.type === "agent-start" || event.type === "log") {void persistChildren()}
-              },
-              onJournal: flush,
-              ...(resume && resume.entries.length > 0
-                ? { previousEntries: resume.entries, resumedFrom: args.resumeFromRunId }
-                : {}),
-            })
-
-            await settleFlushes()
-            await endRun(manifest, {
-              status: "completed",
-              entries: result.journal,
-              value: result.value,
-              // Captured inside the run before its cleanup forgot the sessions — reading the
-              // registry here would always yield [].
-              childSessionIDs: result.childSessionIDs,
-            })
-
-            return renderResult(result, {
-              resumed: resume?.entries.length ?? 0,
-              argsChanged: resume?.argsChanged === true,
-            })
+            return renderStatus(await executeStatus(args, { bootId, signal: context.abort }))
           } catch (error) {
-            const partial = error instanceof WorkflowRunError ? error.partial : undefined
-            await settleFlushes()
-            await endRun(manifest, {
-              status: "failed",
-              entries: partial?.journal ?? [],
-              value: null,
-              childSessionIDs: partial?.childSessionIDs ?? [],
-            })
-            return renderFailure(error instanceof WorkflowRunError ? error.cause : error, args.script, runId)
+            // An unknown or malformed run id is a clear error for the model, never a crash.
+            return error instanceof Error ? error.message : String(error)
           }
         },
       },
@@ -306,71 +201,305 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
 }
 
 /**
- * Renders the result for the model.
+ * Launches one workflow run.
  *
- * Returns the FULL text with the summary first, deliberately uncapped: opencode already pipes
- * plugin tool output through its truncation layer, which spills the whole value to a file the
- * agent is pre-authorised to read and hands back the path. Pre-capping here would stop that spill
- * from ever firing and silently lose the tail.
+ * Two contracts share this path. `background` — the default — returns the run id
+ * at once and hands the run to a detached task, so the session stays free while
+ * the run works; `blocking` waits for the final result, for one-shot hosts that
+ * kill the process after the turn (see tasks/async-runs/notes/host-lifecycle-facts.md).
+ * `dryRun` always blocks: it is free, finishes in milliseconds, and its whole
+ * point is the fan-out preview inside the result.
  */
-function renderResult(
-  result: Awaited<ReturnType<typeof execute>>,
-  resume?: { resumed: number; argsChanged: boolean },
-): string {
-  const lines = [
-    `<result workflow="${result.meta.name}" run="${result.runId}" agents="${result.agentCount}">`,
-    typeof result.value === "string" ? result.value : JSON.stringify(result.value, null, 2),
-    "</result>",
-  ]
+async function launchWorkflow(
+  args: WorkflowArgs,
+  context: ToolContext,
+  options: UltraopenOptions,
+  client: OpencodeClient,
+  bootId: string,
+): Promise<string> {
+  const background = args.dryRun !== true && (args.background ?? options.runMode === "background"),
+   runId = `wf_${randomUUID().replaceAll("-", "").slice(0, 12)}`,
+   // The session's default model, so `effort` resolves against ITS variant set rather
+   // than a guess. A failure here is non-fatal: effort simply goes unapplied, and the run
+   // log says so.
+   defaultModel = await client.config
+    ?.get?.()
+    .then((response) => response.data?.model)
+    .catch(() => undefined),
 
-  // Never let partial coverage read as full coverage.
-  if (result.nulls.length > 0) {
-    lines.push(
-      "",
-      `<failures count="${result.nulls.length}" of="${result.agentCount}">`,
-      ...result.nulls.map((entry) => `  ${entry.label}: ${entry.reason}${entry.detail ? ` — ${entry.detail}` : ""}`),
-      "</failures>",
-    )
+   workflowContext: WorkflowContext = {
+    client,
+    sessionID: context.sessionID,
+    runId,
+    deadlineMs: options.agentDeadlineMs,
+    idleMs: options.agentIdleMs,
+    // Makes the schema-advertised `scriptPath` real: persisted scripts under the run
+    // directory can be re-run by path.
+    readScript: (path: string) => readFile(path, "utf8"),
+    ...(defaultModel === undefined ? {} : { defaultModel }),
+    // The detached run must NOT take the tool call's signal: a parent-turn
+    // interrupt would otherwise kill the run it just launched. The signal is a
+    // launch-phase concern; only the blocking contract still threads it into
+    // the Run, where aborting the call and aborting the run are the same act.
+    ...(!background && context.abort ? { signal: context.abort } : {}),
   }
 
-  if (result.logs.length > 0) {
-    lines.push("", "<log>", ...result.logs.map((line) => `  ${line}`), "</log>")
+  // One live run per session, for BOTH contracts (see lifecycle-policy.md): a
+  // blocking call inside a turn serializes itself anyway, but mixed contracts
+  // would put two agent-spending runs in one session. dryRun is exempt — it is
+  // free, stubbed, and the standard way to debug a script mid-run. Launch-gating
+  // state is registered SYNCHRONOUSLY, before the first await, so two calls from
+  // one session in the same tick cannot both pass the refusal check (the
+  // check-then-act race). Every early return below must drop it.
+  if (args.dryRun !== true) {
+    const active = activeRunForSession(context.sessionID)
+    if (active) {return renderRefusal(active)}
+    if (background) {registerPending(runId, context.sessionID)}
   }
 
-  // A replayed run must never read as a fresh one — the whole point of recording replays is that
-  // a cached empty and a fresh empty look identical otherwise.
-  if (resume?.argsChanged === true) {
-    lines.push("", "<resume note=\"args changed since the previous run, so nothing was replayed\" />")
+  // Incremental journal flush: one line per entry as it is recorded, so a process
+  // killed mid-run keeps every completed agent for resume. Flushes are CHAINED
+  // (appends stay in record order and never interleave) and joined before endRun,
+  // so the settled rewrite can never race a floating append. The store-level flush
+  // never rejects — a disk failure must not lose a live run.
+  let flushChain: Promise<void> = Promise.resolve()
+  const flush = (entry: JournalEntry): void => {
+    flushChain = flushChain.then(() => flushJournalEntry(runId, entry))
   }
 
-  const replayed = result.journal.filter((entry) => entry.replayed === true).length
-  lines.push(
-    "",
-    `<usage agents="${result.agentCount}" failed="${result.nulls.length}" replayed="${replayed}" ` +
-      `output_tokens="${result.outputTokens}" run_dir="${runDir(result.runId)}" />`,
-  )
-  return lines.join("\n")
+  try {
+    // Parse BEFORE asking, so the permission prompt names the real workflow and can show
+    // what it intends to do. `meta` is a pure literal specifically so it can be read
+    // without running anything. Using the tool's `title` argument here instead would be
+    // wrong twice over: it is documented as ignored, and the model usually omits it.
+    const prepared = await prepare(args, workflowContext)
+
+    // `always` is scoped to this workflow's name rather than "*": an "always" grant is
+    // stored instance-wide, so approving once with "*" would permanently disable the
+    // prompt for every workflow in the directory.
+    await context.ask?.({
+      permission: WORKFLOW_TOOL,
+      patterns: [prepared.meta.name],
+      always: [prepared.meta.name],
+      metadata: {
+        runId,
+        name: prepared.meta.name,
+        description: prepared.meta.description,
+        phases: prepared.meta.phases?.map((phase) => phase.title) ?? [],
+        dryRun: args.dryRun === true,
+        background,
+      },
+    })
+
+    // Resume BEFORE the run starts, so replayed calls never spawn anything. A
+    // resume whose source run is still being written by a live Run (this boot
+    // or another) is refused first: two writers on one journal would interleave
+    // appends and race the endRun rewrite.
+    if (args.resumeFromRunId) {
+      // The id is model-supplied input and joins into a filesystem path below,
+      // exactly like the status tool's runId: rejected before any read.
+      if (!isSafeRunId(args.resumeFromRunId)) {
+        dropPending(runId)
+        return renderResumeRefusal(args.resumeFromRunId, undefined)
+      }
+      const source = await readManifest(args.resumeFromRunId)
+      if (source && isLiveAnywhere(source, bootId)) {
+        dropPending(runId)
+        return renderResumeRefusal(source.runId, source.pid)
+      }
+    }
+    const resume = args.resumeFromRunId
+      ? await loadResume(args.resumeFromRunId, args.args, context.sessionID)
+      : undefined
+
+    // The manifest MUST be on disk before this call returns: the launch result
+    // names a run id that `workflow_status` has to resolve, and a run without a
+    // manifest is invisible to the status tool and to the reaper. A beginRun
+    // failure therefore aborts the launch rather than starting a run that could
+    // never be reported on.
+    const manifest = await beginRun({
+      runId,
+      sessionID: context.sessionID,
+      source: prepared.source,
+      args: args.args,
+      bootId,
+    })
+    if (!manifest) {
+      dropPending(runId)
+      return "The workflow could not be started: its run directory could not be created. " +
+        "Nothing was executed and no tokens were spent."
+    }
+
+    /**
+     * The ONE settle protocol for both contracts: join the flush chain, close
+     * the manifest, and persist failure text when there is any. Extracted
+     * because the ordering (flushes settle BEFORE the endRun rewrite, so the
+     * settled write can never race a floating append) is crash-safety, not
+     * style — the escaped-rejection fallback below must obey it too.
+     */
+    const settleRun = async (outcome: {
+      status: "completed" | "failed"
+      entries: readonly JournalEntry[]
+      value: unknown
+      childSessionIDs: string[]
+      failureText?: string | undefined
+    }): Promise<void> => {
+      // The chain variable is read live: appends queued before this await are
+      // included, however long the chain grew.
+      await flushChain
+      await endRun(manifest, outcome)
+      if (outcome.failureText !== undefined) {
+        // Best-effort like every persistence here: a failed write must not
+        // lose the settle itself.
+        try {await writeFailure(runId, outcome.failureText)} catch {
+          // Best-effort: a failed write must not lose the settle itself.
+        }
+      }
+    }
+
+    const progress = new ProgressWriter({
+      runId,
+      workflow: prepared.meta.name,
+      sessionID: context.sessionID,
+      startedAt: Date.now(),
+    })
+
+    // Crash safety: the manifest's child list is updated as sessions appear, so a server
+    // killed mid-run still leaves the reaper a list of children to abort. Written per
+    // agent-start (not per event) to keep the I/O bounded by agent count.
+    let persistedChildren = -1
+    const persistChildren = async (): Promise<void> => {
+      if (!manifest) {return}
+      const sessions = runRegistry.sessionsOf(runId)
+      if (sessions.length === persistedChildren) {return}
+      persistedChildren = sessions.length
+      try {await writeManifest(runId, { ...manifest, childSessionIDs: sessions })} catch {
+        // Crash safety is best-effort: a failed manifest rewrite must not stall the run.
+      }
+    }
+
+    const executeContext = {
+      ...workflowContext,
+      onProgress: (event: Parameters<ProgressWriter["apply"]>[0]) => {
+        progress.apply(event, Date.now())
+        void progress.flush()
+        // Persist on agent-start AND on log lines: a stall restart spawns a NEW child
+        // session without an agent-start, and a killed server must leave the reaper a
+        // list that includes it. persistChildren no-ops when the list is unchanged, so
+        // narration-heavy runs cost no extra writes.
+        if (event.type === "agent-start" || event.type === "log") {void persistChildren()}
+      },
+      onJournal: flush,
+      ...(resume && resume.entries.length > 0
+        ? { previousEntries: resume.entries, resumedFrom: args.resumeFromRunId }
+        : {}),
+    }
+
+    if (!background) {
+      return await runBlocking(args, { runId, manifest, resume, executeContext, settleRun })
+    }
+
+    // Detached: the run outlives this tool call. The task fully captures its own
+    // outcome — flushes, manifest, failure text — because nothing else is
+    // waiting on it anymore.
+    void runDetached({
+      runId,
+      task: async (): Promise<void> => {
+        try {
+          const result = await execute(args, executeContext)
+          await settleRun({
+            status: "completed",
+            entries: result.journal,
+            value: result.value,
+            // Captured inside the run before its cleanup forgot the sessions — reading the
+            // registry here would always yield [].
+            childSessionIDs: result.childSessionIDs,
+          })
+        } catch (error) {
+          const partial = error instanceof WorkflowRunError ? error.partial : undefined
+          await settleRun({
+            status: "failed",
+            entries: partial?.journal ?? [],
+            value: null,
+            childSessionIDs: partial?.childSessionIDs ?? [],
+            failureText: renderFailure(error instanceof WorkflowRunError ? error.cause : error, args.script, runId),
+          })
+        }
+      },
+      // Last resort: the task above is contractually self-capturing, so an
+      // escaping rejection means its own failure path broke. Route through the
+      // same settle protocol — including the flush join — so the degraded
+      // record still follows the crash-safety ordering.
+      onEscapedRejection: (error): Promise<void> =>
+        settleRun({
+          status: "failed",
+          entries: [],
+          value: null,
+          childSessionIDs: [],
+          failureText: renderFailure(error, args.script, runId),
+        }),
+    })
+
+    return renderLaunch(prepared.meta.name, runId)
+  } catch (error) {
+    // Reached only by the launch phase itself: a parse failure or a rejected
+    // permission ask. The run never went live, so the pending entry is dropped.
+    dropPending(runId)
+    return renderFailure(error, args.script, runId)
+  }
+}
+
+/** The shared settle protocol's signature; see settleRun inside launchWorkflow. */
+type SettleRun = (outcome: {
+  status: "completed" | "failed"
+  entries: readonly JournalEntry[]
+  value: unknown
+  childSessionIDs: string[]
+  failureText?: string | undefined
+}) => Promise<void>
+
+interface BlockingRun {
+  runId: string
+  manifest: Manifest
+  resume: { entries: JournalEntry[]; argsChanged: boolean } | undefined
+  executeContext: Parameters<typeof execute>[1]
+  settleRun: SettleRun
 }
 
 /**
- * The tool's argument schema, as a plain JSON-Schema-ish record.
+ * The blocking contract: wait for the run, then return one consolidated result.
  *
- * `title` and `description` are accepted and IGNORED, exactly as the spec specifies — a model
- * trained on Claude Code passes them, and rejecting them would surface as a validation error
- * instead of the documented silent ignore.
+ * Kept behaviorally identical to the pre-async tool — it is the documented kill
+ * switch (`runMode: "blocking"` / `ULTRAOPEN_WORKFLOW_SYNC=1`) and the dry-run
+ * path.
  */
-function workflowArgsSchema(): Record<string, unknown> {
-  return {
-    script: { type: "string", description: "The workflow script. Must begin with `export const meta = {...}`." },
-    scriptPath: { type: "string", description: "Path to a persisted script. Takes precedence over `script`." },
-    args: { description: "Value exposed to the script as the global `args`. Pass real JSON, not a JSON string." },
-    resumeFromRunId: {
-      type: "string",
-      description: "Resume a previous run from this directory's data: unchanged agent calls replay from its journal instantly, and the first changed call onward runs live.",
-    },
-    dryRun: { type: "boolean", description: "Run the script with agent() stubbed out, for zero tokens." },
-    title: { type: "string", description: "Ignored." },
-    description: { type: "string", description: "Ignored." },
+async function runBlocking(args: WorkflowArgs, run: BlockingRun): Promise<string> {
+  const { runId, resume, executeContext, settleRun } = run
+  try {
+    const result = await execute(args, executeContext)
+    await settleRun({
+      status: "completed",
+      entries: result.journal,
+      value: result.value,
+      // Captured inside the run before its cleanup forgot the sessions — reading the
+      // registry here would always yield [].
+      childSessionIDs: result.childSessionIDs,
+    })
+    return renderResult(result, {
+      resumed: resume?.entries.length ?? 0,
+      argsChanged: resume?.argsChanged === true,
+    })
+  } catch (error) {
+    const partial = error instanceof WorkflowRunError ? error.partial : undefined
+    await settleRun({
+      status: "failed",
+      entries: partial?.journal ?? [],
+      value: null,
+      childSessionIDs: partial?.childSessionIDs ?? [],
+      // The blocking contract renders the failure as the tool result, the way
+      // the pre-async tool did; failure.txt is the detached contract's channel.
+    })
+    return renderFailure(error instanceof WorkflowRunError ? error.cause : error, args.script, runId)
   }
 }
 

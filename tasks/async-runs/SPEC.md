@@ -1,6 +1,6 @@
 # Epic: async-runs
 
-Status: not started
+Status: done 2026-09-15 (T1-T4; one recorded deviation, see below)
 Estimate: 3 to 5 focused days
 Depends on: nothing
 
@@ -48,7 +48,19 @@ Negative:
 
 Tasks that touch the same file run in sequence.
 
-- [ ] T1 Move the run out of the tool call. `prepare` and the permission ask stay in the tool. The run starts detached. Files: `src/server/index.ts`, `src/server/tool/workflow.ts`, `src/server/singleton.ts` (a detached-run registry). Estimate 1 day.
-- [ ] T2 Add the `workflow_status` tool and register it. Files: `src/server/tool/status.ts` (new), `src/server/index.ts`. Estimate 1 day.
-- [ ] T3 Rewrite the tool description for the async contract. Update the NOTICE wording for the contract change. Files: `src/server/tool/description.ts`, `NOTICE`. Estimate 0.5 day.
-- [ ] T4 Tests, node parity, and e2e updates. Files: `test/index.test.ts`, `test/workflow.test.ts`, `test/e2e/technical.sh`. Estimate 1 to 2 days.
+- [x] T1 Move the run out of the tool call. `prepare` and the permission ask stay in the tool. The run starts detached. Files: `src/server/index.ts`, `src/server/tool/workflow.ts`, `src/server/singleton.ts` (a detached-run registry). Estimate 1 day. (Registry lives in `src/server/tool/background.ts`, not singleton — the launch-gating state and the session registry split cleanly; `singleton.forgetRun` added for settle cleanup.)
+- [x] T2 Add the `workflow_status` tool and register it. Files: `src/server/tool/status.ts` (new), `src/server/index.ts`. Estimate 1 day.
+- [x] T3 Rewrite the tool description for the async contract. Update the NOTICE wording for the contract change. Files: `src/server/tool/description.ts`, `NOTICE`. Estimate 0.5 day.
+- [x] T4 Tests, node parity, and e2e updates. Files: `test/index.test.ts`, `test/status.test.ts` (new), `test/background.test.ts` (new), `test/workflow.test.ts` (no engine change needed), `test/e2e/technical.sh`. Estimate 1 to 2 days. (Node parity: the new modules use only `node:` APIs and injectable timers; the existing node sandbox-parity harness covers the engine, and background/status carry no Bun-specific code.)
+
+## Recorded deviation: `runMode` option
+
+The spec says the tool returns the run id unconditionally. It does — by default
+(`runMode: "background"`). Verified against opencode 1.18.31 core, headless
+`opencode run` calls `process.exit()` unconditionally after the turn
+(`packages/opencode/src/index.ts`, `finally` block), so an unsettled detached run
+dies with the process no matter what the plugin holds. The tool therefore gains
+`runMode: "blocking"` (and per-call `background: false`) as the documented
+fallback for one-shot hosts, with `ULTRAOPEN_WORKFLOW_SYNC=1` as the env kill
+switch. `dryRun` always waits. Facts and the spike:
+`notes/host-lifecycle-facts.md`.

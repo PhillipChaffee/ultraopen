@@ -111,8 +111,13 @@ ultraopen only tries to be the right tool when the work already happens in openc
 
 ## ✨ What you get
 
-- **`workflow` tool** — runs a JavaScript script that fans out across parallel subagents. Scripts
-  pass inline or by path (`scriptPath`), and a previous run replays with `resumeFromRunId`.
+- **`workflow` tool** — runs a JavaScript script that fans out across parallel subagents. The tool
+  returns the run id at once and the run continues in the server process; poll `workflow_status`
+  for progress and the final value. Scripts pass inline or by path (`scriptPath`), and a previous
+  run replays with `resumeFromRunId`.
+- **`workflow_status` tool** — reads one run's live state from disk: status, phase, agent counts,
+  token total, last logs, and (once settled) the final value or the failure text. Read-only, and
+  it works across processes and after a crash, because the run directory is the source of truth.
 - **Schema-forced output** — `agent(prompt, { schema })` returns a validated object; invalid
   output retries up to three attempts in the same session.
 - **Resume** — `resumeFromRunId` replays unchanged calls instantly; the first edited call and
@@ -124,6 +129,20 @@ ultraopen only tries to be the right tool when the work already happens in openc
 - **Safety rails** — a recursion guard (a nested `workflow()` runs one level only), an inactivity
   deadline plus a wall-clock ceiling per agent, a global concurrency cap, an orphan reaper that
   releases subagents left by a killed server, and retention pruning of finished run directories.
+
+### The launch contract
+
+The `workflow` tool returns immediately with a `<workflow-launched>` result naming the run id and
+directory — it never contains the outcome. Poll `workflow_status(runId, { wait })` until the
+status is not `running`; one long `wait` (up to 300 s) beats many short polls. In the TUI you can
+keep typing while the run works. In one-shot `opencode run` the process exits right after the
+turn, so keep the turn alive by polling until the run settles — an unsettled run dies with the
+process (its completed agents survive on disk and a later `resumeFromRunId` replays them). If you
+need the old synchronous behavior, set the plugin option `"runMode": "blocking"` or the env
+`ULTRAOPEN_WORKFLOW_SYNC=1`; `dryRun` always waits. One live run per session (both contracts; `dryRun` is exempt — it is free and spawns nothing): a
+second launch is refused with the active run id, and resuming a run that is still executing is
+refused for the same reason — two engines would write one journal. Until the run-control epic lands there is no stop
+tool: to stop a run, end the opencode process; finished agents are preserved for resume.
 
 | Global | Behavior |
 | --- | --- |
@@ -214,6 +233,7 @@ Verified against opencode 1.18.29 by the live e2e suites (`test/e2e`).
 
 Working end to end:
 
+- the async launch contract (run id at once, `workflow_status` polling, background runs)
 - parallel and pipeline fan-out
 - schema-forced structured output
 - per-model effort resolution

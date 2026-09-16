@@ -89,6 +89,13 @@ export const registry = {
     return out
   },
 
+  /** Drops every engine-owned session of a run when the run settles. */
+  forgetRun(runId: string): void {
+    for (const [sessionID, id] of sessionToRun) {
+      if (id === runId) {registry.forget(sessionID)}
+    }
+  },
+
   get size(): number {
     return engineSessions.size
   },
