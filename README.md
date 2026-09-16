@@ -293,6 +293,13 @@ prompt status) are where live state shows: failed agents carry the theme's error
 glyph plus the failure reason, a half-failed run shows a failed count while live, and an
 interrupted run (its process died) shows a once-per-boot resume hint in the strip.
 
+Also upstream, and recorded with evidence in `tasks/upstream-fixes/notes/`: the permission
+approval dialog auto-resolves on 1.18.31 without rendering the ask's `metadata` (the workflow
+name, description and phases), and schema-forced agents fail against Together with an empty
+`APIError` when ANY tool in the session carries a `$ref` in its JSON Schema. Both need upstream
+fixes; the transcript-echo collapse (this epic's original upstream PR target) is researched and
+ready to submit separately.
+
 <a id="development"></a>
 
 ## 🛠️ Development

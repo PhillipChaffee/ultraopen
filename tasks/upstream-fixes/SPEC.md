@@ -1,6 +1,6 @@
 # Epic: upstream-fixes
 
-Status: not started
+Status: partial 2026-09-16 (T1 research done and recorded; T3 README note done; T2 upstream PR prepared but NOT submitted — submitting to the opencode maintainers needs their review process and was left as the explicit next step)
 Estimate: 1 to 2 focused days, in the opencode repository
 Depends on: nothing in this repo, except the README note
 
@@ -41,6 +41,6 @@ Negative:
 
 ## Task list
 
-- [ ] T1 Research the render path in opencode core. Find the tool-call render code and the right place for the collapse. Record the finding in the notes. Estimate 0.5 day.
-- [ ] T2 Upstream PR with tests. Estimate 1 to 2 days.
-- [ ] T3 README note in ultraopen that states the upstream status. Files: `README.md`. Estimate 0.25 day.
+- [x] T1 Research the render path in opencode core. Find the tool-call render code and the right place for the collapse. Record the finding in the notes. Estimate 0.5 day. (Done in a previous session; the bisect notes live in notes/transcript-echo.md.)
+- [ ] T2 Upstream PR with tests. Estimate 1 to 2 days. PREPARED, NOT SUBMITTED: the fix is researched and the branch notes carry the bisect; submitting to the opencode repository is the remaining step and needs a maintainer-facing PR in their contribution flow.
+- [x] T3 README note in ultraopen that states the upstream status. Files: `README.md`. Estimate 0.25 day. (Also records the approval-dialog auto-resolve drift and the Together $ref grammar gap, both upstream.)
