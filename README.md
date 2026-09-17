@@ -145,7 +145,7 @@ ultraopen only tries to be the right tool when the work already happens in openc
   `control.jsonl` commands (`pause`, `resume`, `stop-run`, `stop-agent`, `restart-agent`),
   the gate pauses new agents while in-flight work finishes, and `stop-agent` aborts exactly one
   child. Agent rows show output-token spend. The TUI keys for selection/restart and the drill-down
-  detail view are the next slice (recorded in `tasks/run-control/SPEC.md`).
+  detail view are the next slice.
 - **Approval prompt** — the prompt names the real workflow (not the ignored title), its
   description and phases, and the run id. The script is persisted to the run directory **before**
   the prompt appears, so you can open `<run dir>/script.js` and read exactly what will run before
@@ -281,8 +281,7 @@ Known gaps the e2e probes confirmed:
   MCP servers do — Obsidian's `vault_patch` does). Together's grammar compiler misresolves
   `$ref` pointers under the string form of `tool_choice: "required"` that opencode sends for
   `format` calls; the identical request succeeds with the object form. Workaround: disable the
-  offending MCP server, or run those agents schema-less. Full bisect and the candidate
-  upstream fixes live in `tasks/upstream-fixes/notes/transcript-echo.md`.
+  offending MCP server, or run those agents schema-less.
 
 Each probe carries a `bun run check`-clean implementation note in the suites.
 
@@ -293,7 +292,7 @@ prompt status) are where live state shows: failed agents carry the theme's error
 glyph plus the failure reason, a half-failed run shows a failed count while live, and an
 interrupted run (its process died) shows a once-per-boot resume hint in the strip.
 
-Also upstream, and recorded with evidence in `tasks/upstream-fixes/notes/`: the permission
+Also upstream: the permission
 approval dialog auto-resolves on 1.18.31 without rendering the ask's `metadata` (the workflow
 name, description and phases), and schema-forced agents fail against Together with an empty
 `APIError` when ANY tool in the session carries a `$ref` in its JSON Schema. Both need upstream
