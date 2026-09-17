@@ -56,9 +56,22 @@ const META = "export const meta = { name: 'demo', description: 'a demo workflow'
   },
 },
 
- toolOf = (hooks: Record<string, unknown>): ToolDef | undefined => {
+toolOf = (hooks: Record<string, unknown>): ToolDef | undefined => {
   const tools = hooks["tool"] as Record<string, ToolDef> | undefined
   return tools?.[WORKFLOW_TOOL]
+ }
+
+/**
+ * Swaps process.argv around a callback.
+ *
+ * The host-aware launch contract reads argv at plugin-registration time, so a
+ * test controls which contract the plugin serves by standing in the host's
+ * argv. The shapes are the live captures documented in tool/background.ts.
+ */
+, withArgv = async (argv: string[], run: () => Promise<void> | void): Promise<void> => {
+  const saved = process.argv
+  process.argv = argv
+  try { await run() } finally { process.argv = saved }
 }
 
 let savedEnv: string | undefined
@@ -111,6 +124,57 @@ describe("plugin registration", () => {
     // `0 ?? 8` is 0, and a limit below 1 makes every acquire wait forever with no throw.
     ultraopen({ client: stubClient }, { concurrency: 0 })
     expect(registry.semaphore.limit).toBeGreaterThanOrEqual(1)
+  })
+})
+
+describe("host-aware launch contract", () => {
+  test("a long-lived host frees the turn: the description and the launch result end it after launch", async () => {
+    let tool: ToolDef | undefined,
+      output = ""
+    await withArgv(["bun", "/$bunfs/root/src/cli/tui/worker.js"], async () => {
+      tool = toolOf(ultraopen({ client: stubClient }))
+      if (!tool) {throw new Error("tool was not registered")}
+      output = await tool.execute(
+        { script: `${META}await agent('a')\nreturn 'LATE-VALUE'\n`, background: true },
+        { sessionID: "parent" },
+      )
+    })
+    expect(tool?.description).toContain("outlives your")
+    expect(output).toContain("<workflow-launched")
+    expect(output).toContain("end your turn and let it work")
+    expect(output).not.toContain("Before ending your turn")
+    expect(output).not.toContain("LATE-VALUE")
+    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
+    await background.settlePromiseOf(runId)
+  })
+
+  test("a one-shot host keeps the hold-the-turn contract", async () => {
+    let output = ""
+    await withArgv(["bun", "/$bunfs/root/src/index.js", "run", "say hi"], async () => {
+      const tool = toolOf(ultraopen({ client: stubClient }))
+      if (!tool) {throw new Error("tool was not registered")}
+      output = await tool.execute(
+        { script: `${META}await agent('a')\nreturn 'LATE-VALUE'\n`, background: true },
+        { sessionID: "parent" },
+      )
+    })
+    expect(output).toContain("Before ending your turn, poll until the run settles")
+    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
+    await background.settlePromiseOf(runId)
+  })
+
+  test("an explicit blocking runMode wins over a long-lived host", async () => {
+    let description = ""
+    await withArgv(["bun", "/$bunfs/root/src/cli/tui/worker.js"], () => {
+      description = toolOf(ultraopen({ client: stubClient }, { runMode: "blocking" }))?.description ?? ""
+    })
+    expect(description).toContain("This call BLOCKS until the run completes")
+    expect(description).not.toContain("outlives your")
+  })
+
+  test("the test runner's own argv is an unknown shape, so the pinned contract is the default", () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    expect(tool?.description).toContain("The run continues in the background while you keep")
   })
 })
 

@@ -11,10 +11,11 @@ import type { WorkflowArgs, WorkflowContext } from "./tool/workflow.js"
 import { WORKFLOW_TOOL, STATUS_TOOL } from "./bridge/permission.js"
 import { asClient } from "./types.js"
 import type { OpencodeClient } from "./types.js"
-import { description, blockingDescription, statusDescription, withSizeAdvice } from "./tool/description.js"
+import { description, blockingDescription, longLivedDescription, statusDescription, withSizeAdvice } from "./tool/description.js"
 import {
   activeRunForSession,
   isLiveAnywhere,
+  isLongLivedHost,
   registerPending,
   dropPending,
   runDetached,
@@ -83,6 +84,10 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
   registry.configureConcurrency(options.concurrency)
   mode.setDefault(options.ultracode)
   mode.setKeywordBehavior(options.keywordBehavior)
+
+  // Decided once from the process shape: it picks which launch contract the
+  // tool description and every launch result serve (see tool/background.ts).
+  const longLived = isLongLivedHost()
 
   // One sync scan at load builds the /workflow-<name> commands. The RUN path
   // rescans per tool call (a file saved mid-session runs at once); only the
@@ -194,10 +199,10 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
   if (!nested) {
     hooks["tool"] = {
       [WORKFLOW_TOOL]: {
-        description: toolDescription(options),
+        description: toolDescription(options, longLived),
         args: workflowArgsSchema(),
         execute: (args: WorkflowArgs, context: ToolContext): Promise<string> =>
-          launchWorkflow(args, context, options, client, bootId, input.directory),
+          launchWorkflow(args, context, options, client, bootId, input.directory, longLived),
       },
       [STATUS_TOOL]: {
         description: statusDescription,
@@ -217,9 +222,15 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
   return hooks
 }
 
-/** The tool description for this instance's contract and configured size advice. */
-function toolDescription(options: UltraopenOptions): string {
-  const base = options.runMode === "blocking" ? blockingDescription : description
+/**
+ * The tool description for this instance's contract and configured size advice.
+ *
+ * Blocking is the explicit option (and the env kill switch); otherwise the host
+ * decides which background contract the model reads (see tool/background.ts).
+ */
+function toolDescription(options: UltraopenOptions, longLived: boolean): string {
+  if (options.runMode === "blocking") {return blockingDescription}
+  const base = longLived ? longLivedDescription : description
   if (options.sizeGuideline === undefined) {return base}
   return withSizeAdvice(base, options.sizeGuideline)
 }
@@ -241,6 +252,7 @@ async function launchWorkflow(
   client: OpencodeClient,
   bootId: string,
   projectDirectory: string | undefined,
+  longLived: boolean,
 ): Promise<string> {
   const background = args.dryRun !== true && (args.background ?? options.runMode === "background"),
    runId = `wf_${randomUUID().replaceAll("-", "").slice(0, 12)}`,
@@ -491,7 +503,7 @@ async function launchWorkflow(
       renderFailure,
     })
 
-    return [renderLaunch(prepared.meta.name, runId), ...scanNoteLines].join("\n")
+    return [renderLaunch(prepared.meta.name, runId, longLived), ...scanNoteLines].join("\n")
   } catch (error) {
     // Reached only by the launch phase itself: a parse failure or a rejected
     // permission ask. The run never went live, so the pending entry is dropped.
