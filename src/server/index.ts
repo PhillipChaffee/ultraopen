@@ -13,7 +13,8 @@ import { asClient } from "./types.js"
 import type { OpencodeClient } from "./types.js"
 import { description, blockingDescription, longLivedDescription, statusDescription, withSizeAdvice } from "./tool/description.js"
 import {
-  activeRunForSession,
+  liveRunsForSession,
+  siblingRunsForSession,
   isLiveAnywhere,
   isLongLivedHost,
   registerPending,
@@ -304,8 +305,8 @@ async function launchWorkflow(
   // session in the same tick cannot both pass the refusal check (the
   // check-then-act race). Every early return below must drop it.
   if (args.dryRun !== true) {
-    const active = activeRunForSession(context.sessionID)
-    if (active) {return renderRefusal(active)}
+    const [oldest] = liveRunsForSession(context.sessionID)
+    if (oldest) {return renderRefusal(oldest)}
     registerPending(runId, context.sessionID)
   }
 
@@ -507,7 +508,7 @@ async function launchWorkflow(
       renderFailure,
     })
 
-    return [renderLaunch(prepared.meta.name, runId, longLived), ...scanNoteLines].join("\n")
+    return [renderLaunch(prepared.meta.name, runId, longLived, siblingRunsForSession(context.sessionID, runId)), ...scanNoteLines].join("\n")
   } catch (error) {
     // Reached only by the launch phase itself: a parse failure or a rejected
     // permission ask. The run never went live, so the pending entry is dropped.
@@ -544,7 +545,7 @@ interface BlockingRun {
  * finds no residue once it is done.
  */
 async function runBlocking(args: WorkflowArgs, run: BlockingRun): Promise<string> {
-  const { runId, resume, executeContext, settleRun } = run
+  const { runId, manifest, resume, executeContext, settleRun } = run
   try {
     const result = await execute(args, executeContext)
     await settleRun({
@@ -555,10 +556,12 @@ async function runBlocking(args: WorkflowArgs, run: BlockingRun): Promise<string
       // registry here would always yield [].
       childSessionIDs: result.childSessionIDs,
     })
+    // The own entry is still registered at render time (the finally below drops
+    // it after the settle protocol), so the query excludes this run by id.
     return renderResult(result, {
       resumed: resume?.entries.length ?? 0,
       argsChanged: resume?.argsChanged === true,
-    })
+    }, siblingRunsForSession(manifest.sessionID, runId))
   } catch (error) {
     const partial = error instanceof WorkflowRunError ? error.partial : undefined
     await settleRun({

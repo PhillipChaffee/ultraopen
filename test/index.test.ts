@@ -939,7 +939,7 @@ describe("blocking launch registration", () => {
         const manifest = await readManifest(runId, undefined)
         return manifest?.status === "running"
       }, "the manifest")
-      expect(background.activeRunForSession("blocker")?.runId).toBe(runId)
+      expect(background.liveRunsForSession("blocker")[0]?.runId).toBe(runId)
       expect(background.isLive(runId)).toBe(true)
       const second = await tool.execute(
         { script: `${META}await agent('a')\nreturn 2\n`, resumeFromRunId: runId, background: false },
@@ -948,14 +948,14 @@ describe("blocking launch registration", () => {
       expect(second).toContain("<workflow-refused>")
       expect(second).toContain("still executing")
       // The refused resume attempt drops its own entry, never the live run's.
-      expect(background.activeRunForSession("parent")).toBeUndefined()
-      expect(background.activeRunForSession("blocker")?.runId).toBe(runId)
+      expect(background.liveRunsForSession("parent")).toHaveLength(0)
+      expect(background.liveRunsForSession("blocker")[0]?.runId).toBe(runId)
     } finally {
       release()
       await blocking
     }
     // A settled blocking launch leaves no stale entry for the next launch to trip on.
-    expect(background.activeRunForSession("blocker")).toBeUndefined()
+    expect(background.liveRunsForSession("blocker")).toHaveLength(0)
     const settledRunId = asked[0]?.metadata?.runId ?? ""
     const resumed = await tool.execute(
       { script: `${META}await agent('a')\nreturn 2\n`, resumeFromRunId: settledRunId, background: false },
@@ -976,7 +976,7 @@ describe("blocking launch registration", () => {
     const runId = output.match(/id="(?<runId>[^"]+)"/u)?.[1] ?? ""
     const manifest = await readManifest(runId, undefined)
     expect(manifest?.status).toBe("failed")
-    expect(background.activeRunForSession("parent")).toBeUndefined()
+    expect(background.liveRunsForSession("parent")).toHaveLength(0)
   })
 
   test("dryRun stays exempt from registration as well as the gate", async () => {
@@ -989,14 +989,14 @@ describe("blocking launch registration", () => {
         sessionID: "parent",
         ask: () => {
           // Read mid-launch, at the ask: a dryRun must never hold the session's gate.
-          registeredAtAsk = background.activeRunForSession("parent") !== undefined
+          registeredAtAsk = background.liveRunsForSession("parent").length > 0
           return Promise.resolve()
         },
       },
     )
     expect(output).toContain("<result")
     expect(registeredAtAsk).toBe(false)
-    expect(background.activeRunForSession("parent")).toBeUndefined()
+    expect(background.liveRunsForSession("parent")).toHaveLength(0)
   })
 
   test("a rejected permission ask drops the blocking launch's entry", async () => {
@@ -1007,7 +1007,7 @@ describe("blocking launch registration", () => {
       { sessionID: "parent", ask: () => Promise.reject(new Error("user said no")) },
     )
     expect(output).toContain("user said no")
-    expect(background.activeRunForSession("parent")).toBeUndefined()
+    expect(background.liveRunsForSession("parent")).toHaveLength(0)
     // The session must be free to launch again after the rejection.
     const second = await tool.execute({ script: `${META}return 1\n`, dryRun: true }, { sessionID: "parent" })
     expect(second).toContain("<result")
@@ -1021,9 +1021,32 @@ describe("blocking launch registration", () => {
       { sessionID: "parent" },
     )
     expect(output).toContain("not a valid run id")
-    expect(background.activeRunForSession("parent")).toBeUndefined()
+    expect(background.liveRunsForSession("parent")).toHaveLength(0)
     const second = await tool.execute({ script: `${META}return 1\n`, background: false }, { sessionID: "parent" })
     expect(second).toContain("<result")
+  })
+})
+
+describe("sibling advisory on launch results", () => {
+  test("the blocking result names the session's sibling live runs", async () => {
+    // The one-live-run gate refuses any registered launch beside a live sibling,
+    // so the dryRun — which registers nothing — is the only launch that can
+    // render beside one.
+    background.registerPending("wf_sibl0001", "parent")
+    background.promote("wf_sibl0001")
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute({ script: `${META}return 1\n`, dryRun: true }, { sessionID: "parent" })
+    expect(output).toContain("<result")
+    expect(output).toContain("Sibling runs still live in this session, oldest first: wf_sibl0001 (running).")
+  })
+
+  test("a solo launch result carries no sibling advisory", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute({ script: `${META}return 1\n`, dryRun: true }, { sessionID: "parent" })
+    expect(output).toContain("<result")
+    expect(output).not.toContain("Sibling")
   })
 })
 

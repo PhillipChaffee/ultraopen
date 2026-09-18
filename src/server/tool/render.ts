@@ -19,8 +19,15 @@ import type { StatusReport } from "./status.js"
  * plugin tool output through its truncation layer, which spills the whole value to a file the
  * agent is pre-authorised to read and hands back the path. Pre-capping here would stop that spill
  * from ever firing and silently lose the tail.
+ *
+ * The sibling advisory (when the session still holds live runs) trails the usage line: the
+ * blocking call held the turn only for its own run, so the model must know what else is live.
  */
-export function renderResult(result: WorkflowResult, resume?: { resumed: number; argsChanged: boolean }): string {
+export function renderResult(
+  result: WorkflowResult,
+  resume?: { resumed: number; argsChanged: boolean },
+  siblings: readonly RunSummary[] = [],
+): string {
   const lines = [
     `<result workflow="${result.meta.name}" run="${result.runId}" agents="${result.agentCount}">`,
     typeof result.value === "string" ? result.value : JSON.stringify(result.value, null, 2),
@@ -59,6 +66,7 @@ export function renderResult(result: WorkflowResult, resume?: { resumed: number;
     `<usage agents="${result.agentCount}" failed="${result.nulls.length}" replayed="${replayed}" ` +
       `output_tokens="${result.outputTokens}" run_dir="${runDir(result.runId)}" />`,
   )
+  appendAdvisory(lines, siblings)
   return lines.join("\n")
 }
 
@@ -75,22 +83,68 @@ export function renderResult(result: WorkflowResult, resume?: { resumed: number;
  * (the run dies with the process otherwise). The variant follows the HOST, not
  * the `background` flag — a forced-background launch in a one-shot host still
  * needs the hold-the-turn text or the process exits out from under the run.
+ * When the session holds sibling live runs, the one-shot hold names them all:
+ * polling only this run would still end the turn while the siblings execute.
  */
-export function renderLaunch(workflow: string, runId: string, longLived: boolean): string {
-  return [
+export function renderLaunch(
+  workflow: string,
+  runId: string,
+  longLived: boolean,
+  siblings: readonly RunSummary[] = [],
+): string {
+  const lines = [
     `<workflow-launched run="${runId}" workflow="${workflow}" dir="${runDir(runId)}">`,
     "The run is executing in the background; this message does not contain its outcome.",
-    longLived
-      ? `This host keeps the process alive, so the run settles on its own — end your turn and let it work. ` +
+  ]
+  if (longLived) {
+    lines.push(
+      `This host keeps the process alive, so the run settles on its own — end your turn and let it work. ` +
         `Poll workflow_status(runId: "${runId}", wait: 120) when the user asks about the run, or when the ` +
-        `current task cannot finish without the run's value.`
-      : `Poll workflow_status(runId: "${runId}", wait: 120) until the status is not "running" to get the final value or the failure. Before ending your turn, poll until the run settles.`,
-    "</workflow-launched>",
-  ].join("\n")
+        `current task cannot finish without the run's value.`,
+    )
+  } else if (siblings.length === 0) {
+    lines.push(
+      `Poll workflow_status(runId: "${runId}", wait: 120) until the status is not "running" to get the final value or the failure. Before ending your turn, poll until the run settles.`,
+    )
+  } else {
+    const hold = siblings.length === 0
+      ? "Before ending your turn, poll until the run settles."
+      : "Before ending your turn, poll workflow_status for each live run id in this message until all runs settle."
+    lines.push(
+      `Poll workflow_status(runId: "${runId}", wait: 120) until the status is not "running" to get the final value or the failure. ${hold}`,
+    )
+  }
+  appendAdvisory(lines, siblings)
+  lines.push("</workflow-launched>")
+  return lines.join("\n")
+}
+
+/** A run as the model-facing renders name it: its id and status. */
+export interface RunSummary {
+  runId: string
+  status: string
+}
+
+/**
+ * One advisory line naming every sibling live run, oldest first.
+ *
+ * Empty input renders nothing: an append must add no line, not an empty one.
+ * The renderer is naming only — the poll instructions live in the contract
+ * sentences around it, which differ per contract.
+ */
+export function renderSiblingAdvisory(siblings: readonly RunSummary[]): string {
+  if (siblings.length === 0) {return ""}
+  const named = siblings.map((sibling) => `${sibling.runId} (${sibling.status})`).join(", ")
+  return `Sibling runs still live in this session, oldest first: ${named}.`
+}
+
+function appendAdvisory(lines: string[], siblings: readonly RunSummary[]): void {
+  const advisory = renderSiblingAdvisory(siblings)
+  if (advisory !== "") {lines.push(advisory)}
 }
 
 /** Names the run that already occupies this session, so the model polls instead of relaunching. */
-export function renderRefusal(active: { runId: string; status: string }): string {
+export function renderRefusal(active: RunSummary): string {
   return [
     "<workflow-refused>",
     `This session already has a workflow run in flight (${active.status}): run id ${active.runId}, directory ${runDir(active.runId)}.`,

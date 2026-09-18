@@ -1,16 +1,17 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import {
-  activeRunForSession,
   dropPending,
   dropSettled,
   isLive,
   isLiveAnywhere,
   isProcessAlive,
+  liveRunsForSession,
   promote,
   registerPending,
   resetForTests,
   runDetached,
   settlePromiseOf,
+  siblingRunsForSession,
 } from "../src/server/tool/background.js"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -45,27 +46,27 @@ beforeEach(() => {
 describe("launch-gating registry", () => {
   test("registerPending makes a run live for its session, synchronously", () => {
     registerPending("wf_bg000001", "s1")
-    expect(activeRunForSession("s1")?.runId).toBe("wf_bg000001")
-    expect(activeRunForSession("s1")?.status).toBe("pending")
+    expect(liveRunsForSession("s1")[0]?.runId).toBe("wf_bg000001")
+    expect(liveRunsForSession("s1")[0]?.status).toBe("pending")
     expect(isLive("wf_bg000001")).toBe(true)
   })
 
   test("promote moves pending to running", () => {
     registerPending("wf_bg000002", "s1")
     promote("wf_bg000002")
-    expect(activeRunForSession("s1")?.status).toBe("running")
+    expect(liveRunsForSession("s1")[0]?.status).toBe("running")
   })
 
   test("dropPending removes only pending entries", () => {
     registerPending("wf_bg000003", "s1")
     dropPending("wf_bg000003")
-    expect(activeRunForSession("s1")).toBeUndefined()
+    expect(liveRunsForSession("s1")).toHaveLength(0)
     // A running entry is launch-gating state, not launch residue; dropping it
     // would let a second run slip past the refusal.
     registerPending("wf_bg000004", "s1")
     promote("wf_bg000004")
     dropPending("wf_bg000004")
-    expect(activeRunForSession("s1")?.runId).toBe("wf_bg000004")
+    expect(liveRunsForSession("s1")[0]?.runId).toBe("wf_bg000004")
   })
 
   test("dropSettled removes the entry whatever status it reached", () => {
@@ -74,31 +75,74 @@ describe("launch-gating registry", () => {
     // or a settled run would strand the session gate and the resume refusal.
     registerPending("wf_bg000009", "s1")
     dropSettled("wf_bg000009")
-    expect(activeRunForSession("s1")).toBeUndefined()
+    expect(liveRunsForSession("s1")).toHaveLength(0)
     registerPending("wf_bg000010", "s1")
     promote("wf_bg000010")
     dropSettled("wf_bg000010")
-    expect(activeRunForSession("s1")).toBeUndefined()
+    expect(liveRunsForSession("s1")).toHaveLength(0)
   })
 
   test("entries are scoped per session and dropped on settle", async () => {
     registerPending("wf_bg000005", "s1")
     await runDetached({ runId: "wf_bg000005", manifest: undefined, task: async () => {}, renderFailure: FAKE_RENDER, onEscapedRejection: ESCAPE_RECORDER })
-    expect(activeRunForSession("s1")).toBeUndefined()
-    expect(activeRunForSession("s2")).toBeUndefined()
+    expect(liveRunsForSession("s1")).toHaveLength(0)
+    expect(liveRunsForSession("s2")).toHaveLength(0)
   })
 
   test("each session sees only its own live run", () => {
     registerPending("wf_bg000006", "s1")
     registerPending("wf_bg000007", "s2")
-    expect(activeRunForSession("s1")?.runId).toBe("wf_bg000006")
-    expect(activeRunForSession("s2")?.runId).toBe("wf_bg000007")
+    expect(liveRunsForSession("s1")[0]?.runId).toBe("wf_bg000006")
+    expect(liveRunsForSession("s2")[0]?.runId).toBe("wf_bg000007")
+  })
+
+  test("the session query returns EVERY live entry, oldest start first", () => {
+    // Stamps are injectable so the order contract is pinned independently of the
+    // clock: out-of-order registration sorts by start time, and entries stamped
+    // in the same millisecond keep registration order (the registry inserts
+    // each entry in the same synchronous step as its stamp, so insertion
+    // order IS start order).
+    registerPending("wf_bg000011", "s1", 300)
+    registerPending("wf_bg000012", "s2", 100)
+    registerPending("wf_bg000013", "s1", 200)
+    registerPending("wf_bg000014", "s1", 200)
+    expect(liveRunsForSession("s1").map((entry) => entry.runId)).toEqual([
+      "wf_bg000013",
+      "wf_bg000014",
+      "wf_bg000011",
+    ])
+    // Another session's entries never leak in.
+    expect(liveRunsForSession("s2").map((entry) => entry.runId)).toEqual(["wf_bg000012"])
+  })
+
+  test("the session query carries each entry's status, pending and running alike", () => {
+    registerPending("wf_bg000015", "s1")
+    registerPending("wf_bg000016", "s1")
+    promote("wf_bg000015")
+    const live = liveRunsForSession("s1")
+    expect(live.map((entry) => entry.status)).toEqual(["running", "pending"])
+  })
+
+  test("the sibling query excludes the named run and keeps start order", () => {
+    registerPending("wf_bg000016", "s1", 100)
+    registerPending("wf_bg000017", "s1", 200)
+    registerPending("wf_bg000018", "s1", 300)
+    expect(siblingRunsForSession("s1", "wf_bg000017").map((entry) => entry.runId)).toEqual([
+      "wf_bg000016",
+      "wf_bg000018",
+    ])
+    // An unknown id excludes nothing: every live entry is a sibling.
+    expect(siblingRunsForSession("s1", "wf_bg000019").map((entry) => entry.runId)).toEqual([
+      "wf_bg000016",
+      "wf_bg000017",
+      "wf_bg000018",
+    ])
   })
 
   test("resetForTests restores clean module state", () => {
     registerPending("wf_bg000008", "s1")
     resetForTests()
-    expect(activeRunForSession("s1")).toBeUndefined()
+    expect(liveRunsForSession("s1")).toHaveLength(0)
   })
 })
 
@@ -152,7 +196,7 @@ describe("runDetached", () => {
     // The handle must exist while the task is in flight.
     expect(settlePromiseOf("wf_bg000100")).toBeDefined()
     await pending
-    expect(activeRunForSession("s1")).toBeUndefined()
+    expect(liveRunsForSession("s1")).toHaveLength(0)
     // After settle the handle is gone: a late await resolves immediately rather
     // than returning the settled promise (or hanging).
     await settlePromiseOf("wf_bg000100")
@@ -202,7 +246,7 @@ describe("runDetached — unwritable disk", () => {
     process.env["XDG_DATA_HOME"] = "/dev/null/nope"
     try {
       await runDetached({ runId: "wf_bg000200", manifest: undefined, task: BROKEN_TASK, renderFailure: FAKE_RENDER, onEscapedRejection: ESCAPE_RECORDER })
-      expect(activeRunForSession("s1")).toBeUndefined()
+      expect(liveRunsForSession("s1")).toHaveLength(0)
     } finally {
       if (savedXDG === undefined) {delete process.env["XDG_DATA_HOME"]}
       else {process.env["XDG_DATA_HOME"] = savedXDG}
