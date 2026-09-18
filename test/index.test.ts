@@ -83,6 +83,9 @@ const waitFor = async (until: () => boolean | Promise<boolean>, what: string): P
   throw new Error(`timed out waiting for ${what}`)
 }
 
+/** The launch result's run id, for tests that need to name a run they launched. */
+const runIdOf = (output: string): string => output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
+
 let savedEnv: string | undefined
 
 beforeEach(() => {
@@ -608,6 +611,23 @@ const hangingClient = {
   session: { ...stubClient.session, prompt: () => new Promise(() => {}) },
 }
 
+/**
+ * A client whose child prompt settles only when the test releases it, so a
+ * blocking run can be observed live and then let settle on demand.
+ */
+const gatedClient = () => {
+  let arm: (() => void) | undefined
+  const gate = new Promise<void>((resolve) => {arm = resolve})
+  return {
+    client: {
+      config: stubClient.config,
+      session: { ...stubClient.session, prompt: () => gate.then(() => ({ data: { info: {}, parts: [] } })) },
+    },
+    // The executor runs synchronously, so the release is armed before this returns.
+    release: (): void => {arm?.()},
+  }
+}
+
 describe("background launch contract", () => {
   const statusToolOf = (hooks: Record<string, unknown>): ToolDef | undefined => {
     const tools = hooks["tool"] as Record<string, ToolDef> | undefined
@@ -901,23 +921,6 @@ describe("background launch contract", () => {
 })
 
 describe("blocking launch registration", () => {
-  /**
-   * A client whose child prompt settles only when the test releases it, so a
-   * blocking run can be observed live and then let settle on demand.
-   */
-  const gatedClient = () => {
-    let arm: (() => void) | undefined
-    const gate = new Promise<void>((resolve) => {arm = resolve})
-    return {
-      client: {
-        config: stubClient.config,
-        session: { ...stubClient.session, prompt: () => gate.then(() => ({ data: { info: {}, parts: [] } })) },
-      },
-      // The executor runs synchronously, so the release is armed before this returns.
-      release: (): void => {arm?.()},
-    }
-  }
-
   test("a blocking launch registers a pending entry, so the resume gate covers it while it executes", async () => {
     const { client, release } = gatedClient(),
       tool = toolOf(ultraopen({ client }))
@@ -1079,6 +1082,252 @@ describe("background launch contract — unwritable run directory", () => {
     else {process.env["XDG_DATA_HOME"] = savedXDG}
     const second = await tool.execute({ script: `${META}return 1\n`, dryRun: true }, { sessionID: "parent" })
     expect(second).toContain("<result")
+  })
+})
+
+describe("ultracode launch gate", () => {
+  // The gate reads the mode singleton at launch time; each test drives the real
+  // singleton (enable/default-on/agent), never a mock.
+  const launch = (tool: ToolDef, sessionID: string, over: Record<string, unknown> = {}): Promise<string> =>
+    tool.execute({ script: `${META}await agent('a')\nreturn 1\n`, background: true, ...over }, { sessionID })
+
+  test("a non-ultracode second launch keeps the plain one-live-run refusal verbatim", async () => {
+    const tool = toolOf(ultraopen({ client: hangingClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const first = await launch(tool, "parent")
+    expect(first).toContain("<workflow-launched")
+    const second = await launch(tool, "parent", { script: `${META}return 2\n` })
+    expect(second).toContain("<workflow-refused>")
+    // The pre-existing refusal text, unchanged: names THE one run, not a cap.
+    expect(second).toContain("already has a workflow run in flight")
+    expect(second).not.toContain("live-run cap")
+  })
+
+  test("an ultracode session holds concurrent live runs below the cap; each launch names its siblings", async () => {
+    mode.enable("parent", "command")
+    const tool = toolOf(ultraopen({ client: hangingClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const first = await launch(tool, "parent")
+    expect(first).toContain("<workflow-launched")
+    const second = await launch(tool, "parent", { script: `${META}await agent('b')\nreturn 2\n` })
+    expect(second).toContain("<workflow-launched")
+    // The second launch result names the first run as its sibling.
+    expect(second).toContain(`Sibling runs still live in this session, oldest first: ${runIdOf(first)} (running).`)
+  })
+
+  test("two ultracode launches in the same tick both succeed (the gate is conditional, not per-session)", async () => {
+    mode.enable("parent", "command")
+    const tool = toolOf(ultraopen({ client: hangingClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const [a, b] = await Promise.all([
+      tool.execute({ script: `${META}await agent('a')\nreturn 1\n`, background: true }, { sessionID: "parent" }),
+      tool.execute({ script: `${META}await agent('b')\nreturn 2\n`, background: true }, { sessionID: "parent" }),
+    ])
+    expect(a).toContain("<workflow-launched")
+    expect(b).toContain("<workflow-launched")
+  })
+
+  test("an at-cap launch is refused naming every live run id; finishing one frees a slot", async () => {
+    mode.enable("parent", "command")
+    const tool = toolOf(ultraopen({ client: hangingClient }, { ultracodeMaxRuns: 2 }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const first = await launch(tool, "parent"),
+      second = await launch(tool, "parent", { script: `${META}await agent('b')\nreturn 2\n` }),
+      firstRunId = runIdOf(first),
+      secondRunId = runIdOf(second)
+    const third = await launch(tool, "parent", { script: `${META}return 3\n` })
+    expect(third).toContain("<workflow-refused>")
+    expect(third).toContain("live-run cap of 2")
+    // Every live run id is named, so the model can wait on one.
+    expect(third).toContain(firstRunId)
+    expect(third).toContain(secondRunId)
+    // The refused call registered nothing and created no run dir of its own.
+    expect(background.liveRunsForSession("parent")).toHaveLength(2)
+    // Finishing one run frees a slot — runDetached's settle cleanup drops the
+    // entry (pinned at the registry seam); the tool must read the freed state.
+    background.dropSettled(firstRunId)
+    const fourth = await launch(tool, "parent", { script: `${META}return 4\n` })
+    expect(fourth).toContain("<workflow-launched")
+  })
+
+  test("the ultracode-agent activation surface: the agent name the host delivers on the tool context", async () => {
+    // No mode state at all — the driving agent's name is the only signal, the
+    // way the host delivers `agent` on the tool-execute context (cited on
+    // ToolContext in src/server/index.ts).
+    const tool = toolOf(ultraopen({ client: hangingClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const first = await launch(tool, "parent")
+    const concurrent = await tool.execute(
+      { script: `${META}await agent('b')\nreturn 2\n`, background: true },
+      { sessionID: "parent", agent: "ultracode" },
+    )
+    expect(concurrent).toContain("<workflow-launched")
+    // The concurrent launch names the earlier one as its sibling.
+    expect(concurrent).toContain(`Sibling runs still live in this session, oldest first: ${runIdOf(first)} (running).`)
+    // The same launch from a plain agent on the SAME session (and no mode state)
+    // is refused as ever — the agent name is the only difference.
+    const plain = await tool.execute(
+      { script: `${META}await agent('b')\nreturn 3\n`, background: true },
+      { sessionID: "parent", agent: "build" },
+    )
+    expect(plain).toContain("<workflow-refused>")
+    // And with NO agent name delivered, the plain refusal holds too.
+    const unnamed = await launch(tool, "parent", { script: `${META}return 4\n` })
+    expect(unnamed).toContain("<workflow-refused>")
+  })
+
+  test("the plugin-options ultracode flag (default-on) also opens the cap", async () => {
+    // Through the option itself, not a direct setDefault: plugin init sets the
+    // project default from the same tuple.
+    const tool = toolOf(ultraopen({ client: hangingClient }, { ultracode: true }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const first = await launch(tool, "fresh")
+    const second = await launch(tool, "fresh", { script: `${META}await agent('b')\nreturn 2\n` })
+    expect(second).toContain("<workflow-launched")
+    expect(second).toContain(`Sibling runs still live in this session, oldest first: ${runIdOf(first)} (running).`)
+  })
+
+  test("a demoted session's launch behaves like any ultracode launch (demotion is prompt-level)", async () => {
+    mode.enable("parent", "keyword")
+    mode.demote("parent")
+    const tool = toolOf(ultraopen({ client: hangingClient }, { ultracodeMaxRuns: 2 }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const first = await launch(tool, "parent")
+    const second = await launch(tool, "parent", { script: `${META}await agent('b')\nreturn 2\n` })
+    // Below the cap: demotion changed nothing — the launch succeeds normally.
+    expect(second).toContain("<workflow-launched")
+    const third = await launch(tool, "parent", { script: `${META}return 3\n` })
+    // At the cap: the same refusal as any ultracode session.
+    expect(third).toContain("<workflow-refused>")
+    expect(third).toContain("live-run cap of 2")
+    expect(third).toContain(runIdOf(first))
+  })
+
+  test("the env kill switch keeps forcing blocking in an ultracode session", async () => {
+    mode.enable("parent", "command")
+    process.env["ULTRAOPEN_WORKFLOW_SYNC"] = "1"
+    try {
+      const tool = toolOf(ultraopen({ client: stubClient }))
+      if (!tool) {throw new Error("tool was not registered")}
+      // No background arg: the env kill switch pins the contract via its
+      // documented precedence (env > option > default); no ultracode override.
+      const output = await launch(tool, "parent", { script: `${META}await agent('a')\nreturn 'sync-value'\n`, background: undefined })
+      expect(output).toContain("<result")
+      expect(output).not.toContain("<workflow-launched")
+    } finally {
+      delete process.env["ULTRAOPEN_WORKFLOW_SYNC"]
+    }
+  })
+
+  test("a pinned runMode: 'blocking' is respected under ultracode", async () => {
+    mode.enable("parent", "command")
+    const tool = toolOf(ultraopen({ client: stubClient }, { runMode: "blocking" }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await launch(tool, "parent", { background: undefined })
+    expect(output).toContain("<result")
+    expect(output).not.toContain("<workflow-launched")
+    expect(background.liveRunsForSession("parent")).toHaveLength(0)
+  })
+
+  test("the gate covers the blocking contract in ultracode: a launch beside a live blocking run sits below the cap, at the cap it is refused", async () => {
+    mode.enable("parent", "command")
+    const { client, release } = gatedClient(),
+      tool = toolOf(ultraopen({ client }, { ultracodeMaxRuns: 2 }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const asked: { metadata?: { runId?: string } }[] = []
+    let runId = ""
+    const blocking = tool.execute(
+      { script: `${META}await agent('a')\nreturn 1\n`, background: false },
+      { sessionID: "parent", ask: (request: { metadata?: { runId?: string } }) => { asked.push(request); return Promise.resolve() } },
+    )
+    try {
+      await waitFor(() => asked.length > 0, "the permission ask")
+      runId = asked[0]?.metadata?.runId ?? ""
+      await waitFor(async () => {
+        const manifest = await readManifest(runId, undefined)
+        return manifest?.status === "running"
+      }, "the manifest")
+      expect(background.isLive(runId)).toBe(true)
+      // Below the cap, a background launch beside the live blocking run succeeds.
+      const concurrent = await launch(tool, "parent", { script: `${META}await agent('b')\nreturn 2\n` })
+      expect(concurrent).toContain("<workflow-launched")
+      // The blocking run's gate entry is named, whatever its registration status.
+      expect(concurrent).toContain(`Sibling runs still live in this session, oldest first: ${runId} (pending).`)
+      // A seeded third live run puts the session at the cap: refused, naming all.
+      background.registerPending("wf_seed0001", "parent", 1)
+      const atCap = await launch(tool, "parent", { script: `${META}return 3\n` })
+      expect(atCap).toContain("<workflow-refused>")
+      expect(atCap).toContain("live-run cap of 2")
+      expect(atCap).toContain(runId)
+      expect(atCap).toContain("wf_seed0001")
+    } finally {
+      release()
+      await blocking
+    }
+    // The blocking run's own gate entry is dropped at settle; the concurrent
+    // background run (a never-settling client here) keeps its entry by design.
+    expect(background.isLive(runId)).toBe(false)
+  })
+
+  test("finishing a run through the REAL settle path frees its slot", async () => {
+    // Two gated clients: each run's prompt settles only when ITS gate is
+    // released, so a slot can be freed deterministically without registry
+    // surgery. The module-level registry is shared, so two tool instances see
+    // each other's entries.
+    mode.enable("parent", "command")
+    const gateA = gatedClient(),
+      gateB = gatedClient(),
+      toolA = toolOf(ultraopen({ client: gateA.client }, { ultracodeMaxRuns: 2 })),
+      toolB = toolOf(ultraopen({ client: gateB.client }, { ultracodeMaxRuns: 2 })),
+      toolFree = toolOf(ultraopen({ client: stubClient }, { ultracodeMaxRuns: 2 }))
+    if (!toolA || !toolB || !toolFree) {throw new Error("tool was not registered")}
+    const askedA: { metadata?: { runId?: string } }[] = [],
+      askedB: { metadata?: { runId?: string } }[] = []
+    const runA = toolA.execute(
+      { script: `${META}await agent('a')\nreturn 1\n`, background: false },
+      { sessionID: "parent", ask: (request: { metadata?: { runId?: string } }) => { askedA.push(request); return Promise.resolve() } },
+    )
+    const runB = toolB.execute(
+      { script: `${META}await agent('b')\nreturn 2\n`, background: false },
+      { sessionID: "parent", ask: (request: { metadata?: { runId?: string } }) => { askedB.push(request); return Promise.resolve() } },
+    )
+    try {
+      await waitFor(() => askedA.length > 0 && askedB.length > 0, "both permission asks")
+      const aId = askedA[0]?.metadata?.runId ?? "",
+        bId = askedB[0]?.metadata?.runId ?? ""
+      // At the cap of 2, a third launch is refused naming both live runs.
+      const third = await launch(toolA, "parent", { script: `${META}return 3\n` })
+      expect(third).toContain("<workflow-refused>")
+      expect(third).toContain(aId)
+      expect(third).toContain(bId)
+      // A real settle — the gate released, the run completed, runDetached's
+      // settle cleanup dropped the entry — must free the slot for the tool.
+      gateA.release()
+      await runA
+      await waitFor(() => !background.isLive(aId), "run A's settle")
+      // The freed slot is visible to a launch from a settling client (a gated
+      // client here would hang the turn on its own unreleased prompt).
+      const fourth = await launch(toolFree, "parent", { script: `${META}return 4\n` })
+      expect(fourth).toContain("<workflow-launched")
+      await background.settlePromiseOf(fourth.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? "")
+    } finally {
+      gateB.release()
+      await runB
+    }
+    expect(background.liveRunsForSession("parent")).toHaveLength(0)
+  })
+
+  test("dryRun stays exempt from the gate in ultracode too", async () => {
+    mode.enable("parent", "command")
+    const tool = toolOf(ultraopen({ client: stubClient }, { ultracodeMaxRuns: 1 }))
+    if (!tool) {throw new Error("tool was not registered")}
+    // A live run at the cap refuses a real launch...
+    background.registerPending("wf_seed0002", "parent")
+    const real = await launch(tool, "parent")
+    expect(real).toContain("<workflow-refused>")
+    // ...but a dryRun — which spawns nothing — still goes through.
+    const dry = await tool.execute({ script: `${META}return 2\n`, dryRun: true }, { sessionID: "parent" })
+    expect(dry).toContain("<result")
   })
 })
 

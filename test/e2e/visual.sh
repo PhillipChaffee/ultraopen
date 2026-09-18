@@ -209,9 +209,32 @@ PYL
   assert_pane_contains "large-run badge in the summary" "· large run" 5
   frame 05b-large-run
 
+  section "V2d — two runs of one session across the surfaces, and a foreign session's run filtered out"
+  # The TUI renders N concurrent runs per session on every surface (the
+  # concurrent-launch policy: docs/adr/0001-launch-concurrency-policy.md).
+  # Run A's snapshot still holds V2c2's 20 bulk agents, which would clip run B
+  # out of the sidebar panel — restore the two-agent shape first.
+  synth_run wf_synth_a "$SID" e2e-visual Verify "alpha:one" "running" "alpha:two" "done"
   synth_run wf_synth_b "$SID" e2e-other Probe "beta:one" "running"
   assert_pane_contains "prompt status collapses to run count" "ultracode ⠋ 2 runs" 5
   assert_pane_contains "strip lists both runs" "ultracode · e2e-other" 5
+  assert_pane_contains "strip keeps the first run" "ultracode · e2e-visual" 5
+  if ! sidebar_open; then
+    # The toggle races a repaint, so retry it; the assertions below run either way.
+    for attempt in 1 2 3; do
+      tui_keys C-x; sleep 0.5; tui_keys b
+      if wait_for 8 sidebar_open; then break; fi
+      note "toggle attempt $attempt did not open the sidebar — retrying"
+    done
+  fi
+  assert_pane_contains "sidebar renders both runs' summaries" "e2e-other" 5
+  assert_pane_contains "sidebar renders run A's agent row" "⠋ alpha:one" 5
+  assert_pane_contains "sidebar renders run B's agent row" "⠋ beta:one" 5
+  # A run belonging to a DIFFERENT session must never reach this session's view:
+  # every surface filters by session id.
+  synth_run wf_synth_stray "ses_stray0000000000000000" e2e-stray Stray "gamma:one" "running"
+  assert_pane_lacks "a foreign session's run is filtered out of the strip" "ultracode · e2e-stray" 5
+  assert_pane_lacks "a foreign session's run is filtered out of the sidebar" "gamma:one" 5
   frame 06-multi-run
 
   section "V2e — narrow pane keeps the marker prefixes"
@@ -225,6 +248,8 @@ PYL
   section "V2f — terminal status makes surfaces vanish (live-only display)"
   synth_finish wf_synth_a completed
   synth_finish wf_synth_b completed
+  # The foreign-session run settles too, so no later boot reaps it into a hint.
+  synth_finish wf_synth_stray completed
   assert_pane_lacks "prompt-row marker gone after completion" "ultracode ⠋ " 5
   assert_pane_lacks "strip marker gone after completion" "ultracode · e2e-visual" 5
   frame 08-vanished

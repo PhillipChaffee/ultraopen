@@ -153,6 +153,25 @@ export function renderRefusal(active: RunSummary): string {
   ].join("\n")
 }
 
+/**
+ * A launch at an ultracode session's live-run cap.
+ *
+ * Every live run is named (run id + status, oldest first): the model must know
+ * what is in flight and pick one to wait on, since finishing any run frees a
+ * slot. The plain one-live-run refusal above stays the non-ultracode refusal —
+ * the two texts differ because the cap refusal names several runs and states
+ * the ceiling.
+ */
+export function renderCapRefusal(runs: readonly RunSummary[], cap: number): string {
+  const named = runs.map((run) => `${run.runId} (${run.status})`).join(", ")
+  return [
+    "<workflow-refused>",
+    `This session already holds ${runs.length} concurrent workflow runs — at the live-run cap of ${cap}: ${named}.`,
+    `Poll workflow_status for each run id until at least one settles, then launch again.`,
+    "</workflow-refused>",
+  ].join("\n")
+}
+
 /** A resume whose id is malformed or whose source run is still owned by a live process. */
 export function renderResumeRefusal(runId: string, pid: number | undefined): string {
   const reason =

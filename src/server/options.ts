@@ -14,6 +14,12 @@ export interface UltraopenOptions {
   concurrency: number
   /** When true, ultracode's standing opt-in applies from the first turn in this project. */
   ultracode: boolean
+  /**
+   * Live-run cap for an ultracode-active session: how many workflow runs may be
+   * pending or running in it at once. Non-ultracode sessions keep the one-live-run
+   * refusal regardless of this value.
+   */
+  ultracodeMaxRuns: number
   /** Wall-clock ceiling for a single agent, in milliseconds. 0 disables it; the idle limit remains. */
   agentDeadlineMs: number
   /** Inactivity bound for a single agent, in milliseconds. The timer resets on child progress. */
@@ -47,6 +53,7 @@ export interface UltraopenOptions {
 const DEFAULTS: UltraopenOptions = {
   concurrency: 8,
   ultracode: false,
+  ultracodeMaxRuns: 8,
   agentDeadlineMs: 4 * 60 * 60 * 1000,
   agentIdleMs: 5 * 60 * 1000,
   effortPreference: ["xhigh", "max", "high", "medium", "low"],
@@ -70,8 +77,9 @@ export function resolveOptions(raw: unknown): UltraopenOptions {
   const input = raw as Record<string, unknown>
 
   return {
-    concurrency: clampConcurrency(input["concurrency"]),
+    concurrency: clampCount(input["concurrency"], DEFAULTS.concurrency),
     ultracode: input["ultracode"] === true || input["mode"] === "ultracode",
+    ultracodeMaxRuns: clampCount(input["ultracodeMaxRuns"], DEFAULTS.ultracodeMaxRuns),
     agentDeadlineMs: clampTimeout(input["agentDeadlineMs"], DEFAULTS.agentDeadlineMs, true),
     agentIdleMs: clampTimeout(input["agentIdleMs"], DEFAULTS.agentIdleMs, false),
     effortPreference: stringArray(input["effortPreference"]) ?? DEFAULTS.effortPreference,
@@ -123,13 +131,14 @@ function resolveRunMode(value: unknown): "background" | "blocking" {
 }
 
 /**
- * Clamps concurrency into range.
+ * Clamps a count option into [MIN_CONCURRENCY, MAX_CONCURRENCY].
  *
  * 0 is deliberately NOT honoured: `0 ?? 8` is `0`, and a limit below one makes every acquire wait
- * forever — a hang with no throw, no log and no progress.
+ * forever — a hang with no throw, no log and no progress. Shared by the two count-shaped options,
+ * `concurrency` and `ultracodeMaxRuns`, so both reject a zero the same way.
  */
-function clampConcurrency(value: unknown): number {
-  if (typeof value !== "number" || !Number.isFinite(value)) {return DEFAULTS.concurrency}
+function clampCount(value: unknown, fallback: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {return fallback}
   return Math.min(MAX_CONCURRENCY, Math.max(MIN_CONCURRENCY, Math.floor(value)))
 }
 

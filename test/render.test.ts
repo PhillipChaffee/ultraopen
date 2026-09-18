@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { renderLaunch, renderResult, renderSiblingAdvisory } from "../src/server/tool/render.js"
+import { renderCapRefusal, renderLaunch, renderRefusal, renderResult, renderSiblingAdvisory } from "../src/server/tool/render.js"
 import type { WorkflowResult } from "../src/server/tool/workflow.js"
 
 /** A minimal settled result; the advisory pins concern the siblings, not the payload. */
@@ -35,6 +35,43 @@ describe("renderSiblingAdvisory", () => {
     // One line: no newline inside the advisory itself.
     expect(advisory.includes("\n")).toBe(false)
     expect(advisory).toContain("Sibling runs still live in this session, oldest first:")
+  })
+})
+
+describe("renderCapRefusal", () => {
+  test("names every live run id and status, oldest first", () => {
+    const refused = renderCapRefusal(siblings, 2)
+    expect(refused).toContain("<workflow-refused>")
+    expect(refused).toContain("wf_sibl001 (running)")
+    expect(refused).toContain("wf_sibl002 (pending)")
+    // Oldest first: the caller orders the list, the render preserves it.
+    expect(refused.indexOf("wf_sibl001")).toBeLessThan(refused.indexOf("wf_sibl002"))
+    expect(refused).toContain("</workflow-refused>")
+  })
+
+  test("states the cap and the live count so the model knows what to wait for", () => {
+    const refused = renderCapRefusal(siblings, 2)
+    expect(refused).toContain("2 concurrent workflow runs")
+    expect(refused).toContain("cap of 2")
+    // The way back: poll the live runs, not relaunch.
+    expect(refused).toContain("workflow_status")
+  })
+
+  test("a cap of 1 with one live run still names the run (distinct from the plain refusal)", () => {
+    const refused = renderCapRefusal([{ runId: "wf_solo0001", status: "running" }], 1)
+    expect(refused).toContain("wf_solo0001 (running)")
+    expect(refused).toContain("cap of 1")
+  })
+})
+
+describe("renderRefusal", () => {
+  // The non-ultracode refusal is preserved verbatim; this pins the text the
+  // conditional gate must not change.
+  test("names the one active run and its status", () => {
+    const refused = renderRefusal({ runId: "wf_solo0002", status: "running" })
+    expect(refused).toContain("<workflow-refused>")
+    expect(refused).toContain("already has a workflow run in flight (running): run id wf_solo0002")
+    expect(refused).toContain('Poll workflow_status(runId: "wf_solo0002", wait: 120)')
   })
 })
 

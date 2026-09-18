@@ -162,11 +162,21 @@ process exits right after the turn, so the result instead keeps the turn alive: 
 until the run settles — an unsettled run dies with the process (its completed agents survive on
 disk and a later `resumeFromRunId` replays them). If you need the old synchronous behavior, set
 the plugin option `"runMode": "blocking"` or the env `ULTRAOPEN_WORKFLOW_SYNC=1`; `dryRun` always
-waits. One live run per session (both contracts; `dryRun` is exempt — it is free and spawns
-nothing): a second launch is refused with the active run id, and resuming a run that is still
-executing is refused for the same reason — two engines would write one journal. Until the
-run-control epic lands there is no stop
-tool: to stop a run, end the opencode process; finished agents are preserved for resume.
+waits.
+
+How many runs one session may hold is conditional on ultracode (policy and rationale in
+[docs/adr/0001-launch-concurrency-policy.md](./docs/adr/0001-launch-concurrency-policy.md)): a
+session that is not in ultracode keeps the one-live-run rule — a second launch is refused naming
+the active run id. An ultracode-active session (the `ultracode` agent, the keyword, `/ultracode`,
+or the project config flag) may hold up to `ultracodeMaxRuns` (default 8, clamped to 1–32) live
+runs across both contracts: every launch result names its sibling live runs, and a launch at the
+cap is refused naming every live run id — finishing any run frees a slot. Saying "don't fan out"
+demotes ultracode at the prompt level only: it changes the standing guidance, never the gate, so
+an explicitly requested workflow still launches normally. `dryRun` is exempt from the gate in both
+modes — it is free and spawns nothing. Resuming a run that is still executing is refused in both
+modes for the same reason — two engines would write one journal. Until the run-control epic lands
+there is no stop tool: to stop a run, end the opencode process; finished agents are preserved for
+resume.
 
 | Global | Behavior |
 | --- | --- |
@@ -224,6 +234,9 @@ above.
    ```
    - `concurrency` — global cap on live agents. Default 8, clamped to 1–32, 0 rejected.
    - `ultracode` or `mode: "ultracode"` — enable `ultracode` effort mode. Default off.
+   - `ultracodeMaxRuns` — how many workflow runs an ultracode-active session may hold at once
+     (pending or running, both contracts). Default 8, clamped to 1–32, 0 rejected. Non-ultracode
+     sessions always hold one, whatever this is set to.
    - `agentDeadlineMs` — wall-clock ceiling per agent, in milliseconds. Default 4 h; `0` disables
      it (real agents legitimately run for hours; the wall clock only bounds pathology).
    - `agentIdleMs` — inactivity limit per agent, in milliseconds. Default 5 min; the timer resets

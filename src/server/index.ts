@@ -31,6 +31,7 @@ import {
   renderResult,
   renderLaunch,
   renderRefusal,
+  renderCapRefusal,
   renderResumeRefusal,
   renderStatus,
   workflowArgsSchema,
@@ -58,6 +59,12 @@ import { ProgressWriter } from "./resume/progress.js"
 interface ToolContext {
   sessionID: string
   messageID?: string
+  /**
+   * The driving agent's name, delivered by the host on the tool-execute context
+   * (verified against opencode 1.18.31 — packages/plugin/src/tool.ts). It is the
+   * `ultracode` agent's activation surface for the launch gate.
+   */
+  agent?: string
   abort?: AbortSignal
   ask?: (input: { permission: string; patterns: string[]; always: string[]; metadata?: unknown }) => Promise<void>
 }
@@ -294,19 +301,28 @@ async function launchWorkflow(
   }),
    scanNoteLines = scanNotes.length > 0 ? ["", "<scan-notes>", ...scanNotes, "</scan-notes>"] : []
 
-  // One live run per session, for BOTH contracts (see lifecycle-policy.md): a
-  // blocking call inside a turn serializes itself anyway, but mixed contracts
-  // would put two agent-spending runs in one session. dryRun is exempt — it is
-  // free, stubbed, and the standard way to debug a script mid-run. Both
-  // contracts register: the resume gate defers to this registry on the same
-  // boot (isLiveAnywhere), so a blocking run invisible here would let a
-  // same-boot resume run two engines against one journal. Launch-gating state
-  // is registered SYNCHRONOUSLY, before the first await, so two calls from one
-  // session in the same tick cannot both pass the refusal check (the
-  // check-then-act race). Every early return below must drop it.
+  // One live run per session for non-ultracode sessions, for BOTH contracts (see
+  // lifecycle-policy.md): a blocking call inside a turn serializes itself anyway,
+  // but mixed contracts would put two agent-spending runs in one session. dryRun
+  // is exempt — it is free, stubbed, and the standard way to debug a script
+  // mid-run. Ultracode-active sessions (policy: docs/adr/0001-launch-concurrency-policy.md)
+  // bypass that refusal up to the live-run cap `ultracodeMaxRuns` — a launch at
+  // the cap is refused naming every live run — and demotion never changes the
+  // gate: it is prompt-level guidance only. Both contracts register: the resume
+  // gate defers to this registry on the same boot (isLiveAnywhere), so a
+  // blocking run invisible here would let a same-boot resume run two engines
+  // against one journal. Launch-gating state is registered SYNCHRONOUSLY, before
+  // the first await, so two calls from one session in the same tick cannot both
+  // pass the refusal check (the check-then-act race). Every early return below
+  // must drop it.
   if (args.dryRun !== true) {
-    const [oldest] = liveRunsForSession(context.sessionID)
-    if (oldest) {return renderRefusal(oldest)}
+    const live = liveRunsForSession(context.sessionID)
+    if (mode.isActive(context.sessionID, context.agent)) {
+      if (live.length >= options.ultracodeMaxRuns) {return renderCapRefusal(live, options.ultracodeMaxRuns)}
+    } else {
+      const [oldest] = live
+      if (oldest) {return renderRefusal(oldest)}
+    }
     registerPending(runId, context.sessionID)
   }
 
