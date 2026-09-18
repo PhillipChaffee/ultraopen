@@ -308,12 +308,18 @@ prompt status) are where live state shows: failed agents carry the theme's error
 glyph plus the failure reason, a half-failed run shows a failed count while live, and an
 interrupted run (its process died) shows a once-per-boot resume hint in the strip.
 
-Also upstream: the permission
+Also upstream: workflow agents do not get transcript task-rows — the renderer builds those only
+from the built-in task tool's parts (the row's child-session id lives in the part's
+`metadata.sessionId`, which only the task tool writes), so a workflow's child sessions show no
+transcript rows no matter what a plugin does. Per-agent progress shows on the three surfaces
+above, and `Ctrl-x` then `down` navigates into each child session today; the upstream proposal to
+render parented children generically is filed (policy and evidence in
+[docs/adr/0002-transcript-task-rows.md](./docs/adr/0002-transcript-task-rows.md)). The permission
 approval dialog auto-resolves on 1.18.31 without rendering the ask's `metadata` (the workflow
 name, description and phases), and schema-forced agents fail against Together with an empty
-`APIError` when ANY tool in the session carries a `$ref` in its JSON Schema. Both need upstream
-fixes; the transcript-echo collapse (this epic's original upstream PR target) is researched and
-ready to submit separately.
+`APIError` when ANY tool in the session carries a `$ref` in its JSON Schema. The task-row, dialog
+and `$ref` gaps need upstream fixes; the transcript-echo collapse (this epic's original upstream
+PR target) is researched and ready to submit separately.
 
 <a id="development"></a>
 
