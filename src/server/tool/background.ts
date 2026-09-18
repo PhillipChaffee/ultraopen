@@ -74,14 +74,15 @@ export function settlePromiseOf(runId: string): Promise<void> {
 }
 
 /**
- * Registers a launch synchronously, BEFORE the first await.
- *
- * Two tool calls from one session in the same tick would otherwise both pass
- * the refusal check before either registers — the check-then-act race. The
+ * Registers a launch synchronously: the refusal check and this registration
+ * are one await-free step, so two tool calls from one session cannot both
+ * pass the check before either registers — the check-then-act race. The
  * entry starts `pending` and is promoted (or removed) as the launch proceeds.
+ * The stamp fixes the entry's position in start-order queries; passing one
+ * explicitly decouples that order from clock granularity.
  */
-export function registerPending(runId: string, sessionID: string): void {
-  detached.set(runId, { runId, sessionID, status: "pending", startedAt: Date.now() })
+export function registerPending(runId: string, sessionID: string, startedAt: number = Date.now()): void {
+  detached.set(runId, { runId, sessionID, status: "pending", startedAt })
 }
 
 /** Promotes a pending entry to running once the permission ask and manifest are in place. */
@@ -108,12 +109,28 @@ export function dropSettled(runId: string): void {
   detached.delete(runId)
 }
 
-/** The run this session currently has pending or live, if any. */
-export function activeRunForSession(sessionID: string): DetachedRun | undefined {
+/**
+ * Every live entry for the session, oldest start first.
+ *
+ * Returned entries are copies: registry state is not mutable through them.
+ */
+export function liveRunsForSession(sessionID: string): DetachedRun[] {
+  const live: DetachedRun[] = []
   for (const entry of detached.values()) {
-    if (entry.sessionID === sessionID) {return entry}
+    if (entry.sessionID === sessionID) {live.push({ ...entry })}
   }
-  return undefined
+  // Stable sort: entries stamped in the same millisecond keep Map insertion
+  // order — the stamp and the insertion happen in the same synchronous step,
+  // so insertion order is start order.
+  return live.toSorted((a, b) => a.startedAt - b.startedAt)
+}
+
+/**
+ * The session's live entries except the named run — everything left is that
+ * run's sibling, oldest start first.
+ */
+export function siblingRunsForSession(sessionID: string, excludeRunId: string): DetachedRun[] {
+  return liveRunsForSession(sessionID).filter((entry) => entry.runId !== excludeRunId)
 }
 
 /** True while the run is registered as pending or running, in THIS process. */
