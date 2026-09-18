@@ -608,6 +608,24 @@ const hangingClient = {
   session: { ...stubClient.session, prompt: () => new Promise(() => {}) },
 }
 
+/**
+ * A client whose child prompt settles only when the test releases it, so a
+ * blocking run can be observed live and then let settle on demand.
+ */
+const gatedClient = () => {
+  let arm: (() => void) | undefined
+  const gate = new Promise<void>((resolve) => {arm = resolve})
+  return {
+    client: {
+      config: stubClient.config,
+      session: { ...stubClient.session, prompt: () => gate.then(() => ({ data: { info: {}, parts: [] } })) },
+    },
+    // The executor runs synchronously, so the release is armed before this returns.
+    release: (): void => {arm?.()},
+  }
+}
+
+
 describe("background launch contract", () => {
   const statusToolOf = (hooks: Record<string, unknown>): ToolDef | undefined => {
     const tools = hooks["tool"] as Record<string, ToolDef> | undefined
@@ -901,23 +919,6 @@ describe("background launch contract", () => {
 })
 
 describe("blocking launch registration", () => {
-  /**
-   * A client whose child prompt settles only when the test releases it, so a
-   * blocking run can be observed live and then let settle on demand.
-   */
-  const gatedClient = () => {
-    let arm: (() => void) | undefined
-    const gate = new Promise<void>((resolve) => {arm = resolve})
-    return {
-      client: {
-        config: stubClient.config,
-        session: { ...stubClient.session, prompt: () => gate.then(() => ({ data: { info: {}, parts: [] } })) },
-      },
-      // The executor runs synchronously, so the release is armed before this returns.
-      release: (): void => {arm?.()},
-    }
-  }
-
   test("a blocking launch registers a pending entry, so the resume gate covers it while it executes", async () => {
     const { client, release } = gatedClient(),
       tool = toolOf(ultraopen({ client }))
