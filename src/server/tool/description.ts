@@ -9,6 +9,18 @@
  *   - `Workflow({...})` -> `workflow({...})`, the opencode tool id
  *   - "the Agent tool" -> "the task tool"
  */
+
+/**
+ * The one-shot host's contract paragraph, shared by `description` (as its embedded
+ * text) and by the two derived variants (as their replace target). The three must
+ * stay structurally identical so a variant swap never desyncs from the base text.
+ */
+const pinnedContract = `This call RETURNS AT ONCE with the run id. The run continues in the background while you keep
+working. Poll \`workflow_status\` with the run id (pass \`wait\` so one call blocks until the run
+settles or the wait expires) — do not re-launch the same workflow because a poll said "running".
+Aborting this call does not stop the run; if you must stop it, tell the user to end the opencode
+process, or wait for it to settle and resume from its run id.`
+
 export const description = `Execute a workflow script that orchestrates multiple subagents deterministically.
 
 A workflow is a deterministic JavaScript driver in which agent() is the only nondeterministic call.
@@ -17,11 +29,7 @@ write. Only the LLM steps vary between runs. That property is what buys the thre
 are for: comprehensiveness (decompose and cover in parallel), confidence (independent perspectives
 and adversarial checks before committing), and scale (work one context window cannot hold).
 
-This call RETURNS AT ONCE with the run id. The run continues in the background while you keep
-working. Poll \`workflow_status\` with the run id (pass \`wait\` so one call blocks until the run
-settles or the wait expires) — do not re-launch the same workflow because a poll said "running".
-Aborting this call does not stop the run; if you must stop it, tell the user to end the opencode
-process, or wait for it to settle and resume from its run id.
+${pinnedContract}
 
 ## When to use it
 
@@ -126,13 +134,30 @@ export function withSizeAdvice(base: string, guideline: string): string {
  */
 export const blockingDescription = description
   .replace(
-    `This call RETURNS AT ONCE with the run id. The run continues in the background while you keep
-working. Poll \`workflow_status\` with the run id (pass \`wait\` so one call blocks until the run
-settles or the wait expires) — do not re-launch the same workflow because a poll said "running".
-Aborting this call does not stop the run; if you must stop it, tell the user to end the opencode
-process, or wait for it to settle and resume from its run id.`,
+    pinnedContract,
     `This call BLOCKS until the run completes, then returns one consolidated result. A 15-agent run
 can take many minutes. Aborting this call stops the run.`,
+  )
+
+/**
+ * The long-lived host's contract paragraph (the TUI, serve, web, acp, --mini).
+ *
+ * Same base body as the one-shot description; only the contract differs. In a
+ * host whose process outlives the turn, holding the turn by polling buys
+ * nothing — the run survives it — so the text frees the turn instead, while
+ * keeping the poll guidance for the two cases that still need it: the user
+ * asking about the run, and a task that depends on the run's value.
+ */
+export const longLivedDescription = description
+  .replace(
+    pinnedContract,
+    `This call RETURNS AT ONCE with the run id. The run continues in the background and outlives your
+turn — this host keeps the process alive. End your turn once the launch result arrives; do not
+poll just to hold the turn. Poll \`workflow_status\` with the run id when the user asks about the
+run or when the current task cannot finish without its value (pass \`wait\` so one call blocks
+until the run settles or the wait expires) — do not re-launch the same workflow because a status
+said "running". Aborting this call does not stop the run; if you must stop it, tell the user to
+end the opencode process, or wait for it to settle and resume from its run id.`,
   )
 
 /**

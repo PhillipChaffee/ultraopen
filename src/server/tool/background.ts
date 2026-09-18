@@ -4,6 +4,40 @@ import { writeFailure } from "../resume/store.js"
 import { registry } from "../singleton.js"
 
 /**
+ * Which launch contract the host process can honor, decided from the process shape.
+ *
+ * The evidence is live-captured argv from the installed opencode 1.18.31 binary (reproduced
+ * verbatim in the tests):
+ *   - `opencode run` runs its server in-process and exits unconditionally after the turn
+ *     (packages/opencode/src/index.ts, the `finally` block) — an unsettled detached run dies with
+ *     the process. argv: ["bun", "/$bunfs/root/src/index.js", "run", "say hi"].
+ *   - the TUI boots its server inside a Bun worker thread whose argv is the worker file alone,
+ *     because a worker does not inherit the parent's argv:
+ *     ["bun", "/$bunfs/root/src/cli/tui/worker.js"].
+ *   - `opencode serve`, `opencode web` and `opencode acp` call `Server.listen` and live until
+ *     killed; `--mini` is the interactive REPL.
+ *
+ * The failure directions are not symmetric. Freeing the turn in a process that is about to exit
+ * loses the run mid-flight (journal and resume survive, the work does not); pinning the turn in a
+ * long-lived host merely blocks the chat. Unknown shapes therefore keep the pinned contract.
+ */
+export function isLongLivedHost(argv: readonly string[] = process.argv): boolean {
+  const tokens = argv.slice(1)
+  // The `run` subcommand and any driver built on it: the process exits after the
+  // turn, so the model must hold the turn by polling until the run settles.
+  if (tokens.includes("run")) {return false}
+  return tokens.some(
+    (token) =>
+      token === "serve" ||
+      token === "web" ||
+      token === "acp" ||
+      token === "--mini" ||
+      // The TUI's worker thread: plugins never load in the TUI parent process.
+      /tui[\\/]worker\.(?<ext>js|ts)$/u.test(token),
+  )
+}
+
+/**
  * The detached-run layer: everything that lets a run outlive its tool call.
  *
  * State lives at MODULE level for the same reason `singleton.ts` does: opencode

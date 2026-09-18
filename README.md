@@ -154,15 +154,18 @@ ultraopen only tries to be the right tool when the work already happens in openc
 ### The launch contract
 
 The `workflow` tool returns immediately with a `<workflow-launched>` result naming the run id and
-directory — it never contains the outcome. Poll `workflow_status(runId, { wait })` until the
-status is not `running`; one long `wait` (up to 300 s) beats many short polls. In the TUI you can
-keep typing while the run works. In one-shot `opencode run` the process exits right after the
-turn, so keep the turn alive by polling until the run settles — an unsettled run dies with the
-process (its completed agents survive on disk and a later `resumeFromRunId` replays them). If you
-need the old synchronous behavior, set the plugin option `"runMode": "blocking"` or the env
-`ULTRAOPEN_WORKFLOW_SYNC=1`; `dryRun` always waits. One live run per session (both contracts; `dryRun` is exempt — it is free and spawns nothing): a
-second launch is refused with the active run id, and resuming a run that is still executing is
-refused for the same reason — two engines would write one journal. Until the run-control epic lands there is no stop
+directory — it never contains the outcome. The result's instruction is host-aware: in a long-lived
+host (the TUI, `opencode serve`, `opencode web`, `opencode acp`, the `--mini` REPL) it tells the
+model to end its turn once the run is launched and to poll `workflow_status(runId, { wait })` when
+you ask about the run — you keep chatting while the run works. In one-shot `opencode run` the
+process exits right after the turn, so the result instead keeps the turn alive: the model polls
+until the run settles — an unsettled run dies with the process (its completed agents survive on
+disk and a later `resumeFromRunId` replays them). If you need the old synchronous behavior, set
+the plugin option `"runMode": "blocking"` or the env `ULTRAOPEN_WORKFLOW_SYNC=1`; `dryRun` always
+waits. One live run per session (both contracts; `dryRun` is exempt — it is free and spawns
+nothing): a second launch is refused with the active run id, and resuming a run that is still
+executing is refused for the same reason — two engines would write one journal. Until the
+run-control epic lands there is no stop
 tool: to stop a run, end the opencode process; finished agents are preserved for resume.
 
 | Global | Behavior |

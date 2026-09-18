@@ -69,12 +69,22 @@ export function renderResult(result: WorkflowResult, resume?: { resumed: number;
  * surface for one run is how a model ends up trusting a stale snapshot. The
  * value arrives through `workflow_status` — and the poll before the turn ends
  * also keeps a one-shot host's turn alive long enough for the run to settle.
+ *
+ * The contract sentence is host-aware: in a long-lived host the turn is told to
+ * end (the run survives it), in a one-shot host it is told to hold by polling
+ * (the run dies with the process otherwise). The variant follows the HOST, not
+ * the `background` flag — a forced-background launch in a one-shot host still
+ * needs the hold-the-turn text or the process exits out from under the run.
  */
-export function renderLaunch(workflow: string, runId: string): string {
+export function renderLaunch(workflow: string, runId: string, longLived: boolean): string {
   return [
     `<workflow-launched run="${runId}" workflow="${workflow}" dir="${runDir(runId)}">`,
     "The run is executing in the background; this message does not contain its outcome.",
-    `Poll workflow_status(runId: "${runId}", wait: 120) until the status is not "running" to get the final value or the failure. Before ending your turn, poll until the run settles.`,
+    longLived
+      ? `This host keeps the process alive, so the run settles on its own — end your turn and let it work. ` +
+        `Poll workflow_status(runId: "${runId}", wait: 120) when the user asks about the run, or when the ` +
+        `current task cannot finish without the run's value.`
+      : `Poll workflow_status(runId: "${runId}", wait: 120) until the status is not "running" to get the final value or the failure. Before ending your turn, poll until the run settles.`,
     "</workflow-launched>",
   ].join("\n")
 }
