@@ -187,7 +187,7 @@ return 'SAVED-WORKFLOW-RAN'
 PROBE
 runs_snapshot "$OUT/runs-before-t5a.txt"
 oc_run_capture "$OUT/t5a.out" 300 "$(wf_prompt named)" || true
-RUN5="$(newest_run "$OUT/runs-before-t5.txt")"
+RUN5="$(newest_run "$OUT/runs-before-t5a.txt")"
 if [ -n "$RUN5" ]; then
   preserve_run "$RUN5"
   if [ "$(manifest_status "$RUN5")" = "completed" ]; then
