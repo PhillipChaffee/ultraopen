@@ -96,6 +96,18 @@ export function dropPending(runId: string): void {
   if (entry && entry.status === "pending") {detached.delete(runId)}
 }
 
+/**
+ * Drops a settled run's entry, whatever status it holds.
+ *
+ * The blocking contract keeps its gate entry from registration until its settle
+ * protocol completes; that removal cannot be status-guarded (dropPending
+ * deletes pending entries only), or a settle would strand the session gate and
+ * the resume refusal forever.
+ */
+export function dropSettled(runId: string): void {
+  detached.delete(runId)
+}
+
 /** The run this session currently has pending or live, if any. */
 export function activeRunForSession(sessionID: string): DetachedRun | undefined {
   for (const entry of detached.values()) {

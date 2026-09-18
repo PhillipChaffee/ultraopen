@@ -74,6 +74,15 @@ toolOf = (hooks: Record<string, unknown>): ToolDef | undefined => {
   try { await run() } finally { process.argv = saved }
 }
 
+/** Bounded polling: used where a launch phase runs concurrently with the test. */
+const waitFor = async (until: () => boolean | Promise<boolean>, what: string): Promise<void> => {
+  for (let waited = 0; waited < 400; waited++) {
+    if (await until()) {return}
+    await new Promise((resolve) => {setTimeout(resolve, 5)})
+  }
+  throw new Error(`timed out waiting for ${what}`)
+}
+
 let savedEnv: string | undefined
 
 beforeEach(() => {
@@ -888,6 +897,133 @@ describe("background launch contract", () => {
     expect(report.status).toBe("completed")
     expect(report.value).toBe("probe-value")
     expect(report.outputTokens).toBe(0)
+  })
+})
+
+describe("blocking launch registration", () => {
+  /**
+   * A client whose child prompt settles only when the test releases it, so a
+   * blocking run can be observed live and then let settle on demand.
+   */
+  const gatedClient = () => {
+    let arm: (() => void) | undefined
+    const gate = new Promise<void>((resolve) => {arm = resolve})
+    return {
+      client: {
+        config: stubClient.config,
+        session: { ...stubClient.session, prompt: () => gate.then(() => ({ data: { info: {}, parts: [] } })) },
+      },
+      // The executor runs synchronously, so the release is armed before this returns.
+      release: (): void => {arm?.()},
+    }
+  }
+
+  test("a blocking launch registers a pending entry, so the resume gate covers it while it executes", async () => {
+    const { client, release } = gatedClient(),
+      tool = toolOf(ultraopen({ client }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const asked: { metadata?: { runId?: string } }[] = []
+    const blocking = tool.execute(
+      { script: `${META}await agent('a')\nreturn 'SETTLED-VALUE'\n`, background: false },
+      {
+        sessionID: "blocker",
+        ask: (request: { metadata?: { runId?: string } }) => { asked.push(request); return Promise.resolve() },
+      },
+    )
+    try {
+      await waitFor(() => asked.length > 0, "the permission ask")
+      const runId = asked[0]?.metadata?.runId ?? ""
+      // The gate entry exists before the manifest does; the resume refusal reads
+      // the manifest, so wait for the run to go live before attempting it.
+      await waitFor(async () => {
+        const manifest = await readManifest(runId, undefined)
+        return manifest?.status === "running"
+      }, "the manifest")
+      expect(background.activeRunForSession("blocker")?.runId).toBe(runId)
+      expect(background.isLive(runId)).toBe(true)
+      const second = await tool.execute(
+        { script: `${META}await agent('a')\nreturn 2\n`, resumeFromRunId: runId, background: false },
+        { sessionID: "parent" },
+      )
+      expect(second).toContain("<workflow-refused>")
+      expect(second).toContain("still executing")
+      // The refused resume attempt drops its own entry, never the live run's.
+      expect(background.activeRunForSession("parent")).toBeUndefined()
+      expect(background.activeRunForSession("blocker")?.runId).toBe(runId)
+    } finally {
+      release()
+      await blocking
+    }
+    // A settled blocking launch leaves no stale entry for the next launch to trip on.
+    expect(background.activeRunForSession("blocker")).toBeUndefined()
+    const settledRunId = asked[0]?.metadata?.runId ?? ""
+    const resumed = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 2\n`, resumeFromRunId: settledRunId, background: false },
+      { sessionID: "parent" },
+    )
+    expect(resumed).toContain("<result")
+  })
+
+  test("a failed blocking run drops its entry when it settles", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}await agent('a')\nthrow new Error('boom mid-run')\n`, background: false },
+      { sessionID: "parent" },
+    )
+    expect(output).toContain("boom mid-run")
+    // The run failed, but it settled: the manifest is closed and the gate is open.
+    const runId = output.match(/id="(?<runId>[^"]+)"/u)?.[1] ?? ""
+    const manifest = await readManifest(runId, undefined)
+    expect(manifest?.status).toBe("failed")
+    expect(background.activeRunForSession("parent")).toBeUndefined()
+  })
+
+  test("dryRun stays exempt from registration as well as the gate", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    let registeredAtAsk: boolean | undefined
+    const output = await tool.execute(
+      { script: `${META}return 1\n`, dryRun: true },
+      {
+        sessionID: "parent",
+        ask: () => {
+          // Read mid-launch, at the ask: a dryRun must never hold the session's gate.
+          registeredAtAsk = background.activeRunForSession("parent") !== undefined
+          return Promise.resolve()
+        },
+      },
+    )
+    expect(output).toContain("<result")
+    expect(registeredAtAsk).toBe(false)
+    expect(background.activeRunForSession("parent")).toBeUndefined()
+  })
+
+  test("a rejected permission ask drops the blocking launch's entry", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}return 1\n`, background: false },
+      { sessionID: "parent", ask: () => Promise.reject(new Error("user said no")) },
+    )
+    expect(output).toContain("user said no")
+    expect(background.activeRunForSession("parent")).toBeUndefined()
+    // The session must be free to launch again after the rejection.
+    const second = await tool.execute({ script: `${META}return 1\n`, dryRun: true }, { sessionID: "parent" })
+    expect(second).toContain("<result")
+  })
+
+  test("a malformed resume id on the blocking contract frees the session", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}return 1\n`, resumeFromRunId: "../../etc", background: false },
+      { sessionID: "parent" },
+    )
+    expect(output).toContain("not a valid run id")
+    expect(background.activeRunForSession("parent")).toBeUndefined()
+    const second = await tool.execute({ script: `${META}return 1\n`, background: false }, { sessionID: "parent" })
+    expect(second).toContain("<result")
   })
 })
 
