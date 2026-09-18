@@ -317,9 +317,9 @@ render parented children generically is filed (policy and evidence in
 [docs/adr/0002-transcript-task-rows.md](./docs/adr/0002-transcript-task-rows.md)). The permission
 approval dialog auto-resolves on 1.18.31 without rendering the ask's `metadata` (the workflow
 name, description and phases), and schema-forced agents fail against Together with an empty
-`APIError` when ANY tool in the session carries a `$ref` in its JSON Schema. The task-row and
-dialog gaps need upstream fixes; the transcript-echo collapse (this epic's original upstream PR
-target) is researched and ready to submit separately.
+`APIError` when ANY tool in the session carries a `$ref` in its JSON Schema. The task-row, dialog
+and `$ref` gaps need upstream fixes; the transcript-echo collapse (this epic's original upstream
+PR target) is researched and ready to submit separately.
 
 <a id="development"></a>
 

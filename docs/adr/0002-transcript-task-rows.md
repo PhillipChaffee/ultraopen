@@ -23,8 +23,8 @@ exact linkage:
 - Child navigation (`ctrl+x down`) ignores tool parts entirely — it keys off session records'
   `parentID` (~206, ~442), which is why it already works for workflow children.
 
-The transcript is out of a TUI plugin's reach by construction, so a plugin-side approximation is
-not on the menu at any cost:
+The transcript is out of a TUI plugin's reach by construction, so a plugin-side approximation
+does not exist at any price:
 
 - The host slot map has no transcript/message slot (`packages/plugin/src/tui.ts` ~455) — only
   `app`, `app_bottom`, `home_*`, `session_prompt*`, `sidebar_*`.
@@ -42,18 +42,24 @@ binding one here — there is no slot to attach to in the transcript flow at all
    of the current session is filed at anomalyco/opencode#49801: the route already computes
    `children` from `parentID`, live state is available from `session_status[childID]`, and
    navigation reuses `enterChild`; `task`-part rows stay untouched.
-2. **Do not approximate in the plugin.** Every plugin-side construction fails on the verified
+2. **Reject the narrower upstream shape: plugins writing task-shaped parts.** Rendering keyed off
+   `metadata.sessionId` regardless of tool name would still need a part-write API — and the only
+   writer of task-shaped parts today is the task tool, because parts come into existence through
+   real tool executions. An API that lets a plugin append parts to a parent message is more
+   invasive upstream than rendering the children the host already knows about.
+3. **Do not approximate in the plugin.** Every plugin-side construction fails on the verified
    constraints above — no slot, no part-write API, no renderable prompt part. The three existing
    surfaces (strip, sidebar, prompt status) remain the plugin's progress presentation.
-3. **Document the interim affordance.** `ctrl+x down` child navigation reaches workflow children
-   today; the README's upstream notes record it as the interim path until the proposal lands.
+4. **Document the interim affordance.** `ctrl+x down` child navigation reaches workflow children
+   today; the README's upstream notes record it as the interim path while #49801 is pending
+   upstream.
 
 ## Consequences
 
 - Until upstream acts, workflow agents stay invisible in the transcript row flow; per-agent
   progress shows on the three surfaces and per-child detail is reachable via `ctrl+x down`.
-- When the proposal lands, workflow children get rows with no plugin change — the plugin already
-  sets `parentID` on every child (`src/server/bridge/spawn.ts`), which is the only linkage
-  generic rendering needs.
+- The plugin already sets `parentID` on every child (`src/server/bridge/spawn.ts`), which is the
+  only linkage generic rendering needs — workflow children get rows with no plugin change once
+  #49801 ships.
 - The transcript-echo collapse of the `workflow` call (this epic's original upstream target)
   remains a separate, already-researched proposal (README upstream notes).
