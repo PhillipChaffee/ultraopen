@@ -3,6 +3,7 @@ import { resolveOptions } from "../src/server/options.js"
 import { MAX_CONCURRENCY, MIN_CONCURRENCY } from "../src/server/script/limits.js"
 
 const DEFAULT_CONCURRENCY = 8,
+  DEFAULT_ULTRACODE_MAX_RUNS = 8,
   DEFAULT_AGENT_DEADLINE_MS = 4 * 60 * 60 * 1000,
   DEFAULT_AGENT_IDLE_MS = 5 * 60 * 1000,
   DEFAULT_EFFORT_PREFERENCE = ["xhigh", "max", "high", "medium", "low"],
@@ -10,6 +11,7 @@ const DEFAULT_CONCURRENCY = 8,
  DEFAULTS = {
   concurrency: DEFAULT_CONCURRENCY,
   ultracode: false,
+  ultracodeMaxRuns: DEFAULT_ULTRACODE_MAX_RUNS,
   agentDeadlineMs: DEFAULT_AGENT_DEADLINE_MS,
   agentIdleMs: DEFAULT_AGENT_IDLE_MS,
   effortPreference: DEFAULT_EFFORT_PREFERENCE,
@@ -73,6 +75,33 @@ describe("resolveOptions — ultracode", () => {
     [{ ultracode: false }, false],
   ])("resolves false for %p", (input, expected) => {
     expect(resolveOptions(input).ultracode).toBe(expected)
+  })
+})
+
+describe("resolveOptions — ultracodeMaxRuns", () => {
+  test("defaults to 8", () => {
+    expect(resolveOptions({}).ultracodeMaxRuns).toBe(DEFAULT_ULTRACODE_MAX_RUNS)
+  })
+
+  test.each([
+    // 0 is rejected, never honoured: a cap below 1 would refuse every launch
+    // forever — a hang with no throw, exactly the concurrency-0 failure shape.
+    [0, MIN_CONCURRENCY],
+    [-5, MIN_CONCURRENCY],
+    [1, 1],
+    [MAX_CONCURRENCY + 100, MAX_CONCURRENCY],
+    // A float is floored, not rounded or rejected.
+    [3.7, 3],
+  ])("clamps %p to %p", (input, expected) => {
+    expect(resolveOptions({ ultracodeMaxRuns: input }).ultracodeMaxRuns).toBe(expected)
+  })
+
+  // Wrapped one-element rows for the same reason as the concurrency cases: some
+  // of these inputs are themselves arrays and would be spread onto the callback.
+  const nonNumericMaxRuns: unknown[][] = [["8"], [true], [{}], [[]], [Number.NaN], [Number.POSITIVE_INFINITY]]
+
+  test.each(nonNumericMaxRuns)("falls back to the default 8 for %p", (input) => {
+    expect(resolveOptions({ ultracodeMaxRuns: input }).ultracodeMaxRuns).toBe(DEFAULT_ULTRACODE_MAX_RUNS)
   })
 })
 
