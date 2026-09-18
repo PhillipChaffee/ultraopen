@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import {
   activeRunForSession,
   dropPending,
+  dropSettled,
   isLive,
   isLiveAnywhere,
   isProcessAlive,
@@ -65,6 +66,19 @@ describe("launch-gating registry", () => {
     promote("wf_bg000004")
     dropPending("wf_bg000004")
     expect(activeRunForSession("s1")?.runId).toBe("wf_bg000004")
+  })
+
+  test("dropSettled removes the entry whatever status it reached", () => {
+    // The blocking contract holds its gate entry from registration to settle;
+    // settle cleanup must land even if the entry was promoted along the way,
+    // or a settled run would strand the session gate and the resume refusal.
+    registerPending("wf_bg000009", "s1")
+    dropSettled("wf_bg000009")
+    expect(activeRunForSession("s1")).toBeUndefined()
+    registerPending("wf_bg000010", "s1")
+    promote("wf_bg000010")
+    dropSettled("wf_bg000010")
+    expect(activeRunForSession("s1")).toBeUndefined()
   })
 
   test("entries are scoped per session and dropped on settle", async () => {

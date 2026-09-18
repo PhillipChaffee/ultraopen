@@ -18,6 +18,7 @@ import {
   isLongLivedHost,
   registerPending,
   dropPending,
+  dropSettled,
   runDetached,
 } from "./tool/background.js"
 
@@ -295,14 +296,17 @@ async function launchWorkflow(
   // One live run per session, for BOTH contracts (see lifecycle-policy.md): a
   // blocking call inside a turn serializes itself anyway, but mixed contracts
   // would put two agent-spending runs in one session. dryRun is exempt — it is
-  // free, stubbed, and the standard way to debug a script mid-run. Launch-gating
-  // state is registered SYNCHRONOUSLY, before the first await, so two calls from
-  // one session in the same tick cannot both pass the refusal check (the
+  // free, stubbed, and the standard way to debug a script mid-run. Both
+  // contracts register: the resume gate defers to this registry on the same
+  // boot (isLiveAnywhere), so a blocking run invisible here would let a
+  // same-boot resume run two engines against one journal. Launch-gating state
+  // is registered SYNCHRONOUSLY, before the first await, so two calls from one
+  // session in the same tick cannot both pass the refusal check (the
   // check-then-act race). Every early return below must drop it.
   if (args.dryRun !== true) {
     const active = activeRunForSession(context.sessionID)
     if (active) {return renderRefusal(active)}
-    if (background) {registerPending(runId, context.sessionID)}
+    registerPending(runId, context.sessionID)
   }
 
   // Incremental journal flush: one line per entry as it is recorded, so a process
@@ -534,7 +538,10 @@ interface BlockingRun {
  *
  * Kept behaviorally identical to the pre-async tool — it is the documented kill
  * switch (`runMode: "blocking"` / `ULTRAOPEN_WORKFLOW_SYNC=1`) and the dry-run
- * path.
+ * path. Its launch registered at the session gate like every other launch; the
+ * finally drops that entry only after the settle protocol completed, so the
+ * resume gate stays closed while the settle is writing and the next launch
+ * finds no residue once it is done.
  */
 async function runBlocking(args: WorkflowArgs, run: BlockingRun): Promise<string> {
   const { runId, resume, executeContext, settleRun } = run
@@ -563,6 +570,11 @@ async function runBlocking(args: WorkflowArgs, run: BlockingRun): Promise<string
       // the pre-async tool did; failure.txt is the detached contract's channel.
     })
     return renderFailure(error instanceof WorkflowRunError ? error.cause : error, args.script, runId)
+  } finally {
+    // Settled, whatever the outcome. The drop waits for the settle protocol
+    // (no resume may pass while the manifest is still being closed) and deletes
+    // unconditionally: a status-guarded drop could strand the gate.
+    dropSettled(runId)
   }
 }
 
