@@ -24,3 +24,7 @@ A ticket is done only when **every suite is green locally and the PR's CI is gre
    - `bash test/e2e/visual.sh` — the real TUI in tmux (tmux required), the slower suite.
    Criterion: the summary reads `0 failed`. `✗` lines are failures to investigate; `·` lines are informational notes. Known upstream drift is recorded per the README's upstream note and expressed as a note, never a silent skip. When an e2e assertion fails, diagnose before touching anything: product regression, provider flake, or harness drift (an assertion that no longer matches what ships — fix the harness, as with T5a/V3).
 3. **PR and CI**: open the PR with `gh pr create` (the GitHub MCP token cannot create PRs; reads work), fill the body's Test Plan with what actually ran, then `gh pr checks <n> --watch` until every check passes. Merge only on green.
+
+**Every ticket ends with the finish line**: a ticket's body closes with a `## Close-out` section restating this gate — unit gate green, both e2e suites `0 failed`, PR opened, CI green, merged — so any agent picking the ticket up treats the gate as part of the work, not an afterthought.
+
+**main is branch-protected**: required status checks (`check (ubuntu-latest)`, `check (macos-latest)`, `zizmor audit`, `coverage`) and one approving review; admins are enforced. The owner holds a review-bypass allowance so solo merges stay possible — CI is never bypassable.
