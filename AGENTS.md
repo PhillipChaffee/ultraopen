@@ -27,4 +27,4 @@ A ticket is done only when **every suite is green locally and the PR's CI is gre
 
 **Every ticket ends with the finish line**: a ticket's body closes with a `## Close-out` section restating this gate — unit gate green, both e2e suites `0 failed`, PR opened, CI green, merged — so any agent picking the ticket up treats the gate as part of the work, not an afterthought.
 
-**main is branch-protected**: required status checks (`check (ubuntu-latest)`, `check (macos-latest)`, `zizmor audit`, `coverage`) and one approving review; admins are enforced. The owner holds a review-bypass allowance so solo merges stay possible — CI is never bypassable.
+**main is branch-protected by a branch ruleset** (`main: CI + review required`): required status checks (`check (ubuntu-latest)`, `check (macos-latest)`, `zizmor audit`, `coverage`) plus one approving review, enforced even for the owner. Solo merge path: `gh pr merge <n> --merge --admin` — self-approval is impossible, and the ruleset's bypass actors apply only through the web UI's bypass option, not the API.
