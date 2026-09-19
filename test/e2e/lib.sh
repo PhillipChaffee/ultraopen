@@ -62,6 +62,10 @@ RUN_ROOT=""    # $DATA_ROOT/tool-output/ultraopen — the plugin's run dirs
 scratch_new() {
   SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/ultraopen-e2e.XXXXXX")"
   export XDG_DATA_HOME="$SCRATCH/share"
+  # opencode merges $XDG_CONFIG_HOME/opencode config files into every load on
+  # top of OPENCODE_CONFIG_DIR, so leaving this unset lets the developer's real
+  # global config (permissions, agents, global MCP servers) leak into each run.
+  export XDG_CONFIG_HOME="$SCRATCH/config"
   export OPENCODE_CONFIG_DIR="$SCRATCH/config"
   DATA_ROOT="$XDG_DATA_HOME/opencode"
   RUN_ROOT="$DATA_ROOT/tool-output/ultraopen"
