@@ -67,6 +67,12 @@ scratch_new() {
   # global config (permissions, agents, global MCP servers) leak into each run.
   export XDG_CONFIG_HOME="$SCRATCH/config"
   export OPENCODE_CONFIG_DIR="$SCRATCH/config"
+  # third isolation channel: env overrides inherited from the invoking process
+  unset OPENCODE_CONFIG OPENCODE_CONFIG_CONTENT OPENCODE_PERMISSION OPENCODE_TUI_CONFIG
+  # non-product per-process weight (1.18.31 flags, flag.ts:23,29 + runtime-flags.ts:19,21)
+  export OPENCODE_DISABLE_DEFAULT_PLUGINS=1
+  export OPENCODE_DISABLE_EXTERNAL_SKILLS=1
+  export OPENCODE_DISABLE_AUTOUPDATE=1
   DATA_ROOT="$XDG_DATA_HOME/opencode"
   RUN_ROOT="$DATA_ROOT/tool-output/ultraopen"
   mkdir -p "$DATA_ROOT" "$OPENCODE_CONFIG_DIR" "$SCRATCH/project"
