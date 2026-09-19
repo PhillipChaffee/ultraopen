@@ -24,7 +24,7 @@ PLUGIN_PATH="$REPO_ROOT"
 ARTIFACTS_ROOT="$REPO_ROOT/test/e2e/artifacts"
 
 # Config knobs ----------------------------------------------------------------
-E2E_MODEL="${E2E_MODEL:-togetherai/zai-org/GLM-5.3}"
+E2E_MODEL="${E2E_MODEL:-togetherai/zai-org/GLM-5.3-Flash}"
 E2E_PORT="${E2E_PORT:-18888}"
 E2E_TMUX_SOCKET="${E2E_TMUX_SOCKET:-ultraopen-e2e}"
 E2E_WAIT_TIMEOUT="${E2E_WAIT_TIMEOUT:-120}"   # seconds, default for wait_for

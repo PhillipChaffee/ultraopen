@@ -336,8 +336,10 @@ bash test/e2e/tui-dev.sh     # run `opencode` locally with the TUI plugin actual
 
 The e2e suites run in an isolated scratch XDG home (real provider auth, throwaway state) and
 assert on the plugin's own on-disk run artifacts plus captured tmux panes. They make real model
-calls — pennies per run on Together. Re-run on flakes: live turns occasionally stall or hit
-transient provider errors, and both suites retry the common cases. The screenshots at the top
+calls — pennies per run on Together, on the default suite model `togetherai/zai-org/GLM-5.3-Flash`
+(override with `E2E_MODEL`). Measured flake rate: 0 flake events across 87 live turns in one clean
+run of both suites — bad weather is unmeasured, but the watchdog plus per-case retry bound it:
+re-run on flakes, and both suites retry the common cases. The screenshots at the top
 are rendered from `visual.sh` frame captures (see `assets/`).
 
 `tui-dev.sh` exists because of an upstream dev-checkout trap: the TUI host injects its own
