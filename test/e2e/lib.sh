@@ -4,7 +4,9 @@
 # Isolation: every suite runs inside a scratch XDG home, so sessions, run dirs,
 # and logs never touch the developer's real opencode state. Provider auth is
 # symlinked in (auth.json lives under $XDG_DATA_HOME/opencode/) so real model
-# calls work; everything else is throwaway.
+# calls work; everything else is throwaway. Config leakage (e2e) is closed
+# channel by channel: the XDG redirect below, then the env-override unset and
+# non-product weight strip inside scratch_new (#48, #56).
 #
 # The TUI half resolves the run-data root exactly like the server half
 # ($XDG_DATA_HOME else ~/.local/share, then opencode/tool-output/ultraopen),
@@ -67,6 +69,13 @@ scratch_new() {
   # global config (permissions, agents, global MCP servers) leak into each run.
   export XDG_CONFIG_HOME="$SCRATCH/config"
   export OPENCODE_CONFIG_DIR="$SCRATCH/config"
+  # third isolation channel — config leakage (e2e): override env inherited from
+  # the invoking process
+  unset OPENCODE_CONFIG OPENCODE_CONFIG_CONTENT OPENCODE_PERMISSION OPENCODE_TUI_CONFIG
+  # non-product per-process weight (1.18.31 flags, flag.ts:23,29 + runtime-flags.ts:19,21)
+  export OPENCODE_DISABLE_DEFAULT_PLUGINS=1
+  export OPENCODE_DISABLE_EXTERNAL_SKILLS=1
+  export OPENCODE_DISABLE_AUTOUPDATE=1
   DATA_ROOT="$XDG_DATA_HOME/opencode"
   RUN_ROOT="$DATA_ROOT/tool-output/ultraopen"
   mkdir -p "$DATA_ROOT" "$OPENCODE_CONFIG_DIR" "$SCRATCH/project"
