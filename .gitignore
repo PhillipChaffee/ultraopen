@@ -4,3 +4,5 @@ scratch/
 dist-test/
 coverage/
 test/e2e/artifacts/
+# machine-local opencode config (session permission allows, local paths)
+opencode.json
