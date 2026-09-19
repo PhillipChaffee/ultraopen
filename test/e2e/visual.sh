@@ -92,32 +92,40 @@ boot_tui() {
   export OPENCODE_FAST_BOOT=1   # skip the loading screen; shortens the input-drop window
   tui_start --auto
   wait_tui_ready || { frame 00-boot-failed; finish; exit 1; }
-  # Input arriving during the TUI's startup capability probes is silently dropped
-  # (~10s in tmux — opencode issue #42915), so settle before the first send-keys.
-  sleep 12
+  # No fixed settle for the TUI's startup input-drop window (~10s, opencode
+  # issue #42915): input-free steps (frame dumps, V1's rest assertions) run at
+  # once, and the first input-bearing step gates itself on its own effect
+  # (probe_verify_retry).
   frame 00-boot
   ok "TUI up in tmux (artifacts: $OUT)"
 }
 
+# The first real input after a boot is a one-word session prompt; its verify
+# is a NEW session row (sessions persist in the scratch across reboots, so an
+# any-session check would be pre-satisfied on the later boots).
+tui_ready_prompt() { tui_http_prompt "Reply with exactly the word READY."; }
+
 SID=""
 ensure_session() {
   [ -n "$SID" ] && return 0
-  for attempt in 1 2 3; do
-    tui_http_prompt "Reply with exactly the word READY."
-    if wait_for 90 session_exists; then
-      assert_pane_contains "model replied in-session" "READY" 120
-      SID="$(current_session)"
-      break
-    fi
-    note "attempt $attempt: no session appeared — input likely dropped, retrying"
-  done
-  if [ -n "$SID" ]; then
+  sessions_snapshot "$OUT/sessions-before-ensure.txt"
+  ensure_session_landed() { session_landed_since "$OUT/sessions-before-ensure.txt"; }
+  if probe_verify_retry tui_ready_prompt ensure_session_landed; then
+    assert_pane_contains "model replied in-session" "READY" 120
+    SID="$(current_session)"
     ok "session id: $SID"
   else
     bad "could not create a session after 3 attempts"
   fi
   frame 02-session
 }
+
+# The sidebar starts closed; <leader>b opens it. The keystroke occasionally
+# races a repaint, so the toggle is probe-verify-retry: bounded attempts, the
+# heading's render is the verify (spec §5.3).
+sidebar_open() { pane_matches '^ *ultracode *$'; }
+sidebar_keys() { tui_keys C-x; sleep 0.5; tui_keys b; }
+toggle_sidebar() { probe_verify_retry sidebar_keys sidebar_open 3 3; }
 
 if want rest || want synth || want live; then
   section "V0 — boot the real TUI"
@@ -151,15 +159,7 @@ if want synth; then
   frame 03-synth-running
 
   section "V2b — sidebar panel (toggle it open, right column)"
-  # The sidebar starts closed; <leader>b opens it. The keystroke occasionally
-  # races a repaint, so poll for the content and retry the toggle.
-  sidebar_open() { pane_matches '^ *ultracode *$'; }
-  for attempt in 1 2 3; do
-    tui_keys C-x; sleep 0.5; tui_keys b
-    if wait_for 8 sidebar_open; then break; fi
-    note "toggle attempt $attempt did not open the sidebar — retrying"
-  done
-  if sidebar_open; then
+  if toggle_sidebar; then
     ok "sidebar heading renders on its own line"
   else
     bad "sidebar heading not found alone on a line"
@@ -230,11 +230,7 @@ PYL
   assert_pane_contains "strip keeps the first run" "ultracode · e2e-visual" 5
   if ! sidebar_open; then
     # The toggle races a repaint, so retry it; the assertions below run either way.
-    for attempt in 1 2 3; do
-      tui_keys C-x; sleep 0.5; tui_keys b
-      if wait_for 8 sidebar_open; then break; fi
-      note "toggle attempt $attempt did not open the sidebar — retrying"
-    done
+    toggle_sidebar || true
   fi
   assert_pane_contains "sidebar renders both runs' summaries" "e2e-other" 5
   assert_pane_contains "sidebar renders run A's agent row" "⠋ alpha:one" 5
@@ -312,7 +308,6 @@ if want permission; then
   SID=""
   tui_start
   wait_tui_ready || { frame 11-permission-boot-failed; finish; exit 1; }
-  sleep 12
   ensure_session
   # Snapshot BEFORE the workflow prompt: the run dir is created the instant the
   # approved tool executes, so a later baseline would swallow it.
@@ -345,7 +340,24 @@ if want permission; then
   if wait_for 300 v4_ran; then
     ok "approved workflow reached a terminal state: $(newest_run "$OUT/runs-before-v4.txt") is $(manifest_status "$(newest_run "$OUT/runs-before-v4.txt")")"
   else
-    bad "approved workflow never reached a terminal state" "see $OUT for frames"
+    # A rejected ask is not the only way the run never lands: Flash sometimes
+    # transcribes optional tool args as the string "null", and a call that
+    # self-refuses AFTER its ask consumes the approval — the retried call then
+    # asks again (2/2 full-run V4 failures on 2026-09-19; the pre-change run
+    # passed the same lottery). Approve the re-asked dialog once (V3's
+    # one-retry shape) before failing.
+    if pane_contains "Permission required"; then
+      note "approval consumed by a refused re-call — approving the re-asked dialog once"
+      tui_keys Enter
+      sleep 1
+      if wait_for 120 v4_ran; then
+        ok "approved workflow reached a terminal state after the re-ask: $(newest_run "$OUT/runs-before-v4.txt") is $(manifest_status "$(newest_run "$OUT/runs-before-v4.txt")")"
+      else
+        bad "approved workflow never reached a terminal state" "see $OUT for frames"
+      fi
+    else
+      bad "approved workflow never reached a terminal state" "see $OUT for frames"
+    fi
   fi
   assert_pane_lacks "strip clears after the approved run" "ultracode · e2e-smoke" 15
   frame 12-permission-approved
@@ -363,9 +375,13 @@ if want hint; then
   synth_orphan wf_synth_orphan "${SID:-diag-session}" e2e-visual
   tui_start
   wait_tui_ready || { frame 13-hint-boot-failed; finish; exit 1; }
-  sleep 12
-  # The hint needs the session routed to show session surfaces; prompt once.
-  tui_http_prompt "Reply with exactly the word READY."
+  # The hint needs the session routed to show session surfaces; the READY
+  # prompt is this boot's first input, so the ladder gates it (the verify is a
+  # new session — the scratch carries earlier cases' sessions).
+  sessions_snapshot "$OUT/sessions-before-v5.txt"
+  v5_session_landed() { session_landed_since "$OUT/sessions-before-v5.txt"; }
+  probe_verify_retry tui_ready_prompt v5_session_landed ||
+    note "READY prompt never landed in 3 attempts — the hint assert below decides"
   assert_pane_contains "boot hint names the interrupted run" "interrupted: e2e-visual (wf_synth_orphan)" 120
   frame 13-hint-shown
   hint_count() { tui_capture | grep -c "interrupted: e2e-visual (wf_synth_orphan)" || true; }

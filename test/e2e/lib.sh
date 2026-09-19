@@ -15,8 +15,10 @@
 #
 # The TUI at opencode 1.18.x only exposes its HTTP server when started with
 # --port (otherwise it is an in-process worker), so the visual suite always
-# passes --port and readiness-gates on /global/health before sending keys —
-# this also dodges the ~10s startup input-drop window (opencode issue #42915).
+# passes --port and readiness-gates on /global/health before any input, then
+# gates the first input itself with probe_verify_retry: the TUI's startup
+# input-drop window (~10s — opencode issue #42915) has no ready signal, so the
+# input's own effect is the only honest verdict.
 
 set -euo pipefail
 
@@ -52,6 +54,25 @@ wait_for() {
   while [ $SECONDS -lt $deadline ]; do
     if "$@" >/dev/null 2>&1; then return 0; fi
     sleep "$E2E_POLL_INTERVAL"
+  done
+  return 1
+}
+
+# probe_verify_retry SEND VERIFY [WAIT] [ATTEMPTS] — the readiness gate for
+# inputs sent to a freshly booted TUI (opencode #42915: startup capability
+# probes consume stdin and silently discard input for ~10s; no ready signal
+# exists, so the only honest gate is the input's own effect). Run SEND — the
+# case's first real input, no synthetic probe — wait WAIT seconds for VERIFY
+# to turn true, retry with backoff: a dropped input costs seconds, never a
+# fixed settle (spec §5.1, decision #46).
+probe_verify_retry() { # SEND VERIFY [WAIT] [ATTEMPTS]
+  local send="$1" verify="$2" wait="${3:-8}" attempts="${4:-3}" attempt=1
+  while [ "$attempt" -le "$attempts" ]; do
+    "$send"
+    if wait_for "$wait" "$verify"; then return 0; fi
+    note "attempt $attempt: $verify not verified within ${wait}s — retrying"
+    sleep "$((attempt * 2))"
+    attempt=$((attempt + 1))
   done
   return 1
 }
@@ -527,7 +548,16 @@ assert_pane_lacks() { # desc text [timeout] — asserts the text disappears
 }
 
 health_ok() { curl -sf "http://127.0.0.1:$E2E_PORT/global/health" >/dev/null 2>&1; }
-session_exists() { curl -sf "http://127.0.0.1:$E2E_PORT/session" | grep -q "ses_"; }
+
+# Session rows from the TUI's own server, ids extracted tolerantly (the
+# response shape varies across opencode releases). The snapshot/new-since pair
+# mirrors runs_snapshot/runs_new_since; a NEW session row is the honest verify
+# that a prompt landed, because sessions persist in the scratch across reboots
+# and a plain any-session check is pre-satisfied on V4/V5 boots.
+sessions_list() { curl -sf "http://127.0.0.1:$E2E_PORT/session" 2>/dev/null | grep -oE 'ses_[A-Za-z0-9]+' | sort -u || true; }
+sessions_snapshot() { sessions_list > "$1"; }                  # usage: sessions_snapshot file
+sessions_new_since() { comm -13 "$1" <(sessions_list) | grep -v '^$' || true; }
+session_landed_since() { [ -n "$(sessions_new_since "$1")" ]; }
 
 wait_tui_ready() { # also gates frame dumps until the UI is stable
   if wait_for "$E2E_WAIT_TIMEOUT" health_ok; then
