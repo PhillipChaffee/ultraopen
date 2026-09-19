@@ -12,13 +12,21 @@ cd "$(dirname "$0")" || exit 1
 # shellcheck source=lib.sh
 source ./lib.sh
 
-KEEP=0
-[ "${1:-}" = "--keep" ] && KEEP=1
-cleanup() { [ $KEEP -eq 1 ] && note "scratch kept: $SCRATCH"; scratch_destroy; }
-[ $KEEP -eq 1 ] || trap cleanup EXIT
-
 OUT="$(artifacts_dir technical)"
 export PRESERVE_DIR="$OUT"   # consumed by lib.sh's preserve_run
+
+KEEP=0
+[ "${1:-}" = "--keep" ] && KEEP=1
+if [ $KEEP -eq 1 ]; then : > "$OUT/keep.flag"; fi
+
+cleanup() { e2e_teardown technical; }
+trap cleanup EXIT
+e2e_on_signal() {
+  note "caught INT/TERM — stopping the suite and cleaning up"
+  cleanup
+  exit 130
+}
+trap e2e_on_signal INT TERM
 
 # Per-turn watchdog seconds, overridable for a degraded provider (each turn is
 # one `opencode run` process; a slow provider needs a bigger ceiling, a fast one
@@ -33,6 +41,7 @@ oc_run_capture() { # FILE SECONDS args...
   local out="$1" secs="$2"; shift 2
   opencode run --auto "$@" >"$out" 2>&1 &
   local pid=$!
+  manifest_pid "$pid" "opencode run --auto $*"
   local deadline=$((SECONDS + secs))
   while kill -0 "$pid" 2>/dev/null && [ $SECONDS -lt $deadline ]; do sleep 2; done
   if kill -0 "$pid" 2>/dev/null; then
@@ -59,8 +68,14 @@ sys.exit(0 if eval(sys.argv[2], {"d": data}) else 1)
 PYEOF
 }
 
+# Reclaim prior-run orphans before anything of this run exists (#44); the
+# reaper forks right after the scratch exists, so it can tear it down if this
+# script dies any way its traps cannot handle.
+e2e_startup_sweep
+
 section "setup"
 scratch_new
+e2e_start_reaper technical
 note "scratch: $SCRATCH"
 build_plugin && ok "plugin built (dist/ fresh)" || { bad "plugin build failed"; finish; exit 1; }
 

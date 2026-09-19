@@ -54,14 +54,18 @@ cleanup() {
   tui_keys C-c 2>/dev/null || true
   sleep 1
   tui_keys C-c 2>/dev/null || true
-  tmx kill-server 2>/dev/null || true
-  restore_host_modules
-  [ $KEEP -eq 1 ] && note "scratch kept: $SCRATCH"
-  scratch_destroy
+  e2e_teardown visual
 }
 trap cleanup EXIT
+visual_on_signal() {
+  note "caught INT/TERM — stopping the suite and cleaning up"
+  cleanup
+  exit 130
+}
+trap visual_on_signal INT TERM
 
 OUT="$(artifacts_dir visual)"
+if [ $KEEP -eq 1 ]; then : > "$OUT/keep.flag"; fi
 # capture-pane -e (colored frames) returns 0 bytes on tmux 3.7c/arm64, so frames
 # are plain text: layout and content are verifiable, colors are not.
 frame() { tui_capture > "$OUT/$1.frame"; }
@@ -69,7 +73,12 @@ frame() { tui_capture > "$OUT/$1.frame"; }
 command -v tmux >/dev/null || { bad "tmux not installed"; finish; exit 1; }
 
 section "setup"
+# Reclaim prior-run orphans before anything of this run exists (#44); the
+# reaper forks right after the scratch exists, so it can tear it down if this
+# script dies any way its traps cannot handle.
+e2e_startup_sweep
 scratch_new
+e2e_start_reaper visual
 note "scratch: $SCRATCH"
 if build_plugin; then
   ok "plugin built"
@@ -371,6 +380,15 @@ fi
 
 if ! want rest && ! want synth && ! want live && ! want permission && ! want hint; then
   bad "no known case selected" "known cases: rest synth live permission hint; --fast for the short pass"
+fi
+
+if want rest || want synth || want live || want permission || want hint; then
+  # Teardown before the summary so port-freeness is asserted on the real end
+  # state (the EXIT trap's shared teardown then finds nothing left). The port
+  # probe is an assertion, never a kill input.
+  tui_quit
+  tmx kill-server 2>/dev/null || true
+  assert_port_free
 fi
 
 finish

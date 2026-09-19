@@ -142,6 +142,245 @@ restore_host_modules() {
   done
 }
 
+# Cleanup guarantee (#44, evidence #40) ------------------------------------------
+# Every test-spawned opencode process must die when a suite ends — including
+# abnormal exit — and orphans from prior runs are reclaimed at suite start.
+# Three mechanisms: a PID manifest as the primary kill list (argv-guarded),
+# an env-marker backstop sweep (ps -wwE; matched env is NEVER printed —
+# secrets ride along in every process env), and a detached cleanup reaper
+# forked at suite start that runs the teardown when the suite script dies in
+# any way its own traps cannot handle (SIGKILL runs no traps; macOS bash 3.2
+# discards a pending SIGINT). The engine is in-process — every turn is one
+# PID — so there is no process-group machinery, and the port probe is an
+# assertion, never a kill input.
+
+OUT=""          # suite artifacts dir; suites set it before the first spawn
+REAPER_PID=""
+REAPER_LOG=""
+E2E_CLEANED=0   # teardown-once guard, shared by the traps and the reaper
+
+manifest_pid() { # manifest_pid PID ARGV — record a spawn site's PID for the sweep.
+  # Lives in the artifacts dir, never the scratch: normal exits delete the
+  # scratch, abnormal exits never reach scratch_destroy.
+  [ -n "$OUT" ] || return 0
+  printf '%s\t%s\n' "$1" "$2" >> "$OUT/pids.txt" 2>/dev/null || true
+}
+
+manifest_has() { # PID → 0 if recorded in this run's PID manifest
+  [ -n "$OUT" ] && [ -f "$OUT/pids.txt" ] || return 1
+  awk -F'\t' -v p="$1" '$1 == p { found=1 } END { exit found ? 0 : 1 }' "$OUT/pids.txt"
+}
+
+pid_argv_still_matches() { # PID RECORDED_ARGV — PID-reuse guard: kill a recorded PID
+  # only when its live argv still carries the recorded spawn's command line
+  # (first line; prompts span lines and ps renders newlines as \012).
+  local key live
+  key="${2%%$'\n'*}"
+  [ -n "$key" ] || return 1
+  live="$(ps -ww -o command= -p "$1" 2>/dev/null || true)"
+  [ -n "$live" ] || return 1
+  case "$live" in *"$key"*) return 0 ;; esac
+  return 1
+}
+
+e2e_kill_pid() { # PID — the kill ladder: SIGTERM → 10s grace → SIGKILL (#44)
+  kill -0 "$1" 2>/dev/null || return 0
+  kill -TERM "$1" 2>/dev/null || return 0
+  local i=0
+  while [ "$i" -lt 10 ] && kill -0 "$1" 2>/dev/null; do
+    sleep 1
+    i=$((i + 1))
+  done
+  if kill -0 "$1" 2>/dev/null; then
+    kill -KILL "$1" 2>/dev/null || true
+  fi
+  return 0
+}
+
+e2e_kill_manifest() { # argv-guarded kill of every recorded PID
+  [ -f "$OUT/pids.txt" ] || return 0
+  local pid argv
+  while IFS="$(printf '\t')" read -r pid argv; do
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$pid" 2>/dev/null || continue
+    if pid_argv_still_matches "$pid" "$argv"; then
+      sweep_note "manifest kill: pid $pid"
+      e2e_kill_pid "$pid"
+    else
+      sweep_note "manifest pid $pid was recycled (argv mismatch) — left to the marker sweep"
+    fi
+  done < "$OUT/pids.txt"
+  return 0
+}
+
+# e2e_marker_check PID — exit 0 when the process's environment carries an e2e
+# marker (XDG_DATA_HOME / OPENCODE_CONFIG_DIR under ultraopen-e2e.*). The
+# ps -E text itself is never printed.
+e2e_marker_check() {
+  local out
+  out="$(ps -wwE -o command= -p "$1" 2>/dev/null || true)"
+  case "$out" in
+    *XDG_DATA_HOME=*ultraopen-e2e.*|*OPENCODE_CONFIG_DIR=*ultraopen-e2e.*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+e2e_scratch_of() { # TEXT → the ultraopen-e2e XDG_DATA_HOME value found in it, or ""
+  printf '%s' "$1" | python3 -c 'import re,sys; m=re.search(r"XDG_DATA_HOME=(\S*ultraopen-e2e\S*)", sys.stdin.read()); print(m.group(1) if m else "")' 2>/dev/null || true
+}
+
+sweep_note() { # in-suite diagnostics print; the reaper's land in its own log
+  if [ -n "$REAPER_LOG" ]; then
+    printf '%s\n' "$1" >> "$REAPER_LOG" 2>/dev/null || true
+  else
+    note "$1"
+  fi
+}
+
+# e2e_sweep MODE — the env-marker backstop. startup: kill marker-matched
+# processes whose scratch no longer exists (definitively from a finished run)
+# and report — never kill — those whose scratch is still live (a concurrent
+# run's). exit: kill marker-matched processes carrying THIS run's scratch.
+# opencode processes with no marker are noted, never killed; attribution to
+# kill stays exclusively marker-based.
+e2e_sweep() { # MODE startup|exit
+  local mode="$1" own="" line pid rest scratch
+  case "$mode" in
+    startup) [ "${E2E_SKIP_SWEEP:-0}" = "1" ] && return 0 ;;
+    exit)    own="${XDG_DATA_HOME:-}"; [ -n "$own" ] || return 0 ;;
+    *)       return 0 ;;
+  esac
+  while IFS= read -r line; do
+    pid=""
+    rest=""
+    read -r pid rest <<<"$line" || true
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    [ "$pid" = "$$" ] && continue
+    [ -n "$REAPER_PID" ] && [ "$pid" = "$REAPER_PID" ] && continue
+    case "$rest" in
+      *XDG_DATA_HOME=*ultraopen-e2e.*|*OPENCODE_CONFIG_DIR=*ultraopen-e2e.*) ;;
+      *) continue ;;
+    esac
+    scratch="$(e2e_scratch_of "$rest")"
+    if [ "$mode" = exit ]; then
+      if [ "$scratch" = "$own" ]; then
+        sweep_note "marker sweep: killing pid $pid (carries this run's scratch)"
+        e2e_kill_pid "$pid"
+      fi
+    else
+      if [ -n "$scratch" ] && [ -d "$scratch" ]; then
+        sweep_note "startup sweep: pid $pid belongs to a live run (its scratch exists) — not touched"
+      else
+        sweep_note "startup sweep: reclaiming orphan pid $pid (its scratch is gone)"
+        e2e_kill_pid "$pid"
+      fi
+    fi
+  done < <(ps -axwwE -o pid=,command= 2>/dev/null || true)
+  if [ "$mode" = startup ]; then
+    e2e_note_unmarked
+  fi
+  return 0
+}
+
+e2e_note_unmarked() { # one note line per unmarked opencode process (pid + argv)
+  local p cmd
+  for p in $(pgrep -x opencode 2>/dev/null || true); do
+    e2e_marker_check "$p" && continue
+    cmd="$(ps -ww -o command= -p "$p" 2>/dev/null || true)"
+    [ -n "$cmd" ] || continue
+    note "unattributable opencode process (no e2e marker) — pid $p: $cmd"
+  done
+  return 0
+}
+
+e2e_startup_sweep() { # default on; E2E_SKIP_SWEEP=1 opts out for debugging
+  if [ "${E2E_SKIP_SWEEP:-0}" = "1" ]; then
+    note "startup sweep skipped (E2E_SKIP_SWEEP=1)"
+    return 0
+  fi
+  e2e_sweep startup
+}
+
+# e2e_teardown KIND — the one teardown both the in-script traps and the reaper
+# run; idempotent. Kills the manifest, sweeps this run's marker-matched
+# stragglers, then the kind-specific file teardown — unless the --keep flag
+# file exists. Writes the reaper sentinel last, so a reaper waking on a suite
+# that completed its own teardown exits without acting.
+e2e_teardown() { # KIND technical|visual
+  [ "${E2E_CLEANED:-0}" -eq 1 ] && return 0
+  E2E_CLEANED=1
+  [ -n "$OUT" ] || return 0
+  if [ "$1" = "visual" ]; then
+    tmx kill-server 2>/dev/null || true
+  fi
+  e2e_kill_manifest
+  e2e_sweep exit
+  if [ "$1" = "visual" ]; then
+    restore_host_modules
+  fi
+  if [ -f "$OUT/keep.flag" ]; then
+    sweep_note "scratch kept: $SCRATCH"
+  else
+    scratch_destroy
+  fi
+  : > "$OUT/reaper.done" 2>/dev/null || true
+  return 0
+}
+
+# e2e_start_reaper KIND — fork the detached cleanup reaper: a watcher outside
+# the suite script's process. It survives every way the suite can die (it is
+# a separate process; INT/HUP/QUIT are ignored so a terminal Ctrl-C or a
+# closing terminal cannot stop the cleanup) and, when the suite's PID
+# vanishes without the sentinel, runs the full teardown — the abnormal-exit
+# backstop. Its output lands in $OUT/reaper.log.
+e2e_start_reaper() { # KIND
+  REAPER_LOG="$OUT/reaper.log"
+  reaper_suite_pid="$$"
+  reaper_kind="$1"
+  (
+    set +e +u +o pipefail
+    trap '' HUP INT QUIT
+    while kill -0 "$reaper_suite_pid" 2>/dev/null; do sleep 1; done
+    if [ ! -f "$OUT/reaper.done" ]; then
+      e2e_teardown "$reaper_kind"
+    fi
+    exit 0
+  ) > "$REAPER_LOG" 2>&1 &
+  REAPER_PID=$!
+}
+
+# assert_port_free — post-suite port-freeness, scoped to e2e: the suite fails
+# only if a manifest-PID or marker-matched process still holds the port after
+# the settle window; a foreign holder is a note (it would have failed
+# wait_tui_ready at boot anyway).
+assert_port_free() {
+  local holders p e2e=0 foreign="" waited=0
+  while [ "$waited" -lt 10 ]; do
+    holders="$(lsof -nP -tiTCP:"$E2E_PORT" -sTCP:LISTEN 2>/dev/null || true)"
+    [ -z "$holders" ] && break
+    sleep 1
+    waited=$((waited + 1))
+  done
+  holders="$(lsof -nP -tiTCP:"$E2E_PORT" -sTCP:LISTEN 2>/dev/null || true)"
+  if [ -z "$holders" ]; then
+    ok "port $E2E_PORT free after teardown"
+    return 0
+  fi
+  for p in $holders; do
+    if manifest_has "$p" || e2e_marker_check "$p"; then
+      e2e=1
+    else
+      foreign="$foreign $p"
+    fi
+  done
+  if [ "$e2e" -eq 1 ]; then
+    bad "port $E2E_PORT still held by an e2e process after teardown" "a manifest/marker-matched holder survived the settle window"
+  else
+    note "port $E2E_PORT held by foreign process(es):$foreign — not e2e's"
+  fi
+  return 0
+}
+
 # Run-dir helpers ---------------------------------------------------------------
 runs() { ls -1 "$RUN_ROOT" 2>/dev/null || true; }
 runs_snapshot() { runs | sort > "$1"; }                       # usage: runs_snapshot file
@@ -226,6 +465,11 @@ tmx() { tmux -L "$E2E_TMUX_SOCKET" "$@"; }
 
 tui_start() { # tui_start [extra opencode flags...]
   tmx new-session -d -s tui -x 200 -y 50 "opencode --port $E2E_PORT $*"
+  local pane_pid
+  pane_pid="$(tmx display-message -p -t tui '#{pane_pid}' 2>/dev/null || true)"
+  if [ -n "$pane_pid" ]; then
+    manifest_pid "$pane_pid" "opencode --port $E2E_PORT $*"
+  fi
 }
 tui_keys()   { tmx send-keys -t tui "$@"; }
 tui_capture() { tmx capture-pane -p -t tui; }   # plain text, live grid
