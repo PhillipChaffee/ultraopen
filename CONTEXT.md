@@ -38,6 +38,23 @@ Non-ultracode sessions hold exactly one live run regardless of the cap.
 A session where the user said some form of "don't fan out". Demotion is prompt-level guidance
 only — the launch gate ignores it, and an explicitly requested workflow launches normally.
 
+**leak (e2e)**
+Two distinct senses in the e2e suites — keep them apart. A **process leak** is a test-spawned
+opencode process that outlives the suite (what the cleanup guarantee targets). **Config
+leakage** is the scratch environment inheriting developer-environment state it should not,
+through env vars the harness fails to redirect.
+
+**cleanup reaper (e2e)**
+The detached watcher one e2e suite run forks at start. It watches the suite script and, when the
+script dies for any reason, kills the run's recorded processes, sweeps marker-matched leaks, and
+tears down what the EXIT trap would have (scratch, stashed modules, tmux server). Not the plugin's
+boot-time crash reaper, which marks dead runs `orphaned` on disk.
+
+**PID manifest (e2e)**
+The per-suite-run file in the suite's artifacts dir listing every process the harness spawned
+(turn PIDs, the TUI pane pid) with the argv each started with — the cleanup reaper's primary kill
+list, with argv matching guarding against a recycled PID. Not a run's `manifest.json`.
+
 ## Where decisions live
 
 - `docs/adr/` — accepted decisions, one file each. ADR-0001 records the launch concurrency policy
