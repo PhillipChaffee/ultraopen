@@ -7,6 +7,11 @@
 # Usage:  bash test/e2e/technical.sh [--keep]
 #   --keep   keep the scratch XDG home for post-mortem (path printed at exit)
 # Env:     E2E_MODEL, E2E_WAIT_TIMEOUT
+#
+# Echo ceiling (#54): the headless argument echo is byte-faithful to ~700B on
+# Flash — above ~1KB the model's own transcription of verbatim literals fails
+# (a model ceiling, not renderer truncation). No case may lean on >~1KB
+# verbatim tool-argument transcription on Flash.
 
 cd "$(dirname "$0")" || exit 1
 # shellcheck source=lib.sh
@@ -85,97 +90,12 @@ grep -q "READY" "$OUT/t0.out" \
   && ok "model answered in scratch env" \
   || { bad "model did not answer in scratch env" "see $OUT/t0.out — auth symlink or provider config broken; aborting"; finish; exit 1; }
 
-section "T1 — workflow tool end-to-end (async launch, permission auto-approve, schema forcing)"
-runs_snapshot "$OUT/runs-before-t1.txt"
-oc_run_capture "$OUT/t1.out" "$TURN_SECS" "$(wf_prompt smoke)" || true
-if [ -z "$(newest_completed_run "$OUT/runs-before-t1.txt")" ]; then
-  # A schema-forced agent dies on a transient provider api-error ~1 in 3 turns
-  # (see T3); the async contract itself is proven by the poll below.
-  note "first attempt failed or settled failed — retrying once"
-  oc_run_capture "$OUT/t1b.out" "$TURN_SECS" "$(wf_prompt smoke)" || true
-fi
-RUN1_ALL="$(runs_new_since "$OUT/runs-before-t1.txt")"
-for r in $RUN1_ALL; do preserve_run "$r"; done
-RUN1="$(newest_completed_run "$OUT/runs-before-t1.txt")"
-# Headless output echoes tool ARGUMENTS, not tool results, so the launch
-# result itself is invisible here. The observable async-contract proof: the
-# model polled workflow_status in the same turn (it can only do that when the
-# launch returned a run id instead of an outcome) and the run settled on disk.
-if grep -q "workflow_status" "$OUT/t1.out"; then
-  ok "launch returned a run id; the model polled workflow_status in-turn"
-else
-  bad "no workflow_status poll in the turn" "the launch result must hand the model a run id — see $OUT/t1.out"
-fi
-if [ -n "$RUN1" ]; then
-  ok "run dir created: $RUN1"
-  RUN1_ATTEMPTS="$(printf '%s' "$RUN1_ALL" | grep -c . || true)"
-  if [ "$RUN1_ATTEMPTS" -gt 1 ]; then
-    note "$RUN1_ATTEMPTS workflow attempts this turn; asserting on the completed one (outer model self-retried a transient failure)"
-  fi
-  assert_run_completed "$RUN1"
-  [ "$(journal_count "$RUN1")" -ge 1 ] && ok "journal has $(journal_count "$RUN1") entry" || bad "journal empty"
-  result_json_has "$RUN1" '"answer" in d' && ok "schema-forced result shape {answer}" || bad "result.json missing answer"
-  result_json_has "$RUN1" 'isinstance(d.get("answer"), str) and d["answer"].strip() != ""' && ok "agent produced a non-empty schema-forced answer" || bad "schema-forced answer missing/empty"
-else
-  bad "no completed run dir" "attempts: $(printf '%s' "$RUN1_ALL" | tr '\n' ' ') — see $OUT/t1.out"
-fi
-
-section "T3 — resume across processes (self-contained baseline + resume)"
-runs_snapshot "$OUT/runs-before-t3a.txt"
-oc_run_capture "$OUT/t3a.out" "$TURN_SECS" "$(wf_prompt smoke)" || true
-BASE="$(newest_completed_run "$OUT/runs-before-t3a.txt")"
-preserve_run "$BASE"
-if [ -z "$BASE" ]; then
-  # One retry: the schema path hits transient provider errors ~1 in 3 turns
-  # (reason: api-error in the journal); the outer model usually self-heals,
-  # but a turn can still end with no completed run.
-  runs_snapshot "$OUT/runs-before-t3a2.txt"
-  oc_run_capture "$OUT/t3a2.out" "$TURN_SECS" "$(wf_prompt smoke)" || true
-  BASE="$(newest_completed_run "$OUT/runs-before-t3a.txt")"
-  preserve_run "$BASE"
-fi
-if [ -n "$BASE" ]; then
-  assert_run_completed "$BASE"
-  runs_snapshot "$OUT/runs-before-t3b.txt"
-  # -c continues the most recent session in the scratch dir — resume is
-  # same-session-only (src/server/resume/persist.ts), so the journal loads.
-  oc_run_capture "$OUT/t3b.out" "$TURN_SECS" -c "$(wf_prompt smoke "Set resumeFromRunId to $BASE.")" || true
-  RUN3="$(runs_new_since "$OUT/runs-before-t3b.txt" | head -1)"
-  preserve_run "$RUN3"
-  if [ -n "$RUN3" ]; then
-    ok "resume run dir created: $RUN3"
-    assert_run_completed "$RUN3"
-    [ "$(journal_grep "$RUN3" '"replayed":true')" -ge 1 ] \
-      && ok "journal entry replayed from $BASE (zero live agents)" \
-      || bad "no replayed journal entry" "grep replayed in $OUT/$RUN3/journal.jsonl"
-    # The replay invariant: the resumed result EQUALS the baseline's recorded
-    # value. The READY word is a baseline-quality matter — when the baseline
-    # agent returned a degenerate value (provider can return an empty schema
-    # answer), replay faithfully returns it too, and the note says so.
-    T3_FIDELITY="$(python3 - "$RUN_ROOT/$BASE/result.json" "$RUN_ROOT/$RUN3/result.json" <<'PYEOF'
-import json, sys
-try:
-    a = json.load(open(sys.argv[1])); b = json.load(open(sys.argv[2]))
-except Exception:
-    print(0); raise SystemExit
-print(1 if a == b else 0)
-PYEOF
-)"
-    if [ "$T3_FIDELITY" = "1" ]; then
-      ok "resumed result equals the recorded baseline value (replay fidelity)"
-      result_json_has "$RUN3" 'isinstance(d.get("answer"), str) and d["answer"].strip() != ""' \
-        || note "the baseline value itself was degenerate (the provider returned an empty schema answer, replayed faithfully) — baseline: $(cat "$RUN_ROOT/$BASE/result.json" 2>/dev/null)"
-    else
-      bad "resumed result differs from the recorded baseline value" "baseline: $(cat "$RUN_ROOT/$BASE/result.json" 2>/dev/null) — resumed: $(cat "$RUN_ROOT/$RUN3/result.json" 2>/dev/null)"
-    fi
-  else
-    bad "resume produced no run dir" "see $OUT/t3b.out"
-  fi
-else
-  bad "baseline run for T3 failed" "see $OUT/t3a.out"
-fi
-
 section "T2 — parallel fan-out (3 agents, barrier, journal)"
+# First heavyweight case after the slimming (#45): its failure is the suite's
+# triage canary. A schema-forced agent can die on a transient provider
+# api-error (schema-forced $ref against the Together grammar, README:295-300);
+# the parallel barrier and the journal are the contract — a missing answer is
+# provider weather only when the missing agent's journal entry records it.
 runs_snapshot "$OUT/runs-before-t2.txt"
 oc_run_capture "$OUT/t2.out" "$((TURN_SECS * 2))" "$(wf_prompt parallel)" || true
 RUN2="$(newest_completed_run "$OUT/runs-before-t2.txt")"
@@ -195,19 +115,125 @@ PYEOF
 )"
   [ "$T2_LABELS" = "3" ] && ok "journal covers exactly 3 agents" \
     || bad "journal has $T2_LABELS distinct agent labels, expected 3" "a stall restart writes another entry for the same key; the distinct-label count is the invariant"
-  # A schema-forced agent can die on a transient provider api-error (~1 in 3
-  # turns on Together, per the T3 comment); the parallel barrier and the
-  # journal are the contract — the missing answer is provider weather.
   if result_json_has "$RUN2" 'len(d.get("answers", [])) == 3'; then
     ok "3 answers returned"
-  elif result_json_has "$RUN2" 'len(d.get("answers", [])) == 2' && [ "$(journal_grep "$RUN2" '"reason":"api-error"')" -ge 1 ]; then
-    note "2/3 answers returned; the third hit the documented provider api-error flake"
-    ok "answers returned (modulo provider flake)"
+    # Re-homed from T1 (#45): the schema answer must be a non-empty string.
+    result_json_has "$RUN2" 'all(isinstance(a, str) and a.strip() for a in d["answers"])' \
+      && ok "schema-forced answers non-empty" \
+      || bad "schema-forced answer missing/empty" "inspect $RUN2/result.json"
   else
-    bad "answers != 3 and no api-error recorded" "inspect $RUN2"
+    T2_MISSING_ERR="$(python3 - "$RUN_ROOT/$RUN2/journal.jsonl" <<'PYEOF'
+import json, sys
+labels, err_labels = set(), set()
+for line in open(sys.argv[1]):
+    try: e = json.loads(line)
+    except Exception: continue
+    label = e.get("label")
+    if not isinstance(label, str): continue
+    labels.add(label)
+    if e.get("reason") == "api-error": err_labels.add(label)
+missing = {"fanout:1", "fanout:2", "fanout:3"} - labels
+print(1 if missing and missing <= err_labels else 0)
+PYEOF
+)"
+    if result_json_has "$RUN2" 'len(d.get("answers", [])) == 2' && [ "$T2_MISSING_ERR" = "1" ]; then
+      note "2/3 answers returned; the missing agent's journal entry records the provider api-error flake"
+      ok "answers returned (modulo provider flake)"
+    else
+      bad "answers != 3 and the missing agent recorded no api-error" "inspect $RUN2"
+    fi
   fi
 else
-  bad "no completed run dir" "see $OUT/t2.out (watchdog kills print there)"
+  bad "no completed run dir" "first-heavyweight canary — see $OUT/t2.out (watchdog kills print there)"
+fi
+
+section "T3 — resume across processes (T2's run replayed, zero live agents)"
+# Slimmed to a resume-only turn consuming T2's completed run (#45; shape
+# live-proven in #54). Pins: this -c resume is the turn IMMEDIATELY after T2 —
+# no intervening session-creating command — with parallel.js passed verbatim
+# and no args on either call; the manifest hash equality below is the cheap
+# model-independent guard that those pins held. T2's dir is preserved in the
+# T2 section, so both sides of the pair survive teardown.
+if [ -z "$RUN2" ]; then
+  bad "T3 has no baseline: T2 produced no completed run" "the slimmed resume chain consumes T2's run — fix T2 first"
+else
+  runs_snapshot "$OUT/runs-before-t3.txt"
+  oc_run_capture "$OUT/t3.out" "$TURN_SECS" -c "$(wf_prompt parallel "Set resumeFromRunId to $RUN2.")" || true
+  if [ -z "$(newest_completed_run "$OUT/runs-before-t3.txt")" ]; then
+    note "first resume attempt settled short — retrying once"
+    oc_run_capture "$OUT/t3b.out" "$TURN_SECS" -c "$(wf_prompt parallel "Set resumeFromRunId to $RUN2.")" || true
+  fi
+  RUN3="$(newest_run "$OUT/runs-before-t3.txt")"
+  preserve_run "$RUN3"
+  if [ -n "$RUN3" ]; then
+    ok "resume run dir created: $RUN3"
+    assert_run_completed "$RUN3"
+    T3_HASH_GUARD="$(python3 - "$RUN_ROOT/$RUN2/manifest.json" "$RUN_ROOT/$RUN3/manifest.json" <<'PYEOF'
+import json, sys
+a, b = (json.load(open(p)) for p in sys.argv[1:3])
+print(1 if a.get("sourceHash") == b.get("sourceHash") and a.get("argsHash") == b.get("argsHash") else 0)
+PYEOF
+)"
+    if [ "$T3_HASH_GUARD" = "1" ]; then
+      ok "resumed manifest hashes equal the baseline's (script verbatim, no args)"
+    else
+      bad "resumed manifest hashes differ from the baseline's" "the verbatim/no-args pins failed — compare both manifests"
+    fi
+    # Replay asserts hold in full only on an all-ok baseline: the engine
+    # replays only ok entries and re-runs failed calls live on resume, so
+    # all-replayed and result equality cannot hold across a degenerate
+    # (2/3 + api-error) baseline — that path degrades to a note (#54).
+    T3_BASE_OK="$(python3 - "$RUN_ROOT/$RUN2/journal.jsonl" <<'PYEOF'
+import json, sys
+entries = []
+for line in open(sys.argv[1]):
+    try: entries.append(json.loads(line))
+    except Exception: continue
+print(1 if entries and all(e.get("status") == "ok" for e in entries) else 0)
+PYEOF
+)"
+    T3_ALL_REPLAYED="$(python3 - "$RUN_ROOT/$RUN3/journal.jsonl" <<'PYEOF'
+import json, sys
+entries = []
+for line in open(sys.argv[1]):
+    try: entries.append(json.loads(line))
+    except Exception: continue
+print(1 if entries and all(e.get("replayed") is True for e in entries) else 0)
+PYEOF
+)"
+    T3_NO_CHILDREN="$(python3 - "$RUN_ROOT/$RUN3/manifest.json" <<'PYEOF'
+import json, sys
+print(1 if json.load(open(sys.argv[1])).get("childSessionIDs") == [] else 0)
+PYEOF
+)"
+    if [ "$T3_BASE_OK" = "1" ]; then
+      [ "$T3_ALL_REPLAYED" = "1" ] \
+        && ok "every journal entry replayed from $RUN2 (zero live agents)" \
+        || bad "a resume journal entry did not replay" "inspect $OUT/$RUN3/journal.jsonl"
+      [ "$T3_NO_CHILDREN" = "1" ] \
+        && ok "resume spawned no child session (childSessionIDs == [])" \
+        || bad "resume spawned child sessions" "inspect $RUN3/manifest.json"
+      T3_FIDELITY="$(python3 - "$RUN_ROOT/$RUN2/result.json" "$RUN_ROOT/$RUN3/result.json" <<'PYEOF'
+import json, sys
+try:
+    a = json.load(open(sys.argv[1])); b = json.load(open(sys.argv[2]))
+except Exception:
+    print(0); raise SystemExit
+print(1 if a == b else 0)
+PYEOF
+)"
+      [ "$T3_FIDELITY" = "1" ] \
+        && ok "resumed result equals the recorded baseline value (replay fidelity)" \
+        || bad "resumed result differs from the recorded baseline value" "baseline: $(cat "$RUN_ROOT/$RUN2/result.json" 2>/dev/null) — resumed: $(cat "$RUN_ROOT/$RUN3/result.json" 2>/dev/null)"
+    else
+      note "T2's journal was degenerate ($(journal_grep "$RUN2" '"status":"ok"') of $(journal_count "$RUN2") entries ok) — only ok entries replay, so all-replayed and fidelity degrade to a note (#54)"
+      [ "$(journal_grep "$RUN3" '"replayed":true')" -ge 1 ] \
+        && ok "the ok baseline entries replayed" \
+        || note "no replayed entry under a degenerate baseline — inspect $OUT/$RUN3/journal.jsonl"
+    fi
+  else
+    bad "resume produced no run dir" "see $OUT/t3.out"
+  fi
 fi
 
 section "T4 — nested workflow({script})"
@@ -225,53 +251,65 @@ if [ -n "$RUN4" ]; then
   [ "$T4_COUNT" -eq 1 ] && ok "one run dir (nested runs share the parent's, by design)" \
     || note "$T4_COUNT run dirs (outer model retried); asserting on the completed one"
   assert_run_completed "$RUN4"
-  grep -q "INNER" "$OUT/t4.out" && ok "nested result surfaced to the outer return" || bad "nested word INNER not in output"
+  # The INNER grep row was removed (#45): it matched the tool-argument echo,
+  # not results (echo-satisfiable). The nesting property survives without it —
+  # a broken nested call throws and the run cannot complete.
 else
   bad "no completed run dir" "see $OUT/t4.out"
 fi
 
-section "T5a — saved workflow runs by name (context.named is wired)"
-# A saved workflow in the scratch project's .opencode/ultraopen/workflows must
-# run by name through the named form of workflow().
+section "T5 — saved workflow by name + unknown-name error (one merged turn)"
+# T5a+T5b merged (#45; shape live-proven in #54): one script try/catches the
+# unknown-name sync throw, then calls the saved name. Both facts are
+# result.json-assertable, replacing the echo-grade greps; the caught throw
+# creates no run dir — the named call shares the parent's. The saved probe.js
+# fixture stays.
 mkdir -p "$SCRATCH/project/.opencode/ultraopen/workflows"
 cat > "$SCRATCH/project/.opencode/ultraopen/workflows/probe.js" <<'PROBE'
 export const meta = { name: 'probe', description: 'Saved workflow probe' }
 return 'SAVED-WORKFLOW-RAN'
 PROBE
-runs_snapshot "$OUT/runs-before-t5a.txt"
-oc_run_capture "$OUT/t5a.out" "$TURN_SECS" "$(wf_prompt named)" || true
-RUN5="$(newest_run "$OUT/runs-before-t5a.txt")"
+t5_prompt() {
+  printf 'Call the workflow tool now. Pass no scriptPath and no args. Use this script exactly, unchanged:\n\n%s\n\nThe tool returns a launch result with a run id, not the outcome. Then call workflow_status with that run id and wait=120 (repeat the call if it says running). When the status is completed or failed, reply with what workflow_status reported — the value or the failure. Never end your turn while the run is unsettled.' \
+    "$(cat <<'T5SCRIPT'
+export const meta = { name: 'e2e-merged-t5', description: 'Try/catch the unknown-name throw, then run the saved name', phases: [{ title: 'Probe' }] }
+let caught = null
+try {
+  await workflow('definitely-not-saved')
+} catch (e) {
+  caught = { name: e && e.name, message: e && e.message ? e.message : String(e) }
+}
+const saved = await workflow('probe')
+return { caught, saved }
+T5SCRIPT
+)"
+}
+runs_snapshot "$OUT/runs-before-t5.txt"
+oc_run_capture "$OUT/t5.out" "$TURN_SECS" "$(t5_prompt)" || true
+if [ -z "$(newest_completed_run "$OUT/runs-before-t5.txt")" ]; then
+  note "first attempt produced no completed run — retrying once"
+  oc_run_capture "$OUT/t5b.out" "$TURN_SECS" "$(t5_prompt)" || true
+fi
+RUN5="$(newest_run "$OUT/runs-before-t5.txt")"
+T5_RUNS="$(runs_new_since "$OUT/runs-before-t5.txt" | grep -c . || true)"
+preserve_run "$RUN5"
 if [ -n "$RUN5" ]; then
-  preserve_run "$RUN5"
+  [ "$T5_RUNS" -eq 1 ] \
+    && ok "one run dir (the caught throw registered none; the named call shares the parent's)" \
+    || note "$T5_RUNS run dirs (outer model retried); asserting on the newest"
   if [ "$(manifest_status "$RUN5")" = "completed" ]; then
-    ok "saved workflow ran by name (named form no longer throws)"
+    ok "merged turn completed (the caught throw did not fail the run)"
+    result_json_has "$RUN5" 'isinstance(d.get("caught"), dict) and ("No saved workflow named " + chr(34) + "definitely-not-saved" + chr(34) + ".") in (d["caught"].get("message") or "")' \
+      && ok "the unknown-name error is result.json-assertable (caught.message)" \
+      || bad "caught.message does not name the unknown-workflow error" "inspect $RUN5/result.json"
+    result_json_has "$RUN5" 'd.get("saved") == "SAVED-WORKFLOW-RAN"' \
+      && ok "the saved workflow ran by name and returned its value" \
+      || bad "the named call did not return the saved workflow's value" "inspect $RUN5/result.json"
   else
-    bad "named form did not complete" "manifest $(manifest_status "$RUN5") — inspect $OUT/$RUN5 and $OUT/t5a.out"
+    bad "the merged T5 run did not complete" "manifest $(manifest_status "$RUN5") — inspect $OUT/$RUN5 and $OUT/t5.out"
   fi
 else
-  bad "named-form probe produced no run dir" "see $OUT/t5a.out"
-fi
-
-section "T5b — unknown workflow name still gives the clear error"
-runs_snapshot "$OUT/runs-before-t5b.txt"
-oc_run_capture "$OUT/t5b.out" "$TURN_SECS" "$(wf_prompt named 'The workflow name to call is definitely-not-saved.')" || true
-if grep -qiE "no saved workflow|not a saved" "$OUT/t5b.out"; then
-  ok "unknown name gives the clear error naming the suggestion"
-else
-  note "unknown-name error wording not visible in $OUT/t5b.out — inspect"
-fi
-
-section "T6 — isolation: worktree (evidence probe)"
-git init -q . 2>/dev/null || true
-runs_snapshot "$OUT/runs-before-t6.txt"
-oc_run_capture "$OUT/t6.out" "$TURN_SECS" "$(wf_prompt worktree)" || true
-RUN6="$(newest_completed_run "$OUT/runs-before-t6.txt")"
-preserve_run "$RUN6"
-if [ -n "$RUN6" ]; then
-  assert_run_completed "$RUN6"
-  note "evidence: isolation:'worktree' accepted and run completed; check $SCRATCH for worktrees — worktreeRoot is not wired in src/server/index.ts (see triage)"
-  [ -z "$(find "$SCRATCH" -type d -name '*worktree*' 2>/dev/null | head -1)" ] \
-    && note "no worktree directory created — isolation opt is inert in the live path"
+  bad "the merged T5 probe produced no run dir" "see $OUT/t5.out"
 fi
 
 section "T7 — agentDeadlineMs option (tuple-form options reach the engine)"
@@ -290,63 +328,14 @@ else
 fi
 scratch_write_config "null"
 
-section "T8 — ultracode keyword surface (effort raise on the turn)"
-runs_snapshot "$OUT/runs-before-t8.txt"
-oc_run_capture "$OUT/t8.json" "$TURN_SECS" --format json "ultracode $(wf_prompt smoke)" || true
-RUN8="$(newest_completed_run "$OUT/runs-before-t8.txt")"
-if [ -z "$RUN8" ]; then
-  # Parent turns can stall on provider hiccups (opencode retries with no cap);
-  # one retry keeps the suite from flaking on transient hangs.
-  note "no run from the first attempt (stall or non-compliance) — retrying once"
-  runs_snapshot "$OUT/runs-before-t8b.txt"
-  oc_run_capture "$OUT/t8b.json" "$TURN_SECS" --format json "ultracode $(wf_prompt smoke)" || true
-  RUN8="$(newest_completed_run "$OUT/runs-before-t8.txt")"
-fi
-preserve_run "$RUN8"
-if [ -n "$RUN8" ]; then
-  ok "ultracode-keyword turn created run: $RUN8"
-  assert_run_completed "$RUN8"
-  if grep -q '"variant" *: *"\(xhigh\|high\|max\)"' "$OUT/t8.json" "$OUT/t8b.json" 2>/dev/null; then
-    ok "effort variant applied to the turn (see $OUT/t8*.json)"
-  else
-    note "evidence: no reasoning variant on this model's turn — GLM-5.3's variant map may be empty, effort is a no-op on this provider (check run logs)"
-  fi
-else
-  bad "ultracode turn produced no run dir" "see $OUT/t8.json"
-fi
-
-section "T9 — background launch + status delivery (value arrives only via workflow_status)"
-# The launch result must not carry the outcome; the final value reaches the
-# model only through a workflow_status poll, and the run settles before the
-# one-shot process exits because the turn kept polling.
-runs_snapshot "$OUT/runs-before-t9.txt"
-oc_run_capture "$OUT/t9.out" "$TURN_SECS" "$(wf_prompt ping)" || true
-RUN9="$(newest_run "$OUT/runs-before-t9.txt")"
-if [ -n "$RUN9" ]; then
-  preserve_run "$RUN9"
-  grep -q "workflow_status" "$OUT/t9.out" && ok "T9 launch handed a run id that was polled" || bad "T9: no workflow_status poll" "see $OUT/t9.out"
-  # The word the agent was told to produce can only reach the model's reply
-  # through a workflow_status poll — the launch result never carries it. A bare
-  # "completed" echo without the value does NOT prove delivery, so it only notes.
-  if grep -q "PING" "$OUT/t9.out"; then
-    ok "final value delivered through the status poll"
-  elif grep -qE "workflow-status.*completed" "$OUT/t9.out"; then
-    note "status poll surfaced a completion but no value in the reply — inspect $OUT/t9.out"
-  else
-    note "T9 value did not surface in the reply — inspect $OUT/t9.out and $RUN9"
-  fi
-  [ "$(manifest_status "$RUN9")" = "completed" ] || [ "$(manifest_status "$RUN9")" = "failed" ] \
-    && ok "T9 run settled (status: $(manifest_status "$RUN9"))" \
-    || bad "T9 run never settled" "manifest still $(manifest_status "$RUN9") after the turn"
-else
-  bad "T9 produced no run dir" "see $OUT/t9.out"
-fi
-
 section "T10 — concurrent launches in one ultracode session (the live-run cap admits two)"
 # The conditional gate (docs/adr/0001-launch-concurrency-policy.md): an
 # ultracode-active session launches TWO workflows back to back in one turn. The
 # sibling advisory in the second launch result is the registry-level proof the
 # gate saw two live runs; the overlapping manifest windows are the disk proof.
+# The load-bearing case after the slimming (#45): sole e2e prover of keyword
+# activation, per-id status, admission, replay ×2, and value delivery — its
+# two resume turns carry pinned harness retries.
 t10_prompt() {
   printf 'ultracode Call the workflow tool TWICE, both calls in ONE step: emit the two tool calls together in a single response, never one after another across steps. Both calls use background true, no scriptPath, no args, and this script exactly, unchanged:\n\n%s\n\nAfter BOTH launch results arrive, call workflow_status for EACH of the two run ids (wait=120, repeat while any report says running). When both are settled, reply with both run ids and their final statuses. Never end your turn while any run is unsettled.' \
     "$(cat "$E2E_DIR/fixtures/ping.js")"
@@ -477,6 +466,31 @@ if [ "$T10_POLLED" = "1" ]; then
 else
   bad "the turn did not poll both run ids through workflow_status" "see $T10_FILE"
 fi
+# Value delivery, re-homed from T9 (#45): the launch result never carries the
+# outcome — the value reaches the model only through a workflow_status poll.
+# The sound anchor is a tool RESULT: a workflow_status event whose output
+# carries the run's value (PING). The stream's tool-argument echo is the
+# argument channel, not results (the removed T9 grep matched that echo).
+T10_DELIVERED="$(python3 - "$T10_FILE" <<'PYEOF'
+import json, sys
+hit = 0
+for line in open(sys.argv[1]):
+    try: event = json.loads(line)
+    except Exception: continue
+    part = event.get("part") or {}
+    if event.get("type") in ("tool", "tool_use") and part.get("tool") == "workflow_status":
+        if "PING" in ((part.get("state") or {}).get("output") or ""):
+            hit = 1
+print(hit)
+PYEOF
+)" || T10_DELIVERED=0
+if [ "$T10_DELIVERED" = "1" ]; then
+  ok "final value delivered through the status poll (a workflow_status result carried PING)"
+elif [ "$(manifest_status "$T10_A")" = "completed" ] && [ "$(manifest_status "$T10_B")" = "completed" ]; then
+  note "both runs settled completed but no workflow_status result carried the value — the provider's degenerate empty-completion flake (0 tokens, status ok); inspect $T10_FILE"
+else
+  bad "no workflow_status result carried the run's value" "the poll must deliver it — see $T10_FILE"
+fi
 # Each run delivered a settled agent result in its own journal. The VALUE's
 # text is provider weather — the provider can return an empty completion (0
 # tokens, status ok) — so an empty journal value is a note, not a failure.
@@ -503,10 +517,15 @@ else
   bad "a concurrent run's journal lacks its result entry" "inspect $T10_A and $T10_B"
 fi
 # Both settled runs are resumable: -c continues the ultracode session, and each
-# resume replays its run's journal with zero live agents.
+# resume replays its run's journal with zero live agents. T10 is the
+# load-bearing case, so its two resume turns carry pinned harness retries (#45).
 runs_snapshot "$OUT/runs-before-t10r1.txt"
 oc_run_capture "$OUT/t10r1.out" "$TURN_SECS" -c "$(wf_prompt ping "Set resumeFromRunId to $T10_A.")" || true
-R10A="$(runs_new_since "$OUT/runs-before-t10r1.txt" | head -1)"
+if [ -z "$(newest_completed_run "$OUT/runs-before-t10r1.txt")" ]; then
+  note "resume of run A settled short — retrying once"
+  oc_run_capture "$OUT/t10r1b.out" "$TURN_SECS" -c "$(wf_prompt ping "Set resumeFromRunId to $T10_A.")" || true
+fi
+R10A="$(newest_run "$OUT/runs-before-t10r1.txt")"
 preserve_run "$R10A"
 if [ -n "$R10A" ]; then
   assert_run_completed "$R10A"
@@ -518,7 +537,11 @@ else
 fi
 runs_snapshot "$OUT/runs-before-t10r2.txt"
 oc_run_capture "$OUT/t10r2.out" "$TURN_SECS" -c "$(wf_prompt ping "Set resumeFromRunId to $T10_B.")" || true
-R10B="$(runs_new_since "$OUT/runs-before-t10r2.txt" | head -1)"
+if [ -z "$(newest_completed_run "$OUT/runs-before-t10r2.txt")" ]; then
+  note "resume of run B settled short — retrying once"
+  oc_run_capture "$OUT/t10r2b.out" "$TURN_SECS" -c "$(wf_prompt ping "Set resumeFromRunId to $T10_B.")" || true
+fi
+R10B="$(newest_run "$OUT/runs-before-t10r2.txt")"
 preserve_run "$R10B"
 if [ -n "$R10B" ]; then
   assert_run_completed "$R10B"
@@ -530,15 +553,32 @@ else
 fi
 
 section "T11 — a non-ultracode session still refuses its second launch end-to-end"
-runs_snapshot "$OUT/runs-before-t11.txt"
 # Both calls are demanded in ONE step: the first launch registers a pending
-# entry synchronously, so the second call is refused while it is still pending —
-# deterministic, independent of how fast the run settles.
-oc_run_capture "$OUT/t11.json" "$TURN_SECS" --format json "$(wf_prompt ping "Call the workflow tool TWICE in ONE step: emit the two tool calls together in a single response, both with background true, no scriptPath, no args, and this script exactly, unchanged. The second call is expected to be refused — that is the point of this exercise. After both results arrive, call workflow_status for the run id that DID launch (wait=120, repeat while it says running) and reply with what it reported.")" || true
-if grep -q "already has a workflow run in flight" "$OUT/t11.json"; then
+# entry synchronously, so the second call is refused while it is still pending.
+# On Flash the premise is weather, not determinism: the model can split the
+# calls across steps, and a ping run settles in seconds — a first run that
+# settles before the second launch arrives is correctly ADMITTED (the gate
+# drops settled entries at once, src/server/tool/background.ts), so the
+# refusal never renders. One retry tolerates that split, mirroring T10's
+# handling of the same weather class; the refusal assert itself stays hard.
+t11_prompt() {
+  wf_prompt ping "Call the workflow tool TWICE in ONE step: emit the two tool calls together in a single response, both with background true, no scriptPath, no args, and this script exactly, unchanged. The second call is expected to be refused — that is the point of this exercise. After both results arrive, call workflow_status for the run id that DID launch (wait=120, repeat while it says running) and reply with what it reported."
+}
+runs_snapshot "$OUT/runs-before-t11.txt"
+oc_run_capture "$OUT/t11.json" "$TURN_SECS" --format json "$(t11_prompt)" || true
+if ! grep -q "already has a workflow run in flight" "$OUT/t11.json"; then
+  note "first attempt produced no refusal (model split the one-step demand, or the first run settled first) — retrying once"
+  oc_run_capture "$OUT/t11b.json" "$TURN_SECS" --format json "$(t11_prompt)" || true
+fi
+# Assert on whichever attempt produced the refusal (the retry if present).
+T11_FILE="$OUT/t11.json"
+if [ -f "$OUT/t11b.json" ] && grep -q "already has a workflow run in flight" "$OUT/t11b.json"; then
+  T11_FILE="$OUT/t11b.json"
+fi
+if grep -q "already has a workflow run in flight" "$T11_FILE"; then
   ok "the second launch was refused with the one-live-run refusal"
 else
-  bad "no refusal in the non-ultracode turn" "the plain one-live-run gate must hold — see $OUT/t11.json"
+  bad "no refusal in either attempt" "the plain one-live-run gate must hold — see $OUT/t11.json and $OUT/t11b.json"
 fi
 T11_CREATED="$(runs_new_since "$OUT/runs-before-t11.txt" | grep -c . || true)"
 if [ "$T11_CREATED" = "1" ]; then
