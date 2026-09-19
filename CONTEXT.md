@@ -55,6 +55,23 @@ The per-suite-run file in the suite's artifacts dir listing every process the ha
 (turn PIDs, the TUI pane pid) with the argv each started with — the cleanup reaper's primary kill
 list, with argv matching guarding against a recycled PID. Not a run's `manifest.json`.
 
+**input-drop window**
+The startup span in which the opencode TUI's terminal-capability queries consume and silently
+discard input (~10–11s in tmux, which never answers the probes — opencode issue #42915). It ends
+when the queries time out, and no ready signal exposes that moment: health-OK does not close it.
+Dropped inputs are swallowed harmlessly, so retrying is safe.
+
+**boot isolation (e2e)**
+A V-case's need for its own TUI boot because what it asserts is keyed to the boot's startup
+flags. V4 is the canonical case: it asserts a TUI not started with `--auto` surfaces the
+approval dialog, which only a fresh no-flag boot proves.
+
+**readiness gate (e2e)**
+The verification that an input actually landed before the harness proceeds — the replacement
+for fixed settle sleeps, because no upstream signal marks the end of the input-drop window.
+Gated once per boot, before the first input-bearing step; later keystrokes are outside the
+window.
+
 ## Where decisions live
 
 - `docs/adr/` — accepted decisions, one file each. ADR-0001 records the launch concurrency policy
