@@ -18,6 +18,7 @@ import {
   isLiveAnywhere,
   isLongLivedHost,
   registerPending,
+  nameRun,
   dropPending,
   dropSettled,
   runDetached,
@@ -354,6 +355,10 @@ async function launchWorkflow(
     // without running anything. Using the tool's `title` argument here instead would be
     // wrong twice over: it is documented as ignored, and the model usually omits it.
     const prepared = await prepare(args, workflowContext)
+
+    // The per-turn live-run reminder names the workflow, and prepare() is where the name is
+    // first known — recorded before the ask so even a pending entry carries it.
+    nameRun(runId, prepared.meta.name)
 
     // Persist the script BEFORE the ask, so the user can open the real file
     // while the prompt is on screen. beginRun writes it again (same bytes) when

@@ -59,11 +59,17 @@ export function isLongLivedHost(argv: readonly string[] = process.argv): boolean
 
 type RunStatus = "pending" | "running"
 
-interface DetachedRun {
+export interface DetachedRun {
   runId: string
   sessionID: string
   status: RunStatus
   startedAt: number
+  /**
+   * The workflow's meta name, recorded once the launch path has parsed the script. Absent in the
+   * window between registration and prepare (and on a run whose parse failed); the per-turn
+   * live-run reminder falls back to the run id for that window.
+   */
+  name?: string
 }
 
 const detached = new Map<string, DetachedRun>()
@@ -92,6 +98,18 @@ export function registerPending(runId: string, sessionID: string, startedAt: num
 export function promote(runId: string): void {
   const entry = detached.get(runId)
   if (entry) {entry.status = "running"}
+}
+
+/**
+ * Records a launch's workflow name once prepare() has parsed the script.
+ *
+ * Called from the launch path between registration and the permission ask, so even a pending
+ * entry carries the name the reminder should show. Unknown ids are ignored: a dropped launch
+ * must not resurrect anything.
+ */
+export function nameRun(runId: string, name: string): void {
+  const entry = detached.get(runId)
+  if (entry) {entry.name = name}
 }
 
 /** Drops a pending entry — the launch failed before the run went live. */

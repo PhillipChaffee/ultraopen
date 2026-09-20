@@ -1,6 +1,8 @@
 import { registry } from "../singleton.js"
+import { liveRunsForSession } from "../tool/background.js"
+import type { DetachedRun } from "../tool/background.js"
 import { mentionsKeyword, mode, requestsNoFanOut } from "./mode.js"
-import { decorate, ULTRACODE_DEMOTED, ULTRACODE_ON } from "./reminders.js"
+import { decorate, decorateLatest, renderRunsReminder, ULTRACODE_DEMOTED, ULTRACODE_ON } from "./reminders.js"
 import type { MessageLike } from "./reminders.js"
 
 /**
@@ -77,12 +79,20 @@ export function onChatMessage(
 }
 
 /**
- * Injects the per-turn reminder.
+ * Injects the per-turn reminders.
+ *
+ * Two decorations share this hook. The live-run reminder re-anchors any session holding live
+ * background runs, independent of the ultracode mode; the ultracode reminder keeps the mode
+ * visible. Both are ephemeral: the hook operates on messages re-read from the database each step,
+ * so nothing it adds is persisted.
  *
  * The hook's input is an empty object, so the session and agent must be recovered from the
  * messages themselves.
  */
-export function onMessagesTransform(output: MessagesTransformOutput, options: { compacting?: boolean } = {}): number {
+export function onMessagesTransform(
+  output: MessagesTransformOutput,
+  options: { compacting?: boolean; now?: (() => number) | undefined } = {},
+): number {
   // Compaction runs this same hook over a clone that IS sent to the model. Decorating there would
   // put the fan-out instruction into the summarizer's prompt, where it means nothing.
   if (options.compacting === true) {return 0}
@@ -97,7 +107,28 @@ export function onMessagesTransform(output: MessagesTransformOutput, options: { 
   const lastUser = messages.findLast((message) => message.info?.role === "user"),
    agentName = lastUser?.info?.agent
 
-  if (!mode.isActive(sessionID, agentName)) {return 0}
+  // The live-run reminder FIRST and unconditionally of ultracode: a session that launched a
+  // background run needs the anchor even when it never fanned out. Elapsed time and agent counts
+  // read live state (the launch registry and the engine registry), so the text is computed per
+  // fire — decorateLatest replaces rather than stacks, keeping exactly one reminder per turn.
+  let runsDecorated = 0
+  const live: readonly DetachedRun[] = liveRunsForSession(sessionID)
+  if (lastUser !== undefined && live.length > 0) {
+    runsDecorated = decorateLatest(
+      messages,
+      renderRunsReminder(
+        live.map((entry) => ({
+          runId: entry.runId,
+          name: entry.name ?? entry.runId,
+          agents: registry.sessionsOf(entry.runId).length,
+          startedAt: entry.startedAt,
+        })),
+        options.now?.() ?? Date.now(),
+      ),
+    )
+  }
+
+  if (!mode.isActive(sessionID, agentName)) {return runsDecorated}
 
   // §1.6: an explicit instruction beats the mode. Effort stays raised; the standing opt-in does not.
   const demoted = mode.isDemoted(sessionID),
@@ -106,7 +137,7 @@ export function onMessagesTransform(output: MessagesTransformOutput, options: { 
   return decorate(messages, {
     text: demoted ? ULTRACODE_DEMOTED : ULTRACODE_ON,
     fromMessageID: state?.fromMessageID,
-  })
+  }) + runsDecorated
 }
 
 /**

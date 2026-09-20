@@ -1,20 +1,47 @@
 import { beforeEach, describe, expect, test } from "bun:test"
 import { mentionsKeyword, mode, requestsNoFanOut } from "../src/server/ultracode/mode.js"
-import { decorate, REMINDER_MARKER, ULTRACODE_DEMOTED, ULTRACODE_ON } from "../src/server/ultracode/reminders.js"
-import type { MessageLike } from "../src/server/ultracode/reminders.js"
+import {
+  decorate,
+  decorateLatest,
+  formatElapsed,
+  REMINDER_MARKER,
+  renderRunsReminder,
+  RUNS_REMINDER_PREFIX,
+  ULTRACODE_DEMOTED,
+  ULTRACODE_ON,
+} from "../src/server/ultracode/reminders.js"
+import type { LiveRunLine, MessageLike } from "../src/server/ultracode/reminders.js"
 import { onChatMessage, onChatParams, onMessagesTransform } from "../src/server/ultracode/hooks.js"
 import type { MessagesTransformOutput } from "../src/server/ultracode/hooks.js"
 import { registry } from "../src/server/singleton.js"
+import {
+  dropSettled,
+  nameRun,
+  registerPending,
+  resetForTests as resetRunsRegistry,
+} from "../src/server/tool/background.js"
 
 beforeEach(() => {
   mode.resetForTests()
   registry.resetForTests()
+  resetRunsRegistry()
 })
 
 const userMessage = (id: string, sessionID = "s1", agent?: string): MessageLike => ({
   info: { id, role: "user", sessionID, ...(agent ? { agent } : {}) },
   parts: [],
 })
+
+/** One live run as the reminder's renderer takes it — module scope, it captures nothing. */
+const run = (runId: string, name: string, agents: number, startedAt: number): LiveRunLine => ({
+  runId,
+  name,
+  agents,
+  startedAt,
+})
+
+/** The constant template lines of a rendered reminder: header, phrasing, closer. */
+const templateOf = (lines: string[]) => [lines[0], lines[1], lines[2], lines[3], lines.at(-1)]
 
 describe("keyword detection", () => {
   test.each([
@@ -253,7 +280,7 @@ describe("chat.message hook", () => {
   })
 })
 
-const transform = (messages: MessageLike[], options?: { compacting?: boolean }) =>
+const transform = (messages: MessageLike[], options?: { compacting?: boolean; now?: () => number }) =>
   onMessagesTransform({ messages }, options)
 
 describe("messages.transform hook", () => {
@@ -396,5 +423,158 @@ describe("one-shot keyword — reminder and effort do not leak", () => {
     expect(output.messages[0]?.parts?.length ?? 0).toBe(1)
     expect(added).toBe(1)
     expect(onMessagesTransform(output)).toBe(0)
+  })
+})
+
+describe("live-run runs reminder", () => {
+  test("a live background run injects the reminder even with ultracode off", () => {
+    // The anchor is not an ultracode feature: any session holding a live run needs it.
+    registerPending("wf_runs0001", "s1", 100)
+    const messages = [userMessage("m1")]
+    expect(transform(messages, { now: () => 61_100 })).toBe(1)
+    const part = messages[0]?.parts?.[0] as Record<string, unknown> | undefined
+    expect(String(part?.["text"])).toContain("wf_runs0001")
+    expect(String(part?.["text"])).toContain("Do not duplicate their work")
+    expect(String(part?.["text"])).toContain("1m elapsed")
+  })
+
+  test("exactly one reminder per turn — a refire replaces it and carries the fresh elapsed time", () => {
+    // The hook can fire more than once per turn; stacking would both waste context and show a
+    // stale elapsed time. Replacement keeps exactly one reminder per turn.
+    registerPending("wf_runs0002", "s1", 100)
+    const messages = [userMessage("m1")]
+    transform(messages, { now: () => 1100 })
+    transform(messages, { now: () => 2100 })
+    expect(messages[0]?.parts?.length).toBe(1)
+    const part = messages[0]?.parts?.[0] as Record<string, unknown> | undefined
+    expect(String(part?.["text"])).toContain("2s elapsed")
+    expect(String(part?.["text"])).not.toContain("1s elapsed")
+    expect(String(part?.["id"])).toBe(`${RUNS_REMINDER_PREFIX}m1`)
+  })
+
+  test("the reminder disappears once every live run has settled", () => {
+    registerPending("wf_runs0003", "s1", 100)
+    const messages = [userMessage("m1")]
+    expect(transform(messages)).toBe(1)
+    dropSettled("wf_runs0003")
+    // The host re-reads the rows from the DB each step, so the next turn's messages are fresh —
+    // the settled run contributes nothing and the reminder is gone.
+    const fresh = [userMessage("m1")]
+    expect(transform(fresh)).toBe(0)
+    expect(fresh[0]?.parts?.length).toBe(0)
+  })
+
+  test("renders one line per run for multiple concurrent runs, in a single reminder", () => {
+    registerPending("wf_runs0004", "s1", 100)
+    registerPending("wf_runs0005", "s1", 200)
+    const messages = [userMessage("m1")]
+    expect(transform(messages, { now: () => 2100 })).toBe(1)
+    const text = String((messages[0]?.parts?.[0] as Record<string, unknown>)?.["text"])
+    expect(text).toContain("wf_runs0004")
+    expect(text).toContain("wf_runs0005")
+    expect(text.match(/agents spawned so far/gu)).toHaveLength(2)
+  })
+
+  test("names the workflow once the launch path knows it, falling back to the run id", () => {
+    registerPending("wf_runs0004", "s1", 100)
+    nameRun("wf_runs0004", "audit-diff")
+    registerPending("wf_runs0005", "s1", 200)
+    const messages = [userMessage("m1")]
+    transform(messages)
+    const text = String((messages[0]?.parts?.[0] as Record<string, unknown>)?.["text"])
+    expect(text).toContain('"audit-diff"')
+    expect(text).toContain('"wf_runs0005"')
+  })
+
+  test("counts agents spawned so far from the engine registry's live children", () => {
+    registerPending("wf_runs0006", "s1", 100)
+    registry.register("child-a", "wf_runs0006")
+    registry.register("child-b", "wf_runs0006")
+    const messages = [userMessage("m1")]
+    transform(messages)
+    const text = String((messages[0]?.parts?.[0] as Record<string, unknown>)?.["text"])
+    expect(text).toContain("2 agents spawned so far")
+  })
+
+  test("marks the part synthetic and never accumulates it in the re-read rows", () => {
+    // Ephemeral by contract: the host re-reads the rows from the DB each step, so nothing the
+    // hook adds may reach persistence — a reminder there would accumulate one copy per turn.
+    registerPending("wf_runs0007", "s1", 100)
+    const messages = [userMessage("m1")]
+    transform(messages)
+    const part = messages[0]?.parts?.[0] as Record<string, unknown> | undefined
+    expect(part?.["synthetic"]).toBe(true)
+    const fresh = [userMessage("m1")]
+    expect(transform(fresh)).toBe(1)
+    expect(fresh[0]?.parts?.length).toBe(1)
+  })
+
+  test("decorates only the latest user message", () => {
+    registerPending("wf_runs0007", "s1", 100)
+    const messages = [userMessage("m1"), userMessage("m2")]
+    expect(transform(messages)).toBe(1)
+    expect(messages[0]?.parts?.length).toBe(0)
+    expect(messages[1]?.parts?.length).toBe(1)
+  })
+
+  test("coexists with the ultracode reminder when the mode is on", () => {
+    mode.enable("s1", "keyword")
+    registerPending("wf_runs0008", "s1", 100)
+    const messages = [userMessage("m1"), userMessage("m2")]
+    expect(transform(messages)).toBe(3)
+    // Earlier messages carry only the ultracode reminder; the last carries both.
+    expect(messages[0]?.parts?.length).toBe(1)
+    expect(messages[1]?.parts?.length).toBe(2)
+    const ids = (messages[1]?.parts ?? []).map((part) => String((part as Record<string, unknown>)?.["id"]))
+    expect(ids.some((id) => id.startsWith(RUNS_REMINDER_PREFIX))).toBe(true)
+    expect(ids.some((id) => id.startsWith("ultraopen-reminder-"))).toBe(true)
+  })
+
+  test("skips engine-owned sessions even while a run is live", () => {
+    // Children are the fan-out; a reminder there invites recursion.
+    registerPending("wf_runs0009", "s1", 100)
+    registry.register("child", "wf_runs0009")
+    const messages = [userMessage("m1", "child")]
+    expect(transform(messages)).toBe(0)
+    expect(messages[0]?.parts?.length).toBe(0)
+  })
+})
+
+describe("runs reminder — fixed shape and elapsed format", () => {
+  test("the same state renders byte-identically — the shape is stable between steps", () => {
+    const runs = [run("wf_shape001", "audit-diff", 3, 100)]
+    expect(renderRunsReminder(runs, 62_100)).toBe(renderRunsReminder(runs, 62_100))
+  })
+
+  test("the template lines are constant across run counts; only per-run lines vary", () => {
+    const one = renderRunsReminder([run("wf_shape002", "demo", 1, 100)], 62_100).split("\n")
+    const two = renderRunsReminder([run("wf_shape002", "demo", 1, 100), run("wf_shape003", "other", 5, 150)], 62_100)
+      .split("\n")
+    expect(templateOf(one)).toEqual(templateOf(two))
+    expect(one).toHaveLength(6)
+    expect(two).toHaveLength(7)
+    expect(two[4]).toBe('- wf_shape002 "demo" — 1 agents spawned so far, 1m elapsed')
+    expect(two[5]).toBe('- wf_shape003 "other" — 5 agents spawned so far, 1m elapsed')
+  })
+
+  test.each([
+    [0, "0s"],
+    [59_999, "59s"],
+    [60_000, "1m"],
+    [3_599_999, "59m"],
+    [3_600_000, "1h00m"],
+    [7_326_000, "2h02m"],
+  ])("formatElapsed(%p) -> %p", (ms, expected) => {
+    expect(formatElapsed(ms)).toBe(expected)
+  })
+
+  test("decorateLatest appends once to the last user message and leaves earlier messages alone", () => {
+    const messages = [userMessage("m1"), { info: { id: "a1", role: "assistant", sessionID: "s1" }, parts: [] }, userMessage("m2")]
+    expect(decorateLatest(messages, "reminder text")).toBe(1)
+    expect(messages[0]?.parts?.length).toBe(0)
+    expect(messages[1]?.parts?.length).toBe(0)
+    expect(messages[2]?.parts?.length).toBe(1)
+    expect(decorateLatest(messages, "reminder text")).toBe(1)
+    expect(messages[2]?.parts?.length).toBe(1)
   })
 })

@@ -566,6 +566,18 @@ describe("ultracode hooks are wired", () => {
     expect(output.messages[0]?.parts.length).toBe(1)
   })
 
+  test("messages.transform appends the live-run reminder while a background run holds", () => {
+    const hook = hookOf("experimental.chat.messages.transform") as (i: unknown, o: unknown) => void
+    background.registerPending("wf_runs0100", "s1", 100)
+    background.nameRun("wf_runs0100", "demo")
+    const output = { messages: [{ info: { id: "m1", role: "user", sessionID: "s1" }, parts: [] as unknown[] }] }
+    hook({}, output)
+    expect(output.messages[0]?.parts).toHaveLength(1)
+    const part = output.messages[0]?.parts[0] as Record<string, unknown> | undefined
+    expect(String(part?.["id"])).toBe("ultraopen-runs-m1")
+    expect(String(part?.["text"])).toContain('wf_runs0100 "demo"')
+  })
+
   test("chat.params merges the variant's provider options", () => {
     const hook = hookOf("chat.params") as (i: unknown, o: unknown) => void
     mode.enable("s1", "keyword")
