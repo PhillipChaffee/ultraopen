@@ -39,7 +39,8 @@ export interface Manifest {
   sessionID: string
   sourceHash: string
   argsHash: string
-  status: "running" | "completed" | "failed" | "orphaned"
+  /** `cancelled` is written by the stop path: the run was stopped by request, not by failure. */
+  status: "running" | "completed" | "failed" | "cancelled" | "orphaned"
   childSessionIDs: string[]
   startedAt: number
   endedAt?: number

@@ -11,3 +11,9 @@ change what the tool does. Adaptations are limited to what opencode actually doe
 `Workflow({...})` becoming `workflow({...})`, "the Agent tool" becoming "the task tool", and
 `workflow_status` being a disk-only read of the run directory where the original tracks background
 tasks in memory.
+
+The background task-id/notification contract adapts wording the same way, from opencode's task
+tool and Claude Code's task-notification text: the notification-on-completion contract, the
+no-polling/no-duplication discipline, and the stop path are their background-task wording changed
+to what the workflow tool actually does — a run handle on launch, a hydration notification on
+settle, and a stop argument in place of the task id.

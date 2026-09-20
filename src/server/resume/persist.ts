@@ -52,14 +52,31 @@ export async function beginRun(record: RunRecord, env?: NodeJS.ProcessEnv): Prom
   }
 }
 
-/** Closes a run: writes the journal and result, and records the terminal status. */
+/**
+ * Closes a run: writes the journal and result, and records the terminal status.
+ *
+ * The status is TERMINAL and first-terminal-write-wins: whatever terminal status reached
+ * disk first stands. The stop path marks a run `cancelled` while its detached task is
+ * still unwinding, and that task's own failure path calls this with `failed` — a later
+ * failed-write must never overwrite `cancelled`. The journal and result are skipped with
+ * the status: the first terminal record settles the run's whole settlement.
+ */
 export async function endRun(
   manifest: Manifest | undefined,
-  outcome: { status: "completed" | "failed"; entries: readonly JournalEntry[]; value: unknown; childSessionIDs: string[] },
+  outcome: {
+    status: "completed" | "failed" | "cancelled"
+    entries: readonly JournalEntry[]
+    value: unknown
+    childSessionIDs: string[]
+  },
   env?: NodeJS.ProcessEnv,
 ): Promise<void> {
   if (!manifest) {return}
   try {
+    // A manifest on disk always starts `running` (beginRun writes it); any other status
+    // is a terminal record that already won.
+    const current = await readManifest(manifest.runId, env)
+    if (current !== undefined && current.status !== "running") {return}
     await appendJournal(manifest.runId, outcome.entries.map((entry) => JSON.stringify(entry)).join("\n"), env)
     await writeResult(manifest.runId, outcome.value, env)
     await writeManifest(

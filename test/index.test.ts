@@ -138,6 +138,16 @@ describe("plugin registration", () => {
     expect(Object.keys(args)).toContain("dryRun")
     // Resume is a headline feature; if the model cannot see the argument, it can never use it.
     expect(Object.keys(args)).toContain("resumeFromRunId")
+    // The background contract's launch switch and the stop path are both model-visible.
+    expect(Object.keys(args)).toContain("background")
+    expect(Object.keys(args)).toContain("stop")
+  })
+
+  test("the stop arg's schema teaches the stop contract", () => {
+    // The schema is model-facing: a model that never learns what stop does cannot use it.
+    const args = toolOf(ultraopen({ client: stubClient }))?.args ?? {}
+    expect(JSON.stringify(args["stop"])).toContain("cancelled")
+    expect(JSON.stringify(args["stop"])).toContain("clear error")
   })
 
   test("applies the configured concurrency to the process-wide gate", () => {
@@ -200,6 +210,36 @@ describe("host-aware launch contract", () => {
   test("the test runner's own argv is an unknown shape, so the pinned contract is the default", () => {
     const tool = toolOf(ultraopen({ client: stubClient }))
     expect(tool?.description).toContain("The run continues in the background while you keep")
+  })
+
+  test("both background contracts teach the notification, no-duplication and stop path", async () => {
+    // The description is load-bearing model behavior: a model that is not taught the
+    // notification contract polls, duplicates the run's work, or never learns it can stop.
+    const hosts: [string, string[]][] = [
+      ["one-shot", ["bun", "/$bunfs/root/src/index.js", "run", "say hi"]],
+      ["long-lived", ["bun", "/$bunfs/root/src/cli/tui/worker.js"]],
+    ]
+    for (const [label, hostArgv] of hosts) {
+      let text = ""
+      await withArgv(hostArgv, () => {
+        text = toolOf(ultraopen({ client: stubClient }))?.description ?? ""
+      })
+      expect(text, label).toContain("<workflow-completed>")
+      expect(text, label).toContain("<workflow-failed>")
+      expect(text, label).toContain("notification")
+      expect(text, label).toContain("duplicate this run's work")
+      expect(text, label).toContain('workflow({stop: "<runId>"})')
+      expect(text, label).not.toContain("end the opencode process")
+    }
+  })
+
+  test("the blocking contract teaches no notification — the call itself returns the result", async () => {
+    let description = ""
+    await withArgv(["bun", "/$bunfs/root/src/cli/tui/worker.js"], () => {
+      description = toolOf(ultraopen({ client: stubClient }, { runMode: "blocking" }))?.description ?? ""
+    })
+    expect(description).not.toContain("<workflow-completed>")
+    expect(description).not.toContain("notification")
   })
 })
 

@@ -85,6 +85,32 @@ describe("endRun", () => {
     expect(reread?.status).toBe("failed")
   })
 
+  test("a cancelled status is terminal and a later failed-write never overwrites it", async () => {
+    // The stop path marks the manifest cancelled while the detached task is still unwinding;
+    // that task's failure catch then calls endRun with `failed`. First terminal write wins.
+    const opened = await beginRun(record, env)
+    if (!opened) {throw new Error("the run did not open")}
+    await writeManifest("wf_abc123", { ...opened, status: "cancelled" }, env)
+    await endRun(
+      opened,
+      { status: "failed", entries: [entry], value: null, childSessionIDs: [] },
+      env,
+    )
+    const reread = await readManifest("wf_abc123", env)
+    expect(reread?.status).toBe("cancelled")
+    // The journal and result are skipped with the status: the cancelled record stands whole.
+    expect(await readJournal("wf_abc123", env)).toEqual([])
+    expect(await Bun.file(artifactPaths("wf_abc123", env).resultPath).exists()).toBe(false)
+  })
+
+  test("the first terminal status wins whatever it is", async () => {
+    const manifest = await beginRun(record, env)
+    await endRun(manifest, { status: "completed", entries: [], value: 1, childSessionIDs: [] }, env)
+    await endRun(manifest, { status: "failed", entries: [], value: null, childSessionIDs: [] }, env)
+    const reread = await readManifest("wf_abc123", env)
+    expect(reread?.status).toBe("completed")
+  })
+
   test("is a no-op when the run was never opened", async () => {
     await endRun(undefined, { status: "completed", entries: [entry], value: 1, childSessionIDs: [] }, env)
     expect(await readManifest("wf_abc123", env)).toBeUndefined()

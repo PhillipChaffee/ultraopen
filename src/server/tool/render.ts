@@ -237,6 +237,11 @@ export function workflowArgsSchema(): Record<string, unknown> {
       type: "boolean",
       description: "Launch detached and return the run id at once (the default), or wait for the final result. dryRun always waits.",
     },
+    stop: {
+      type: "string",
+      description:
+        "Stop the live workflow run with this id: its subagents are aborted and the run is marked cancelled. Unknown or already-finished run ids return a clear error.",
+    },
     title: { type: "string", description: "Ignored." },
     description: { type: "string", description: "Ignored." },
   }
