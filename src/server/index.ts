@@ -352,6 +352,27 @@ async function launchWorkflow(
     await ensureRunDir(runId).catch(() => undefined)
     await writeScript(runId, prepared.source).catch(() => undefined)
 
+    // A resume that will be refused is refused BEFORE the permission ask: a call
+    // with a malformed resumeFromRunId, or one whose source run is live elsewhere,
+    // would otherwise render the approval dialog, consume the user's approval, and
+    // only then refuse — nothing launches, and the approval is spent (the burned
+    // approval also cascades into a re-ask chain, since models retry after the
+    // refusal). The journal rationale still holds: two writers on one journal
+    // would interleave appends and race the endRun rewrite.
+    if (args.resumeFromRunId) {
+      // The id is model-supplied input and joins into a filesystem path below,
+      // exactly like the status tool's runId: rejected before any read.
+      if (!isSafeRunId(args.resumeFromRunId)) {
+        dropPending(runId)
+        return renderResumeRefusal(args.resumeFromRunId, undefined)
+      }
+      const source = await readManifest(args.resumeFromRunId)
+      if (source && isLiveAnywhere(source, bootId)) {
+        dropPending(runId)
+        return renderResumeRefusal(source.runId, source.pid)
+      }
+    }
+
     // `always` is scoped to this workflow's name rather than "*": an "always" grant is
     // stored instance-wide, so approving once with "*" would permanently disable the
     // prompt for every workflow in the directory.
@@ -369,23 +390,8 @@ async function launchWorkflow(
       },
     })
 
-    // Resume BEFORE the run starts, so replayed calls never spawn anything. A
-    // resume whose source run is still being written by a live Run (this boot
-    // or another) is refused first: two writers on one journal would interleave
-    // appends and race the endRun rewrite.
-    if (args.resumeFromRunId) {
-      // The id is model-supplied input and joins into a filesystem path below,
-      // exactly like the status tool's runId: rejected before any read.
-      if (!isSafeRunId(args.resumeFromRunId)) {
-        dropPending(runId)
-        return renderResumeRefusal(args.resumeFromRunId, undefined)
-      }
-      const source = await readManifest(args.resumeFromRunId)
-      if (source && isLiveAnywhere(source, bootId)) {
-        dropPending(runId)
-        return renderResumeRefusal(source.runId, source.pid)
-      }
-    }
+    // Resume BEFORE the run starts, so replayed calls never spawn anything; the
+    // refusal gates above already cleared a live source run.
     const resume = args.resumeFromRunId
       ? await loadResume(args.resumeFromRunId, args.args, context.sessionID)
       : undefined

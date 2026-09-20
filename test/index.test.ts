@@ -739,12 +739,19 @@ describe("background launch contract", () => {
     if (!tool) {throw new Error("tool was not registered")}
     const first = await tool.execute({ script: `${META}await agent('a')\nreturn 1\n`, background: true }, { sessionID: "other" })
     const liveRunId = first.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
+    const asked: unknown[] = []
     const second = await tool.execute(
       { script: `${META}await agent('a')\nreturn 2\n`, background: false, resumeFromRunId: liveRunId },
-      { sessionID: "parent" },
+      {
+        sessionID: "parent",
+        ask: (request: unknown) => { asked.push(request); return Promise.resolve() },
+      },
     )
     expect(second).toContain("<workflow-refused>")
     expect(second).toContain("still executing")
+    // Refused BEFORE the ask: the live-source refusal must not spend an approval
+    // on a call that never launches.
+    expect(asked).toEqual([])
   })
 
   test("a parse failure in the background contract does not leave a pending launch behind", async () => {
@@ -897,11 +904,18 @@ describe("background launch contract", () => {
   test("a malformed resume id is refused before any path join", async () => {
     const tool = toolOf(ultraopen({ client: stubClient }))
     if (!tool) {throw new Error("tool was not registered")}
+    const asked: unknown[] = []
     const output = await tool.execute(
       { script: `${META}return 1\n`, resumeFromRunId: "../../etc", background: false },
-      { sessionID: "parent" },
+      {
+        sessionID: "parent",
+        ask: (request: unknown) => { asked.push(request); return Promise.resolve() },
+      },
     )
     expect(output).toContain("not a valid run id")
+    // Refused BEFORE the ask: an approval spent on a call that refuses itself
+    // buys nothing and cascades into a re-ask chain when the model retries.
+    expect(asked).toEqual([])
   })
 
   test("executeStatus can be driven directly against real run artifacts", async () => {
