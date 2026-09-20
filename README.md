@@ -274,7 +274,7 @@ recorded value.
 
 ## 🧭 Compatibility and known limits
 
-Verified against opencode 1.18.29 by the live e2e suites (`test/e2e`).
+Verified against opencode 1.18.31 by the live e2e suites (`test/e2e`).
 
 Working end to end:
 
