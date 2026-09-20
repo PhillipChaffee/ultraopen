@@ -23,7 +23,7 @@
 #                                   glyph, multi-run, narrow pane, vanish
 #                        live       V3  a real workflow turn (VISUAL_LIVE_FIXTURE
 #                                   picks the fixture, default "parallel")
-#                        permission V4  the approval dialog names the workflow
+#                        permission V4  the approval dialog renders (no --auto)
 #                        hint       V5  the interrupted-run hint on boot
 #   --keep             keep the scratch XDG home for post-mortem
 #
@@ -301,7 +301,7 @@ if want live; then
 fi
 
 if want permission; then
-  section "V4 — permission dialog names the real workflow (no --auto)"
+  section "V4 — the approval dialog renders the generic ask (no --auto)"
   tui_quit
   tmx kill-server 2>/dev/null || true
   sleep 1
@@ -313,17 +313,13 @@ if want permission; then
   # approved tool executes, so a later baseline would swallow it.
   runs_snapshot "$OUT/runs-before-v4.txt"
   tui_http_prompt "$(wf_prompt tiny)"
-  # The ask is supposed to surface the approval dialog, but on opencode 1.18.31
-  # it auto-resolves without rendering one (the upstream drift recorded in the
-  # README). A rendered dialog still gets the name check below; the
-  # auto-resolve instead proceeds to the launch, which the terminal-state
-  # assert still proves.
-  if wait_for 300 pane_contains "Permission required"; then
-    ok "permission dialog opens"
-  else
-    note "no dialog rendered — the 1.18.31 approval-dialog auto-resolve (see README upstream note)"
-  fi
-  assert_pane_contains "dialog names the workflow (e2e-smoke)" "e2e-smoke" 300
+  # On an isolated TUI (no --auto, no leaked config) the ask surfaces the
+  # approval dialog (#43). The assert anchors to the dialog frame's own
+  # heading, never free-pane text — a metadata-name grep here always matched
+  # the transcript echo of the tool-call args instead (echo false-positive
+  # class, spec §5.2), so the name check is consciously removed.
+  assert_pane_contains "the approval dialog renders the generic ask" "Permission required" 300
+  note "upstream gap: the dialog omits the ask's metadata (workflow name, description, phases) — 1.18.31"
   frame 11-permission-dialog
   tui_keys Enter   # dialog.select.submit = return -> Allow once
   sleep 1
@@ -338,7 +334,7 @@ if want permission; then
     [ -n "$r" ] && [ "$(manifest_status "$r")" != "running" ] && [ "$(manifest_status "$r")" != "missing" ]
   }
   if wait_for 300 v4_ran; then
-    ok "approved workflow reached a terminal state: $(newest_run "$OUT/runs-before-v4.txt") is $(manifest_status "$(newest_run "$OUT/runs-before-v4.txt")")"
+    ok "Enter submitted the dialog (Allow once) — approved workflow reached a terminal state: $(newest_run "$OUT/runs-before-v4.txt") is $(manifest_status "$(newest_run "$OUT/runs-before-v4.txt")")"
   else
     # A rejected ask is not the only way the run never lands: Flash sometimes
     # transcribes optional tool args as the string "null", and a call that
@@ -351,7 +347,7 @@ if want permission; then
       tui_keys Enter
       sleep 1
       if wait_for 120 v4_ran; then
-        ok "approved workflow reached a terminal state after the re-ask: $(newest_run "$OUT/runs-before-v4.txt") is $(manifest_status "$(newest_run "$OUT/runs-before-v4.txt")")"
+        ok "Enter submitted the re-asked dialog (Allow once) — approved workflow reached a terminal state: $(newest_run "$OUT/runs-before-v4.txt") is $(manifest_status "$(newest_run "$OUT/runs-before-v4.txt")")"
       else
         bad "approved workflow never reached a terminal state" "see $OUT for frames"
       fi
