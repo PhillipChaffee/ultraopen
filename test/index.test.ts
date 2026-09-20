@@ -6,7 +6,7 @@ import { STATUS_TOOL, WORKFLOW_TOOL } from "../src/server/bridge/permission.js"
 import { executeStatus } from "../src/server/tool/status.js"
 import { mode } from "../src/server/ultracode/mode.js"
 import type { MutableConfig } from "../src/server/ultracode/config.js"
-import { ensureRunDir, readJournal, readManifest, writeScript } from "../src/server/resume/store.js"
+import { ensureRunDir, artifactPaths, readJournal, readManifest, writeScript } from "../src/server/resume/store.js"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -40,6 +40,9 @@ interface ToolDef {
 }
 
 const META = "export const meta = { name: 'demo', description: 'a demo workflow' }\n",
+  /** promptAsync deliveries recorded across tests, newest last (read-only in assertions). */
+  hydrationCalls: { sessionID: string; text: string }[] = [],
+  idleListings: string[] = [],
 
 /** A client that never actually spawns — index tests exercise wiring, not the bridge. */
  stubClient = {
@@ -53,6 +56,14 @@ const META = "export const meta = { name: 'demo', description: 'a demo workflow'
     delete: () => Promise.resolve({}),
     abort: () => Promise.resolve({}),
     prompt: () => Promise.resolve({ data: { info: {}, parts: [] } }),
+    promptAsync: (options: { path: { id: string }; body: { parts: { text: string }[] } }) => {
+      hydrationCalls.push({ sessionID: options.path.id, text: options.body.parts[0]?.text ?? "" })
+      return Promise.resolve({ data: undefined })
+    },
+    messages: (options: { path: { id: string } }) => {
+      idleListings.push(options.path.id)
+      return Promise.resolve({ data: [] })
+    },
   },
 },
 
@@ -92,6 +103,8 @@ beforeEach(() => {
   registry.resetForTests()
   background.resetForTests()
   mode.resetForTests()
+  hydrationCalls.length = 0
+  idleListings.length = 0
   savedEnv = process.env["ULTRAOPEN_ACTIVE"]
   delete process.env["ULTRAOPEN_ACTIVE"]
 })
@@ -711,6 +724,93 @@ describe("background launch contract", () => {
     const entries = await readJournal(runId)
     expect(entries.length).toBe(1)
     expect(entries[0]?.status).toBe("ok")
+  })
+
+  test("a settled background run hydrates the parent with a completion notification", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute({ script: `${META}await agent('a')\nreturn 'HYDRA-MARKER'\n`, background: true }, { sessionID: "parent" })
+    const runId = runIdOf(output)
+    await settle(runId)
+    await waitFor(() => hydrationCalls.length > 0, "the hydration promptAsync")
+    expect(hydrationCalls).toHaveLength(1)
+    expect(hydrationCalls[0]?.sessionID).toBe("parent")
+    const text = hydrationCalls[0]?.text ?? ""
+    expect(text).toContain(`<workflow-completed run="${runId}"`)
+    expect(text).toContain("HYDRA-MARKER")
+    // capped-run-dir policy: the pointer to the full result always rides along.
+    expect(text).toContain(`full result: ${artifactPaths(runId).resultPath}`)
+  })
+
+  test("a failed background run hydrates with the failure and its run dir", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute({ script: `${META}throw new Error('HYDRA-BOOM')\n`, background: true }, { sessionID: "parent" })
+    const runId = runIdOf(output)
+    await settle(runId)
+    await waitFor(() => hydrationCalls.length > 0, "the failure hydration")
+    const text = hydrationCalls[0]?.text ?? ""
+    expect(text).toContain(`<workflow-failed run="${runId}"`)
+    expect(text).toContain("HYDRA-BOOM")
+    // renderFailure's run dir line survives the cap.
+    expect(text).toContain(runId)
+  })
+
+  test("the blocking contract does not hydrate — the tool result already delivered", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute({ script: `${META}return 'sync-value'\n`, background: false }, { sessionID: "parent" })
+    expect(output).toContain("sync-value")
+    await new Promise((resolve) => {setTimeout(resolve, 20)})
+    expect(hydrationCalls).toHaveLength(0)
+  })
+
+  test("the event hook nudges once when a notification landed unanswered", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute({ script: `${META}return 'NUDGE-MARKER'\n`, background: true }, { sessionID: "parent" })
+    const runId = runIdOf(output)
+    await settle(runId)
+    await waitFor(() => hydrationCalls.length > 0, "the hydration promptAsync")
+    // The notification landed exactly as the turn ended: it is the session's last message.
+    const notification = hydrationCalls[0]?.text ?? ""
+    const idleClient = {
+      ...stubClient,
+      session: {
+        ...stubClient.session,
+        messages: () => Promise.resolve({ data: [{ info: { role: "user" }, parts: [{ type: "text", text: notification }] }] }),
+      },
+    }
+    const hooks = ultraopen({ client: idleClient }),
+      onEvent = hooks["event"] as (input: unknown) => void
+    onEvent({ event: { type: "session.idle", properties: { sessionID: "parent" } } })
+    await waitFor(() => hydrationCalls.length > 1, "the idle nudge")
+    expect(hydrationCalls[1]?.text).toContain(`<workflow-nudge run="${runId}"`)
+    // Once, ever: a second idle for the same session must not stack another nudge.
+    onEvent({ event: { type: "session.idle", properties: { sessionID: "parent" } } })
+    await new Promise((resolve) => {setTimeout(resolve, 20)})
+    expect(hydrationCalls).toHaveLength(2)
+  })
+
+  test("the event hook does not nudge when the notification was answered", async () => {
+    const answeringClient = {
+      ...stubClient,
+      session: {
+        ...stubClient.session,
+        messages: () =>
+          Promise.resolve({ data: [{ info: { role: "assistant" }, parts: [] }] }),
+      },
+    }
+    const tool = toolOf(ultraopen({ client: answeringClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute({ script: `${META}return 1\n`, background: true }, { sessionID: "parent" })
+    await settle(runIdOf(output))
+    await waitFor(() => hydrationCalls.length > 0, "the hydration promptAsync")
+    const hooks = ultraopen({ client: answeringClient }),
+      onEvent = hooks["event"] as (input: unknown) => void
+    onEvent({ event: { type: "session.idle", properties: { sessionID: "parent" } } })
+    await new Promise((resolve) => {setTimeout(resolve, 20)})
+    expect(hydrationCalls).toHaveLength(1)
   })
 
   test("aborting the tool call's signal does not abort the detached run", async () => {

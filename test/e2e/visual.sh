@@ -14,7 +14,7 @@
 #
 # Usage:  bash test/e2e/visual.sh [--fast|--keep|CASE...]
 #
-#   (no args)          the full suite: rest, synth, live, permission, hint
+#   (no args)          the full suite: rest, synth, live, hydration, permission, hint
 #   --fast             the short version: rest, synth, hint — one model call
 #                      for session setup, no live workflow turns (~2 min)
 #   CASE...            run only the named cases, in this order:
@@ -23,6 +23,8 @@
 #                                   glyph, multi-run, narrow pane, vanish
 #                        live       V3  a real workflow turn (VISUAL_LIVE_FIXTURE
 #                                   picks the fixture, default "parallel")
+#                        hydration  V6  a settled run starts a new turn while
+#                                   the host idles (ticket #7)
 #                        permission V4  the approval dialog renders (no --auto)
 #                        hint       V5  the interrupted-run hint on boot
 #   --keep             keep the scratch XDG home for post-mortem
@@ -40,7 +42,7 @@ for arg in "$@"; do
   if [ "$arg" = "--keep" ]; then KEEP=1; else ARGS+=("$arg"); fi
 done
 
-RUN_CASES="rest synth live permission hint"
+RUN_CASES="rest synth live hydration permission hint"
 if [ "${1:-}" = "--fast" ]; then
   RUN_CASES="rest synth hint"
   shift
@@ -127,7 +129,7 @@ sidebar_open() { pane_matches '^ *ultracode *$'; }
 sidebar_keys() { tui_keys C-x; sleep 0.5; tui_keys b; }
 toggle_sidebar() { probe_verify_retry sidebar_keys sidebar_open 3 3; }
 
-if want rest || want synth || want live; then
+if want rest || want synth || want live || want hydration; then
   section "V0 — boot the real TUI"
   boot_tui
 fi
@@ -300,6 +302,79 @@ if want live; then
   frame 10-live-done
 fi
 
+if want hydration; then
+  section "V6 — idle hydration: a settled run starts a new turn in a long-lived host"
+  # The detached run settles ~30s after launch — AFTER the launch turn has
+  # ended (long-lived host: the contract text frees the turn). The plugin then
+  # hydrates the parent with a synthetic `<workflow-completed>` notification
+  # (ticket #7), which starts a NEW turn; the model answers it. The prompt is
+  # phrased WITHOUT the literal `workflow-completed` so the transcript echo of
+  # the prompt cannot satisfy the notification assert (echo false-positive
+  # class, spec §5.2), and the ack is asserted on an ASSISTANT message in the
+  # scratch db — the prompt echo renders it too, so the pane cannot decide it.
+  runs_snapshot "$OUT/runs-before-v6.txt"
+  tui_http_prompt "Call the workflow tool now. Pass no scriptPath and no args. Use this script exactly, unchanged:
+
+$(cat "$E2E_DIR/fixtures/idle-hydration.js")
+
+The tool returns a launch result with a run id, not the outcome. Do NOT poll workflow_status and do not wait for the run: end your turn immediately after the launch result. A completion notification will arrive in this conversation when the run settles. When it arrives, reply with exactly HYDRA-VIS-ACK-7391 and nothing else."
+  assert_pane_contains "GenericTool transcript row shows the launch" "⚙ workflow" 300
+  v6_done() { [ -n "$(newest_completed_run "$OUT/runs-before-v6.txt")" ]; }
+  if wait_for 300 v6_done; then
+    ok "the idle run completed on disk: $(newest_completed_run "$OUT/runs-before-v6.txt")"
+  else
+    bad "the idle-hydration run never completed" "see $OUT for frames"
+  fi
+  # The notification lands while the host idles; hydration starts a new turn.
+  # Upstream note: the TUI hides synthetic user messages from the visible
+  # timeline (opencode 1.18.31, packages/tui/src/routes/session/index.tsx:394
+  # filters `!part.synthetic`), so the notification asserts on the scratch db —
+  # the pane's visible effect is the ack turn it started (asserted on an
+  # assistant message after the notification, also db-level: the prompt echo
+  # renders the ack literal too, so the pane cannot decide it).
+  v6_notified() {
+    python3 - "$XDG_DATA_HOME/opencode/opencode.db" <<'PYEOF'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+row = db.execute(
+    "SELECT 1 FROM part WHERE data LIKE '%\"synthetic\":true%' AND data LIKE '%<workflow-completed run=%' LIMIT 1"
+).fetchone()
+sys.exit(0 if row else 1)
+PYEOF
+  }
+  if wait_for 60 v6_notified; then
+    ok "the synthetic notification is in the parent transcript"
+  else
+    bad "no synthetic notification in the transcript db" "inspect $SCRATCH/share/opencode/opencode.db"
+  fi
+  frame 15-hydration-notification
+  v6_acked() {
+    python3 - "$XDG_DATA_HOME/opencode/opencode.db" <<'PYEOF'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+notif = db.execute(
+    "SELECT message_id FROM part WHERE data LIKE '%<workflow-completed run=%' ORDER BY rowid DESC LIMIT 1"
+).fetchone()
+if notif is None:
+    sys.exit(1)
+row = db.execute(
+    "SELECT p.data FROM part p JOIN message m ON m.id = p.message_id "
+    "WHERE m.session_id = (SELECT session_id FROM message WHERE id = ?) "
+    "AND m.data LIKE '%\"assistant\"%' AND p.data LIKE '%HYDRA-VIS-ACK-7391%' "
+    "AND m.rowid > (SELECT rowid FROM message WHERE id = ?) LIMIT 1",
+    (notif[0], notif[0]),
+).fetchone()
+sys.exit(0 if row else 1)
+PYEOF
+  }
+  if wait_for 240 v6_acked; then
+    ok "the model responded to the notification in a new turn (assistant ack after it)"
+  else
+    bad "no assistant ack after the hydration notification" "see $OUT/15-hydration-ack.frame and the scratch db"
+  fi
+  frame 15-hydration-ack
+fi
+
 if want permission; then
   section "V4 — the approval dialog renders the generic ask (no --auto)"
   tui_quit
@@ -390,8 +465,8 @@ if want hint; then
   frame 14-hint-once
 fi
 
-if ! want rest && ! want synth && ! want live && ! want permission && ! want hint; then
-  bad "no known case selected" "known cases: rest synth live permission hint; --fast for the short pass"
+if ! want rest && ! want synth && ! want live && ! want hydration && ! want permission && ! want hint; then
+  bad "no known case selected" "known cases: rest synth live hydration permission hint; --fast for the short pass"
 fi
 
 if want rest || want synth || want live || want permission || want hint; then
