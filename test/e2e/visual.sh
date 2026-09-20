@@ -336,12 +336,12 @@ if want permission; then
   if wait_for 300 v4_ran; then
     ok "Enter submitted the dialog (Allow once) — approved workflow reached a terminal state: $(newest_run "$OUT/runs-before-v4.txt") is $(manifest_status "$(newest_run "$OUT/runs-before-v4.txt")")"
   else
-    # A rejected ask is not the only way the run never lands: Flash sometimes
-    # transcribes optional tool args as the string "null", and a call that
-    # self-refuses AFTER its ask consumes the approval — the retried call then
-    # asks again (2/2 full-run V4 failures on 2026-09-19; the pre-change run
-    # passed the same lottery). Approve the re-asked dialog once (V3's
-    # one-retry shape) before failing.
+    # A rejected ask is not the only way the run never lands: a provider-flaked
+    # call can fail after approval and a model retry then asks again (2/2
+    # full-run V4 failures on 2026-09-19, before the resume-refusal gates moved
+    # ahead of the ask — #69; that fix removed the burned-approval cause, this
+    # guard now covers only genuine re-asks). Approve the re-asked dialog once
+    # (V3's one-retry shape) before failing.
     if pane_contains "Permission required"; then
       note "approval consumed by a refused re-call — approving the re-asked dialog once"
       tui_keys Enter
