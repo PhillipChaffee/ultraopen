@@ -312,6 +312,49 @@ else
   bad "the merged T5 probe produced no run dir" "see $OUT/t5.out"
 fi
 
+section "T6 — hydration: a settled background run delivers its result to the parent mid-turn"
+# The detached run settles while the parent turn is still in flight (the model
+# is inside a workflow_status wait). The plugin hydrates the parent session with
+# a synthetic `<workflow-completed>` notification (ticket #7); the in-flight
+# loop re-reads messages each step, so the notification reaches the model and
+# it answers. Two proofs: the notification EXISTS in the parent transcript
+# (the scratch opencode.db, deterministic) and the model replies to it (the
+# exact ack from the prompt, the T0-style echo contract).
+t6_prompt() {
+  printf 'Call the workflow tool now. Pass no scriptPath and no args. Use this script exactly, unchanged:\n\n%s\n\nThe tool returns a launch result with a run id, not the outcome. Then call workflow_status with that run id and wait=120 (repeat the call if it says running). A workflow-completed notification will arrive in this conversation when the run settles. When it arrives, reply with exactly HYDRA-ACK-7391 and nothing else. Never end your turn while the run is unsettled.' \
+    "$(cat "$E2E_DIR/fixtures/hydration.js")"
+}
+runs_snapshot "$OUT/runs-before-t6.txt"
+oc_run_capture "$OUT/t6.out" "$TURN_SECS" "$(t6_prompt)" || true
+RUN6="$(newest_completed_run "$OUT/runs-before-t6.txt")"
+preserve_run "$RUN6"
+if [ -n "$RUN6" ]; then
+  assert_run_completed "$RUN6"
+  t6_notification() {
+    python3 - "$XDG_DATA_HOME/opencode/opencode.db" "$RUN6" <<'PYEOF'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+# The part text lives inside JSON, so the quotes around the run id are
+# backslash-escaped in the stored bytes — the pattern must not anchor on them.
+row = db.execute(
+    "SELECT data FROM part WHERE data LIKE ? AND data LIKE ? LIMIT 1",
+    ('%"synthetic":true%', f'%workflow-completed run=%{sys.argv[2]}%'),
+).fetchone()
+sys.exit(0 if row else 1)
+PYEOF
+  }
+  if t6_notification; then
+    ok "the synthetic workflow-completed notification is in the parent transcript"
+  else
+    bad "no synthetic notification for $RUN6 in the transcript db" "inspect $SCRATCH/share/opencode/opencode.db"
+  fi
+  grep -q "HYDRA-ACK-7391" "$OUT/t6.out" \
+    && ok "the model responded to the notification" \
+    || bad "the model never acknowledged the notification" "see $OUT/t6.out"
+else
+  bad "the hydration probe produced no completed run dir" "see $OUT/t6.out"
+fi
+
 section "T7 — agentDeadlineMs option (tuple-form options reach the engine)"
 scratch_write_config '{"agentDeadlineMs": 1}'
 runs_snapshot "$OUT/runs-before-t7.txt"
