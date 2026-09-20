@@ -20,6 +20,12 @@ import type { StatusReport } from "./status.js"
  * agent is pre-authorised to read and hands back the path. Pre-capping here would stop that spill
  * from ever firing and silently lose the tail.
  *
+ * TWO delivery paths read this text. The blocking tool output keeps the uncapped stance above —
+ * opencode's truncation layer owns the size. The detached contract's hydration notification
+ * (tool/background.ts) wraps this same render in its synthetic message, which has NO truncation
+ * layer, so THAT path caps the render at a line boundary and appends a pointer to the run's full
+ * `result.json` — the cap lives there, never here.
+ *
  * The sibling advisory (when the session still holds live runs) trails the usage line: the
  * blocking call held the turn only for its own run, so the model must know what else is live.
  */

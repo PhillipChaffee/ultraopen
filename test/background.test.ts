@@ -1,21 +1,30 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import {
+  HYDRATION_CAP,
+  HYDRATION_NOTIFICATION_RE,
+  capAtLineBoundary,
+  deliverOutcome,
   dropPending,
   dropSettled,
+  hydrateParent,
   isLive,
   isLiveAnywhere,
   isProcessAlive,
   liveRunsForSession,
+  onSessionIdle,
   promote,
   registerPending,
+  renderNotification,
   resetForTests,
   runDetached,
   settlePromiseOf,
   siblingRunsForSession,
 } from "../src/server/tool/background.js"
+import { artifactPaths } from "../src/server/resume/store.js"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import type { OpencodeClient } from "../src/server/types.js"
 
 /** A task whose own failure path is itself broken — the harness must still record it. */
 const BROKEN_TASK = (): Promise<void> => Promise.reject(new Error("the failure path itself broke"))
@@ -251,5 +260,230 @@ describe("runDetached — unwritable disk", () => {
       if (savedXDG === undefined) {delete process.env["XDG_DATA_HOME"]}
       else {process.env["XDG_DATA_HOME"] = savedXDG}
     }
+  })
+})
+
+/** A hand-rolled fake client — records promptAsync deliveries and serves canned reads. */
+function fakeClient(options: {
+  agent?: string
+  messages?: { info: { role: string }; parts: { type: string; text?: string }[] }[]
+  failPromptAsync?: boolean
+}): { client: OpencodeClient; sent: { sessionID: string; text: string; agent?: string }[] } {
+  const sent: { sessionID: string; text: string; agent?: string }[] = []
+  const client = {
+    session: {
+      get: () => Promise.resolve({ data: { id: "parent", ...(options.agent === undefined ? {} : { agent: options.agent }) } }),
+      promptAsync: (call: { path: { id: string }; body: { parts: { text: string }[]; agent?: string } }) => {
+        if (options.failPromptAsync === true) {return Promise.reject(new Error("transport down"))}
+        const agent = call.body.agent
+        sent.push({ sessionID: call.path.id, text: call.body.parts[0]?.text ?? "", ...(agent === undefined ? {} : { agent }) })
+        return Promise.resolve({ data: undefined })
+      },
+      messages: () => Promise.resolve({ data: options.messages ?? [] }),
+    },
+  } as unknown as OpencodeClient
+  return { client, sent }
+}
+
+/** A canned transcript row: our notification as a session's last user message. */
+const notificationRow = (runId: string): { info: { role: string }; parts: { type: string; text?: string }[] } => ({
+  info: { role: "user" },
+  parts: [{ type: "text", text: `<workflow-completed run="${runId}" workflow="demo">\nthe value\n</workflow-completed>\nfull result: /tmp/x` }],
+})
+
+describe("hydration — capAtLineBoundary", () => {
+  test("under the cap the whole text hydrates", () => {
+    const text = "line one\nline two\nline three"
+    expect(capAtLineBoundary(text)).toBe(text)
+  })
+
+  test("over the cap, whole lines are kept and no line is ever split", () => {
+    const lines = Array.from({ length: 20 }, (_, i) => `line-${i}-${"x".repeat(40)}`),
+      text = lines.join("\n")
+    const capped = capAtLineBoundary(text)
+    expect(capped.length).toBeLessThanOrEqual(HYDRATION_CAP)
+    for (const line of capped.split("\n")) {
+      expect(lines).toContain(line)
+    }
+    expect(capped.startsWith(lines[0] ?? "")).toBe(true)
+  })
+
+  test("a single over-cap line survives whole rather than degrading to empty", () => {
+    const huge = "y".repeat(HYDRATION_CAP + 500)
+    expect(capAtLineBoundary(huge)).toBe(huge)
+  })
+
+  test("the default cap is the documented 4KB policy", () => {
+    expect(HYDRATION_CAP).toBe(4096)
+  })
+})
+
+describe("hydration — renderNotification", () => {
+  let dataHome: string,
+   savedXDG: string | undefined
+
+  beforeEach(async () => {
+    dataHome = await mkdtemp(join(tmpdir(), "ultraopen-hydration-"))
+    savedXDG = process.env["XDG_DATA_HOME"]
+    process.env["XDG_DATA_HOME"] = dataHome
+  })
+
+  afterEach(async () => {
+    if (savedXDG === undefined) {delete process.env["XDG_DATA_HOME"]}
+    else {process.env["XDG_DATA_HOME"] = savedXDG}
+    await rm(dataHome, { recursive: true, force: true })
+  })
+
+  test("a completion wraps the body in the marker and points at result.json", () => {
+    const text = renderNotification({ status: "completed", name: "demo", runId: "wf_hyd0001", body: "the value" })
+    expect(text).toContain('<workflow-completed run="wf_hyd0001" workflow="demo">')
+    expect(text).toContain("the value")
+    expect(text).toContain("</workflow-completed>")
+    expect(text).toContain(`full result: ${artifactPaths("wf_hyd0001").resultPath}`)
+  })
+
+  test("a failure wraps in the failed marker and points at failure.txt", () => {
+    const text = renderNotification({ status: "failed", name: "demo", runId: "wf_hyd0001", body: "it broke" })
+    expect(text).toContain('<workflow-failed run="wf_hyd0001" workflow="demo">')
+    expect(text).toContain("it broke")
+    expect(text).toContain(`full failure: ${artifactPaths("wf_hyd0001").failurePath}`)
+  })
+
+  test("an over-cap body is capped but the pointer line always survives the cut", () => {
+    const body = Array.from({ length: 400 }, (_, i) => `row-${i}-${"z".repeat(30)}`).join("\n")
+    const text = renderNotification({ status: "completed", name: "demo", runId: "wf_hyd0001", body })
+    expect(text.length).toBeLessThan(HYDRATION_CAP + 200)
+    expect(text.endsWith(artifactPaths("wf_hyd0001").resultPath)).toBe(true)
+  })
+})
+
+describe("hydration — hydrateParent and deliverOutcome", () => {
+  test("fires exactly one promptAsync to the parent with the rendered notification", async () => {
+    const { client, sent } = fakeClient({})
+    await hydrateParent({ client, sessionID: "parent", outcome: { status: "completed", name: "demo", runId: "wf_hyd0001", body: "v" } })
+    expect(sent).toHaveLength(1)
+    expect(sent[0]?.sessionID).toBe("parent")
+    expect(sent[0]?.text).toContain('<workflow-completed run="wf_hyd0001"')
+  })
+
+  test("passes the parent session's stored agent so the prompt does not fall back to the default agent", async () => {
+    const { client, sent } = fakeClient({ agent: "plan" })
+    await hydrateParent({ client, sessionID: "parent", outcome: { status: "completed", name: "demo", runId: "wf_hyd0001", body: "v" } })
+    expect(sent[0]?.agent).toBe("plan")
+  })
+
+  test("an absent stored agent is omitted from the body, not sent as undefined", async () => {
+    const { client, sent } = fakeClient({})
+    await hydrateParent({ client, sessionID: "parent", outcome: { status: "completed", name: "demo", runId: "wf_hyd0001", body: "v" } })
+    expect(sent[0]?.agent).toBeUndefined()
+  })
+
+  test("a failed delivery never rejects — the settle protocol already closed the manifest", async () => {
+    const { client } = fakeClient({ failPromptAsync: true })
+    await hydrateParent({ client, sessionID: "parent", outcome: { status: "failed", name: "demo", runId: "wf_hyd0001", body: "x" } })
+  })
+
+  test("deliverOutcome renders the completed shape from the shared renderResult", async () => {
+    const { client, sent } = fakeClient({})
+    await deliverOutcome({
+      client,
+      sessionID: "parent",
+      runId: "wf_hyd0001",
+      workflow: "demo",
+      result: { runId: "wf_hyd0001", meta: { name: "demo", description: "d" }, value: "OUTCOME", agentCount: 1, nulls: [], logs: [], outputTokens: 0, journal: [], childSessionIDs: [] },
+    })
+    expect(sent).toHaveLength(1)
+    expect(sent[0]?.text).toContain('<workflow-completed run="wf_hyd0001" workflow="demo">')
+    expect(sent[0]?.text).toContain("OUTCOME")
+    expect(sent[0]?.text).toContain("<usage ")
+  })
+
+  test("deliverOutcome renders the failed shape from the failure text", async () => {
+    const { client, sent } = fakeClient({})
+    await deliverOutcome({ client, sessionID: "parent", runId: "wf_hyd0001", workflow: "demo", failureText: "it exploded" })
+    expect(sent).toHaveLength(1)
+    expect(sent[0]?.text).toContain('<workflow-failed run="wf_hyd0001" workflow="demo">')
+    expect(sent[0]?.text).toContain("it exploded")
+  })
+})
+
+describe("hydration — onSessionIdle (the missed-wake nudge)", () => {
+  test("re-fires once when the last message is our unanswered notification", async () => {
+    const { client, sent } = fakeClient({ messages: [notificationRow("wf_hyd0001")] })
+    await hydrateParent({ client, sessionID: "parent", outcome: { status: "completed", name: "demo", runId: "wf_hyd0001", body: "the value" } })
+    await onSessionIdle(client, "parent")
+    expect(sent).toHaveLength(2)
+    expect(sent[1]?.text).toContain('<workflow-nudge run="wf_hyd0001"')
+    expect(sent[1]?.text).toContain('workflow="demo"')
+  })
+
+  test("once, ever: a second idle does not stack another nudge", async () => {
+    const { client, sent } = fakeClient({ messages: [notificationRow("wf_hyd0001")] })
+    await hydrateParent({ client, sessionID: "parent", outcome: { status: "completed", name: "demo", runId: "wf_hyd0001", body: "v" } })
+    await onSessionIdle(client, "parent")
+    await onSessionIdle(client, "parent")
+    expect(sent).toHaveLength(2)
+  })
+
+  test("a last user message that is not ours drops the pending entry without a nudge", async () => {
+    const { client, sent } = fakeClient({
+      messages: [{ info: { role: "user" }, parts: [{ type: "text", text: "a normal user turn" }] }],
+    })
+    await hydrateParent({ client, sessionID: "parent", outcome: { status: "completed", name: "demo", runId: "wf_hyd0001", body: "v" } })
+    await onSessionIdle(client, "parent")
+    expect(sent).toHaveLength(1)
+  })
+
+  test("a run already nudged is never nudged again, even if its notification re-arms", async () => {
+    const { client, sent } = fakeClient({ messages: [notificationRow("wf_hyd0001")] })
+    await hydrateParent({ client, sessionID: "parent", outcome: { status: "completed", name: "demo", runId: "wf_hyd0001", body: "v" } })
+    await onSessionIdle(client, "parent")
+    // One hydration delivery plus one nudge.
+    expect(sent).toHaveLength(2)
+    // The same run hydrating again re-arms the pending entry (that delivery is sent[2]),
+    // but the once-ever guard holds: the second idle must not stack another nudge.
+    await hydrateParent({ client, sessionID: "parent", outcome: { status: "completed", name: "demo", runId: "wf_hyd0001", body: "v" } })
+    expect(sent).toHaveLength(3)
+    await onSessionIdle(client, "parent")
+    expect(sent).toHaveLength(3)
+  })
+
+  test("an assistant answer after the notification means no nudge", async () => {
+    const { client, sent } = fakeClient({
+      messages: [notificationRow("wf_hyd0001"), { info: { role: "assistant" }, parts: [] }],
+    })
+    await hydrateParent({ client, sessionID: "parent", outcome: { status: "completed", name: "demo", runId: "wf_hyd0001", body: "v" } })
+    await onSessionIdle(client, "parent")
+    expect(sent).toHaveLength(1)
+  })
+
+  test("a session never hydrated here is not even listed", async () => {
+    const { client, sent } = fakeClient({ messages: [notificationRow("wf_hyd0001")] })
+    await onSessionIdle(client, "stranger")
+    expect(sent).toHaveLength(0)
+  })
+
+  test("a listing failure keeps the pending entry for the next idle and never throws", async () => {
+    const failing = {
+      session: {
+        get: () => Promise.resolve({ data: { id: "parent" } }),
+        promptAsync: () => Promise.resolve({ data: undefined }),
+        messages: () => Promise.reject(new Error("server hiccup")),
+      },
+    } as unknown as OpencodeClient
+    await hydrateParent({ client: failing, sessionID: "parent", outcome: { status: "completed", name: "demo", runId: "wf_hyd0001", body: "v" } })
+    await onSessionIdle(failing, "parent")
+    const { client, sent } = fakeClient({ messages: [notificationRow("wf_hyd0001")] })
+    await onSessionIdle(client, "parent")
+    expect(sent).toHaveLength(1)
+  })
+})
+
+describe("hydration — HYDRATION_NOTIFICATION_RE", () => {
+  test("recognises both markers and captures the run id", () => {
+    expect(HYDRATION_NOTIFICATION_RE.exec('<workflow-completed run="wf_hyd0001" workflow="x">')?.groups?.["runId"]).toBe("wf_hyd0001")
+    expect(HYDRATION_NOTIFICATION_RE.exec('<workflow-failed run="wf_hyd0001" workflow="x">')?.groups?.["runId"]).toBe("wf_hyd0001")
+    expect(HYDRATION_NOTIFICATION_RE.exec('<workflow-nudge run="wf_hyd0001">')).toBeNull()
+    expect(HYDRATION_NOTIFICATION_RE.exec("some other message")).toBeNull()
   })
 })

@@ -21,6 +21,8 @@ import {
   dropPending,
   dropSettled,
   runDetached,
+  deliverOutcome,
+  onSessionIdle,
 } from "./tool/background.js"
 
 import { watchControl } from "./runtime/control.js"
@@ -190,15 +192,25 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
     },
 
     /**
-     * Feeds the idle deadline's activity map.
+     * Feeds the idle deadline's activity map, and drives the hydration idle nudge.
      *
      * Every live message update touches the emitting child's last-activity stamp. Bus events are
      * the only progress signal that covers schema'd children: `format` poisons the REST message
      * listing, but part events are emitted live regardless. Touching is scoped to engine-owned
      * sessions, so the user's own sessions never inflate the map.
+     *
+     * `session.idle` (captured v1.18.31: `{ type: "session.idle", properties: { sessionID } }`,
+     * deprecated upstream but still published) arms the missed-wake nudge for a session whose
+     * last word is an unanswered hydration notification. Fire-and-forget: the hook is synchronous
+     * by contract and must never reject.
      */
-    event: (hookInput: { event?: { type?: string; properties?: { part?: { sessionID?: string }; info?: { sessionID?: string } } } }): void => {
+    event: (hookInput: { event?: { type?: string; properties?: { part?: { sessionID?: string }; info?: { sessionID?: string }; sessionID?: string } } }): void => {
       const event = hookInput?.event
+      if (event?.type === "session.idle") {
+        const sessionID = event.properties?.sessionID
+        if (sessionID !== undefined) {void onSessionIdle(client, sessionID)}
+        return
+      }
       if (event?.type !== "message.part.updated" && event?.type !== "message.updated") {return}
       const sessionID = event.properties?.part?.sessionID ?? event.properties?.info?.sessionID
       if (sessionID !== undefined) {registry.touchActivity(sessionID)}
@@ -512,21 +524,35 @@ async function launchWorkflow(
             // registry here would always yield [].
             childSessionIDs: result.childSessionIDs,
           })
+          // Hydration fires AFTER the settle protocol: the manifest is closed, so a model
+          // reacting to the notification finds workflow_status settled, not "running".
+          await deliverOutcome({
+            client,
+            sessionID: manifest.sessionID,
+            runId,
+            workflow: prepared.meta.name,
+            result,
+            resume: { resumed: resume?.entries.length ?? 0, argsChanged: resume?.argsChanged === true },
+          })
         } catch (error) {
-          const partial = error instanceof WorkflowRunError ? error.partial : undefined
+          const partial = error instanceof WorkflowRunError ? error.partial : undefined,
+            failureText = renderFailure(error instanceof WorkflowRunError ? error.cause : error, args.script, runId)
           await settleRun({
             status: "failed",
             entries: partial?.journal ?? [],
             value: null,
             childSessionIDs: partial?.childSessionIDs ?? [],
-            failureText: renderFailure(error instanceof WorkflowRunError ? error.cause : error, args.script, runId),
+            failureText,
           })
+          await deliverOutcome({ client, sessionID: manifest.sessionID, runId, workflow: prepared.meta.name, failureText })
         }
       },
       // Last resort: the task above is contractually self-capturing, so an
       // escaping rejection means its own failure path broke. Route through the
       // same settle protocol — including the flush join — so the degraded
-      // record still follows the crash-safety ordering.
+      // record still follows the crash-safety ordering. The degraded record is
+      // disk-only (failure.txt + manifest); no hydration fires when even the
+      // failure path broke.
       renderFailure,
     })
 

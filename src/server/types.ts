@@ -6,7 +6,7 @@
  * justifies it, so a codegen refresh has exactly one place to break. `test/drift/` re-reads the
  * real opencode sources and fails when one of these becomes wrong — or unnecessary.
  *
- * All citations are against opencode v1.18.20.
+ * All citations are against opencode v1.18.31 (the installed, README-verified release).
  */
 
 import type { Ruleset } from "./bridge/permission.js"
@@ -41,6 +41,19 @@ export type OutputFormat = { type: "text" } | { type: "json_schema"; schema: Rec
  * Source of truth: `packages/opencode/src/session/prompt.ts:1494-1521` (`SessionPrompt.PromptInput`,
  * minus `sessionID`, which travels in the path). The SDK's `SessionPromptData["body"]`
  * (`types.gen.ts:2588-2613`) omits `format` and `variant`.
+ *
+ * The `prompt_async` route accepts the SAME body: its payload is
+ * `Schema.Struct(Struct.omit(PromptInput.fields, ["sessionID"]))` — captured at v1.18.31,
+ * `packages/opencode/src/server/routes/instance/httpapi/groups/session.ts:70` — and the handler
+ * feeds it to the same `prompt` service (`.../handlers/session.ts:311-329`), so every field here,
+ * `format` and `variant` included, is honoured async too. The SDK's generated
+ * `SessionPromptAsyncData` (`types.gen.ts:2329-2347`) omits `format` and `variant` and narrows
+ * `parts` — the usual gen drift; async calls cast through this interface (see
+ * `OpencodeClient.session.promptAsync`).
+ *
+ * `messageID`, on either route, is the id assigned to the NEW user message
+ * (`prompt.ts:657`: `id: input.messageID ?? MessageID.ascending()`) — not a pointer that re-queues
+ * an existing one. `test/drift/hydration.test.ts` pins all of this.
  *
  * `variant` is a SIBLING of `model`, not a field inside it — and it is honoured unconditionally
  * (`prompt.ts:654` reads `input.variant ?? ...`), unlike an agent-configured variant which only
@@ -129,6 +142,15 @@ export interface SessionInfo {
   directory?: string
   title?: string
   metadata?: Record<string, unknown>
+  /**
+   * The agent the session runs under. The SERVER keeps it (`packages/schema/src/v1/session.ts:556`,
+   * `agent: optional(Schema.String)`, v1.18.31) and prompt resolution reads it back when a prompt
+   * names no agent — but the SDK's generated `Session` (`types.gen.ts:465-497`) omits the field,
+   * so reading it requires this cast. Hydration passes it as the prompt body's `agent`, because an
+   * omitted `agent` resolves to the DEFAULT agent (`prompt.ts:629-631`:
+   * `input.agent ? agents.get(...) : agents.defaultInfo()`), not the session's stored one.
+   */
+  agent?: string
 }
 
 /**
@@ -160,6 +182,32 @@ export interface OpencodeClient {
     abort: (options: { path: { id: string } }) => Promise<{ data?: unknown; error?: unknown }>
     prompt: (options: { path: { id: string }; body: PromptBody }) => Promise<{
       data?: PromptResponse
+      error?: unknown
+    }>
+    /**
+     * Fire-and-forget prompt: `POST /session/{id}/prompt_async`.
+     *
+     * Source of truth: the SDK method (`sdk.gen.d.ts:182`, v1.18.30+ — the generated surface the
+     * casts here exist to route around) and the server handler
+     * (`.../httpapi/handlers/session.ts:311-329`, v1.18.31): the prompt is forked into the
+     * request scope and `204 NoContent` returns at once, so `data` is always undefined on
+     * success; a failure inside the forked prompt publishes a Session Error event and never
+     * rejects this call. Body shape: same as {@link PromptBody} (see its citation for the
+     * route's `PromptPayload`), which the SDK gen narrows — hence the cast.
+     */
+    promptAsync: (options: { path: { id: string }; body: PromptBody }) => Promise<{
+      data?: unknown
+      error?: unknown
+    }>
+    /**
+     * Lists a session's messages: `GET /session/{id}/message`.
+     *
+     * Source of truth: `sdk.gen.d.ts:170` (`SessionMessagesData`, v1.18.31) — path-only, and a
+     * 200 of `Array<{ info: Message; parts: Part[] }>` (`types.gen.ts:2234-2243`). The idle nudge
+     * reads the tail of this listing to recognise an unanswered hydration notification.
+     */
+    messages: (options: { path: { id: string } }) => Promise<{
+      data?: { info: { role: string }; parts: MessagePart[] }[]
       error?: unknown
     }>
   }

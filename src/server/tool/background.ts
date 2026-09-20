@@ -1,7 +1,10 @@
 import type { Manifest } from "../resume/journal.js"
 import { endRun } from "../resume/persist.js"
-import { writeFailure } from "../resume/store.js"
+import { artifactPaths, writeFailure } from "../resume/store.js"
 import { registry } from "../singleton.js"
+import type { OpencodeClient } from "../types.js"
+import { renderResult } from "./render.js"
+import type { WorkflowResult } from "./workflow.js"
 
 /**
  * Which launch contract the host process can honor, decided from the process shape.
@@ -198,8 +201,223 @@ export function isProcessAlive(pid: number): boolean {
   }
 }
 
+/**
+ * Hydration: how a settled detached run's outcome reaches the conversation.
+ *
+ * The detached contract returns a launch handle, so the result must be DELIVERED. opencode's own
+ * background task tool shows the way (`packages/opencode/src/tool/task.ts`, v1.18.31):
+ * `injectBackgroundResult` prompts the PARENT session with a `synthetic: true` text part, which
+ * the session loop picks up — the prompt service persists the user message before entering the
+ * loop, and the loop re-reads messages each step, so a notification landing mid-turn is picked up
+ * by the in-flight turn and one landing on an idle session starts a new turn. That injection drops
+ * on the busy race (a notification arriving exactly as the turn ends is never read); the idle
+ * nudge below covers it.
+ *
+ * The first `promptAsync` fires unconditionally at settle time — idle vs mid-turn is a server-side
+ * distinction the loop resolves either way. The nudge exists ONLY for the turn-end race.
+ */
+
+/**
+ * The hydration notification's size cap, in characters.
+ *
+ * The decision is `capped-run-dir` (ticket #7, 2026-09-12): the synthetic message has NO
+ * truncation layer — opencode's spill-to-file only wraps plugin TOOL output — so the render is
+ * capped here and the full value stays on disk, one pointer line away.
+ */
+export const HYDRATION_CAP = 4096
+
+/**
+ * Cuts text to the cap at a line boundary — never splitting a line, so never splitting a tag.
+ *
+ * Returns the input unchanged when it already fits. When cutting, whole lines are kept while they
+ * fit, and at least one line is always kept (a single over-cap line survives whole rather than
+ * degrading to an empty notification). The caller appends the pointer line after the cap.
+ */
+export function capAtLineBoundary(text: string, cap: number = HYDRATION_CAP): string {
+  if (text.length <= cap) {return text}
+  const lines = text.split("\n")
+  let kept = ""
+  for (const line of lines) {
+    const candidate = kept === "" ? line : `${kept}\n${line}`
+    // A single line longer than the cap is still kept: an empty body is worse than an over-cap one.
+    if (candidate.length > cap && kept !== "") {break}
+    kept = candidate
+  }
+  return kept
+}
+
+/**
+ * The marker every hydration notification opens with, and its recogniser.
+ *
+ * The idle nudge matches this against the session's last user message, so the wrapper is
+ * contract: change it and the nudge goes blind. Tolerant of leading whitespace — transcript
+ * round-trips have been known to re-indent.
+ */
+export const HYDRATION_NOTIFICATION_RE = /^\s*<workflow-(?:completed|failed) run="(?<runId>wf_[a-z0-9]{6,})"/u
+
+export interface HydrationOutcome {
+  status: "completed" | "failed"
+  name: string
+  runId: string
+  /** The rendered result (completed) or failure text (failed) to wrap and cap. */
+  body: string
+}
+
+/**
+ * Renders the synthetic notification for one settled run.
+ *
+ * The body is capped (see {@link HYDRATION_CAP}) and the full artifact is named on the pointer
+ * line — `result.json` for a completion, `failure.txt` for a failure. The pointer is appended
+ * AFTER the cap on purpose: `renderFailure` trails its run-dir line at the end of its text, so a
+ * tail-cut failure would otherwise lose the very path the model needs to recover.
+ */
+export function renderNotification(outcome: HydrationOutcome): string {
+  const tag = outcome.status === "completed" ? "workflow-completed" : "workflow-failed",
+    { resultPath, failurePath } = artifactPaths(outcome.runId),
+    full = outcome.status === "completed" ? `full result: ${resultPath}` : `full failure: ${failurePath}`
+  return [
+    `<${tag} run="${outcome.runId}" workflow="${outcome.name}">`,
+    capAtLineBoundary(outcome.body),
+    `</${tag}>`,
+    full,
+  ].join("\n")
+}
+
+/**
+ * One pending hydration notification: a run whose notification may still be unanswered.
+ *
+ * Tracked so the idle nudge reads messages only for sessions this process actually hydrated —
+ * the user's own sessions never pay a listing call on their idle events.
+ */
+const pending = new Map<string, Map<string, string>>()
+
+/** Run ids this process has already nudged; a session is nudged once per run, ever. */
+const nudged = new Set<string>()
+
+/** Delivers the settlement notification to the run's parent session. Never throws. */
+export async function hydrateParent(options: {
+  client: OpencodeClient
+  sessionID: string
+  outcome: HydrationOutcome
+}): Promise<void> {
+  const { client, sessionID, outcome } = options
+  try {
+    // The session's stored agent rides along: an omitted `agent` would resolve the prompt to the
+    // DEFAULT agent (prompt.ts:629-631), not the session's own. Absent or unreadable → omit and
+    // accept the default; a hydration under the default agent still beats no hydration.
+    const row = await client.session.get({ path: { id: sessionID } }).catch(() => undefined),
+      agent = row?.data?.agent,
+      text = renderNotification(outcome)
+    await client.session.promptAsync({
+      path: { id: sessionID },
+      body: { parts: [{ type: "text", synthetic: true, text }], ...(agent === undefined ? {} : { agent }) },
+    })
+    // The notification MAY now be unanswered (the turn-end race). Arm the nudge for this session.
+    const runs = pending.get(sessionID) ?? new Map<string, string>()
+    runs.set(outcome.runId, outcome.name)
+    pending.set(sessionID, runs)
+  } catch {
+    // Fire-and-forget by contract: a rejected hydration must not break the settle protocol that
+    // already closed the manifest. The run's outcome is still on disk for workflow_status.
+  }
+}
+
+/**
+ * Delivers one settled run's outcome to its parent session.
+ *
+ * The index.ts settle paths call this — wiring only. The completion body is the shared
+ * `renderResult` render (sibling advisory included, this run excluded); a failure delivers the
+ * failure text as rendered for failure.txt. Both are capped and pointed at the full artifact by
+ * {@link renderNotification}.
+ */
+export function deliverOutcome(options: {
+  client: OpencodeClient
+  sessionID: string
+  runId: string
+  workflow: string
+  /** The completed run's result; its presence picks the completed shape. */
+  result?: WorkflowResult
+  resume?: { resumed: number; argsChanged: boolean }
+  /** The rendered failure text for a failed run. */
+  failureText?: string
+}): Promise<void> {
+  if (options.result !== undefined) {
+    return hydrateParent({
+      client: options.client,
+      sessionID: options.sessionID,
+      outcome: {
+        status: "completed",
+        name: options.workflow,
+        runId: options.runId,
+        body: renderResult(options.result, options.resume, siblingRunsForSession(options.sessionID, options.runId)),
+      },
+    })
+  }
+  return hydrateParent({
+    client: options.client,
+    sessionID: options.sessionID,
+    outcome: { status: "failed", name: options.workflow, runId: options.runId, body: options.failureText ?? "" },
+  })
+}
+
+/**
+ * The idle nudge: re-fire `promptAsync` once when a notification landed unanswered.
+ *
+ * Called from the plugin `event` hook on `session.idle` (captured at v1.18.31:
+ * `packages/schema/src/session-status-event.ts` — `{ type: "session.idle", properties:
+ * { sessionID } }`, deprecated upstream but still published from `session/status.ts:43`; the hook
+ * itself is `(input: { event: Event }) => Promise<void>`, `packages/plugin/src/index.ts:224`).
+ * Race the ticket fixes: the notification persists exactly as the loop finishes its final step,
+ * so it is never read — the session idles with our notification as its last word.
+ *
+ * Once, ever, per run: the re-fire itself is a new user message, so a second idle would find the
+ * notification no longer last and re-nudging would only stack duplicates.
+ */
+export async function onSessionIdle(client: OpencodeClient, sessionID: string): Promise<void> {
+  const runs = pending.get(sessionID)
+  if (!runs || runs.size === 0) {return}
+  try {
+    const messages = await client.session.messages({ path: { id: sessionID } })
+    const last = messages.data?.at(-1)
+    if (!last || last.info.role !== "user") {
+      // Answered (an assistant message follows) or the conversation moved on: the race is over.
+      pending.delete(sessionID)
+      return
+    }
+    const text = last.parts.map((part) => ("text" in part ? part.text : "")).join("\n"),
+      runId = HYDRATION_NOTIFICATION_RE.exec(text)?.groups?.["runId"],
+      name = runId === undefined ? undefined : runs.get(runId)
+    if (runId === undefined || name === undefined) {
+      pending.delete(sessionID)
+      return
+    }
+    if (nudged.has(runId)) {
+      pending.delete(sessionID)
+      return
+    }
+    nudged.add(runId)
+    await client.session.promptAsync({
+      path: { id: sessionID },
+      body: {
+        parts: [{
+          type: "text",
+          synthetic: true,
+          text: `<workflow-nudge run="${runId}" workflow="${name}">The completion notification above is still unanswered — ` +
+            `the turn ended as it landed. Read it and act on its result now.</workflow-nudge>`,
+        }],
+      },
+    })
+    pending.delete(sessionID)
+  } catch {
+    // A failed listing or re-fire is retried on the NEXT idle for this session: the pending entry
+    // is kept. Never throws — the event hook cannot afford a rejection.
+  }
+}
+
 /** Test-only: restore clean module state. */
 export function resetForTests(): void {
   detached.clear()
   settling.clear()
+  pending.clear()
+  nudged.clear()
 }

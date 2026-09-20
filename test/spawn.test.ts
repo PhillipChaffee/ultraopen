@@ -81,6 +81,8 @@ function makeClient(
         promptCalls.push(call)
         return prompt(call)
       },
+      promptAsync: () => Promise.resolve({ data: undefined }),
+      messages: () => Promise.resolve({ data: [] }),
     },
   }
 
