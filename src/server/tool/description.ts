@@ -16,10 +16,14 @@
  * stay structurally identical so a variant swap never desyncs from the base text.
  */
 const pinnedContract = `This call RETURNS AT ONCE with the run id. The run continues in the background while you keep
-working. Poll \`workflow_status\` with the run id (pass \`wait\` so one call blocks until the run
-settles or the wait expires) — do not re-launch the same workflow because a poll said "running".
-Aborting this call does not stop the run; if you must stop it, tell the user to end the opencode
-process, or wait for it to settle and resume from its run id.`
+working; when it settles, a \`<workflow-completed>\` or \`<workflow-failed>\` notification arrives in
+this conversation — you know nothing about the run's results until that notification arrives.
+Do not sleep, poll for progress, ask the subagents for status, or duplicate this run's work —
+avoid working with the same files or topics it is using. This host may exit after your turn, so
+hold the turn while the run works by polling \`workflow_status\` with the run id (pass \`wait\` so
+one call blocks until the run settles or the wait expires) — do not re-launch the same workflow
+because a poll said "running". Aborting this call does not stop the run; to stop it, call
+\`workflow({stop: "<runId>"})\`.`
 
 export const description = `Execute a workflow script that orchestrates multiple subagents deterministically.
 
@@ -153,11 +157,15 @@ export const longLivedDescription = description
     pinnedContract,
     `This call RETURNS AT ONCE with the run id. The run continues in the background and outlives your
 turn — this host keeps the process alive. End your turn once the launch result arrives; do not
-poll just to hold the turn. Poll \`workflow_status\` with the run id when the user asks about the
-run or when the current task cannot finish without its value (pass \`wait\` so one call blocks
-until the run settles or the wait expires) — do not re-launch the same workflow because a status
-said "running". Aborting this call does not stop the run; if you must stop it, tell the user to
-end the opencode process, or wait for it to settle and resume from its run id.`,
+poll just to hold the turn. When the run settles, a \`<workflow-completed>\` or
+\`<workflow-failed>\` notification arrives in this conversation — you know nothing about the run's
+results until that notification arrives. Do not sleep, poll for progress, ask the subagents for
+status, or duplicate this run's work — avoid working with the same files or topics it is using.
+Work on non-overlapping tasks, or briefly tell the user what you launched and end your response.
+Poll \`workflow_status\` with the run id only when the user asks about the run or when the current
+task cannot finish without its value (pass \`wait\` so one call blocks until the run settles or the
+wait expires) — do not re-launch the same workflow because a status said "running". Aborting this
+call does not stop the run; to stop it, call \`workflow({stop: "<runId>"})\`.`,
   )
 
 /**
@@ -171,7 +179,8 @@ export const statusDescription = `Read the live state of one workflow run from d
 
 Pass the runId from the workflow launch result. Pass wait (seconds, up to 300) to block the call
 until the run settles or the wait expires — prefer one long wait over many short polls. The report
-carries: status (running, completed, failed, or orphaned), the phase names seen so far, agent
+carries: status (running, completed, failed, cancelled, or orphaned — cancelled means the run was
+stopped by request), the phase names seen so far, agent
 counts (total, running, done, failed), the run's output token total, the last log lines, and, when
 the run has settled, the final value (completed) or the failure text (failed, orphaned). A run
 whose owning process died reports orphaned with a pointer at resume. This tool is read-only and

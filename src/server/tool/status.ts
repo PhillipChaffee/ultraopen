@@ -40,7 +40,7 @@ export interface StatusDeps {
 export interface StatusReport {
   runId: string
   dir: string
-  status: "running" | "completed" | "failed" | "orphaned"
+  status: "running" | "completed" | "failed" | "cancelled" | "orphaned"
   phase?: string | undefined
   phases: string[]
   agents: { total: number; running: number; done: number; failed: number }
@@ -126,6 +126,7 @@ async function buildSnapshot(input: {
   // The boot check keeps a queued run in THIS process from reading as dead.
   let status: StatusReport["status"] = "running"
   if (manifest?.status === "completed" || manifest?.status === "failed") {status = manifest.status}
+  else if (manifest?.status === "cancelled") {status = "cancelled"}
   else if (manifest?.status === "orphaned") {status = "orphaned"}
   if (
     status === "running" &&

@@ -150,6 +150,15 @@ describe("executeStatus — running, completed, failed", () => {
     expect(report.failure?.message).toContain("resumeFromRunId")
   })
 
+  test("a cancelled manifest reports terminal state without inventing a failure", async () => {
+    // The stop path marks the manifest cancelled; the status tool must settle on it
+    // rather than polling forever, and must not fabricate a failure the run never had.
+    const manifest = JSON.stringify({ ...MANIFEST_RUNNING, status: "cancelled" })
+    const report = await executeStatus({ runId: RUN }, { ...deps(), readFile: fakeReadFile({ "manifest.json": manifest }) })
+    expect(report.status).toBe("cancelled")
+    expect(report.failure).toBeUndefined()
+  })
+
   test("a run from a dead other-boot process reports orphaned instead of running forever", async () => {
     // The manifest says running under boot-live, but the observer's boot is
     // different and the pid is gone: this run will never settle.
