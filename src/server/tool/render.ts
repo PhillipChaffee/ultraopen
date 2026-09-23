@@ -120,6 +120,9 @@ export function renderLaunch(
     // reconsider before the fan-out is scheduled.
     ...(projectionLine === undefined ? [] : [projectionLine]),
     "The run is executing in the background; this message does not contain its outcome.",
+    // Sets user-facing expectations: the host's cancel cascade (ESC) cannot
+    // reach plugin background runs — the stop argument is the only off switch.
+    `Interrupting the turn (ESC) does not stop this run; to stop it, call workflow({ stop: "${runId}" }).`,
   ]
   if (longLived) {
     lines.push(

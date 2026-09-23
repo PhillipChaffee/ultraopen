@@ -21,8 +21,10 @@ import {
   nameRun,
   dropPending,
   dropSettled,
+  registerStopHandle,
   runDetached,
-  deliverOutcome,
+  stopRun,
+  deliverOutcomeUnlessStopped,
   onSessionIdle,
 } from "./tool/background.js"
 
@@ -276,8 +278,13 @@ async function launchWorkflow(
   projectDirectory: string | undefined,
   longLived: boolean,
 ): Promise<string> {
+  // The stop path short-circuits BEFORE the launch gate: a session with a live run must be able to stop it.
+  // An EMPTY stop value is a launch default, not a stop request — models emit optional fields as "".
+  if (args.stop !== undefined && args.stop !== "") {return await stopRun({ runId: args.stop, client, bootId })}
+
   const background = args.dryRun !== true && (args.background ?? options.runMode === "background"),
    runId = `wf_${randomUUID().replaceAll("-", "").slice(0, 12)}`,
+   stopController = new AbortController(),
    // The session's default model, so `effort` resolves against ITS variant set rather
    // than a guess. A failure here is non-fatal: effort simply goes unapplied, and the run
    // log says so.
@@ -297,11 +304,9 @@ async function launchWorkflow(
     readScript: (path: string) => readFile(path, "utf8"),
     ...(defaultModel === undefined ? {} : { defaultModel }),
     ...(options.budgetTokens === null ? {} : { budgetTotal: options.budgetTokens }),
-    // The detached run must NOT take the tool call's signal: a parent-turn
-    // interrupt would otherwise kill the run it just launched. The signal is a
-    // launch-phase concern; only the blocking contract still threads it into
-    // the Run, where aborting the call and aborting the run are the same act.
-    ...(background || !context.abort ? {} : { signal: context.abort }),
+    // The detached run must NOT take the tool call's signal: a parent-turn interrupt would
+    // otherwise kill the run it just launched — it takes the stop controller's signal.
+    signal: background ? stopController.signal : context.abort,
   }
 
   // Saved workflows resolve from disk on every call: a file saved mid-session
@@ -483,16 +488,21 @@ async function launchWorkflow(
       budgetTotal: options.budgetTokens,
     })
 
-    // Crash safety: the manifest's child list is updated as sessions appear, so a server
-    // killed mid-run still leaves the reaper a list of children to abort. Written per
-    // agent-start (not per event) to keep the I/O bounded by agent count.
+    // Crash safety: the manifest's child list is updated as sessions appear, so a server killed
+    // mid-run leaves the reaper a list of children to abort. The on-disk status guard keeps an
+    // unwind-time progress event from resurrecting a cancelled record.
     let persistedChildren = -1
     const persistChildren = async (): Promise<void> => {
-      if (!manifest) {return}
+      // The stop controller's signal is the run-level cancelled gate: once a stop is in
+      // flight, child-list rewrites are moot and must not race the cancel write.
+      if (!manifest || stopController.signal.aborted) {return}
       const sessions = runRegistry.sessionsOf(runId)
       if (sessions.length === persistedChildren) {return}
       persistedChildren = sessions.length
-      try {await writeManifest(runId, { ...manifest, childSessionIDs: sessions })} catch {
+      try {
+        const current = await readManifest(runId)
+        if (current !== undefined && current.status === "running") {await writeManifest(runId, { ...current, childSessionIDs: sessions })}
+      } catch {
         // Crash safety is best-effort: a failed manifest rewrite must not stall the run.
       }
     }
@@ -530,6 +540,7 @@ async function launchWorkflow(
     // Detached: the run outlives this tool call. The task fully captures its own
     // outcome — flushes, manifest, failure text — because nothing else is
     // waiting on it anymore.
+    registerStopHandle(runId, stopController)
     void runDetached({
       runId,
       manifest,
@@ -544,9 +555,9 @@ async function launchWorkflow(
             // registry here would always yield [].
             childSessionIDs: result.childSessionIDs,
           })
-          // Hydration fires AFTER the settle protocol: the manifest is closed, so a model
-          // reacting to the notification finds workflow_status settled, not "running".
-          await deliverOutcome({
+          // Hydration fires AFTER the settle protocol — the manifest is closed, so a model reacting
+          // to the notification finds workflow_status settled, not "running".
+          await deliverOutcomeUnlessStopped({
             client,
             sessionID: manifest.sessionID,
             runId,
@@ -564,7 +575,7 @@ async function launchWorkflow(
             childSessionIDs: partial?.childSessionIDs ?? [],
             failureText,
           })
-          await deliverOutcome({ client, sessionID: manifest.sessionID, runId, workflow: prepared.meta.name, failureText })
+          await deliverOutcomeUnlessStopped({ client, sessionID: manifest.sessionID, runId, workflow: prepared.meta.name, failureText })
         }
       },
       // Last resort: the task above is contractually self-capturing, so an

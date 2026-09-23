@@ -1,26 +1,36 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+import { afterAll, afterEach, beforeEach, beforeAll, describe, expect, test } from "bun:test"
 import {
   HYDRATION_CAP,
   HYDRATION_NOTIFICATION_RE,
+  STOP_ABORT_REASON,
   capAtLineBoundary,
   deliverOutcome,
   dropPending,
   dropSettled,
+  dropStopHandle,
   hydrateParent,
   isLive,
   isLiveAnywhere,
   isProcessAlive,
   liveRunsForSession,
+  nameRun,
   onSessionIdle,
   promote,
   registerPending,
+  registerStopHandle,
   renderNotification,
   resetForTests,
   runDetached,
   settlePromiseOf,
   siblingRunsForSession,
+  stopHandleOf,
+  stopRun,
+  notifyStopped,
 } from "../src/server/tool/background.js"
-import { artifactPaths } from "../src/server/resume/store.js"
+import { artifactPaths, appendJournalEntry, ensureRunDir, readJournal, readManifest } from "../src/server/resume/store.js"
+import { beginRun, endRun } from "../src/server/resume/persist.js"
+import type { JournalEntry } from "../src/server/resume/journal.js"
+import { registry } from "../src/server/singleton.js"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -46,6 +56,15 @@ const manifest = (over: Partial<Parameters<typeof isLiveAnywhere>[0]> = {}) => (
   childSessionIDs: [],
   startedAt: 1,
   ...over,
+})
+
+/** A launch record for the disk-backed stop tests. */
+const record = (runId: string) => ({
+  runId,
+  sessionID: "parent",
+  source: "export const meta = { name: 'demo', description: 'd' }",
+  args: {},
+  bootId: "boot-a",
 })
 
 beforeEach(() => {
@@ -232,10 +251,10 @@ describe("runDetached", () => {
 
   test("a settled run's children are dropped from the engine registry", async () => {
     registerPending("wf_bg000102", "s1")
-    const { registry } = await import("../src/server/singleton.js")
-    registry.register("child-a", "wf_bg000102")
+    const engineRegistry = await import("../src/server/singleton.js")
+    engineRegistry.registry.register("child-a", "wf_bg000102")
     await runDetached({ runId: "wf_bg000102", manifest: undefined, task: async () => {}, renderFailure: FAKE_RENDER, onEscapedRejection: ESCAPE_RECORDER })
-    expect(registry.owns("child-a")).toBe(false)
+    expect(engineRegistry.registry.owns("child-a")).toBe(false)
   })
 })
 
@@ -268,11 +287,15 @@ function fakeClient(options: {
   agent?: string
   messages?: { info: { role: string }; parts: { type: string; text?: string }[] }[]
   failPromptAsync?: boolean
+  failGet?: boolean
 }): { client: OpencodeClient; sent: { sessionID: string; text: string; agent?: string }[] } {
   const sent: { sessionID: string; text: string; agent?: string }[] = []
   const client = {
     session: {
-      get: () => Promise.resolve({ data: { id: "parent", ...(options.agent === undefined ? {} : { agent: options.agent }) } }),
+      get: () =>
+        options.failGet === true
+          ? Promise.reject(new Error("transport down"))
+          : Promise.resolve({ data: { id: "parent", ...(options.agent === undefined ? {} : { agent: options.agent }) } }),
       promptAsync: (call: { path: { id: string }; body: { parts: { text: string }[]; agent?: string } }) => {
         if (options.failPromptAsync === true) {return Promise.reject(new Error("transport down"))}
         const agent = call.body.agent
@@ -383,6 +406,15 @@ describe("hydration — hydrateParent and deliverOutcome", () => {
     await hydrateParent({ client, sessionID: "parent", outcome: { status: "failed", name: "demo", runId: "wf_hyd0001", body: "x" } })
   })
 
+  test("an unreadable session row still delivers the notification, under the default agent", async () => {
+    // The session lookup's catch keeps the hydration alive on a transport hiccup; the delivery
+    // loses only the stored-agent passthrough.
+    const { client, sent } = fakeClient({ failGet: true })
+    await hydrateParent({ client, sessionID: "parent", outcome: { status: "completed", name: "demo", runId: "wf_hyd0001", body: "v" } })
+    expect(sent).toHaveLength(1)
+    expect(sent[0]?.agent).toBeUndefined()
+  })
+
   test("deliverOutcome renders the completed shape from the shared renderResult", async () => {
     const { client, sent } = fakeClient({})
     await deliverOutcome({
@@ -485,5 +517,259 @@ describe("hydration — HYDRATION_NOTIFICATION_RE", () => {
     expect(HYDRATION_NOTIFICATION_RE.exec('<workflow-failed run="wf_hyd0001" workflow="x">')?.groups?.["runId"]).toBe("wf_hyd0001")
     expect(HYDRATION_NOTIFICATION_RE.exec('<workflow-nudge run="wf_hyd0001">')).toBeNull()
     expect(HYDRATION_NOTIFICATION_RE.exec("some other message")).toBeNull()
+  })
+})
+
+/** Disk-backed stop tests: stopRun reads the manifest under the process XDG root. */
+describe("stopRun — refusals", () => {
+  let base: string,
+   savedXDG: string | undefined
+
+  beforeAll(async () => {
+    base = await mkdtemp(join(tmpdir(), "ultraopen-stopref-"))
+    savedXDG = process.env["XDG_DATA_HOME"]
+    process.env["XDG_DATA_HOME"] = base
+  })
+
+  afterAll(async () => {
+    if (savedXDG === undefined) {delete process.env["XDG_DATA_HOME"]}
+    else {process.env["XDG_DATA_HOME"] = savedXDG}
+    await rm(base, { recursive: true, force: true })
+  })
+
+  test("a malformed id is refused before any disk read", async () => {
+    const { client, sent } = fakeClient({})
+    expect(await stopRun({ runId: "wf_../escape", client, bootId: "boot-a" })).toContain("not a valid run id")
+    expect(sent).toHaveLength(0)
+  })
+
+  test("an unknown id is refused with a pointer at workflow_status", async () => {
+    const { client } = fakeClient({})
+    expect(await stopRun({ runId: "wf_nosuch01", client, bootId: "boot-a" })).toContain(
+      'No workflow run with id "wf_nosuch01" exists',
+    )
+  })
+
+  test("a run that already finished is refused, naming its status", async () => {
+    const opened = await beginRun({
+      runId: "wf_strefin01",
+      sessionID: "parent",
+      source: "export const meta = {}",
+      args: {},
+      bootId: "boot-a",
+    })
+    await ensureRunDir("wf_strefin01")
+    // Settle it completed before the stop arrives.
+    await endRun(opened, { status: "completed", entries: [], value: 1, childSessionIDs: [] })
+    const { client } = fakeClient({})
+    expect(await stopRun({ runId: "wf_strefin01", client, bootId: "boot-a" })).toContain(
+      'already finished with status "completed"',
+    )
+  })
+
+  test("another live process's run is refused — aborting its children from here would only lie", async () => {
+    await beginRun({
+      runId: "wf_strcross1",
+      sessionID: "parent",
+      source: "export const meta = {}",
+      args: {},
+      bootId: "boot-OTHER",
+    })
+    const { client } = fakeClient({})
+    // pid is this process (alive): the manifest claims a different boot that is still running.
+    expect(await stopRun({ runId: "wf_strcross1", client, bootId: "boot-a" })).toContain(
+      "another opencode process",
+    )
+  })
+
+  test("a blocking-contract run is refused with the abort-the-turn guidance", async () => {
+    await beginRun({
+      runId: "wf_stforeg1",
+      sessionID: "parent",
+      source: "export const meta = {}",
+      args: {},
+      bootId: "boot-a",
+    })
+    registerPending("wf_stforeg1", "parent")
+    const { client } = fakeClient({})
+    expect(await stopRun({ runId: "wf_stforeg1", client, bootId: "boot-a" })).toContain(
+      "running in the foreground of its session",
+    )
+  })
+
+  test("a run whose owning boot is gone is refused as not live here", async () => {
+    await beginRun({
+      runId: "wf_strdead1",
+      sessionID: "parent",
+      source: "export const meta = {}",
+      args: {},
+      bootId: "boot-OTHER",
+    })
+    // Point the manifest's pid at a process that cannot exist: re-write it directly.
+    const stale = await readManifest("wf_strdead1")
+    if (!stale) {throw new Error("manifest missing")}
+    const { writeManifest } = await import("../src/server/resume/store.js")
+    await writeManifest("wf_strdead1", { ...stale, pid: 99_999_999 })
+    const { client } = fakeClient({})
+    expect(await stopRun({ runId: "wf_strdead1", client, bootId: "boot-a" })).toContain(
+      "not live in this opencode process",
+    )
+  })
+})
+
+describe("stopRun — the stop itself", () => {
+  let base: string,
+   savedXDG: string | undefined
+
+  const flushEntry: JournalEntry = {
+    type: "result",
+    key: "k1",
+    scopePath: "root",
+    ordinal: 0,
+    label: "worker",
+    status: "ok",
+    value: "v",
+    outputTokens: 3,
+  }
+
+  beforeAll(async () => {
+    base = await mkdtemp(join(tmpdir(), "ultraopen-stop-"))
+    savedXDG = process.env["XDG_DATA_HOME"]
+    process.env["XDG_DATA_HOME"] = base
+  })
+
+  afterAll(async () => {
+    if (savedXDG === undefined) {delete process.env["XDG_DATA_HOME"]}
+    else {process.env["XDG_DATA_HOME"] = savedXDG}
+    await rm(base, { recursive: true, force: true })
+  })
+
+  test("aborts the engine, records cancelled with the live children, hydrates the parent, keeps the journal", async () => {
+    const runId = "wf_stokill1"
+    await beginRun(record(runId))
+    registerPending(runId, "parent")
+    nameRun(runId, "demo")
+    const controller = new AbortController()
+    registerStopHandle(runId, controller)
+    registry.register("child-1", runId)
+    // The incremental flush already landed one entry; the stop must not clobber it.
+    await appendJournalEntry(runId, flushEntry)
+
+    const { client, sent } = fakeClient({})
+    const result = await stopRun({ runId, client, bootId: "boot-a" })
+
+    expect(result).toContain('<workflow-stopped run="wf_stokill1"')
+    expect(result).toContain("Stopped by request")
+    expect(result).toContain("run dir:")
+    // The engine's controller tripped with the stop marker on it.
+    expect(controller.signal.aborted).toBe(true)
+    expect(controller.signal.reason).toBe(STOP_ABORT_REASON)
+    // The manifest: cancelled, children named, journal untouched, no result invented.
+    const cancelled = await readManifest(runId)
+    expect(cancelled?.status).toBe("cancelled")
+    expect(cancelled?.childSessionIDs).toEqual(["child-1"])
+    expect(await readJournal(runId)).toEqual([flushEntry])
+    expect(await Bun.file(artifactPaths(runId).resultPath).exists()).toBe(false)
+    // The confirmation reached the run's own parent session, not the caller's.
+    expect(sent).toHaveLength(1)
+    expect(sent[0]?.sessionID).toBe("parent")
+    expect(sent[0]?.text).toContain('<workflow-stopped run="wf_stokill1"')
+    expect(sent[0]?.text).toContain('workflow="demo"')
+  })
+
+  test("leaves sibling runs untouched", async () => {
+    const target = "wf_stokill2",
+     sibling = "wf_stokill3"
+    await beginRun(record(target))
+    await beginRun(record(sibling))
+    const targetController = new AbortController(),
+     siblingController = new AbortController()
+    registerStopHandle(target, targetController)
+    registerStopHandle(sibling, siblingController)
+    registry.register("t-child", target)
+    registry.register("s-child", sibling)
+
+    const { client } = fakeClient({})
+    await stopRun({ runId: target, client, bootId: "boot-a" })
+
+    expect(targetController.signal.aborted).toBe(true)
+    expect(siblingController.signal.aborted).toBe(false)
+    const standing = await readManifest(sibling)
+    expect(standing?.status).toBe("running")
+  })
+
+  test("the tool result still returns the stop when the confirmation delivery fails", async () => {
+    const runId = "wf_stokill4"
+    await beginRun(record(runId))
+    registerStopHandle(runId, new AbortController())
+    const { client } = fakeClient({ failPromptAsync: true })
+    // The delivery failure is swallowed; the tool result still reports the stop.
+    const result = await stopRun({ runId, client, bootId: "boot-a" })
+    expect(result).toContain("<workflow-stopped")
+    const cancelled = await readManifest(runId)
+    expect(cancelled?.status).toBe("cancelled")
+  })
+
+  test("reports the loss honestly when the cancel write loses the terminal race", async () => {
+    const runId = "wf_stokill7"
+    await beginRun(record(runId))
+    registerStopHandle(runId, new AbortController())
+    const { client } = fakeClient({})
+    // The unwind settled completed in the window between stopRun's status check and the
+    // guarded write: markCancelled reports the standing record instead of a cancel it
+    // never landed, and the stop result says so instead of claiming success.
+    const result = await stopRun({
+      runId,
+      client,
+      bootId: "boot-a",
+      markCancelledFn: (standing, children) => Promise.resolve({ ...standing, status: "completed", childSessionIDs: children }),
+    })
+    expect(result).toContain('settled with status "completed"')
+    expect(result).toContain("nothing was stopped")
+  })
+
+  test("runDetached drops the stop handle when the run settles", async () => {
+    const runId = "wf_stokill5"
+    registerPending(runId, "parent")
+    registerStopHandle(runId, new AbortController())
+    expect(stopHandleOf(runId)).toBeDefined()
+    await runDetached({ runId, manifest: undefined, task: (): Promise<void> => Promise.resolve(), renderFailure: FAKE_RENDER })
+    expect(stopHandleOf(runId)).toBeUndefined()
+  })
+
+  test("dropStopHandle clears a controller without touching anything else", () => {
+    const runId = "wf_stokill6"
+    registerStopHandle(runId, new AbortController())
+    dropStopHandle(runId)
+    expect(stopHandleOf(runId)).toBeUndefined()
+  })
+})
+
+describe("notifyStopped — the stop confirmation", () => {
+  test("reaches the run's parent session with the stopped tag and no nudge registration", async () => {
+    const { client, sent } = fakeClient({})
+    await notifyStopped({ client, sessionID: "parent", runId: "wf_stokill7", name: "demo" })
+    expect(sent).toHaveLength(1)
+    expect(sent[0]?.sessionID).toBe("parent")
+    expect(sent[0]?.text).toContain('<workflow-stopped run="wf_stokill7" workflow="demo">')
+    expect(sent[0]?.text).toContain("No completion notification will arrive")
+  })
+
+  test("an unknown workflow name omits the attribute instead of sending an empty one", async () => {
+    const { client, sent } = fakeClient({})
+    await notifyStopped({ client, sessionID: "parent", runId: "wf_stokill8" })
+    expect(sent[0]?.text).toContain('<workflow-stopped run="wf_stokill8">')
+  })
+
+  test("a failed delivery never rejects", async () => {
+    const { client } = fakeClient({ failPromptAsync: true })
+    await notifyStopped({ client, sessionID: "parent", runId: "wf_stokill9" })
+  })
+
+  test("an unreadable session row still delivers the confirmation, under the default agent", async () => {
+    const { client, sent } = fakeClient({ failGet: true })
+    await notifyStopped({ client, sessionID: "parent", runId: "wf_stokill9" })
+    expect(sent).toHaveLength(1)
+    expect(sent[0]?.agent).toBeUndefined()
   })
 })

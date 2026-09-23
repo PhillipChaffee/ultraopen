@@ -2,8 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import { chmod, mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { beginRun, endRun, loadResume } from "../src/server/resume/persist.js"
-import { artifactPaths, ensureRunDir, readJournal, readManifest, writeManifest } from "../src/server/resume/store.js"
+import { beginRun, endRun, loadResume, markCancelled } from "../src/server/resume/persist.js"
+import { artifactPaths, appendJournalEntry, ensureRunDir, readJournal, readManifest, writeManifest } from "../src/server/resume/store.js"
 import type { JournalEntry } from "../src/server/resume/journal.js"
 
 let base: string,
@@ -125,6 +125,60 @@ describe("endRun", () => {
     await expect(
       endRun(manifest, { status: "completed", entries: [entry], value: 1, childSessionIDs: [] }, env),
     ).resolves.toBeUndefined()
+  })
+})
+
+describe("markCancelled — the stop path's terminal write", () => {
+  test("marks a running run cancelled, naming the children, without touching journal or result", async () => {
+    const manifest = await beginRun(record, env)
+    if (!manifest) {throw new Error("the run did not open")}
+    // The stop path must not clobber what the run already flushed incrementally.
+    await appendJournalEntry("wf_abc123", entry, env)
+
+    const settled = await markCancelled(manifest, ["child-1"], env)
+
+    expect(settled?.status).toBe("cancelled")
+    expect(settled?.childSessionIDs).toEqual(["child-1"])
+    expect(settled?.endedAt).toBeGreaterThan(0)
+    // The journal's incrementally flushed entries survive the cancel write: a stopped run
+    // remains resumable for the agents that already completed.
+    expect(await readJournal("wf_abc123", env)).toEqual([entry])
+    expect(await Bun.file(artifactPaths("wf_abc123", env).resultPath).exists()).toBe(false)
+  })
+
+  test("the cancelled record wins over the detached task's later failed-write", async () => {
+    // The stop path marks cancelled while the detached task is still unwinding; the task's
+    // failure catch then calls endRun with `failed`. First terminal write wins.
+    const manifest = await beginRun(record, env)
+    if (!manifest) {throw new Error("the run did not open")}
+    await appendJournalEntry("wf_abc123", entry, env)
+    await markCancelled(manifest, ["child-1"], env)
+    await endRun(manifest, { status: "failed", entries: [entry], value: null, childSessionIDs: [] }, env)
+    const reread = await readManifest("wf_abc123", env)
+    expect(reread?.status).toBe("cancelled")
+    expect(await readJournal("wf_abc123", env)).toEqual([entry])
+  })
+
+  test("returns the standing terminal manifest untouched when the run already settled", async () => {
+    const manifest = await beginRun(record, env)
+    if (!manifest) {throw new Error("the run did not open")}
+    await endRun(manifest, { status: "completed", entries: [entry], value: 1, childSessionIDs: [] }, env)
+
+    const settled = await markCancelled(manifest, ["child-1"], env)
+
+    expect(settled?.status).toBe("completed")
+    expect(settled?.endedAt).toBeGreaterThan(0)
+    // The first terminal record stands whole: no cancel rewrite raced over it.
+    const result = JSON.parse(await Bun.file(artifactPaths("wf_abc123", env).resultPath).text())
+    expect(result).toBe(1)
+  })
+
+  test("a disk-write failure reports undefined instead of lying about a cancel that never landed", async () => {
+    const manifest = await beginRun(record, env)
+    if (!manifest) {throw new Error("the run did not open")}
+    await chmod(artifactPaths("wf_abc123", env).manifestPath, 0o400)
+
+    expect(await markCancelled(manifest, [], env)).toBeUndefined()
   })
 })
 

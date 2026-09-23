@@ -76,6 +76,12 @@ describe("renderRefusal", () => {
 })
 
 describe("renderLaunch", () => {
+  test("the launch handle teaches that ESC cannot stop the run — the stop argument is the off switch", () => {
+    // Sets user-facing expectations: opencode's cancel cascade cannot reach plugin background runs.
+    const launched = renderLaunch("demo", "wf_stoptes1", false)
+    expect(launched).toContain('Interrupting the turn (ESC) does not stop this run; to stop it, call workflow({ stop: "wf_stoptes1" }).')
+  })
+
   test("the one-shot hold-the-turn text is unchanged without siblings", () => {
     const launched = renderLaunch("demo", "wf_solo0001", false)
     expect(launched).toContain(

@@ -1,6 +1,6 @@
 import type { Manifest } from "../resume/journal.js"
-import { endRun } from "../resume/persist.js"
-import { artifactPaths, writeFailure } from "../resume/store.js"
+import { endRun, markCancelled } from "../resume/persist.js"
+import { artifactPaths, isSafeRunId, readManifest, runDir, writeFailure } from "../resume/store.js"
 import { registry } from "../singleton.js"
 import type { OpencodeClient } from "../types.js"
 import { renderResult } from "./render.js"
@@ -131,6 +131,140 @@ export function dropSettled(runId: string): void {
 }
 
 /**
+ * The abort reason the stop path stamps on a detached run's controller.
+ *
+ * It is carried on the AbortSignal so the journal can eventually tell a
+ * deliberate stop apart from a parent-turn interrupt — the abort-reason copy
+ * and its never-auto-resume invariant land with ticket #11; the marker exists
+ * from here so that work has a single definition to read.
+ */
+export const STOP_ABORT_REASON = "stopped by request"
+
+/** runId -> the controller whose signal drives that detached run's engine. */
+const stopHandles = new Map<string, AbortController>()
+
+/** Registers the controller a stop call will trip. One per detached run. */
+export function registerStopHandle(runId: string, controller: AbortController): void {
+  stopHandles.set(runId, controller)
+}
+
+/** Drops a run's controller — the run settled or never detached. */
+export function dropStopHandle(runId: string): void {
+  stopHandles.delete(runId)
+}
+
+/** The controller registered for a run, for tests and diagnostics. */
+export function stopHandleOf(runId: string): AbortController | undefined {
+  return stopHandles.get(runId)
+}
+
+/**
+ * The stop path: `workflow({ stop: "<runId>" })` from any session.
+ *
+ * The contract (issue #10): validate the id, abort the run's engine via its
+ * controller — the signal unwinds the script and the Run's own cleanup aborts
+ * every child — record the manifest as `cancelled` first-terminal-write-wins,
+ * and hydrate a confirmation into the run's parent session so the model knows
+ * the stop landed. Every failure returns a clear error string, never a throw:
+ * the tool result is the model's only feedback surface.
+ */
+export async function stopRun(options: {
+  runId: string
+  client: OpencodeClient
+  bootId: string
+  /** Injectable for tests: the guarded cancel write whose race this branch reports. */
+  markCancelledFn?: typeof markCancelled
+}): Promise<string> {
+  const { runId, client, bootId } = options
+  if (!isSafeRunId(runId)) {
+    return stopRefused(`"${runId}" is not a valid run id — pass the id exactly as the launch result reported it.`)
+  }
+  // readManifest resolves undefined for a missing or unreadable manifest — no catch needed.
+  const manifest = await readManifest(runId)
+  if (manifest === undefined) {
+    return stopRefused(`No workflow run with id "${runId}" exists. Poll workflow_status for the ids of recent runs.`)
+  }
+  if (manifest.status !== "running") {
+    return stopRefused(`Run "${runId}" already finished with status "${manifest.status}" — nothing to stop.`)
+  }
+  if (manifest.bootId !== bootId && isProcessAlive(manifest.pid)) {
+    return stopRefused(
+      `Run "${runId}" is executing in another opencode process (pid ${manifest.pid}) — stop it from that session instead.`,
+    )
+  }
+  const handle = stopHandles.get(runId)
+  if (handle === undefined) {
+    if (isLive(runId)) {
+      return stopRefused(
+        `Run "${runId}" is running in the foreground of its session (blocking contract) — abort that conversation's turn to stop it. workflow({ stop }) only controls detached runs.`,
+      )
+    }
+    return stopRefused(`Run "${runId}" is not live in this opencode process — nothing to stop.`)
+  }
+  // Snapshot BEFORE tripping the signal: the unwind forgets the sessions, and the cancelled
+  // manifest should name what was alive at stop time.
+  const sessions = registry.sessionsOf(runId)
+  handle.abort(STOP_ABORT_REASON)
+  const settled = await (options.markCancelledFn ?? markCancelled)(manifest, sessions)
+  if (settled?.status !== "cancelled") {
+    return stopRefused(
+      `Run "${runId}" settled with status "${settled?.status ?? "unknown"}" while the stop was being applied — nothing was stopped. Its outcome notification will arrive on its own.`,
+    )
+  }
+  await notifyStopped({ client, sessionID: manifest.sessionID, runId, name: detached.get(runId)?.name })
+  return [
+    `<workflow-stopped run="${runId}"${nameAttribute(detached.get(runId)?.name)}>`,
+    "Stopped by request: the run's subagents are being aborted and the run is recorded as cancelled. No completion notification will arrive.",
+    `Completed agents remain on disk for a later resume — run dir: ${runDir(runId)}`,
+    "</workflow-stopped>",
+  ].join("\n")
+}
+
+/** Renders the stop refusal the way the launch and resume refusals do. */
+function stopRefused(reason: string): string {
+  return ["<workflow-refused>", reason, "</workflow-refused>"].join("\n")
+}
+
+/** The ` workflow="..."` attribute for a stop tag, empty when the name is unknown. */
+function nameAttribute(name: string | undefined): string {
+  return name === undefined || name === "" ? "" : ` workflow="${name}"`
+}
+
+/**
+ * The stop confirmation, hydrated into the run's parent session.
+ *
+ * The tool result already told the CALLING session; this delivers the same
+ * fact to the run's own conversation — which is the same session in the
+ * common case, but not always. A direct promptAsync WITHOUT the idle-nudge
+ * registration: a stop confirmation is informational, and the persisted
+ * message carries it to the next turn even if the current one already ended.
+ */
+export async function notifyStopped(options: {
+  client: OpencodeClient
+  sessionID: string
+  runId: string
+  name?: string | undefined
+}): Promise<void> {
+  const { client, sessionID, runId } = options
+  try {
+    const row = await client.session.get({ path: { id: sessionID } }).catch(() => undefined),
+      agent = row?.data?.agent,
+      text =
+        `<workflow-stopped run="${runId}"${nameAttribute(options.name)}>` +
+        "Stopped by request: this run's subagents were aborted and the run is recorded as cancelled. " +
+        "No completion notification will arrive." +
+        `</workflow-stopped>`
+    await client.session.promptAsync({
+      path: { id: sessionID },
+      body: { parts: [{ type: "text", synthetic: true, text }], ...(agent === undefined ? {} : { agent }) },
+    })
+  } catch {
+    // Fire-and-forget by contract, like every hydration: a rejected stop
+    // confirmation must not make the tool result lie about what it did.
+  }
+}
+
+/**
  * Every live entry for the session, oldest start first.
  *
  * Returned entries are copies: registry state is not mutable through them.
@@ -202,6 +336,7 @@ export async function runDetached(options: {
     } finally {
       detached.delete(options.runId)
       settling.delete(options.runId)
+      dropStopHandle(options.runId)
       registry.forgetRun(options.runId)
     }
   })()
@@ -379,6 +514,28 @@ export function deliverOutcome(options: {
 }
 
 /**
+ * Delivers one settled run's outcome to its parent session, UNLESS a stop won the manifest.
+ *
+ * The stop path hydrates its own confirmation, and a settlement notification (completed or
+ * failed) landing after it would contradict the cancelled record — a run the model stopped
+ * must never appear to have finished on its own. The manifest read is the arbiter: the
+ * unwind may settle before, during, or after the stop, and whatever stands on disk decides.
+ */
+export async function deliverOutcomeUnlessStopped(options: {
+  client: OpencodeClient
+  sessionID: string
+  runId: string
+  workflow: string
+  result?: WorkflowResult
+  resume?: { resumed: number; argsChanged: boolean }
+  failureText?: string
+}): Promise<void> {
+  const settled = await readManifest(options.runId)
+  if (settled?.status === "cancelled") {return}
+  await deliverOutcome(options)
+}
+
+/**
  * The idle nudge: re-fire `promptAsync` once when a notification landed unanswered.
  *
  * Called from the plugin `event` hook on `session.idle` (captured at v1.18.31:
@@ -438,4 +595,5 @@ export function resetForTests(): void {
   settling.clear()
   pending.clear()
   nudged.clear()
+  stopHandles.clear()
 }

@@ -1,8 +1,39 @@
 import { describe, expect, test } from "bun:test"
-import { agentRowText, formatTokens, writeControlCommand } from "../src/tui/data.js"
+import { agentRowText, formatTokens, stopHint, writeControlCommand } from "../src/tui/data.js"
+import type { RunView } from "../src/tui/data.js"
 import { mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+
+const runView = (runId: string): RunView => ({
+  runId,
+  workflow: "demo",
+  sessionID: "ses_1",
+  agents: [],
+  done: 1,
+  failed: 0,
+  total: 1,
+  elapsedSeconds: 5,
+  logs: [],
+})
+
+describe("stopHint — the sidebar's stop guidance", () => {
+  test("no live runs means no hint", () => {
+    expect(stopHint([])).toBeUndefined()
+  })
+
+  test("a single live run names its id so the user can copy the call verbatim", () => {
+    expect(stopHint([runView("wf_hint0001")])).toBe(
+      `⏹ to stop a run: ask the agent for workflow({ stop: "wf_hint0001" }) — ESC does not stop it.`,
+    )
+  })
+
+  test("several live runs keep the line generic instead of stacking ids", () => {
+    const hint = stopHint([runView("wf_hint0001"), runView("wf_hint0002")])
+    expect(hint).toContain('workflow({ stop: "<runId>" })')
+    expect(hint).toContain("ESC does not stop it")
+  })
+})
 
 describe("token counts in agent rows", () => {
   test("a settled agent's tokens render compactly", () => {

@@ -194,6 +194,22 @@ export function glyph(status: AgentRow["status"]): string {
   return "⠋"
 }
 
+/**
+ * The stop guidance for a session with live runs, shown under the run rows in
+ * the sidebar.
+ *
+ * The TUI plugin has no client access — it renders from disk — so it cannot
+ * stop a run itself (issue #10, P2): the honest surface is telling the user
+ * what works. With exactly one live run the line names its id so the user can
+ * copy the call verbatim; with several it stays generic.
+ */
+export function stopHint(runs: readonly RunView[]): string | undefined {
+  const first = runs[0]
+  if (first === undefined) {return undefined}
+  const target = runs.length === 1 ? `workflow({ stop: "${first.runId}" })` : `workflow({ stop: "<runId>" })`
+  return `⏹ to stop a run: ask the agent for ${target} — ESC does not stop it.`
+}
+
 /** One agent row's text: glyph, label, and the failure reason when there is one. */
 export const INTERRUPTED_MARKER = "interrupted.txt"
 

@@ -355,6 +355,66 @@ else
   bad "the hydration probe produced no completed run dir" "see $OUT/t6.out"
 fi
 
+section "T6b — stop path: workflow({stop}) aborts a live detached run and records it cancelled"
+# The run has three real model calls, so it is still live when the parent makes
+# the stop call in the same turn. Proofs: the stop tool result reports the stop
+# (workflow-stopped), the manifest is cancelled with NO result.json (a cancelled
+# record never settles a result), the synthetic workflow-stopped confirmation is
+# in the parent transcript (the hydration half of the stop contract), and
+# workflow_status reports cancelled (issue #10).
+t6b_prompt() {
+  printf 'Call the workflow tool now. Pass no scriptPath and no args. Use this script exactly, unchanged:\n\n%s\n\nThe tool returns a launch result with a run id, not the outcome. Call the workflow tool AGAIN immediately after, passing ONLY the stop argument with that run id (no script, no scriptPath, no args). The stop result will describe what happened. Then call workflow_status with that run id and wait=120 and reply with the status it reported. Never end your turn while the run is unsettled.' \
+    "$(cat "$E2E_DIR/fixtures/stop.js")"
+}
+runs_snapshot "$OUT/runs-before-t6b.txt"
+oc_run_capture "$OUT/t6b.out" "$TURN_SECS" "$(t6b_prompt)" || true
+RUN6B="$(newest_run "$OUT/runs-before-t6b.txt")"
+preserve_run "$RUN6B"
+if [ -n "$RUN6B" ]; then
+  if [ "$(manifest_status "$RUN6B")" = "cancelled" ]; then
+    ok "the stopped run's manifest is cancelled"
+  elif [ "$(manifest_status "$RUN6B")" = "completed" ]; then
+    note "the run completed before the stop landed (fast provider) — retrying once"
+    runs_snapshot "$OUT/runs-before-t6b2.txt"
+    oc_run_capture "$OUT/t6b2.out" "$TURN_SECS" "$(t6b_prompt)" || true
+    RUN6B="$(newest_run "$OUT/runs-before-t6b2.txt")"
+    preserve_run "$RUN6B"
+    if [ -n "$RUN6B" ] && [ "$(manifest_status "$RUN6B")" = "cancelled" ]; then
+      ok "the stopped run's manifest is cancelled (retry)"
+    else
+      bad "the stop probe produced no cancelled manifest" "see $OUT/t6b*.out"
+    fi
+  else
+    bad "the stop probe run did not cancel" "manifest $(manifest_status "$RUN6B") — inspect $OUT/$RUN6B and $OUT/t6b.out"
+  fi
+  if [ -n "$RUN6B" ] && [ "$(manifest_status "$RUN6B")" = "cancelled" ]; then
+    [ ! -f "$RUN_ROOT/$RUN6B/result.json" ] \
+      && ok "a cancelled run has no result.json (the stop path settles the manifest alone)" \
+      || bad "a cancelled run invented a result.json" "inspect $RUN_ROOT/$RUN6B"
+    t6b_notification() {
+      python3 - "$XDG_DATA_HOME/opencode/opencode.db" "$RUN6B" <<'PYEOF'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+row = db.execute(
+    "SELECT data FROM part WHERE data LIKE ? AND data LIKE ? LIMIT 1",
+    ('%"synthetic":true%', f'%workflow-stopped run=%{sys.argv[2]}%'),
+).fetchone()
+sys.exit(0 if row else 1)
+PYEOF
+    }
+    if t6b_notification; then
+      ok "the synthetic workflow-stopped confirmation is in the parent transcript"
+    else
+      bad "no synthetic workflow-stopped notification for $RUN6B in the transcript db" "inspect $SCRATCH/share/opencode/opencode.db"
+    fi
+    grep -q "cancelled" "$OUT/t6b.out" \
+      && ok "workflow_status reported the run cancelled to the model" \
+      || bad "the model's reply never reported cancelled" "see $OUT/t6b.out"
+  fi
+else
+  bad "the stop probe produced no run dir" "see $OUT/t6b.out"
+fi
+
 section "T7 — agentDeadlineMs option (tuple-form options reach the engine)"
 scratch_write_config '{"agentDeadlineMs": 1}'
 runs_snapshot "$OUT/runs-before-t7.txt"
