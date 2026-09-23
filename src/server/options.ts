@@ -1,4 +1,4 @@
-import { MAX_CONCURRENCY, MAX_TIMER_MS, MIN_CONCURRENCY } from "./script/limits.js"
+import { LARGE_WORKFLOW_AGENTS, MAX_CONCURRENCY, MAX_TIMER_MS, MIN_CONCURRENCY } from "./script/limits.js"
 
 /**
  * Plugin options, supplied via the tuple form in opencode.json:
@@ -46,6 +46,12 @@ export interface UltraopenOptions {
    * capping them.
    */
   budgetTokens: number | null
+  /**
+   * Projected agent count at which a launch is flagged as a large workflow in
+   * the permission prompt and the launch handle. The projection is advisory —
+   * it never blocks or caps anything.
+   */
+  largeWorkflowAgents: number
   /** Size advice appended to the tool description; unset omits the line entirely. */
   sizeGuideline: string | undefined
 }
@@ -61,6 +67,7 @@ const DEFAULTS: UltraopenOptions = {
   keywordBehavior: "one-shot",
   workflowPaths: [],
   budgetTokens: null,
+  largeWorkflowAgents: LARGE_WORKFLOW_AGENTS,
   sizeGuideline: undefined,
 }
 
@@ -85,6 +92,7 @@ export function resolveOptions(raw: unknown): UltraopenOptions {
     effortPreference: stringArray(input["effortPreference"]) ?? DEFAULTS.effortPreference,
     workflowPaths: stringArray(input["workflowPaths"]) ?? DEFAULTS.workflowPaths,
     budgetTokens: resolveBudgetTokens(input["budgetTokens"]),
+    largeWorkflowAgents: resolveLargeWorkflowAgents(input["largeWorkflowAgents"]),
     sizeGuideline: typeof input["sizeGuideline"] === "string" && input["sizeGuideline"].trim() !== ""
       ? input["sizeGuideline"] as string
       : DEFAULTS.sizeGuideline,
@@ -102,6 +110,18 @@ export function resolveOptions(raw: unknown): UltraopenOptions {
  */
 function resolveBudgetTokens(value: unknown): number | null {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {return DEFAULTS.budgetTokens}
+  return Math.floor(value)
+}
+
+/**
+ * Validates the launch advisory threshold.
+ *
+ * Same stance as the budget: only a positive finite number is honoured, and an invalid value
+ * falls back to the default rather than disabling the advisory — a mistyped threshold must not
+ * silently turn the large-workflow warning off.
+ */
+function resolveLargeWorkflowAgents(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {return DEFAULTS.largeWorkflowAgents}
   return Math.floor(value)
 }
 

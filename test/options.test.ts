@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { resolveOptions } from "../src/server/options.js"
-import { MAX_CONCURRENCY, MIN_CONCURRENCY } from "../src/server/script/limits.js"
+import { LARGE_WORKFLOW_AGENTS, MAX_CONCURRENCY, MIN_CONCURRENCY } from "../src/server/script/limits.js"
 
 const DEFAULT_CONCURRENCY = 8,
   DEFAULT_ULTRACODE_MAX_RUNS = 8,
@@ -19,6 +19,7 @@ const DEFAULT_CONCURRENCY = 8,
   keywordBehavior: "one-shot" as const,
   workflowPaths: [] as string[],
   budgetTokens: null as number | null,
+  largeWorkflowAgents: LARGE_WORKFLOW_AGENTS,
   sizeGuideline: undefined as string | undefined,
 }
 
@@ -262,6 +263,25 @@ describe("resolveOptions — budgetTokens", () => {
     // A mistyped ceiling must not trade an uncapped run for a surprise limit.
     for (const bad of [0, -5, "100000", Number.NaN, Number.POSITIVE_INFINITY, true]) {
       expect(resolveOptions({ budgetTokens: bad as unknown }).budgetTokens).toBeNull()
+    }
+  })
+})
+
+describe("resolveOptions — largeWorkflowAgents", () => {
+  test("defaults to the 25-agent launch advisory threshold", () => {
+    expect(resolveOptions({}).largeWorkflowAgents).toBe(LARGE_WORKFLOW_AGENTS)
+    expect(resolveOptions({ largeWorkflowAgents: undefined }).largeWorkflowAgents).toBe(LARGE_WORKFLOW_AGENTS)
+  })
+
+  test("a positive number is honoured and floored", () => {
+    expect(resolveOptions({ largeWorkflowAgents: 50 }).largeWorkflowAgents).toBe(50)
+    expect(resolveOptions({ largeWorkflowAgents: 10.9 }).largeWorkflowAgents).toBe(10)
+  })
+
+  test("an invalid value falls back to the default, never disables the advisory", () => {
+    // A mistyped threshold must not silently turn the large-workflow warning off.
+    for (const bad of [0, -1, "25", Number.NaN, Number.POSITIVE_INFINITY, true]) {
+      expect(resolveOptions({ largeWorkflowAgents: bad as unknown }).largeWorkflowAgents).toBe(LARGE_WORKFLOW_AGENTS)
     }
   })
 })

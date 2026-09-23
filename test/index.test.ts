@@ -1657,3 +1657,93 @@ describe("safety rails — budget, size advice, script before ask", () => {
     // state is reset by the suite's beforeEach, not by the run settling.
   })
 })
+
+describe("launch projection — the ask names what approving costs", () => {
+  const FANOUT = `${META}await parallel([() => agent('a'), () => agent('b'), () => agent('c')])\nreturn 'done'\n`
+
+  test("the permission metadata carries the projected agent count", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const asked: { metadata?: Record<string, unknown> }[] = []
+    await tool.execute(
+      { script: FANOUT, background: false },
+      { sessionID: "parent", ask: (request: { metadata?: Record<string, unknown> }) => { asked.push(request); return Promise.resolve() } },
+    )
+    const metadata = asked[0]?.metadata ?? {}
+    expect(metadata["projectedAgents"]).toBe(3)
+    expect(metadata["largeWorkflow"]).toBeUndefined()
+  })
+
+  test("the launch handle states the projection below the threshold", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute({ script: FANOUT, background: true }, { sessionID: "parent" })
+    expect(output).toContain("~3 agents projected at launch.")
+    expect(output).not.toContain("Large workflow")
+  })
+
+  test("at or above the threshold, both surfaces render the large-workflow advisory", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }, { largeWorkflowAgents: 2 }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const asked: { metadata?: Record<string, unknown> }[] = []
+    const output = await tool.execute(
+      { script: FANOUT, background: true },
+      { sessionID: "parent", ask: (request: { metadata?: Record<string, unknown> }) => { asked.push(request); return Promise.resolve() } },
+    )
+    const metadata = asked[0]?.metadata ?? {}
+    expect(metadata["projectedAgents"]).toBe(3)
+    expect(metadata["largeWorkflow"]).toBe(true)
+    expect(output).toContain("Large workflow: ~3 agents projected (threshold 2)")
+  })
+
+  test("a dry run skips the projection: it is its own free preview", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const asked: { metadata?: Record<string, unknown> }[] = []
+    await tool.execute(
+      { script: FANOUT, dryRun: true },
+      { sessionID: "parent", ask: (request: { metadata?: Record<string, unknown> }) => { asked.push(request); return Promise.resolve() } },
+    )
+    expect(asked[0]?.metadata?.["projectedAgents"]).toBeUndefined()
+    expect(asked[0]?.metadata?.["largeWorkflow"]).toBeUndefined()
+  })
+
+  test("a projection failure degrades to no advisory and never blocks the ask", async () => {
+    // A script that throws mid-body makes its fan-out unknowable — the launch proceeds with
+    // no count rather than an invented one, and the run still fails on its own merits.
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const asked: { metadata?: Record<string, unknown> }[] = []
+    const output = await tool.execute(
+      { script: `${META}throw new Error('boom')\n`, background: false },
+      { sessionID: "parent", ask: (request: { metadata?: Record<string, unknown> }) => { asked.push(request); return Promise.resolve() } },
+    )
+    expect(asked.length).toBe(1)
+    expect(asked[0]?.metadata?.["projectedAgents"]).toBeUndefined()
+    // The launch itself was never blocked by the projection's failure: the run proceeded and
+    // failed with its own error.
+    expect(output).toContain("boom")
+  })
+
+  test("the projection never costs a spawn: the launched run's agents are the only ones", async () => {
+    // The projection runs the body in-memory; if it ever reached the live spawn path the
+    // client would see DOUBLE the sessions for one launch.
+    let spawns = 0
+    const countingClient = {
+      config: { get: () => Promise.resolve({ data: {} }), providers: () => Promise.resolve({ data: { providers: [] } }) },
+      session: {
+        create: () => {spawns++; return Promise.resolve({ data: { id: `child-${spawns}` } })},
+        get: () => Promise.resolve({ data: { id: "child" } }),
+        delete: () => Promise.resolve({}),
+        abort: () => Promise.resolve({}),
+        prompt: () => Promise.resolve({ data: { info: {}, parts: [] } }),
+        promptAsync: () => Promise.resolve({ data: undefined }),
+        messages: () => Promise.resolve({ data: [] }),
+      },
+    }
+    const tool = toolOf(ultraopen({ client: countingClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    await tool.execute({ script: FANOUT, background: false }, { sessionID: "parent" })
+    expect(spawns).toBe(3)
+  })
+})

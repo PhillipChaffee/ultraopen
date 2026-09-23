@@ -30,6 +30,12 @@ export interface ProgressSnapshot {
   logs: string[]
   startedAt: number
   updatedAt: number
+  /**
+   * The run's output-token budget and live spend. Always present (total null = uncapped) so
+   * the shape the sidebar reads stays stable; spent accumulates from agent-end events and
+   * mirrors `budget.spent()` in the script's own `budget` global.
+   */
+  budget: { total: number | null; spent: number }
 }
 
 export const PROGRESS_FILE = "progress.json"
@@ -60,6 +66,8 @@ export class ProgressWriter {
     workflow: string
     sessionID: string
     startedAt: number
+    /** The run's output-token ceiling; null (or omitted) means uncapped. */
+    budgetTotal?: number | null | undefined
     env?: NodeJS.ProcessEnv | undefined
     /** Injectable for tests. Defaults to a real file write. */
     write?: ((path: string, body: string) => Promise<void>) | undefined
@@ -72,6 +80,7 @@ export class ProgressWriter {
       logs: [],
       startedAt: options.startedAt,
       updatedAt: options.startedAt,
+      budget: { total: options.budgetTotal ?? null, spent: 0 },
     }
     this.#env = options.env
     this.#flush = options.write ?? ((path, body) => writeFile(path, body, "utf8"))
@@ -119,6 +128,10 @@ export class ProgressWriter {
             ...(tokens === undefined ? {} : { outputTokens: tokens }),
           })
         }
+        // The run-scoped spend accumulator: every settled call's outputTokens feeds it, the
+        // same way the run's records feed `budget.spent()`. Failed agents contribute their
+        // (zero) spend, so the running total matches the journal.
+        if (tokens !== undefined) {this.snapshot.budget.spent += tokens}
         break
       }
     }

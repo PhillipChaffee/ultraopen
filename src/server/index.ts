@@ -6,7 +6,7 @@ import type { UltraopenOptions } from "./options.js"
 import { registry, registry as runRegistry } from "./singleton.js"
 import { installConfig } from "./ultracode/config.js"
 import type { MutableConfig } from "./ultracode/config.js"
-import { execute, prepare, renderFailure, WorkflowRunError } from "./tool/workflow.js"
+import { execute, prepare, projectLaunchSize, renderFailure, WorkflowRunError } from "./tool/workflow.js"
 import type { WorkflowArgs, WorkflowContext } from "./tool/workflow.js"
 import { WORKFLOW_TOOL, STATUS_TOOL } from "./bridge/permission.js"
 import { asClient } from "./types.js"
@@ -393,6 +393,16 @@ async function launchWorkflow(
     // `always` is scoped to this workflow's name rather than "*": an "always" grant is
     // stored instance-wide, so approving once with "*" would permanently disable the
     // prompt for every workflow in the directory.
+    //
+    // Before the ask, a free IN-MEMORY projection of the fresh-run fan-out: the prompt
+    // names what approving costs, and a large projected fan-out is flagged so an
+    // unattended launch can be caught before it spends. projectLaunchSize degrades any
+    // projection failure to undefined — advisory, never a gate. A dry run is its own
+    // free preview, so the pass is skipped for it.
+    const projectedAgents = args.dryRun === true
+      ? undefined
+      : await projectLaunchSize(prepared, args, named, { signal: context.abort })
+
     await context.ask?.({
       permission: WORKFLOW_TOOL,
       patterns: [prepared.meta.name],
@@ -404,6 +414,8 @@ async function launchWorkflow(
         phases: prepared.meta.phases?.map((phase) => phase.title) ?? [],
         dryRun: args.dryRun === true,
         background,
+        ...(projectedAgents === undefined ? {} : { projectedAgents }),
+        ...(projectedAgents !== undefined && projectedAgents >= options.largeWorkflowAgents ? { largeWorkflow: true } : {}),
       },
     })
 
@@ -466,6 +478,9 @@ async function launchWorkflow(
       workflow: prepared.meta.name,
       sessionID: context.sessionID,
       startedAt: Date.now(),
+      // Mirrors the run's ceiling in the snapshot so the sidebar can show spend against it.
+      // Null (uncapped) is passed through, not omitted, so the shape stays stable.
+      budgetTotal: options.budgetTokens,
     })
 
     // Crash safety: the manifest's child list is updated as sessions appear, so a server
@@ -561,7 +576,8 @@ async function launchWorkflow(
       renderFailure,
     })
 
-    return [renderLaunch(prepared.meta.name, runId, longLived, siblingRunsForSession(context.sessionID, runId)), ...scanNoteLines].join("\n")
+    const projection = projectedAgents === undefined ? undefined : { agents: projectedAgents, threshold: options.largeWorkflowAgents }
+    return [renderLaunch(prepared.meta.name, runId, longLived, siblingRunsForSession(context.sessionID, runId), projection), ...scanNoteLines].join("\n")
   } catch (error) {
     // Reached only by the launch phase itself: a parse failure or a rejected
     // permission ask. The run never went live, so the pending entry is dropped.
