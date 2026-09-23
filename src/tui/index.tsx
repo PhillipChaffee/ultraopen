@@ -1,7 +1,7 @@
 import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { createEffect, createSignal, onCleanup } from "solid-js"
 import { homedir } from "node:os"
-import { RunPoller, agentRowText, consumeInterruptedMarker, dataRoot, formatElapsed, glyph, hintLine, loadInterruptedRuns, summarize } from "./data.js"
+import { RunPoller, agentRowText, consumeInterruptedMarker, dataRoot, formatElapsed, glyph, hintLine, loadInterruptedRuns, stopHint, summarize } from "./data.js"
 import type { InterruptedHint, RunView } from "./data.js"
 
 /**
@@ -88,6 +88,8 @@ function sidebarLines(rs: RunView[]): string {
     lines.push(summarize(run))
     for (const agent of run.agents) {lines.push(agentRowText(agent))}
   }
+  const stop = stopHint(rs)
+  if (stop !== undefined) {lines.push(stop)}
   return lines.join("\n")
 }
 

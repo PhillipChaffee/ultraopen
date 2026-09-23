@@ -94,6 +94,65 @@ export async function endRun(
   }
 }
 
+/**
+ * Marks a run `cancelled` — the stop path's terminal write.
+ *
+ * Deliberately NOT `endRun({ status: "cancelled" })`: `endRun` rewrites the
+ * journal and result from the outcome it is handed, and the stop path has no
+ * settlement of its own — its callers would pass empty entries, clobbering the
+ * journal entries the run already flushed incrementally. The cancel write is
+ * manifest-only, and it obeys the same first-terminal-write-wins rule: it
+ * lands only over a still-`running` manifest, so a run that settled a moment
+ * earlier keeps its own status and the stop reports the loss honestly.
+ *
+ * Returns whatever stands on disk after the attempt — `cancelled` when the
+ * stop won, the earlier terminal status when it lost the race, `undefined`
+ * when the disk could not be read at all.
+ */
+/**
+ * Marks a run `cancelled` — the stop path's terminal write.
+ *
+ * Deliberately NOT `endRun({ status: "cancelled" })`: `endRun` rewrites the
+ * journal and result from the outcome it is handed, and the stop path has no
+ * settlement of its own — its callers would pass empty entries, clobbering the
+ * journal entries the run already flushed incrementally. The cancel write is
+ * manifest-only, and it obeys the same first-terminal-write-wins rule: it
+ * lands only over a still-`running` manifest, so a run that settled a moment
+ * earlier keeps its own status and the stop reports the loss honestly.
+ *
+ * The write retries a bounded number of times: a live run's own progress
+ * checkpoint can rewrite `running` in the instant between this read and this
+ * write (both are plain file writes), and a single clobber must not flip the
+ * run's settled status — the retry re-reads and re-claims until the cancelled
+ * record stands or another terminal status has already won.
+ *
+ * Returns whatever stands on disk after the attempt — `cancelled` when the
+ * stop won, the earlier terminal status when it lost the race, `undefined`
+ * when the disk could not be read at all.
+ */
+export async function markCancelled(
+  manifest: Manifest,
+  childSessionIDs: string[],
+  env?: NodeJS.ProcessEnv,
+): Promise<Manifest | undefined> {
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const current = await readManifest(manifest.runId, env)
+      if (current === undefined || current.status !== "running") {return current}
+      await writeManifest(
+        manifest.runId,
+        { ...manifest, status: "cancelled", childSessionIDs, endedAt: Date.now() },
+        env,
+      )
+      const after = await readManifest(manifest.runId, env)
+      if (after === undefined || after.status !== "running") {return after}
+    }
+    return undefined
+  } catch {
+    return undefined
+  }
+}
+
 export interface ResumeSource {
   entries: JournalEntry[]
   /** Set when the previous run's args differ, which invalidates every cached result. */

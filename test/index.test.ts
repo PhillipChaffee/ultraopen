@@ -1747,3 +1747,107 @@ describe("launch projection — the ask names what approving costs", () => {
     expect(spawns).toBe(3)
   })
 })
+
+describe("stop path — workflow({ stop })", () => {
+  test("an empty stop value is a launch default, not a stop request", async () => {
+    // Models emit optional fields as empty strings; treating "" as a stop would reject
+    // every such launch (seen live in the T6b e2e probe).
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const launched = await tool.execute(
+      { script: `${META}return 'EMPTY-STOP-VALUE'\n`, stop: "", background: true },
+      { sessionID: "parent" },
+    )
+    expect(launched).toContain("<workflow-launched")
+    await background.settlePromiseOf(runIdOf(launched))
+  })
+
+  test("short-circuits BEFORE the launch gate: a session with a live run can still stop", async () => {
+    // The one-live-run-per-session gate refuses LAUNCHES; a stop call must never be
+    // mistaken for one, or a session could never stop its own run.
+    background.registerPending("wf_gatelive1", "parent")
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute({ stop: "wf_gatenone1" }, { sessionID: "parent" })
+    // The stop path ran (its refusal names the unknown id) — the gate refusal never fired.
+    expect(output).toContain('No workflow run with id "wf_gatenone1" exists')
+    expect(output).not.toContain("already has a workflow run in flight")
+  })
+
+  test("a stop unwinds a detached run: cancelled manifest, no settlement notification", async () => {
+    // A real detached launch against a parked child: the agent sits mid-flight until the
+    // test releases it, which can only happen after the stop has landed.
+    let release!: () => void
+    const parked = new Promise<void>((resolve) => {release = resolve})
+    const parkClient = {
+      ...stubClient,
+      session: {
+        ...stubClient.session,
+        prompt: (): Promise<unknown> => parked.then(() => ({ data: { info: {}, parts: [] } })),
+      },
+    }
+    const tool = toolOf(ultraopen({ client: parkClient }))
+    if (!tool) {throw new Error("tool was not registered")
+    }
+    const launched = await tool.execute(
+      { script: `${META}await agent('a')\nawait agent('b')\nreturn 'NEVER-SEEN'\n`, background: true },
+      { sessionID: "parent" },
+    )
+    expect(launched).toContain("Interrupting the turn (ESC) does not stop this run")
+    const runId = runIdOf(launched)
+    expect(background.stopHandleOf(runId)).toBeDefined()
+
+    const stopped = await tool.execute({ stop: runId }, { sessionID: "parent" })
+    expect(stopped).toContain(`<workflow-stopped run="${runId}"`)
+
+    // Unwind: the parked child finishes, the engine sees the aborted signal, the next
+    // agent() call throws, and the detached task settles WITHOUT a notification — the
+    // stop path already told the conversation.
+    release()
+    await background.settlePromiseOf(runId)
+
+    const manifest = await readManifest(runId)
+    expect(manifest?.status).toBe("cancelled")
+    expect(manifest?.childSessionIDs.length).toBeGreaterThan(0)
+    const deliveries = hydrationCalls.filter((call) => call.text.includes(`run="${runId}"`))
+    expect(deliveries.length).toBeGreaterThan(0)
+    for (const call of deliveries) {
+      expect(call.text).toContain("<workflow-stopped")
+    }
+  })
+
+  test("the stop confirmation is the only hydration a stopped run ever delivers", async () => {
+    // Same shape as above, but the run FAILS on unwind — the failure notification must be
+    // skipped exactly as the completion one is.
+    let release!: () => void
+    const parked = new Promise<void>((resolve) => {release = resolve})
+    const parkClient = {
+      ...stubClient,
+      session: {
+        ...stubClient.session,
+        prompt: (): Promise<unknown> => parked.then(() => ({ data: { info: {}, parts: [] } })),
+      },
+    }
+    const tool = toolOf(ultraopen({ client: parkClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    // A script that throws after the parked agent returns: the unwind takes the failure path.
+    const launched = await tool.execute(
+      { script: `${META}await agent('a')\nthrow new Error('post-stop blowup')\n`, background: true },
+      { sessionID: "parent" },
+    )
+    const runId = runIdOf(launched)
+
+    const stopped = await tool.execute({ stop: runId }, { sessionID: "parent" })
+    expect(stopped).toContain("<workflow-stopped")
+    release()
+    await background.settlePromiseOf(runId)
+
+    const cancelled = await readManifest(runId)
+    expect(cancelled?.status).toBe("cancelled")
+    const deliveries = hydrationCalls.filter((call) => call.text.includes(`run="${runId}"`))
+    for (const call of deliveries) {
+      expect(call.text).toContain("<workflow-stopped")
+      expect(call.text).not.toContain("<workflow-failed")
+    }
+  })
+})

@@ -31,6 +31,7 @@ export interface WorkflowArgs {
   /**
    * The runId of a live workflow run to stop: its subagents are aborted and the run is marked
    * cancelled. Unknown or already-finished run ids return a clear error string, never a throw.
+   * An empty string is a launch default, not a stop request, and is ignored.
    */
   stop?: string
   /**
