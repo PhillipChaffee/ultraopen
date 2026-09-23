@@ -62,6 +62,17 @@ export const LARGE_RUN_AGENTS = 20
 export const LARGE_RUN_PROJECTED_TOKENS = 500_000
 
 /**
+ * Projected agent count at which a LAUNCH is flagged as a large workflow, before the user
+ * approves it.
+ *
+ * Launch-time (projected from a free in-memory pass) and in-run (observed counts) are separate
+ * thresholds on purpose: the launch advisory speaks before anything is spent, so it uses the
+ * projection; the in-run advice uses what has actually been scheduled. Both are advisory, never
+ * a stop. Matches Claude Code's 25-agent "Large workflow" advisory.
+ */
+export const LARGE_WORKFLOW_AGENTS = 25
+
+/**
  * The largest delay the platform's timers honour.
  *
  * Node clamps setTimeout delays above 2^31-1 ms down to ~1ms, so a value past this would make

@@ -104,6 +104,25 @@ describe("renderLaunch", () => {
     expect(launched).not.toContain("Sibling")
     expect(launched).not.toMatch(/\n\n/u)
   })
+
+  test("a projection below the threshold states the projected count", () => {
+    const launched = renderLaunch("demo", "wf_proj0001", false, [], { agents: 3, threshold: 25 })
+    expect(launched).toContain("~3 agents projected at launch.")
+    expect(launched).not.toContain("Large workflow")
+  })
+
+  test("a projection at or above the threshold renders the large-workflow advisory prominently", () => {
+    const launched = renderLaunch("demo", "wf_proj0002", false, [], { agents: 30, threshold: 25 })
+    expect(launched).toContain("Large workflow: ~30 agents projected (threshold 25) — check the script's fan-out if this is larger than intended.")
+    // Prominence is positional: the advisory leads the launch body, before the contract sentence.
+    expect(launched.indexOf("Large workflow")).toBeLessThan(launched.indexOf("The run is executing"))
+  })
+
+  test("no projection appends nothing", () => {
+    const launched = renderLaunch("demo", "wf_proj0002", false, [])
+    expect(launched).not.toContain("projected")
+    expect(launched).not.toContain("Large workflow")
+  })
 })
 
 describe("renderResult", () => {

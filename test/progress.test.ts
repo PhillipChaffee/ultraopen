@@ -24,6 +24,53 @@ const writer = (writes: { path: string; body: string }[]) =>
     },
   })
 
+const budgetWriter = (
+  writes: { path: string; body: string }[],
+  budgetTotal: number | null,
+) =>
+  new ProgressWriter({
+    runId: "wf_abc123",
+    workflow: "demo",
+    sessionID: "s1",
+    startedAt: 1000,
+    budgetTotal,
+    env: { XDG_DATA_HOME: "/tmp/x" } as NodeJS.ProcessEnv,
+    write: (path, body) => {
+      writes.push({ path, body })
+      return Promise.resolve()
+    },
+  })
+
+describe("ProgressWriter — budget", () => {
+  test("the snapshot always carries the budget shape, uncapped by default", () => {
+    // A stable shape: the sidebar reads total/spent without optionality gymnastics, and an
+    // uncapped run still reports its spend.
+    const progress = writer([])
+    expect(progress.snapshot.budget).toEqual({ total: null, spent: 0 })
+  })
+
+  test("budgetTotal passes the ceiling through", () => {
+    const progress = budgetWriter([], 50_000)
+    expect(progress.snapshot.budget).toEqual({ total: 50_000, spent: 0 })
+  })
+
+  test("spent accumulates from agent-end events, including replayed calls", () => {
+    // Replayed agents carry their recorded spend as if paid — the same way the run's own
+    // budget.spent() counts them, so the snapshot and the script's budget global agree.
+    const progress = budgetWriter([], 1000)
+    progress.apply({ type: "agent-start", index: 0, label: "a", phase: undefined }, 1)
+    progress.apply({ type: "agent-end", index: 0, label: "a", phase: undefined, ok: true, outputTokens: 300 }, 2)
+    progress.apply({ type: "agent-end", index: 1, label: "b", phase: undefined, ok: true, outputTokens: 250 }, 3)
+    expect(progress.snapshot.budget).toEqual({ total: 1000, spent: 550 })
+  })
+
+  test("a failed agent contributes its zero spend, keeping the total journal-shaped", () => {
+    const progress = budgetWriter([], 1000)
+    progress.apply({ type: "agent-end", index: 0, label: "a", phase: undefined, ok: false, outputTokens: 0 }, 1)
+    expect(progress.snapshot.budget.spent).toBe(0)
+  })
+})
+
 describe("ProgressWriter", () => {
   test("folds agent lifecycle events into the snapshot", () => {
     const progress = writer([])
@@ -314,6 +361,7 @@ describe("default write path", () => {
     const written = JSON.parse(await Bun.file(join(dir, "progress.json")).text())
     expect(written.workflow).toBe("demo")
     expect(written.agents.length).toBe(1)
+    expect(written.budget).toEqual({ total: null, spent: 0 })
     await rm(base, { recursive: true, force: true })
   })
 })

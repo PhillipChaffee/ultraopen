@@ -7,8 +7,10 @@ import type { ControlCommand } from "../runtime/control.js"
 import type { AgentOptions, ProgressEvent } from "../runtime/run.js"
 import { subagentContract } from "../bridge/contract.js"
 import { makeResolvers } from "../bridge/models.js"
+import { makeBudget } from "../runtime/budget.js"
 import { argsHash } from "../resume/key.js"
 import { runDir } from "../resume/store.js"
+import { MAX_AGENTS_PER_RUN } from "../script/limits.js"
 import type { JournalEntry } from "../resume/journal.js"
 import { registry } from "../singleton.js"
 import type { Ruleset } from "../bridge/permission.js"
@@ -141,6 +143,106 @@ export async function prepare(args: WorkflowArgs, context: WorkflowContext): Pro
   return { source, meta: parsed.meta, body: parsed.body }
 }
 
+/** Raised when the projection runs into the lifetime agent backstop and stops counting. */
+/**
+ * Raised when the projection hits the lifetime agent backstop and stops counting. A module-private
+ * symbol sentinel rather than an Error subclass: it never escapes `projectAgentCount`, which
+ * converts it into the backstop count itself, and the engine files keep one class each.
+ */
+const PROJECTION_CAP = Symbol("ultraopen.projection.cap")
+
+/**
+ * Projects how many agents a fresh run of this workflow would spawn, at zero cost.
+ *
+ * The pass is IN-MEMORY and side-effect free by construction: the prepared body runs in the
+ * sandbox with a stub `agent` that only counts, a no-ceiling budget, and NO progress, journal,
+ * control or persistence wiring — nothing touches the registry, the disk or the client (the
+ * live progress pipeline writes progress.json, so it is deliberately not reused here). Nested
+ * `workflow()` calls project recursively — still one level, same validation — so the count
+ * covers the whole fan-out. A script whose control flow reads an agent's RESULT sees the same
+ * stub answer a dry run would give, so the count is exact for deterministic scripts and a
+ * preview otherwise.
+ *
+ * The projection budget is deliberately UNCAPPED: spend is unknowable for free, so a script
+ * guarding a loop on `budget.remaining()` contributes only the prefix knowable without
+ * spending. Undercounting a budget-guarded loop is the honest direction for an advisory — the
+ * loop is already self-limiting by the user's own ceiling.
+ *
+ * Throws when the script throws (parse errors are caught earlier by prepare; runtime errors and
+ * determinism traps surface here) — the caller treats ANY failure as "no projection available",
+ * never as a launch blocker.
+ */
+export async function projectAgentCount(
+  prepared: PreparedWorkflow,
+  args: WorkflowArgs,
+  named: Record<string, string> | undefined,
+  options?: { signal?: AbortSignal | undefined },
+): Promise<number> {
+  let count = 0
+  const claim = (): void => {
+    if (count >= MAX_AGENTS_PER_RUN) {throw PROJECTION_CAP}
+    count++
+  }
+  const agent = (prompt: string, opts: AgentOptions = {}): Promise<unknown> => {
+    // An interrupted launch must not keep projecting; the caller degrades to no projection.
+    if (options?.signal?.aborted) {
+      throw new Error("The launch was interrupted while projecting the workflow's size.")
+    }
+    claim()
+    return Promise.resolve(opts.schema ? {} : `[dryRun] ${prompt.slice(0, 200)}`)
+  }
+  const project = (body: string, depth: number): Promise<unknown> =>
+    runSandbox(body, {
+      agent,
+      parallel,
+      pipeline,
+      phase: (): void => {},
+      log: (): void => {},
+      args: args.args,
+      budget: makeBudget({ total: null, spent: () => 0 }),
+      workflow: (nameOrRef: unknown): Promise<unknown> => {
+        // Same one-level rule as the live engine, thrown synchronously like makeNested, so a
+        // projection fails exactly where the real run would.
+        if (depth > 0) {
+          throw new WorkflowScriptError({
+            kind: "RuntimeError",
+            message: "workflow() nesting is one level only — a nested workflow cannot call workflow().",
+          })
+        }
+        const parsed = parse(resolveNamed(nameOrRef, { named }))
+        return project(parsed.body, depth + 1)
+      },
+    })
+  try {
+    await project(prepared.body, 0)
+  } catch (error) {
+    // The cap is not a failure: the projection cannot see past the lifetime backstop, and the
+    // real run stops at the same line — report the backstop itself as the projection.
+    if (error === PROJECTION_CAP) {return MAX_AGENTS_PER_RUN}
+    throw error
+  }
+  return count
+}
+
+/**
+ * The launch's degraded projection: any failure resolves to undefined instead of throwing.
+ *
+ * The advisory must never block an ask, so the launch wiring calls THIS and branches on
+ * undefined — an advisory that cannot be computed honestly is omitted, never invented.
+ */
+export async function projectLaunchSize(
+  prepared: PreparedWorkflow,
+  args: WorkflowArgs,
+  named: Record<string, string> | undefined,
+  options?: { signal?: AbortSignal | undefined },
+): Promise<number | undefined> {
+  try {
+    return await projectAgentCount(prepared, args, named, options)
+  } catch {
+    return undefined
+  }
+}
+
 async function runPrepared(
   prepared: PreparedWorkflow,
   args: WorkflowArgs,
@@ -233,7 +335,7 @@ async function runPrepared(
           log: run.log,
           args: args.args,
           budget: run.budget,
-          workflow: makeNested(context, run),
+          workflow: makeNested(context, run, args.dryRun === true),
         }),
     )
 
@@ -315,6 +417,7 @@ async function resolveSource(args: WorkflowArgs, context: WorkflowContext): Prom
 function makeNested(
   context: WorkflowContext,
   parentRun: Run,
+  dryRun: boolean,
 ): (nameOrRef: unknown, childArgs?: unknown) => Promise<unknown> {
   // Deliberately NOT an async function: validation throws SYNCHRONOUSLY, so both
   // `workflow('bad')` and `await workflow('bad')` fail at the call site. An async function would
@@ -331,7 +434,7 @@ function makeNested(
     }
 
     const source = resolveNamed(nameOrRef, context)
-    return runNested(source, childArgs, context, parentRun)
+    return runNested(source, childArgs, context, parentRun, dryRun)
   }
 }
 
@@ -340,11 +443,20 @@ async function runNested(
   childArgs: unknown,
   context: WorkflowContext,
   parentRun: Run,
+  dryRun: boolean,
 ): Promise<unknown> {
   let child: Awaited<ReturnType<typeof execute>>
   try {
     child = await execute(
-      { script: source, args: childArgs },
+      {
+        script: source,
+        args: childArgs,
+        // A nested call inherits the parent's dryRun: a free preview must never
+        // reach the live spawn path through the one door that bypasses the
+        // stubbed agent() — the child ran with fresh args and would otherwise
+        // execute for real inside a dry run.
+        ...(dryRun ? { dryRun: true } : {}),
+      },
       {
         ...context,
         depth: (context.depth ?? 0) + 1,
@@ -375,7 +487,7 @@ function mergeNestedJournal(entries: readonly JournalEntry[] | undefined, parent
   }
 }
 
-function resolveNamed(nameOrRef: unknown, context: WorkflowContext): string {
+function resolveNamed(nameOrRef: unknown, context: Pick<WorkflowContext, "named">): string {
   if (typeof nameOrRef === "object" && nameOrRef !== null && "script" in nameOrRef) {
     const {script} = (nameOrRef as { script?: unknown })
     if (typeof script === "string") {return script}

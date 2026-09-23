@@ -91,15 +91,34 @@ export function renderResult(
  * needs the hold-the-turn text or the process exits out from under the run.
  * When the session holds sibling live runs, the one-shot hold names them all:
  * polling only this run would still end the turn while the siblings execute.
+ *
+ * The launch-time projection, when available, follows the opening tag: the
+ * projected fan-out always shows, and at or above the threshold it renders as
+ * a large-workflow advisory — the one place a model sees run size BEFORE
+ * agents are scheduled, so it is the model's chance to double-check the script.
  */
 export function renderLaunch(
   workflow: string,
   runId: string,
   longLived: boolean,
   siblings: readonly RunSummary[] = [],
+  projection?: { agents: number; threshold: number } | undefined,
 ): string {
+  let projectionLine: string | undefined
+  if (projection === undefined) {
+    projectionLine = undefined
+  } else if (projection.agents >= projection.threshold) {
+    projectionLine =
+      `Large workflow: ~${projection.agents} agents projected (threshold ${projection.threshold}) — ` +
+      `check the script's fan-out if this is larger than intended.`
+  } else {
+    projectionLine = `~${projection.agents} agents projected at launch.`
+  }
   const lines = [
     `<workflow-launched run="${runId}" workflow="${workflow}" dir="${runDir(runId)}">`,
+    // First body line, ahead of the contract sentence: size is what the model should
+    // reconsider before the fan-out is scheduled.
+    ...(projectionLine === undefined ? [] : [projectionLine]),
     "The run is executing in the background; this message does not contain its outcome.",
   ]
   if (longLived) {
