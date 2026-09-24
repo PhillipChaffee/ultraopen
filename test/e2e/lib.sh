@@ -107,7 +107,11 @@ scratch_new() {
     ln -s "$real_auth" "$DATA_ROOT/auth.json"
   fi
 
-  scratch_write_config "null"
+  # autoResume off for the suite's baseline: cases that kill a server mid-run
+  # (watchdogs, TUI kills) leave `running` manifests, and a later case's boot
+  # must not silently re-execute them. The dedicated auto-resume case flips it
+  # on for its own relaunch (technical.sh T12).
+  scratch_write_config '{"autoResume": false}'
 
   cd "$SCRATCH/project"
 }
