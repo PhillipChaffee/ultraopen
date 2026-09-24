@@ -3,11 +3,11 @@ import { readFile } from "node:fs/promises"
 import { join } from "node:path"
 import { resolveOptions } from "./options.js"
 import type { UltraopenOptions } from "./options.js"
-import { registry, registry as runRegistry } from "./singleton.js"
+import { registry } from "./singleton.js"
 import { installConfig } from "./ultracode/config.js"
 import type { MutableConfig } from "./ultracode/config.js"
 import { execute, prepare, projectLaunchSize, renderFailure, WorkflowRunError } from "./tool/workflow.js"
-import type { WorkflowArgs, WorkflowContext } from "./tool/workflow.js"
+import type { WorkflowArgs } from "./tool/workflow.js"
 import { WORKFLOW_TOOL, STATUS_TOOL } from "./bridge/permission.js"
 import { asClient } from "./types.js"
 import type { OpencodeClient } from "./types.js"
@@ -21,15 +21,10 @@ import {
   nameRun,
   dropPending,
   dropSettled,
-  registerStopHandle,
-  runDetached,
   stopRun,
-  deliverOutcomeUnlessStopped,
   onSessionIdle,
 } from "./tool/background.js"
 
-import { watchControl } from "./runtime/control.js"
-import type { ControlCommand } from "./runtime/control.js"
 import { executeStatus } from "./tool/status.js"
 import type { StatusArgs } from "./tool/status.js"
 import {
@@ -43,14 +38,16 @@ import {
   statusArgsSchema,
 } from "./tool/render.js"
 import { listSavedWorkflows, scanNamedWorkflows } from "./tool/named.js"
-import { beginRun, endRun, loadResume } from "./resume/persist.js"
-import { ensureRunDir, isSafeRunId, readManifest, runDir, writeManifest, writeScript, flushJournalEntry, writeFailure } from "./resume/store.js"
+import { wireRun, startDetachedRun } from "./tool/settlement.js"
+import type { SettleOutcome } from "./tool/settlement.js"
+import { beginRun, loadResume } from "./resume/persist.js"
+import { ensureRunDir, isSafeRunId, readManifest, writeScript } from "./resume/store.js"
 import type { JournalEntry, Manifest } from "./resume/journal.js"
 import { onChatMessage, onChatParams, onMessagesTransform } from "./ultracode/hooks.js"
 import { mode } from "./ultracode/mode.js"
 import { resolveEffort } from "./bridge/effort.js"
 import { newBootId, pruneRuns, reapOrphans } from "./resume/reaper.js"
-import { ProgressWriter } from "./resume/progress.js"
+import { resumeInterruptedRuns } from "./resume/autoresume.js"
 
 /**
  * The ultraopen server plugin.
@@ -117,12 +114,10 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
   // an abort to plain parentID children. Swept in the background so plugin init is never blocked
   // by a slow or unreachable server.
   const bootId = newBootId()
-  // No .catch(): reapOrphans is contractually non-throwing (every I/O failure is swallowed and
-  // reported in its result), and an unreachable handler here would be untestable defensive code.
-  void reapOrphans(client, bootId, {})
-  // Same fire-and-forget contract. Runs still on disk past the retention window are pruned after
-  // the reaper marks any interrupted ones, so a just-orphaned run is not deleted mid-sweep.
-  void pruneRuns({})
+  // No .catch(): every stage of the boot sweep is contractually non-throwing (every I/O failure
+  // is swallowed and reported in its result), and an unreachable handler here would be untestable
+  // defensive code.
+  void bootSweep(client, bootId, options, input.directory)
 
   const hooks: Record<string, unknown> = {
     /**
@@ -284,30 +279,13 @@ async function launchWorkflow(
 
   const background = args.dryRun !== true && (args.background ?? options.runMode === "background"),
    runId = `wf_${randomUUID().replaceAll("-", "").slice(0, 12)}`,
-   stopController = new AbortController(),
    // The session's default model, so `effort` resolves against ITS variant set rather
    // than a guess. A failure here is non-fatal: effort simply goes unapplied, and the run
    // log says so.
    defaultModel = await client.config
     ?.get?.()
     .then((response) => response.data?.model)
-    .catch(() => undefined),
-
-   workflowContext: WorkflowContext = {
-    client,
-    sessionID: context.sessionID,
-    runId,
-    deadlineMs: options.agentDeadlineMs,
-    idleMs: options.agentIdleMs,
-    // Makes the schema-advertised `scriptPath` real: persisted scripts under the run
-    // directory can be re-run by path.
-    readScript: (path: string) => readFile(path, "utf8"),
-    ...(defaultModel === undefined ? {} : { defaultModel }),
-    ...(options.budgetTokens === null ? {} : { budgetTotal: options.budgetTokens }),
-    // The detached run must NOT take the tool call's signal: a parent-turn interrupt would
-    // otherwise kill the run it just launched — it takes the stop controller's signal.
-    signal: background ? stopController.signal : context.abort,
-  }
+    .catch(() => undefined)
 
   // Saved workflows resolve from disk on every call: a file saved mid-session
   // runs by name at once, and no cached map can drift from what is on disk.
@@ -344,22 +322,19 @@ async function launchWorkflow(
     registerPending(runId, context.sessionID)
   }
 
-  // Incremental journal flush: one line per entry as it is recorded, so a process
-  // killed mid-run keeps every completed agent for resume. Flushes are CHAINED
-  // (appends stay in record order and never interleave) and joined before endRun,
-  // so the settled rewrite can never race a floating append. The store-level flush
-  // never rejects — a disk failure must not lose a live run.
-  let flushChain: Promise<void> = Promise.resolve()
-  const flush = (entry: JournalEntry): void => {
-    flushChain = flushChain.then(() => flushJournalEntry(runId, entry))
-  }
-
   try {
     // Parse BEFORE asking, so the permission prompt names the real workflow and can show
     // what it intends to do. `meta` is a pure literal specifically so it can be read
     // without running anything. Using the tool's `title` argument here instead would be
     // wrong twice over: it is documented as ignored, and the model usually omits it.
-    const prepared = await prepare(args, workflowContext)
+    const prepared = await prepare(args, {
+      client,
+      sessionID: context.sessionID,
+      runId,
+      // Makes the schema-advertised `scriptPath` real: persisted scripts under the run
+      // directory can be re-run by path.
+      readScript: (path: string) => readFile(path, "utf8"),
+    })
 
     // The per-turn live-run reminder names the workflow, and prepare() is where the name is
     // first known — recorded before the ask so even a pending entry carries it.
@@ -448,144 +423,37 @@ async function launchWorkflow(
         "Nothing was executed and no tokens were spent."
     }
 
-    /**
-     * The ONE settle protocol for both contracts: join the flush chain, close
-     * the manifest, and persist failure text when there is any. Extracted
-     * because the ordering (flushes settle BEFORE the endRun rewrite, so the
-     * settled write can never race a floating append) is crash-safety, not
-     * style — the escaped-rejection fallback below must obey it too.
-     */
-    const settleRun = async (outcome: {
-      status: "completed" | "failed"
-      entries: readonly JournalEntry[]
-      value: unknown
-      childSessionIDs: string[]
-      failureText?: string | undefined
-    }): Promise<void> => {
-      stopControl?.()
-      // The chain variable is read live: appends queued before this await are
-      // included, however long the chain grew.
-      await flushChain
-      await endRun(manifest, outcome)
-      if (outcome.failureText !== undefined) {
-        // Best-effort like every persistence here: a failed write must not
-        // lose the settle itself.
-        try {
-          await writeFailure(runId, outcome.failureText)
-        } catch {
-          // Nothing better is knowable on a failed write; the manifest still closed.
-        }
-      }
-    }
-
-    const progress = new ProgressWriter({
+    // The shared execution wiring — flush chain, progress writer with crash-safe child
+    // persistence, run-control channel, and the ONE settle protocol — is assembled by
+    // tool/settlement.ts so the detached auto-resume path reuses it verbatim.
+    const shared = {
       runId,
-      workflow: prepared.meta.name,
+      client,
       sessionID: context.sessionID,
-      startedAt: Date.now(),
-      // Mirrors the run's ceiling in the snapshot so the sidebar can show spend against it.
-      // Null (uncapped) is passed through, not omitted, so the shape stays stable.
-      budgetTotal: options.budgetTokens,
-    })
-
-    // Crash safety: the manifest's child list is updated as sessions appear, so a server killed
-    // mid-run leaves the reaper a list of children to abort. The on-disk status guard keeps an
-    // unwind-time progress event from resurrecting a cancelled record.
-    let persistedChildren = -1
-    const persistChildren = async (): Promise<void> => {
-      // The stop controller's signal is the run-level cancelled gate: once a stop is in
-      // flight, child-list rewrites are moot and must not race the cancel write.
-      if (!manifest || stopController.signal.aborted) {return}
-      const sessions = runRegistry.sessionsOf(runId)
-      if (sessions.length === persistedChildren) {return}
-      persistedChildren = sessions.length
-      try {
-        const current = await readManifest(runId)
-        if (current !== undefined && current.status === "running") {await writeManifest(runId, { ...current, childSessionIDs: sessions })}
-      } catch {
-        // Crash safety is best-effort: a failed manifest rewrite must not stall the run.
-      }
-    }
-
-    // The run-control channel: a per-run watcher reads the TUI's control file
-    // and dispatches to the Run; cleared when the run settles.
-    let stopControl: (() => void) | undefined
-
-    const executeContext = {
-      ...workflowContext,
-      ...(Object.keys(named).length > 0 ? { named } : {}),
-      onProgress: (event: Parameters<ProgressWriter["apply"]>[0]) => {
-        progress.apply(event, Date.now())
-        void progress.flush()
-        // Persist on agent-start AND on log lines: a stall restart spawns a NEW child
-        // session without an agent-start, and a killed server must leave the reaper a
-        // list that includes it. persistChildren no-ops when the list is unchanged, so
-        // narration-heavy runs cost no extra writes.
-        if (event.type === "agent-start" || event.type === "log") {void persistChildren()}
-      },
-      onJournal: flush,
-      registerControl: (dispatch: (command: ControlCommand) => void): void => {
-        stopControl = watchControl({ runId, runDir: runDir(runId), dispatch, onNote: (note) => progress.apply({ type: "log", message: note }, Date.now()) })
-      },
-      ...(resume && resume.entries.length > 0
-        ? { previousEntries: resume.entries, resumedFrom: args.resumeFromRunId }
-        : {}),
+      manifest,
+      prepared,
+      args,
+      options,
+      named: Object.keys(named).length > 0 ? named : undefined,
+      ...(defaultModel === undefined ? {} : { defaultModel }),
+      previousEntries: resume?.entries,
+      resumedFrom: args.resumeFromRunId,
+      resume: { resumed: resume?.entries.length ?? 0, argsChanged: resume?.argsChanged === true },
     }
 
     if (!background) {
-      const result = await runBlocking(args, { runId, manifest, resume, executeContext, settleRun })
+      // The blocking contract waits for the run and takes the tool call's abort signal: a
+      // parent-turn interrupt unwinds the script it is waiting on.
+      const wiring = wireRun({ ...shared, signal: context.abort })
+      const result = await runBlocking(args, { runId, manifest, resume, executeContext: wiring.executeContext, settleRun: wiring.settle })
       return [result, ...scanNoteLines].join("\n")
     }
 
     // Detached: the run outlives this tool call. The task fully captures its own
     // outcome — flushes, manifest, failure text — because nothing else is
-    // waiting on it anymore.
-    registerStopHandle(runId, stopController)
-    void runDetached({
-      runId,
-      manifest,
-      task: async (): Promise<void> => {
-        try {
-          const result = await execute(args, executeContext)
-          await settleRun({
-            status: "completed",
-            entries: result.journal,
-            value: result.value,
-            // Captured inside the run before its cleanup forgot the sessions — reading the
-            // registry here would always yield [].
-            childSessionIDs: result.childSessionIDs,
-          })
-          // Hydration fires AFTER the settle protocol — the manifest is closed, so a model reacting
-          // to the notification finds workflow_status settled, not "running".
-          await deliverOutcomeUnlessStopped({
-            client,
-            sessionID: manifest.sessionID,
-            runId,
-            workflow: prepared.meta.name,
-            result,
-            resume: { resumed: resume?.entries.length ?? 0, argsChanged: resume?.argsChanged === true },
-          })
-        } catch (error) {
-          const partial = error instanceof WorkflowRunError ? error.partial : undefined,
-            failureText = renderFailure(error instanceof WorkflowRunError ? error.cause : error, args.script, runId)
-          await settleRun({
-            status: "failed",
-            entries: partial?.journal ?? [],
-            value: null,
-            childSessionIDs: partial?.childSessionIDs ?? [],
-            failureText,
-          })
-          await deliverOutcomeUnlessStopped({ client, sessionID: manifest.sessionID, runId, workflow: prepared.meta.name, failureText })
-        }
-      },
-      // Last resort: the task above is contractually self-capturing, so an
-      // escaping rejection means its own failure path broke. Route through the
-      // same settle protocol — including the flush join — so the degraded
-      // record still follows the crash-safety ordering. The degraded record is
-      // disk-only (failure.txt + manifest); no hydration fires when even the
-      // failure path broke.
-      renderFailure,
-    })
+    // waiting on it anymore; startDetachedRun owns the stop controller the
+    // stop path trips.
+    startDetachedRun(shared)
 
     const projection = projectedAgents === undefined ? undefined : { agents: projectedAgents, threshold: options.largeWorkflowAgents }
     return [renderLaunch(prepared.meta.name, runId, longLived, siblingRunsForSession(context.sessionID, runId), projection), ...scanNoteLines].join("\n")
@@ -597,14 +465,8 @@ async function launchWorkflow(
   }
 }
 
-/** The shared settle protocol's signature; see settleRun inside launchWorkflow. */
-type SettleRun = (outcome: {
-  status: "completed" | "failed"
-  entries: readonly JournalEntry[]
-  value: unknown
-  childSessionIDs: string[]
-  failureText?: string | undefined
-}) => Promise<void>
+/** The shared settle protocol's signature; the ONE settle protocol lives in tool/settlement.ts. */
+type SettleRun = (outcome: SettleOutcome) => Promise<void>
 
 interface BlockingRun {
   runId: string
@@ -659,6 +521,37 @@ async function runBlocking(args: WorkflowArgs, run: BlockingRun): Promise<string
     // unconditionally: a status-guarded drop could strand the gate.
     dropSettled(runId)
   }
+}
+
+/**
+ * The boot-time durability sweep, in dependency order.
+ *
+ * 1. The reaper aborts the children a dead process left behind and harvests the
+ *    freshly-interrupted manifests — that abort is also what makes a run resumable, since it
+ *    stops the billing while the journal keeps the completed agents.
+ * 2. Prune deletes run directories past retention, but never a just-orphaned one: the resume
+ *    window guard keeps runs inside the pending-decision TTL, whatever `autoResume` says.
+ * 3. The auto-resume sweep re-executes the candidates it can, from their own journals, and
+ *    hydrates their original sessions with the outcome.
+ *
+ * Fire-and-forget like every boot-time persistence: no stage rejects, so plugin init never waits
+ * on a slow or unreachable server and no caller needs a catch.
+ */
+async function bootSweep(
+  client: OpencodeClient,
+  bootId: string,
+  options: UltraopenOptions,
+  directory: string | undefined,
+): Promise<void> {
+  const reaped = await reapOrphans(client, bootId, {})
+  void pruneRuns({ autoResumeTtlHours: options.autoResumeTtlHours })
+  await resumeInterruptedRuns({
+    client,
+    bootId,
+    candidates: reaped.orphaned,
+    options,
+    directory,
+  })
 }
 
 const plugin = { id: "ultraopen", server: ultraopen }

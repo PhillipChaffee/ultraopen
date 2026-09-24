@@ -373,9 +373,22 @@ export class Run {
 
       // A parent abort that lands during a stall can win the race as a deadline kill; report it
       // as what it was, or the failures list misattributes the user's own interrupt.
-      const finalOutcome = !outcome.ok && outcome.reason === "deadline" && this.#options.signal?.aborted
-        ? { ...outcome, reason: "aborted" as const, detail: "parent aborted" }
-        : outcome
+      //
+      // An abort whose reason is a STRING names the requester (today only the stop path aborts
+      // with a string — see STOP_ABORT_REASON), so the journal can tell a deliberate stop apart
+      // from a parent-turn interrupt: the boot-time auto-resume sweep skips any run whose
+      // children recorded that reason, honoring "stopped runs never resume".
+      const aborted = this.#options.signal?.aborted === true,
+        stopReason = aborted && typeof this.#options.signal?.reason === "string" && this.#options.signal.reason.trim() !== ""
+          ? this.#options.signal.reason
+          : undefined
+
+      let finalOutcome = outcome
+      if (!outcome.ok && outcome.reason === "deadline" && aborted) {
+        finalOutcome = { ...outcome, reason: "aborted" as const, detail: stopReason ?? "parent aborted" }
+      } else if (!outcome.ok && outcome.reason === "aborted" && stopReason !== undefined) {
+        finalOutcome = { ...outcome, detail: stopReason }
+      }
 
       const record: AgentRecord = finalOutcome.ok
         ? {

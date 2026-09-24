@@ -132,6 +132,9 @@ export function watchControl(options: WatchOptions): () => void {
     for (const command of commands) {
       options.dispatch(command)
       cursor = Math.max(cursor, command.seq)
+      // The doc'd log sink: a consumed command is visible in the run's progress log, so a
+      // pause or stop the TUI requested shows up where the user is looking.
+      options.onNote?.(`run-control: ${command.action}${command.target === undefined ? "" : ` → agent ${command.target}`}`)
     }
     // The cursor is written back so a hand-edited replay is observable, but a
     // failed write changes nothing: the cursor is authoritative in memory.

@@ -39,6 +39,14 @@ export interface Manifest {
   sessionID: string
   sourceHash: string
   argsHash: string
+  /**
+   * The launch's `args` value, persisted verbatim so an auto-resume can
+   * re-execute without anyone re-supplying it. Absent on manifests written
+   * before auto-resume existed; the auto-resume sweep re-hashes what it finds
+   * against `argsHash` and skips the run on a mismatch, so a hand-edited or
+   * pre-feature manifest can never replay against guessed inputs.
+   */
+  args?: unknown
   /** `cancelled` is written by the stop path: the run was stopped by request, not by failure. */
   status: "running" | "completed" | "failed" | "cancelled" | "orphaned"
   childSessionIDs: string[]

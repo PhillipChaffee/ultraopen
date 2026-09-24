@@ -37,6 +37,12 @@ export async function beginRun(record: RunRecord, env?: NodeJS.ProcessEnv): Prom
       sessionID: record.sessionID,
       sourceHash: sourceHash(record.source),
       argsHash: argsHash(record.args),
+      // Persisted verbatim so an auto-resume can re-execute this run without
+      // anyone re-supplying the inputs. JSON.stringify drops an undefined value,
+      // which keeps "no args" manifests byte-identical to the pre-args format —
+      // and `argsHash(undefined)` matches them at read time, so the sweep's
+      // hash re-check distinguishes old manifests from tampered ones for free.
+      args: record.args,
       status: "running",
       childSessionIDs: [],
       // Wall-clock, stamped by the host rather than the script — scripts cannot read the clock at

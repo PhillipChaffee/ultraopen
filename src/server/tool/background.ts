@@ -481,7 +481,8 @@ export async function hydrateParent(options: {
  * The index.ts settle paths call this — wiring only. The completion body is the shared
  * `renderResult` render (sibling advisory included, this run excluded); a failure delivers the
  * failure text as rendered for failure.txt. Both are capped and pointed at the full artifact by
- * {@link renderNotification}.
+ * {@link renderNotification}. An optional `prefix` is prepended INSIDE the wrapper tag — the
+ * auto-resume sweep uses it to explain that this result came from a resumed interrupted run.
  */
 export function deliverOutcome(options: {
   client: OpencodeClient
@@ -493,7 +494,10 @@ export function deliverOutcome(options: {
   resume?: { resumed: number; argsChanged: boolean }
   /** The rendered failure text for a failed run. */
   failureText?: string
+  /** Prepended to the notification body, before the result render. */
+  prefix?: string
 }): Promise<void> {
+  const prefixLine = options.prefix === undefined ? "" : `${options.prefix}\n`
   if (options.result !== undefined) {
     return hydrateParent({
       client: options.client,
@@ -502,14 +506,14 @@ export function deliverOutcome(options: {
         status: "completed",
         name: options.workflow,
         runId: options.runId,
-        body: renderResult(options.result, options.resume, siblingRunsForSession(options.sessionID, options.runId)),
+        body: `${prefixLine}${renderResult(options.result, options.resume, siblingRunsForSession(options.sessionID, options.runId))}`,
       },
     })
   }
   return hydrateParent({
     client: options.client,
     sessionID: options.sessionID,
-    outcome: { status: "failed", name: options.workflow, runId: options.runId, body: options.failureText ?? "" },
+    outcome: { status: "failed", name: options.workflow, runId: options.runId, body: `${prefixLine}${options.failureText ?? ""}` },
   })
 }
 
@@ -529,6 +533,8 @@ export async function deliverOutcomeUnlessStopped(options: {
   result?: WorkflowResult
   resume?: { resumed: number; argsChanged: boolean }
   failureText?: string
+  /** Prepended to the notification body, before the result render. */
+  prefix?: string
 }): Promise<void> {
   const settled = await readManifest(options.runId)
   if (settled?.status === "cancelled") {return}

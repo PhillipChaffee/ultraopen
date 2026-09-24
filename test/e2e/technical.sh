@@ -697,5 +697,99 @@ else
   bad "the admitted run did not settle" "manifest: $(manifest_status "$T11_RUN")"
 fi
 
+section "T12 — auto-resume-on-boot: a killed server's interrupted run continues"
+# The durability default, end to end. Phase 1: launch a 3-agent workflow and SIGKILL
+# the process once the journal shows the first agent settled — the run dies orphaned
+# mid-flight. Phase 2: flip the plugin config to autoResume:true and boot
+# `opencode serve` (a long-lived host, so the resumed run survives past any turn);
+# the boot sweep adopts the orphan, replays the completed agent, runs the missing
+# tail, and hydrates the original session. Phase 3: verify the settled manifest,
+# the replayed journal entries, and the notification in the original session.
+t12_prompt() {
+  wf_prompt kill-resume "Use background true."
+}
+runs_snapshot "$OUT/runs-before-t12.txt"
+T12_PROMPT="$(t12_prompt)"
+opencode run --auto --format json "$T12_PROMPT" >"$OUT/t12.json" 2>&1 &
+T12_PID=$!
+manifest_pid "$T12_PID" "opencode run --auto --format json (t12 launch)"
+# The kill must land mid-run: poll tightly for the first settled agent (the journal's
+# replayable prefix) and SIGKILL immediately — six sequential agents give a ~10s+ margin
+# before the run could settle on its own.
+RUN12=""
+for _ in $(seq 1 240); do
+  RUN12="$(newest_run "$OUT/runs-before-t12.txt")"
+  if [ -n "$RUN12" ] && [ "$(manifest_status "$RUN12")" = "running" ] && [ "$(journal_count "$RUN12")" -ge 1 ]; then
+    break
+  fi
+  sleep 1
+done
+if [ -z "$RUN12" ]; then
+  bad "no run reached its first settled agent within the ceiling" "see $OUT/t12.json"
+else
+  # Kill -9 mid-poll: the run is live in the process and dies with it, unsettled.
+  kill -9 "$T12_PID" 2>/dev/null || true
+  sleep 2
+  if [ "$(manifest_status "$RUN12")" = "running" ]; then
+    ok "the server was killed mid-run; the run is unsettled on disk"
+  else
+    note "run settled before the kill landed ($(manifest_status "$RUN12")); resuming assertions still decide the case"
+  fi
+  preserve_run "$RUN12"
+
+  # Phase 2: the relaunch. A long-lived serve host so the resumed run outlives turns.
+  scratch_write_config '{"autoResume": true}'
+  T12_PORT="${E2E_RESUME_PORT:-18889}"
+  opencode serve --port "$T12_PORT" >"$OUT/t12-serve.log" 2>&1 &
+  T12_SERVE_PID=$!
+  manifest_pid "$T12_SERVE_PID" "opencode serve --port $T12_PORT (t12 resume host)"
+  t12_health_ok() { curl -sf "http://127.0.0.1:$T12_PORT/global/health" >/dev/null 2>&1; }
+  if wait_for "$E2E_WAIT_TIMEOUT" t12_health_ok; then
+    ok "the relaunched server is up (the boot sweep runs at plugin init)"
+  else
+    bad "the relaunched server never became healthy" "see $OUT/t12-serve.log"
+  fi
+
+  # `opencode serve` defers its server instance (and the plugin init that runs the boot sweep)
+  # until the first instance-scoped request — /global/health is server-level and never creates
+  # one, so touch the instance explicitly and give the sweep a beat.
+  curl -sf "http://127.0.0.1:$T12_PORT/session" >/dev/null 2>&1 || true
+  sleep 2
+
+  t12_settled() { [ "$(manifest_status "$RUN12")" = "completed" ]; }
+  if wait_for 240 t12_settled; then
+    ok "the interrupted run auto-resumed from its journal and completed"
+  else
+    bad "the resumed run did not settle completed" "manifest: $(manifest_status "$RUN12") — serve log: $OUT/t12-serve.log"
+  fi
+
+  T12_REPLAYED="$(journal_grep "$RUN12" '"replayed":true')"
+  if [ "$T12_REPLAYED" -ge 1 ]; then
+    ok "the journal records the replayed prefix ($T12_REPLAYED replayed entr(y/ies))"
+  else
+    bad "no replayed entries in the resumed journal" "the run re-paid work the journal already had"
+  fi
+  preserve_run "$RUN12"
+
+  # Phase 3: the original session received the notification, hydrated by the NEW process.
+  SESSION12="$(python3 -c 'import re,sys; m=re.search(r"ses_[A-Za-z0-9]+", open(sys.argv[1]).read()); print(m.group(0) if m else "")' "$OUT/t12.json")"
+  if [ -z "$SESSION12" ]; then
+    bad "no session id in the launch stream" "cannot address the original session"
+  else
+    curl -sf "http://127.0.0.1:$T12_PORT/session/$SESSION12/message" >"$OUT/t12-messages.json" 2>/dev/null || true
+    if [ -f "$OUT/t12-messages.json" ] && grep -q "workflow-completed" "$OUT/t12-messages.json" && grep -qF "$RUN12" "$OUT/t12-messages.json"; then
+      ok "the original session received the completion notification"
+    else
+      bad "no completion notification in the original session" "messages: $OUT/t12-messages.json (session $SESSION12)"
+    fi
+    if [ -f "$OUT/t12-messages.json" ] && grep -q "was interrupted when opencode exited" "$OUT/t12-messages.json"; then
+      ok "the notification carries the interrupted-resume prefix"
+    else
+      bad "the notification lacks the interrupted-resume prefix" "a resumed result must not read as a fresh one"
+    fi
+  fi
+  kill "$T12_SERVE_PID" 2>/dev/null || true
+fi
+
 [ -f "$DATA_ROOT/log/opencode.log" ] && cp "$DATA_ROOT/log/opencode.log" "$OUT/server.log" 2>/dev/null || true
 finish

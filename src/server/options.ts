@@ -1,5 +1,14 @@
 import { LARGE_WORKFLOW_AGENTS, MAX_CONCURRENCY, MAX_TIMER_MS, MIN_CONCURRENCY } from "./script/limits.js"
 
+/** Default resume window for runs interrupted by a process death, in hours. */
+const DEFAULT_AUTO_RESUME_TTL_HOURS = 24
+
+/** Ceiling for the resume window: a year. Beyond that "resume it" means "keep it forever". */
+const MAX_AUTO_RESUME_TTL_HOURS = 24 * 365
+
+/** Ceiling for per-boot auto-resumes; each is a full run, so this stays a backstop, not a knob. */
+const MAX_AUTO_RESUME = 64
+
 /**
  * Plugin options, supplied via the tuple form in opencode.json:
  *
@@ -54,6 +63,21 @@ export interface UltraopenOptions {
   largeWorkflowAgents: number
   /** Size advice appended to the tool description; unset omits the line entirely. */
   sizeGuideline: string | undefined
+  /**
+   * Auto-resume-on-boot: when true (the default), a run interrupted by a process
+   * death is re-executed from its journal on the next start, within
+   * {@linkcode autoResumeTtlHours}, and its original session is hydrated with
+   * the outcome. `false` restores the manual-resume-only behaviour.
+   */
+  autoResume: boolean
+  /**
+   * How long an interrupted run stays worth resuming, in hours. Runs whose
+   * interruption is older are left orphaned (and eventually pruned). Invalid
+   * values fall back to the default rather than silently disabling resume.
+   */
+  autoResumeTtlHours: number
+  /** How many interrupted runs may auto-resume at one boot. Minimum 1. */
+  autoResumeMax: number
 }
 
 const DEFAULTS: UltraopenOptions = {
@@ -69,6 +93,9 @@ const DEFAULTS: UltraopenOptions = {
   budgetTokens: null,
   largeWorkflowAgents: LARGE_WORKFLOW_AGENTS,
   sizeGuideline: undefined,
+  autoResume: true,
+  autoResumeTtlHours: DEFAULT_AUTO_RESUME_TTL_HOURS,
+  autoResumeMax: 1,
 }
 
 /**
@@ -98,6 +125,9 @@ export function resolveOptions(raw: unknown): UltraopenOptions {
       : DEFAULTS.sizeGuideline,
     runMode: resolveRunMode(input["runMode"]),
     keywordBehavior: resolveKeywordBehavior(input["keywordBehavior"]),
+    autoResume: input["autoResume"] !== false,
+    autoResumeTtlHours: resolveTtlHours(input["autoResumeTtlHours"]),
+    autoResumeMax: resolveAutoResumeMax(input["autoResumeMax"]),
   }
 }
 
@@ -130,6 +160,29 @@ function resolveKeywordBehavior(value: unknown): "one-shot" | "session" {
   const normalized = typeof value === "string" ? value.trim().toLowerCase() : undefined
   if (normalized === "one-shot" || normalized === "session") {return normalized}
   return "one-shot"
+}
+
+/**
+ * Validates the resume window in hours.
+ *
+ * Same stance as the other numeric options: only a positive finite number is
+ * honoured, and an invalid value falls back to the default rather than
+ * disabling auto-resume — a mistyped TTL must not silently turn durability off.
+ */
+function resolveTtlHours(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {return DEFAULT_AUTO_RESUME_TTL_HOURS}
+  return Math.min(MAX_AUTO_RESUME_TTL_HOURS, Math.floor(value))
+}
+
+/**
+ * Validates the per-boot resume cap.
+ *
+ * Minimum 1: 0 would make the option a second, confusing kill switch alongside
+ * `autoResume: false`, so a zero is treated as mistyped and falls back.
+ */
+function resolveAutoResumeMax(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 1) {return DEFAULTS.autoResumeMax}
+  return Math.min(MAX_AUTO_RESUME, Math.floor(value))
 }
 
 /**

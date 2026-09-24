@@ -80,12 +80,12 @@ describe("reapOrphans", () => {
   test("aborts every child of a run abandoned by a dead process", async () => {
     // opencode never cascades an abort to plain parentID children, so without this they keep
     // running — and billing — after the server that started them is gone.
-    await seed()
+    const entry = await seed()
     const { client, aborted } = makeClient(),
 
      result = await reapOrphans(client, "current-boot", { env, isProcessAlive: DEAD })
     expect(aborted).toEqual(["child-1", "child-2"])
-    expect(result).toEqual({ runs: 1, sessions: 2, failures: 0, live: 0 })
+    expect(result).toEqual({ runs: 1, sessions: 2, failures: 0, live: 0, orphaned: [entry] })
   })
 
   test("leaves an interrupted marker the TUI reads, so the next start hints", async () => {
@@ -125,8 +125,22 @@ describe("reapOrphans", () => {
       sessions: 0,
       failures: 0,
       live: 0,
+      orphaned: [],
     })
     expect(second.aborted).toEqual([])
+  })
+
+  test("stamps the moment the run became a pending resume decision", async () => {
+    // The orphan stamp starts the auto-resume window and the prune window alike, so it must be
+    // the orphaning moment — not the epoch placeholder, which would expire every run instantly.
+    await seed()
+    const { client } = makeClient(),
+      before = Date.now()
+    await reapOrphans(client, "current-boot", { env, isProcessAlive: DEAD })
+
+    const orphanManifest = await readManifest("wf_dead001", env)
+    expect(orphanManifest?.endedAt).toBeGreaterThanOrEqual(before)
+    expect(orphanManifest?.endedAt ?? 0).toBeLessThanOrEqual(Date.now())
   })
 
   test("skips a run whose owning process is still alive", async () => {
@@ -142,7 +156,7 @@ describe("reapOrphans", () => {
       onNote: (note) => notes.push(note),
     })
     expect(aborted).toEqual([])
-    expect(result).toEqual({ runs: 0, sessions: 0, failures: 0, live: 1 })
+    expect(result).toEqual({ runs: 0, sessions: 0, failures: 0, live: 1, orphaned: [] })
     const orphanManifest = await readManifest("wf_dead001", env)
     expect(orphanManifest?.status).toBe("running")
     // The skip is visible rather than silent.
@@ -164,6 +178,7 @@ describe("reapOrphans", () => {
       sessions: 0,
       failures: 0,
       live: 0,
+      orphaned: [],
     })
     expect(aborted).toEqual([])
   })
@@ -171,11 +186,11 @@ describe("reapOrphans", () => {
   test("counts aborts that fail and still marks the run orphaned", async () => {
     // A session may already be gone. The run is lost either way; the point is to stop it costing
     // money, not to insist every abort lands.
-    await seed()
+    const entry = await seed()
     const { client } = makeClient((id) => (id === "child-1" ? Promise.reject(new Error("gone")) : Promise.resolve({}))),
 
      result = await reapOrphans(client, "current-boot", { env, isProcessAlive: DEAD })
-    expect(result).toEqual({ runs: 1, sessions: 1, failures: 1, live: 0 })
+    expect(result).toEqual({ runs: 1, sessions: 1, failures: 1, live: 0, orphaned: [entry] })
     const orphanManifest = await readManifest("wf_dead001", env)
     expect(orphanManifest?.status).toBe("orphaned")
   })
@@ -207,18 +222,20 @@ describe("reapOrphans", () => {
       sessions: 0,
       failures: 0,
       live: 0,
+      orphaned: [],
     })
     expect(notes).toEqual([])
   })
 
   test("a run with no recorded children is still marked orphaned", async () => {
-    await seed({ childSessionIDs: [] })
+    const entry = await seed({ childSessionIDs: [] })
     const { client } = makeClient()
     expect(await reapOrphans(client, "current-boot", { env, isProcessAlive: DEAD })).toEqual({
       runs: 1,
       sessions: 0,
       failures: 0,
       live: 0,
+      orphaned: [entry],
     })
   })
 })
@@ -232,7 +249,7 @@ describe("failure tolerance", () => {
 
     expect(
       await reapOrphans(client, "boot", { env: { XDG_DATA_HOME: notADirectory } as NodeJS.ProcessEnv }),
-    ).toEqual({ runs: 0, sessions: 0, failures: 0, live: 0 })
+    ).toEqual({ runs: 0, sessions: 0, failures: 0, live: 0, orphaned: [] })
   })
 
   test("a manifest that cannot be rewritten still counts the aborts it managed", async () => {
@@ -270,9 +287,9 @@ describe("pruneRuns", () => {
     // Old enough to be pruned no matter when the test runs.
     const ancient = 0,
      seed = async (runId: string, overrides: Partial<Manifest>): Promise<void> => {
-      await ensureRunDir(runId, env)
-      await writeManifest(runId, manifest({ runId, ...overrides }), env)
-    }
+       await ensureRunDir(runId, env)
+       await writeManifest(runId, manifest({ runId, ...overrides }), env)
+     }
     await seed("wf_ancient1", { runId: "wf_ancient1", ...finished(ancient) })
     await seed("wf_fresh01", { runId: "wf_fresh01", status: "completed", startedAt: Date.now() })
     await seed("wf_liverun", { runId: "wf_liverun", status: "running", startedAt: ancient })
@@ -283,6 +300,28 @@ describe("pruneRuns", () => {
     expect(await readManifest("wf_fresh01", env)).toBeDefined()
     // A live run must never lose its journal, however old it is.
     expect(await readManifest("wf_liverun", env)).toBeDefined()
+  })
+
+  test("an orphaned run inside the resume window survives pruning", async () => {
+    // An orphaned run is an unanswered resume decision, not waste: this one is old enough to be
+    // retention-prunable, but its interruption is 2 days old and the sweep window is 7 days.
+    const now = Date.now(),
+     day = 24 * 60 * 60 * 1000,
+     seed = async (runId: string, overrides: Partial<Manifest>): Promise<void> => {
+       await ensureRunDir(runId, env)
+       await writeManifest(runId, manifest({ runId, ...overrides }), env)
+     }
+    await seed("wf_orphyng", { runId: "wf_orphyng", status: "orphaned", startedAt: now - 40 * day, endedAt: now - 2 * day })
+    await seed("wf_orphold", { runId: "wf_orphold", status: "orphaned", startedAt: now - 40 * day, endedAt: now - 40 * day })
+    await seed("wf_doneold", { runId: "wf_doneold", status: "completed", startedAt: now - 40 * day, endedAt: now - 40 * day })
+
+    const pruned = await pruneRuns({ env, now, autoResumeTtlHours: 24 * 7 })
+    // The young orphan survives its pending-decision window; the window-expired orphan and the
+    // terminal run prune like waste.
+    expect(pruned).toBe(2)
+    expect(await readManifest("wf_orphyng", env)).toBeDefined()
+    expect(await readManifest("wf_orphold", env)).toBeUndefined()
+    expect(await readManifest("wf_doneold", env)).toBeUndefined()
   })
 
   test("never rejects, so callers can fire-and-forget without a handler", async () => {
