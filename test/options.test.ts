@@ -300,3 +300,57 @@ describe("resolveOptions — sizeGuideline", () => {
     expect(resolveOptions({ sizeGuideline: 42 as unknown }).sizeGuideline).toBeUndefined()
   })
 })
+
+describe("resolveOptions — autoResume", () => {
+  test("on by default; explicitly false opts out", () => {
+    expect(resolveOptions({}).autoResume).toBe(true)
+    expect(resolveOptions({ autoResume: undefined }).autoResume).toBe(true)
+    expect(resolveOptions({ autoResume: false }).autoResume).toBe(false)
+  })
+
+  test("only an explicit false opts out; anything else is not a kill switch", () => {
+    // A mistyped value must not silently disable durability.
+    for (const value of [0, "", "false", null]) {
+      expect(resolveOptions({ autoResume: value as unknown }).autoResume).toBe(true)
+    }
+  })
+})
+
+describe("resolveOptions — autoResumeTtlHours", () => {
+  test("defaults to 24 hours", () => {
+    expect(resolveOptions({}).autoResumeTtlHours).toBe(24)
+    expect(resolveOptions({ autoResumeTtlHours: undefined }).autoResumeTtlHours).toBe(24)
+  })
+
+  test("a positive number is honoured, floored, and clamped to a year", () => {
+    expect(resolveOptions({ autoResumeTtlHours: 72 }).autoResumeTtlHours).toBe(72)
+    expect(resolveOptions({ autoResumeTtlHours: 7.9 }).autoResumeTtlHours).toBe(7)
+    expect(resolveOptions({ autoResumeTtlHours: 24 * 365 * 100 }).autoResumeTtlHours).toBe(24 * 365)
+  })
+
+  test("an invalid value falls back to the default, never disables resume", () => {
+    for (const bad of [0, -1, "24", Number.NaN, Number.POSITIVE_INFINITY, true]) {
+      expect(resolveOptions({ autoResumeTtlHours: bad as unknown }).autoResumeTtlHours).toBe(24)
+    }
+  })
+})
+
+describe("resolveOptions — autoResumeMax", () => {
+  test("defaults to one adoption per boot", () => {
+    expect(resolveOptions({}).autoResumeMax).toBe(1)
+    expect(resolveOptions({ autoResumeMax: undefined }).autoResumeMax).toBe(1)
+  })
+
+  test("a positive number is honoured, floored, clamped to [1, 64]", () => {
+    expect(resolveOptions({ autoResumeMax: 5 }).autoResumeMax).toBe(5)
+    expect(resolveOptions({ autoResumeMax: 2.9 }).autoResumeMax).toBe(2)
+    expect(resolveOptions({ autoResumeMax: 0 }).autoResumeMax).toBe(1)
+    expect(resolveOptions({ autoResumeMax: 1000 }).autoResumeMax).toBe(64)
+  })
+
+  test("an invalid value falls back to 1", () => {
+    for (const bad of [-4, "1", Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(resolveOptions({ autoResumeMax: bad as unknown }).autoResumeMax).toBe(1)
+    }
+  })
+})

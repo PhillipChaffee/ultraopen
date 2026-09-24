@@ -6,8 +6,9 @@ import { STATUS_TOOL, WORKFLOW_TOOL } from "../src/server/bridge/permission.js"
 import { executeStatus } from "../src/server/tool/status.js"
 import { mode } from "../src/server/ultracode/mode.js"
 import type { MutableConfig } from "../src/server/ultracode/config.js"
-import { ensureRunDir, artifactPaths, readJournal, readManifest, writeScript } from "../src/server/resume/store.js"
-import { mkdtemp, rm } from "node:fs/promises"
+import { ensureRunDir, artifactPaths, readJournal, readManifest, writeManifest, writeScript } from "../src/server/resume/store.js"
+import { argsHash } from "../src/server/resume/key.js"
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -539,6 +540,81 @@ describe("startup orphan sweep", () => {
     await new Promise((resolve) => {
       setTimeout(resolve, 5)
     })
+  })
+
+  test("a run interrupted by a dead process auto-resumes on init and hydrates its session", async () => {
+    // The acceptance shape of the durability default: relaunch, and the interrupted run continues
+    // from its journal on its own — no model turn, no permission ask, result delivered to the
+    // ORIGINAL session. The engine is real; the client is the suite's stub.
+    const runId = "wf_bootres1",
+     sessionID = "ses_orig",
+     manifest = {
+      runId,
+      bootId: "old-boot",
+      pid: 2 ** 31 - 2,
+      sessionID,
+      sourceHash: "s",
+      argsHash: argsHash({ a: 1 }),
+      args: { a: 1 },
+      status: "running" as const,
+      childSessionIDs: [],
+      startedAt: Date.now() - 60_000,
+     },
+     source = `${META}return 'ok'\n`
+    await ensureRunDir(runId)
+    await writeManifest(runId, manifest)
+    await writeScript(runId, source)
+    await writeFile(join(artifactPaths(runId).dir, "interrupted.txt"), runId, "utf8")
+
+    ultraopen({ client: stubClient })
+    await waitFor(async () => {
+      const booted = await readManifest(runId)
+      return booted?.status !== "orphaned"
+    }, "the sweep to adopt the run")
+    await waitFor(async () => {
+      const booted = await readManifest(runId)
+      return booted?.status === "completed" || booted?.status === "failed"
+    }, "the resumed run to settle")
+
+    const settled = await readManifest(runId)
+    expect(settled?.status).toBe("completed")
+    // Hydrated the original session, with the resume story attached to the result.
+    const delivery = hydrationCalls.find((call) => call.text.includes(`run="${runId}"`))
+    expect(delivery?.sessionID).toBe(sessionID)
+    expect(delivery?.text).toContain("<workflow-completed")
+    expect(delivery?.text).toContain(`${runId} was interrupted when opencode exited; it has been resumed`)
+    // The hint marker is consumed by adoption.
+    const marker = readFile(join(artifactPaths(runId).dir, "interrupted.txt"))
+    await expect(marker).rejects.toThrow()
+  })
+
+  test("autoResume: false keeps interrupted runs orphaned at init", async () => {
+    const runId = "wf_bootoff1",
+     manifest = {
+      runId,
+      bootId: "old-boot",
+      pid: 2 ** 31 - 2,
+      sessionID: "ses_orig",
+      sourceHash: "s",
+      argsHash: argsHash(undefined),
+      status: "running" as const,
+      childSessionIDs: [],
+      startedAt: Date.now() - 60_000,
+     },
+     source = `${META}return 'ok'\n`
+    await ensureRunDir(runId)
+    await writeManifest(runId, manifest)
+    await writeScript(runId, source)
+    await writeFile(join(artifactPaths(runId).dir, "interrupted.txt"), runId, "utf8")
+
+    ultraopen({ client: stubClient }, { autoResume: false })
+    await new Promise((resolve) => {
+      setTimeout(resolve, 20)
+    })
+
+    const orphaned = await readManifest(runId)
+    expect(orphaned?.status).toBe("orphaned")
+    expect(hydrationCalls.find((call) => call.text.includes(`run="${runId}"`))).toBeUndefined()
   })
 })
 
@@ -1507,7 +1583,7 @@ describe("saved workflows (context.named)", () => {
   })
 
   test("a saved workflow in the config directory runs by name", async () => {
-    const { mkdtemp: mkTemp, mkdir, rm: fsRm, writeFile } = await import("node:fs/promises"),
+    const { mkdtemp: mkTemp, mkdir, rm: fsRm, writeFile: writeFileSaved } = await import("node:fs/promises"),
       { tmpdir: osTmpdir } = await import("node:os"),
       { join: cfgJoin } = await import("node:path")
     configHome = await mkTemp(cfgJoin(osTmpdir(), "ultraopen-saved-"))
@@ -1516,7 +1592,7 @@ describe("saved workflows (context.named)", () => {
     try {
       const dir = cfgJoin(configHome, "ultraopen", "workflows")
       await mkdir(dir, { recursive: true })
-      await writeFile(
+      await writeFileSaved(
         cfgJoin(dir, "deploy-check.js"),
         "export const meta = { name: 'deploy-check', description: 'Deploy gate' }\nreturn 'saved-value'\n",
       )
@@ -1535,7 +1611,7 @@ describe("saved workflows (context.named)", () => {
   })
 
   test("a broken saved file is skipped with a note and never breaks the call", async () => {
-    const { mkdtemp: mkTemp, mkdir, rm: fsRm, writeFile } = await import("node:fs/promises"),
+    const { mkdtemp: mkTemp, mkdir, rm: fsRm, writeFile: writeFileSaved } = await import("node:fs/promises"),
       { tmpdir: osTmpdir } = await import("node:os"),
       { join: cfgJoin } = await import("node:path")
     configHome = await mkTemp(cfgJoin(osTmpdir(), "ultraopen-saved-"))
@@ -1544,7 +1620,7 @@ describe("saved workflows (context.named)", () => {
     try {
       const dir = cfgJoin(configHome, "ultraopen", "workflows")
       await mkdir(dir, { recursive: true })
-      await writeFile(cfgJoin(dir, "broken.js"), "const x: string[] = []\n")
+      await writeFileSaved(cfgJoin(dir, "broken.js"), "const x: string[] = []\n")
       const tool = toolOf(ultraopen({ client: stubClient }))
       if (!tool) {throw new Error("tool was not registered")}
       const output = await tool.execute({ script: `${META}return 1\n`, dryRun: true }, { sessionID: "parent" })
@@ -1559,7 +1635,7 @@ describe("saved workflows (context.named)", () => {
   })
 
   test("one /workflow-<name> command per saved workflow, template keeping $ARGUMENTS", async () => {
-    const { mkdtemp: mkTemp, mkdir, rm: fsRm, writeFile } = await import("node:fs/promises"),
+    const { mkdtemp: mkTemp, mkdir, rm: fsRm, writeFile: writeFileSaved } = await import("node:fs/promises"),
       { tmpdir: osTmpdir } = await import("node:os"),
       { join: cfgJoin } = await import("node:path")
     configHome = await mkTemp(cfgJoin(osTmpdir(), "ultraopen-cmds-"))
@@ -1568,7 +1644,7 @@ describe("saved workflows (context.named)", () => {
     try {
       const dir = cfgJoin(configHome, "ultraopen", "workflows")
       await mkdir(dir, { recursive: true })
-      await writeFile(
+      await writeFileSaved(
         cfgJoin(dir, "deploy-check.js"),
         "export const meta = { name: 'deploy-check', description: 'Deploy gate' }\nreturn 1\n",
       )
