@@ -21,6 +21,9 @@ const DEFAULT_CONCURRENCY = 8,
   budgetTokens: null as number | null,
   largeWorkflowAgents: LARGE_WORKFLOW_AGENTS,
   sizeGuideline: undefined as string | undefined,
+  autoResume: true,
+  autoResumeTtlHours: 24,
+  autoResumeMax: 1,
 }
 
 describe("resolveOptions — non-object input", () => {
