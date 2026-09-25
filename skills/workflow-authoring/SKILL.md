@@ -98,6 +98,43 @@ cached empty is distinguishable from a fresh one.
 Pass `resumeFromRunId` to replay a previous run. Unchanged calls return instantly; the first edited
 call and everything after it in the same scope runs live.
 
+## Background runs
+
+By default the `workflow` tool launches detached: the call returns a `<workflow-launched>` handle
+naming the run id and run directory at once, and the script keeps executing after the turn. Pass
+`background: false` to wait for the final result instead — `dryRun` always waits, whichever way
+the default is set. The plugin's `runMode` option or the env `ULTRAOPEN_WORKFLOW_SYNC=1` flips the
+default for the whole host.
+
+- **The handle carries no outcome.** When the run settles, a `<workflow-completed>` or
+  `<workflow-failed>` notification arrives in the conversation — the body is capped (4096
+  characters, cut at a line boundary) with a pointer line to the full `result.json` or
+  `failure.txt` in the run directory. Until it arrives you know nothing about the run's results.
+- **Don't poll, don't duplicate.** Never sleep, poll for progress, or work the same files and
+  topics the run is on. Poll `workflow_status(runId, { wait })` only when the user asks about the
+  run or the current task cannot finish without its value — one long `wait` beats many short
+  polls, and never re-launch because a status said "running".
+- **One-shot hosts must hold the turn.** In `opencode run` the process exits after the turn, so
+  keep polling `workflow_status` until the run settles before ending the turn. The launch result
+  states which contract applies — follow it.
+- **Stop.** `workflow({ stop: "<runId>" })` aborts the run's subagents, records the run
+  `cancelled`, and hydrates a `<workflow-stopped>` confirmation — no completion notification
+  follows a stop. Interrupting the turn (ESC) never stops a background run. `workflow_status`
+  reports `cancelled` as terminal.
+- **Parallel runs.** A session outside ultracode holds one live run — a second launch is refused
+  naming the active run id. An ultracode-active session may hold `ultracodeMaxRuns` (default 8,
+  clamped 1–32); every launch result names its sibling live runs, oldest first. The stop argument
+  bypasses the gate, so a session can always stop what it has running.
+- **Per-turn reminder.** While the session holds a live run, each turn carries an ephemeral
+  reminder naming the run id, the workflow, the agents spawned and the elapsed time. It is never
+  persisted and refiring replaces it, so there is exactly one per turn.
+- **Crash recovery is automatic.** On the next start, a run its dead process interrupted
+  re-executes from the journal under the SAME run id: completed agents replay instantly, the
+  missing tail re-runs, and the original session is hydrated with the outcome. Guards: the
+  interruption must be younger than `autoResumeTtlHours` (default 24 h), at most `autoResumeMax`
+  (default 1) run adopts per boot, and a run stopped with the stop argument never resumes. Opt
+  out with `autoResume: false`; resume any older run manually with `resumeFromRunId`.
+
 ## Gotchas
 
 - `meta` is a pure literal — no variables, calls, spreads or template strings.

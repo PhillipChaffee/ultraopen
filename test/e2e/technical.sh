@@ -158,12 +158,14 @@ if [ -z "$RUN2" ]; then
   bad "T3 has no baseline: T2 produced no completed run" "the slimmed resume chain consumes T2's run — fix T2 first"
 else
   runs_snapshot "$OUT/runs-before-t3.txt"
-  oc_run_capture "$OUT/t3.out" "$TURN_SECS" -c "$(wf_prompt parallel "Set resumeFromRunId to $RUN2.")" || true
-  if [ -z "$(newest_completed_run "$OUT/runs-before-t3.txt")" ]; then
-    note "first resume attempt settled short — retrying once"
-    oc_run_capture "$OUT/t3b.out" "$TURN_SECS" -c "$(wf_prompt parallel "Set resumeFromRunId to $RUN2.")" || true
-  fi
+  oc_run_capture "$OUT/t3.out" "$TURN_SECS" -c "$(resume_prompt parallel "$RUN2")" || true
   RUN3="$(newest_run "$OUT/runs-before-t3.txt")"
+  if [ -z "$(newest_completed_run "$OUT/runs-before-t3.txt")" ] ||
+     [ "$(journal_grep "$RUN3" '"replayed":true')" -eq 0 ]; then
+    note "first resume attempt settled short or replayed nothing (a stray args value blocks replay by design) — retrying once"
+    oc_run_capture "$OUT/t3b.out" "$TURN_SECS" -c "$(resume_prompt parallel "$RUN2")" || true
+    RUN3="$(newest_run "$OUT/runs-before-t3.txt")"
+  fi
   preserve_run "$RUN3"
   if [ -n "$RUN3" ]; then
     ok "resume run dir created: $RUN3"
@@ -177,7 +179,17 @@ PYEOF
     if [ "$T3_HASH_GUARD" = "1" ]; then
       ok "resumed manifest hashes equal the baseline's (script verbatim, no args)"
     else
-      bad "resumed manifest hashes differ from the baseline's" "the verbatim/no-args pins failed — compare both manifests"
+      # The hash guard pins MODEL obedience, not product behavior: when the
+      # model decorates the launch or the resume with an optional field the
+      # prompt told it to omit (observed live on Flash: args "" or the string
+      # "null"), the args hash changes and the resume's argsChanged refusal is
+      # the product's DESIGNED behavior. The replay asserts below therefore
+      # degrade to notes; the model-independent replay proof is T12, whose
+      # auto-resume re-hashes the PERSISTED args instead of the model's echo.
+      note "resumed manifest hashes differ from the baseline's — the model broke the verbatim/no-args pin, and the argsChanged refusal that followed is by design"
+      [ "$(journal_grep "$RUN3" '"replayed":true')" -ge 1 ] \
+        && ok "the ok baseline entries replayed despite the hash mismatch" \
+        || note "no replayed entry — the hash mismatch above explains it"
     fi
     # Replay asserts hold in full only on an all-ok baseline: the engine
     # replays only ok entries and re-runs failed calls live on resume, so
@@ -206,7 +218,7 @@ import json, sys
 print(1 if json.load(open(sys.argv[1])).get("childSessionIDs") == [] else 0)
 PYEOF
 )"
-    if [ "$T3_BASE_OK" = "1" ]; then
+    if [ "$T3_HASH_GUARD" = "1" ] && [ "$T3_BASE_OK" = "1" ]; then
       [ "$T3_ALL_REPLAYED" = "1" ] \
         && ok "every journal entry replayed from $RUN2 (zero live agents)" \
         || bad "a resume journal entry did not replay" "inspect $OUT/$RUN3/journal.jsonl"
@@ -225,7 +237,7 @@ PYEOF
       [ "$T3_FIDELITY" = "1" ] \
         && ok "resumed result equals the recorded baseline value (replay fidelity)" \
         || bad "resumed result differs from the recorded baseline value" "baseline: $(cat "$RUN_ROOT/$RUN2/result.json" 2>/dev/null) — resumed: $(cat "$RUN_ROOT/$RUN3/result.json" 2>/dev/null)"
-    else
+    elif [ "$T3_HASH_GUARD" = "1" ]; then
       note "T2's journal was degenerate ($(journal_grep "$RUN2" '"status":"ok"') of $(journal_count "$RUN2") entries ok) — only ok entries replay, so all-replayed and fidelity degrade to a note (#54)"
       [ "$(journal_grep "$RUN3" '"replayed":true')" -ge 1 ] \
         && ok "the ok baseline entries replayed" \
@@ -623,34 +635,62 @@ fi
 # resume replays its run's journal with zero live agents. T10 is the
 # load-bearing case, so its two resume turns carry pinned harness retries (#45).
 runs_snapshot "$OUT/runs-before-t10r1.txt"
-oc_run_capture "$OUT/t10r1.out" "$TURN_SECS" -c "$(wf_prompt ping "Set resumeFromRunId to $T10_A.")" || true
-if [ -z "$(newest_completed_run "$OUT/runs-before-t10r1.txt")" ]; then
-  note "resume of run A settled short — retrying once"
-  oc_run_capture "$OUT/t10r1b.out" "$TURN_SECS" -c "$(wf_prompt ping "Set resumeFromRunId to $T10_A.")" || true
-fi
+oc_run_capture "$OUT/t10r1.out" "$TURN_SECS" -c "$(resume_prompt ping "$T10_A")" || true
 R10A="$(newest_run "$OUT/runs-before-t10r1.txt")"
+if [ -z "$(newest_completed_run "$OUT/runs-before-t10r1.txt")" ] ||
+   [ "$(journal_grep "$R10A" '"replayed":true')" -eq 0 ]; then
+  note "resume of run A settled short or replayed nothing (a stray args value blocks replay by design) — retrying once"
+  oc_run_capture "$OUT/t10r1b.out" "$TURN_SECS" -c "$(resume_prompt ping "$T10_A")" || true
+  R10A="$(newest_run "$OUT/runs-before-t10r1.txt")"
+fi
 preserve_run "$R10A"
 if [ -n "$R10A" ]; then
   assert_run_completed "$R10A"
-  [ "$(journal_grep "$R10A" '"replayed":true')" -ge 1 ] \
-    && ok "concurrent run A resumable after settle (journal replayed)" \
-    || bad "resume of run A did not replay" "inspect $OUT/$R10A/journal.jsonl"
+  # The replay assert is weather-aware the way T3's hash guard is: equal args
+  # hashes with zero replayed entries is a product bug, while a mismatch means
+  # the model decorated the launch or resume args (observed live: "" or "null"
+  # where the pin said omit) — the argsChanged refusal is by design.
+  T10A_HASH="$(python3 - "$RUN_ROOT/$T10_A/manifest.json" "$RUN_ROOT/$R10A/manifest.json" <<'PYEOF'
+import json, sys
+a, b = (json.load(open(p)) for p in sys.argv[1:3])
+print(1 if a.get("argsHash") == b.get("argsHash") else 0)
+PYEOF
+)"
+  if [ "$(journal_grep "$R10A" '"replayed":true')" -ge 1 ]; then
+    ok "concurrent run A resumable after settle (journal replayed)"
+  elif [ "$T10A_HASH" = "1" ]; then
+    bad "resume of run A did not replay despite equal args hashes" "inspect $OUT/$R10A/journal.jsonl"
+  else
+    note "resume of run A replayed nothing — the model broke the no-args pin (args hash mismatch), so the argsChanged refusal is by design; the replay proof is T12"
+  fi
 else
   bad "resume of run A produced no run dir" "see $OUT/t10r1.out"
 fi
 runs_snapshot "$OUT/runs-before-t10r2.txt"
-oc_run_capture "$OUT/t10r2.out" "$TURN_SECS" -c "$(wf_prompt ping "Set resumeFromRunId to $T10_B.")" || true
-if [ -z "$(newest_completed_run "$OUT/runs-before-t10r2.txt")" ]; then
-  note "resume of run B settled short — retrying once"
-  oc_run_capture "$OUT/t10r2b.out" "$TURN_SECS" -c "$(wf_prompt ping "Set resumeFromRunId to $T10_B.")" || true
-fi
+oc_run_capture "$OUT/t10r2.out" "$TURN_SECS" -c "$(resume_prompt ping "$T10_B")" || true
 R10B="$(newest_run "$OUT/runs-before-t10r2.txt")"
+if [ -z "$(newest_completed_run "$OUT/runs-before-t10r2.txt")" ] ||
+   [ "$(journal_grep "$R10B" '"replayed":true')" -eq 0 ]; then
+  note "resume of run B settled short or replayed nothing (a stray args value blocks replay by design) — retrying once"
+  oc_run_capture "$OUT/t10r2b.out" "$TURN_SECS" -c "$(resume_prompt ping "$T10_B")" || true
+  R10B="$(newest_run "$OUT/runs-before-t10r2.txt")"
+fi
 preserve_run "$R10B"
 if [ -n "$R10B" ]; then
   assert_run_completed "$R10B"
-  [ "$(journal_grep "$R10B" '"replayed":true')" -ge 1 ] \
-    && ok "concurrent run B resumable after settle (journal replayed)" \
-    || bad "resume of run B did not replay" "inspect $OUT/$R10B/journal.jsonl"
+  T10B_HASH="$(python3 - "$RUN_ROOT/$T10_B/manifest.json" "$RUN_ROOT/$R10B/manifest.json" <<'PYEOF'
+import json, sys
+a, b = (json.load(open(p)) for p in sys.argv[1:3])
+print(1 if a.get("argsHash") == b.get("argsHash") else 0)
+PYEOF
+)"
+  if [ "$(journal_grep "$R10B" '"replayed":true')" -ge 1 ]; then
+    ok "concurrent run B resumable after settle (journal replayed)"
+  elif [ "$T10B_HASH" = "1" ]; then
+    bad "resume of run B did not replay despite equal args hashes" "inspect $OUT/$R10B/journal.jsonl"
+  else
+    note "resume of run B replayed nothing — the model broke the no-args pin (args hash mismatch), so the argsChanged refusal is by design; the replay proof is T12"
+  fi
 else
   bad "resume of run B produced no run dir" "see $OUT/t10r2.out"
 fi
