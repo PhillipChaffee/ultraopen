@@ -50,8 +50,8 @@ return { confirmed: results.flat().filter(Boolean) }
 
 ## 🎬 What a run looks like
 
-Real captures from the live TUI (`bash test/e2e/visual.sh` — real opencode processes, real model
-calls), re-themed in presentation only.
+Real captures from the live TUI — the same machinery the e2e suites drive: real opencode
+processes, real model calls — re-themed in presentation only.
 
 **1. You hand the model the script; the engine fans out instantly.** The tool call returns at
 once with a `<workflow-launched>` handle — the run is executing in the background — and four
@@ -61,9 +61,10 @@ agent, the sidebar fills in, and `ultracode ⠋ 0/4` appears beside the input.
 
 ![Invoking a workflow](assets/screenshots/01-invoking.png)
 
-**2. The fan-out keeps working.** Two minutes later the same run is still going — four real
-review agents (real model calls, real file reads) with progress and elapsed time updating every
-second. You keep chatting; the run outlives the turn that launched it.
+**2. The run keeps working.** Two minutes in, the four reviewers have reported (green rows, token
+counts) and a second wave is verifying their findings by execution — real model calls, real file
+reads, progress and elapsed time updating every second. You keep chatting; the run outlives the
+turn that launched it.
 
 ![The fan-out mid-run](assets/screenshots/02-grinding.png)
 
