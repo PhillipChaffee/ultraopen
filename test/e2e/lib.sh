@@ -529,9 +529,23 @@ wf_prompt() { # wf_prompt FIXTURE [EXTRA]
   # The async contract: the tool returns the run id at once, so the model must
   # poll workflow_status with wait until the run settles BEFORE ending the turn
   # — a one-shot `opencode run` exits (process.exit) after the turn, taking an
-  # unsettled run with it.
-  printf 'Call the workflow tool now. Pass no scriptPath and no args. %s Use this script exactly, unchanged:\n\n%s\n\nThe tool returns a launch result with a run id, not the outcome. Then call workflow_status with that run id and wait=120 (repeat the call if it says running). When the status is completed or failed, reply with what workflow_status reported — the value or the failure. Never end your turn while the run is unsettled.' \
+  # unsettled run with it. The args/scriptPath omission is pinned hard (not
+  # just "no args"): Flash has been observed decorating the call with
+  # zero-values ("" or the string "null"), and an args value changes the
+  # manifest's argsHash — the resume-replay asserts below depend on the pin
+  # holding on both the launch and the resume.
+  printf 'Call the workflow tool now. Pass no scriptPath and no args — omit both fields entirely; do not pass empty strings or the string "null". %s Use this script exactly, unchanged:\n\n%s\n\nThe tool returns a launch result with a run id, not the outcome. Then call workflow_status with that run id and wait=120 (repeat the call if it says running). When the status is completed or failed, reply with what workflow_status reported — the value or the failure. Never end your turn while the run is unsettled.' \
     "${2:-}" "$(cat "$E2E_DIR/fixtures/$1.js")"
+}
+
+# The resume variant of wf_prompt, with the args pin. A resume replays only
+# while the resume call's args still hash to the source run's argsHash; the
+# model decorating the call with the string "null" (observed live, T10) or any
+# other placeholder changes that hash, and the argsChanged guard then refuses
+# the replay BY DESIGN. The pin names the omission; the retry at each resume
+# site covers the weather class that ignores it.
+resume_prompt() { # resume_prompt FIXTURE RUNID
+  wf_prompt "$1" "Set resumeFromRunId to $2. Omit the args field entirely — do not pass \"null\", an empty string, or any placeholder: any args value on a resume changes the args hash and blocks the replay by design."
 }
 
 assert_pane_contains() { # desc text [timeout]
