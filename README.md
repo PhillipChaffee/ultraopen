@@ -53,16 +53,17 @@ return { confirmed: results.flat().filter(Boolean) }
 Real captures from the live TUI (`bash test/e2e/visual.sh` — real opencode processes, real model
 calls), re-themed in presentation only.
 
-**1. You hand the model the script; the engine fans out instantly.** Four review agents spawn
-in parallel — the transcript echoes the raw `workflow` call (an upstream renderer quirk, and
-exactly why the progress surfaces exist), the bottom strip gains one row per agent, the sidebar
-fills in, and `ultracode ⠋ 0/4` appears beside the input.
+**1. You hand the model the script; the engine fans out instantly.** The tool call returns at
+once with a `<workflow-launched>` handle — the run is executing in the background — and four
+review agents spawn in parallel: the transcript echoes the raw `workflow` call (an upstream
+renderer quirk, and exactly why the progress surfaces exist), the bottom strip gains one row per
+agent, the sidebar fills in, and `ultracode ⠋ 0/4` appears beside the input.
 
 ![Invoking a workflow](assets/screenshots/01-invoking.png)
 
 **2. The fan-out keeps working.** Two minutes later the same run is still going — four real
 review agents (real model calls, real file reads) with progress and elapsed time updating every
-second.
+second. You keep chatting; the run outlives the turn that launched it.
 
 ![The fan-out mid-run](assets/screenshots/02-grinding.png)
 
@@ -71,9 +72,10 @@ one row per agent, glyphs for state.
 
 ![The sidebar panel](assets/screenshots/03-sidebar.png)
 
-**4. The findings come back as a value.** When the run returns, the model reports what it
-confirmed — here, specific findings about a staged demo diff, from an uncaught fetch to the
-off-by-one loop planted in `src/pagination.ts`.
+**4. The findings arrive on their own.** When the run settles, a `<workflow-completed>`
+notification is delivered into the transcript — no polling asked for it — and the model reports
+what the run confirmed: here, specific findings about a staged demo diff, from an uncaught fetch
+to the off-by-one loop planted in `src/pagination.ts`.
 
 ![Findings in the transcript](assets/screenshots/04-results.png)
 
@@ -111,13 +113,27 @@ ultraopen only tries to be the right tool when the work already happens in openc
 
 ## ✨ What you get
 
-- **`workflow` tool** — runs a JavaScript script that fans out across parallel subagents. The tool
-  returns the run id at once and the run continues in the server process; poll `workflow_status`
-  for progress and the final value. Scripts pass inline or by path (`scriptPath`), and a previous
-  run replays with `resumeFromRunId`.
-- **`workflow_status` tool** — reads one run's live state from disk: status, phase, agent counts,
-  token total, last logs, and (once settled) the final value or the failure text. Read-only, and
-  it works across processes and after a crash, because the run directory is the source of truth.
+- **`workflow` tool** — runs a JavaScript script that fans out across parallel subagents.
+  Background by default: the tool returns the run id at once and the run continues detached,
+  while `workflow_status` reads its live state on demand. Pass `background: false` to wait for
+  the final result, or set the `runMode` option (or env `ULTRAOPEN_WORKFLOW_SYNC=1`) to flip the
+  default for the host. Scripts pass inline or by path (`scriptPath`), and a previous run replays
+  with `resumeFromRunId`.
+- **`workflow_status` tool** — reads one run's live state from disk: status (`running`,
+  `completed`, `failed`, `cancelled` — stopped by request — or `orphaned`), phase, agent counts,
+  token total, last logs, and (once settled) the final value or the failure text. Pass `wait` to
+  block one call up to 300 s instead of polling. Read-only, and it works across processes and
+  after a crash, because the run directory is the source of truth.
+- **Notifications, not polling** — a background run's outcome is delivered, not requested: a
+  `<workflow-completed>` or `<workflow-failed>` synthetic message lands in the conversation when
+  the run settles (capped at 4096 characters, with a pointer to the full artifact on disk), and
+  an idle nudge re-fires it once if the turn ended exactly as it landed. While a run is live,
+  every turn carries a one-line reminder naming the run. Poll only when you ask for progress.
+- **Stop and auto-resume** — `workflow({ stop: "<runId>" })` aborts a detached run's subagents
+  and records it `cancelled` (interrupting the turn never stops a background run, and the sidebar
+  shows the stop hint). A run its process interrupted auto-resumes on the next start: completed
+  agents replay from the journal, the missing tail re-runs, and the original session is hydrated
+  with the outcome. Stopped runs never resume.
 - **Saved workflows** — a directory of named scripts runs by name: `workflow('deploy-check')` inside
   any script, one `/workflow-<name>` command per saved file, and `/workflow-resume <runId>` to
   replay a past run. Default directories: `<config>/ultraopen/workflows` and the project's
@@ -140,16 +156,19 @@ ultraopen only tries to be the right tool when the work already happens in openc
   deadline plus a wall-clock ceiling per agent, a global concurrency cap, an orphan reaper that
   releases subagents left by a killed server, retention pruning of finished run directories, and a
   large-run advisory: when a run crosses the scheduled-agent or projected-token thresholds, the
-  run log, the result, and the strip badge all say so — advice only, nothing stops.
-- **Run control (in progress)** — the control channel ships: a run's directory accepts
-  `control.jsonl` commands (`pause`, `resume`, `stop-run`, `stop-agent`, `restart-agent`),
-  the gate pauses new agents while in-flight work finishes, and `stop-agent` aborts exactly one
-  child. Agent rows show output-token spend. The TUI keys for selection/restart and the drill-down
-  detail view are the next slice.
+  run log, the result, and the strip badge all say so — advice only, nothing stops. Before the
+  ask, the launch path projects the fresh run's fan-out in memory and, at or above
+  `largeWorkflowAgents` (default 25), the prompt and the launch handle both say
+  "Large workflow: ~N agents projected" — advice, never a block.
+- **Run control (in progress)** — `workflow({ stop: "<runId>" })` is the stop surface (above); a
+  run's directory also accepts `control.jsonl` commands (`pause`, `resume`, `stop-run`,
+  `stop-agent`, `restart-agent`), the gate pauses new agents while in-flight work finishes, and
+  `stop-agent` aborts exactly one child. Agent rows show output-token spend. The TUI keys for
+  selection/restart and the drill-down detail view are the next slice.
 - **Approval prompt** — the prompt names the real workflow (not the ignored title), its
-  description and phases, and the run id. The script is persisted to the run directory **before**
-  the prompt appears, so you can open `<run dir>/script.js` and read exactly what will run before
-  approving. `always` is scoped per workflow name.
+  description and phases, the run id, and the projected agent count. The script is persisted to
+  the run directory **before** the prompt appears, so you can open `<run dir>/script.js` and read
+  exactly what will run before approving. `always` is scoped per workflow name.
 
 ### The launch contract
 
@@ -174,9 +193,36 @@ cap is refused naming every live run id — finishing any run frees a slot. Sayi
 demotes ultracode at the prompt level only: it changes the standing guidance, never the gate, so
 an explicitly requested workflow still launches normally. `dryRun` is exempt from the gate in both
 modes — it is free and spawns nothing. Resuming a run that is still executing is refused in both
-modes for the same reason — two engines would write one journal. Until the run-control epic lands
-there is no stop tool: to stop a run, end the opencode process; finished agents are preserved for
-resume.
+modes for the same reason — two engines would write one journal.
+
+**Stopping a run.** Interrupting the turn (ESC) never stops a background run — the launch result
+says so, and the sidebar carries the same hint: to stop a detached run, call
+`workflow({ stop: "<runId>" })`. Its subagents abort, the run is recorded `cancelled`
+(`workflow_status` reports it terminal), a `<workflow-stopped>` confirmation hydrates into the
+run's session, and no completion notification follows — a run you stopped must never appear to
+have finished on its own. Completed agents stay on disk for a later `resumeFromRunId`. A run in
+the blocking contract stops by aborting its turn; a run owned by another opencode process must be
+stopped from that session, and a stop call that cannot act (unknown or finished id, cross-process
+owner) returns a clear refusal instead.
+
+**The notification.** When a detached run settles, the outcome is delivered to the run's session:
+a `<workflow-completed>` or `<workflow-failed>` synthetic message wrapping the same render the
+blocking result carries, capped at 4096 characters (cut at a line boundary) with a pointer line to
+the full `result.json` or `failure.txt`. If the turn ended exactly as the notification landed, one
+idle nudge re-fires it — once per run, ever. While the run is live, each turn also carries an
+ephemeral one-line reminder naming the run id, the workflow, and its elapsed time (never persisted,
+never duplicated); this is what keeps the model from duplicating work already in flight. One
+visibility caveat: the TUI hides synthetic user messages from the timeline (upstream 1.18.x), so
+the notification never shows as its own row — the turn it starts is what you see.
+
+**Auto-resume.** A detached run survives process death up to its journal: on the next start, runs
+the dead process interrupted re-execute automatically under the same run id — completed agents
+replay from the journal, the missing tail re-runs, and the original session is hydrated with the
+outcome. Guards keep it safe and bounded: the interruption must be younger than
+`autoResumeTtlHours` (default 24 h), at most `autoResumeMax` (default 1) run adopts per boot
+(oldest first), a run stopped by request never resumes, and the stored args must still hash to
+the run's manifest. `autoResume: false` restores manual-resume-only; runs outside the window stay
+resumable by hand with `resumeFromRunId`.
 
 | Global | Behavior |
 | --- | --- |
@@ -250,8 +296,20 @@ above.
   - `sizeGuideline` — size advice appended to the tool description (the same channel as Claude
      Code's size guideline): write what a right-sized run looks like for this project, e.g.
      "keep runs under 10 agents; prefer pipeline stages over wide parallel() bursts".
-  - `effortPreference` — the effort ladder tried in order. Default
-     `["xhigh", "max", "high", "medium", "low"]`.
+- `effortPreference` — the effort ladder tried in order. Default
+      `["xhigh", "max", "high", "medium", "low"]`.
+   - `runMode` — the launch contract: `"background"` (default) returns the run id at once and
+      delivers the outcome as a notification; `"blocking"` waits for the final result. The env
+      `ULTRAOPEN_WORKFLOW_SYNC=1` forces blocking over whatever this says.
+   - `largeWorkflowAgents` — the projected-agent count at which a launch is flagged "Large
+      workflow: ~N agents projected" in the approval prompt and the launch handle. Default 25.
+      Advisory only — it never blocks.
+   - `autoResume` — re-execute interrupted background runs on the next start (default on). A run
+      stopped by request never resumes; `false` restores manual-resume-only.
+   - `autoResumeTtlHours` — how long an interrupted run stays worth auto-resuming. Default 24 h;
+      older runs stay resumable by hand with `resumeFromRunId` until retention prunes them.
+   - `autoResumeMax` — how many interrupted runs may auto-resume at one boot, oldest first.
+      Default 1, minimum 1.
 
 <a id="authoring"></a>
 
@@ -274,11 +332,12 @@ recorded value.
 
 ## 🧭 Compatibility and known limits
 
-Verified against opencode 1.18.31 by the live e2e suites (`test/e2e`).
+Verified against opencode 1.18.31 and 1.18.32 by the live e2e suites (`test/e2e`).
 
 Working end to end:
 
-- the async launch contract (run id at once, `workflow_status` polling, background runs)
+- the background contract end to end (launch handle, per-turn live-run reminder, completion
+  notification in the parent session, `workflow({ stop })`, auto-resume after a process death)
 - parallel and pipeline fan-out
 - schema-forced structured output
 - per-model effort resolution
@@ -320,6 +379,12 @@ name, description and phases) on 1.18.31, and schema-forced agents fail against 
 `APIError` when ANY tool in the session carries a `$ref` in its JSON Schema. The task-row, dialog
 and `$ref` gaps need upstream fixes; the transcript-echo collapse (this epic's original upstream
 PR target) is researched and ready to submit separately.
+
+One more upstream quirk concerns the background notifications specifically: the TUI hides
+synthetic user messages from the visible timeline (`!part.synthetic` filter, 1.18.x), so a
+`<workflow-completed>` notification never renders as its own row — what you see is the turn it
+starts (the model replying to the result), and what you get is the outcome. The e2e suites assert
+the notification at the session-database level for exactly this reason.
 
 <a id="development"></a>
 
