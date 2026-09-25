@@ -422,6 +422,32 @@ PYEOF
     grep -q "cancelled" "$OUT/t6b.out" \
       && ok "workflow_status reported the run cancelled to the model" \
       || bad "the model's reply never reported cancelled" "see $OUT/t6b.out"
+    # Children are gone (ticket #14, scenario 3): the stop aborts every in-flight
+    # child and its unwind fails queued children before they start. A child that
+    # was mid-flight when the abort landed journals a "reason":"aborted" entry —
+    # the stop reason that also makes the sweep refuse this run (#84). A stop that
+    # lands in the pre-start check journals nothing for the queued child, so that
+    # half is weather; the quiet-journal proof below is the load-bearing pin.
+    if [ "$(journal_grep "$RUN6B" '"reason":"aborted"')" -ge 1 ]; then
+      ok "the journal records the stop's aborted children (reason aborted)"
+    else
+      note "no aborted-child entry — the stop landed before an agent could start, and a pre-start abort never journals; the quiet-journal proof still decides"
+    fi
+    # No zombie child keeps working after the unwind: the journal must go quiet.
+    # Samples are spaced 5s apart because the unwind's own abort entries land
+    # asynchronously after the stop result returns.
+    T6B_QUIET=0
+    for _ in 1 2 3 4 5 6; do
+      T6B_Q1="$(journal_count "$RUN6B")"
+      sleep 5
+      T6B_Q2="$(journal_count "$RUN6B")"
+      if [ "$T6B_Q1" = "$T6B_Q2" ]; then T6B_QUIET=1; break; fi
+    done
+    if [ "$T6B_QUIET" = "1" ]; then
+      ok "the journal went quiet after the stop — no child kept working"
+    else
+      bad "the journal kept growing after cancellation ($T6B_Q1 → $T6B_Q2 entries)" "a child survived the stop — inspect $RUN_ROOT/$RUN6B/journal.jsonl"
+    fi
   fi
 else
   bad "the stop probe produced no run dir" "see $OUT/t6b.out"
@@ -556,6 +582,26 @@ if [ "$(manifest_status "$T10_A")" = "completed" ] && [ "$(manifest_status "$T10
   ok "both runs settled completed independently"
 else
   bad "both runs must settle completed" "A: $(manifest_status "$T10_A"), B: $(manifest_status "$T10_B")"
+fi
+# Both notifications arrive (ticket #14, scenario 2): hydration is unconditional on
+# settle, so a parallel pair must leave TWO synthetic workflow-completed parts in
+# the parent session — one naming each run id. Same db-level proof as T6 (the
+# literal pixel is upstream-hidden in the TUI on 1.18.x).
+t10_notifications() {
+  python3 - "$XDG_DATA_HOME/opencode/opencode.db" "$T10_A" "$T10_B" <<'PYEOF'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+missing = [run_id for run_id in sys.argv[2:4] if not db.execute(
+    "SELECT 1 FROM part WHERE data LIKE ? AND data LIKE ? LIMIT 1",
+    ('%"synthetic":true%', f'%workflow-completed run=%{run_id}%'),
+).fetchone()]
+sys.exit(1 if missing else 0)
+PYEOF
+}
+if t10_notifications; then
+  ok "both parallel runs delivered their completion notifications to the parent session"
+else
+  bad "a parallel run's completion notification is missing from the parent transcript" "db: $XDG_DATA_HOME/opencode/opencode.db — runs: $T10_A, $T10_B"
 fi
 # workflow_status reports each run by its own id: the stream must contain a poll
 # naming run A and one naming run B.
