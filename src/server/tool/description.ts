@@ -23,7 +23,8 @@ avoid working with the same files or topics it is using. This host may exit afte
 hold the turn while the run works by polling \`workflow_status\` with the run id (pass \`wait\` so
 one call blocks until the run settles or the wait expires) — do not re-launch the same workflow
 because a poll said "running". Aborting this call does not stop the run; to stop it, call
-\`workflow({stop: "<runId>"})\`.`
+\`workflow({stop: "<runId>"})\`. Pass \`args\` as real JSON or omit it for no arguments — the
+strings "", "null" and "undefined" are refused as zero-value decorations.`
 
 export const description = `Execute a workflow script that orchestrates multiple subagents deterministically.
 
@@ -140,7 +141,8 @@ export const blockingDescription = description
   .replace(
     pinnedContract,
     `This call BLOCKS until the run completes, then returns one consolidated result. A 15-agent run
-can take many minutes. Aborting this call stops the run.`,
+can take many minutes. Aborting this call stops the run. Pass \`args\` as real JSON or omit it for
+no arguments — the strings "", "null" and "undefined" are refused as zero-value decorations.`,
   )
 
 /**
@@ -165,7 +167,9 @@ Work on non-overlapping tasks, or briefly tell the user what you launched and en
 Poll \`workflow_status\` with the run id only when the user asks about the run or when the current
 task cannot finish without its value (pass \`wait\` so one call blocks until the run settles or the
 wait expires) — do not re-launch the same workflow because a status said "running". Aborting this
-call does not stop the run; to stop it, call \`workflow({stop: "<runId>"})\`.`,
+call does not stop the run; to stop it, call \`workflow({stop: "<runId>"})\`. Pass \`args\` as real
+JSON or omit it for no arguments — the strings "", "null" and "undefined" are refused as
+zero-value decorations.`,
   )
 
 /**

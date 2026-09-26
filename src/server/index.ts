@@ -33,6 +33,7 @@ import {
   renderRefusal,
   renderCapRefusal,
   renderResumeRefusal,
+  renderArgsRefusal,
   renderStatus,
   workflowArgsSchema,
   statusArgsSchema,
@@ -276,6 +277,18 @@ async function launchWorkflow(
   // The stop path short-circuits BEFORE the launch gate: a session with a live run must be able to stop it.
   // An EMPTY stop value is a launch default, not a stop request — models emit optional fields as "".
   if (args.stop !== undefined && args.stop !== "") {return await stopRun({ runId: args.stop, client, bootId })}
+
+  // Zero-value decoration weather (decided in #86): models emit the strings "", "null" or
+  // "undefined" for an absent optional `args` field. Refused loudly at the boundary, never
+  // normalized — the identity contract is that the script sees exactly what was passed, and a
+  // decorated resume hashes differently from its source baseline, so the argsChanged guard
+  // would refuse the replay and the string would run live as the script's `args`. Placement
+  // pins: after the stop dispatch (a stop call carrying decoration still stops), before the
+  // launch gate and the permission ask (a refused call registers no pending entry and burns
+  // no approval, #74's precedent). One guard covers launch, resume, and dryRun.
+  if (typeof args.args === "string" && (args.args === "" || args.args === "null" || args.args === "undefined")) {
+    return renderArgsRefusal(args.args)
+  }
 
   const background = args.dryRun !== true && (args.background ?? options.runMode === "background"),
    runId = `wf_${randomUUID().replaceAll("-", "").slice(0, 12)}`,
