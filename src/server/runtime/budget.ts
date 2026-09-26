@@ -32,6 +32,33 @@ export function makeBudget(options: BudgetOptions): Budget {
 }
 
 /**
+ * One launch's family spend ledger.
+ *
+ * The launch's Run creates it and each nested child Run attaches to the same one, so a nested
+ * fan-out draws from ONE ceiling instead of a fresh one per child — the docstring and README both
+ * promise sharing, and this is what makes the code keep the promise. Members are attached runs
+ * and the total is recomputed from their live records, so there is no second number that can
+ * drift from what the records already say; `progress.json`'s event-fed `budget.spent` agrees
+ * with it by construction.
+ */
+export interface FamilySpend {
+  /** Attaches a run whose records feed the family total. */
+  attach: (run: { readonly outputTokens: number }) => void
+  /** Output tokens across every attached run — the number `budget.spent()` reads. */
+  spent: () => number
+}
+
+export function makeFamilySpend(): FamilySpend {
+  const members: { readonly outputTokens: number }[] = []
+  return {
+    attach: (run): void => {
+      members.push(run)
+    },
+    spent: () => members.reduce((total, member) => total + member.outputTokens, 0),
+  }
+}
+
+/**
  * Enforces the ceiling before a call is made.
  *
  * Checked at `agent()` entry rather than after: spending past the target and then reporting it

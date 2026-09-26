@@ -515,12 +515,92 @@ describe("Run.agent — budget", () => {
     // The budget is a HARD ceiling, not advisory: `agent()` checks it at entry so a guarded loop
     // terminates rather than running to the agent cap. This drives the real agent() path.
     const { client } = makeClient(),
-     run = makeRun(client, { budgetTotal: 100 })
+      run = makeRun(client, { budgetTotal: 100 })
     await run.agent("burn tokens", { label: "spend" })
     // Force the spend past the ceiling (outputTokensOf reads only completed records).
     run.records[0]!.outputTokens = 500
 
     await expect(run.agent("one more")).rejects.toThrow(/100 output-token budget/u)
+  })
+
+  test("a nested child charges the parent's ledger, and the parent's remaining() moves", async () => {
+    // The family ceiling is what the option docstring and README promise: the child draws the
+    // parent's ceiling instead of a fresh one, so the parent script's budget decrements as
+    // children spend.
+    const { client } = makeClient({
+      prompt: () => Promise.resolve({ data: { info: baseInfo({ outputTokens: 60 }), parts: [textPart("hi")] } }),
+    })
+    const parent = makeRun(client, { budgetTotal: 1000 }),
+      child = makeRun(client, { budgetTotal: 1000, familySpend: parent.familySpend })
+
+    await child.agent("child work")
+    expect(child.budget.spent()).toBe(60)
+    expect(parent.budget.spent()).toBe(60)
+    expect(parent.budget.remaining()).toBe(940)
+
+    await parent.agent("parent work")
+    expect(parent.budget.spent()).toBe(120)
+    // Both readers see the same ledger, so neither can read a private total.
+    expect(child.budget.spent()).toBe(120)
+  })
+
+  test("the family ceiling binds each child to the whole family's spend, not its own", async () => {
+    // The (k+1) × total overflow a per-child fresh ceiling allowed is now impossible: the child
+    // has spent nothing of its own, but the parent's spend still blocks its next call.
+    const { client } = makeClient({
+      prompt: () => Promise.resolve({ data: { info: baseInfo({ outputTokens: 600 }), parts: [textPart("hi")] } }),
+    })
+    const parent = makeRun(client, { budgetTotal: 600 }),
+      child = makeRun(client, { budgetTotal: 600, familySpend: parent.familySpend })
+
+    await parent.agent("parent burns")
+    await expect(child.agent("child work")).rejects.toThrow(/600 output-token budget/u)
+    await expect(parent.agent("parent again")).rejects.toThrow(/600 output-token budget/u)
+  })
+
+  test("a top-level run owns its family, so sibling runs never see each other's spend", async () => {
+    // Concurrent launches each keep their own family ceiling — decided in #32.
+    const { client } = makeClient({
+      prompt: () => Promise.resolve({ data: { info: baseInfo({ outputTokens: 60 }), parts: [textPart("hi")] } }),
+    })
+    const a = makeRun(client, { budgetTotal: 1000 }),
+      b = makeRun(client, { budgetTotal: 1000 })
+
+    await a.agent("a work")
+    expect(a.budget.spent()).toBe(60)
+    expect(b.budget.spent()).toBe(0)
+  })
+
+  test("replayed entries count as paid, so a resumed family's ceiling accounts for them", async () => {
+    // Replayed spend is pushed into the records exactly like live spend, so the family ledger —
+    // read from records — counts it against the ceiling without a separate replay rule.
+    const { client } = makeClient({
+      prompt: () => Promise.resolve({ data: { info: baseInfo({ outputTokens: 600 }), parts: [textPart("hi")] } }),
+    })
+    // First run: the parent and its nested child each spend once against the shared ledger.
+    const firstParent = makeRun(client, { budgetTotal: 1000 }),
+      firstChild = makeRun(client, { budgetTotal: 1000, familySpend: firstParent.familySpend })
+    await firstParent.agent("parent work")
+    await firstChild.agent("child work")
+    expect(firstParent.budget.spent()).toBe(1200)
+
+    // Resume: fresh runs replay both entries — and the family still counts their spend.
+    const previous = [...firstParent.journal.entries, ...firstChild.journal.entries],
+      replayClient = makeClient().client,
+      parent = makeRun(replayClient, { budgetTotal: 1000, previousEntries: previous, resumedFrom: "wf_prev0000" }),
+      child = makeRun(replayClient, {
+        budgetTotal: 1000,
+        previousEntries: previous,
+        resumedFrom: "wf_prev0000",
+        familySpend: parent.familySpend,
+      })
+    await parent.agent("parent work")
+    await child.agent("child work")
+    expect(parent.records[0]?.replayed).toBe(true)
+    expect(child.records[0]?.replayed).toBe(true)
+    expect(parent.budget.spent()).toBe(1200)
+    // The ceiling still binds on the replayed total: the next call draws nothing first.
+    await expect(parent.agent("one more")).rejects.toThrow(/1000 output-token budget/u)
   })
 })
 
