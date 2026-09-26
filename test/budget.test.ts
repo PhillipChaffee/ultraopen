@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { assertWithinBudget, makeBudget } from "../src/server/runtime/budget.js"
+import { assertWithinBudget, makeBudget, makeFamilySpend } from "../src/server/runtime/budget.js"
 import { WorkflowScriptError } from "../src/server/script/errors.js"
 
 describe("makeBudget", () => {
@@ -48,5 +48,21 @@ describe("assertWithinBudget", () => {
 
   test("never throws when no target was set", () => {
     expect(() => assertWithinBudget(makeBudget({ total: null, spent: () => 1e9 }))).not.toThrow()
+  })
+})
+
+describe("makeFamilySpend", () => {
+  test("reads the live sum across attached runs, so it cannot drift from the records", () => {
+    const family = makeFamilySpend()
+    expect(family.spent()).toBe(0)
+    const parent = { outputTokens: 100 },
+      child = { outputTokens: 250 }
+    family.attach(parent)
+    family.attach(child)
+    expect(family.spent()).toBe(350)
+    // The ledger recomputes from the members' live records — there is no second number to
+    // update, so an in-place record change is reflected rather than lost.
+    parent.outputTokens = 40
+    expect(family.spent()).toBe(290)
   })
 })

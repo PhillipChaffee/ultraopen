@@ -10,8 +10,8 @@ import { toJournalEntry, toReplayedEntry, tryReplay } from "../resume/replay.js"
 import { stableStringify } from "../resume/key.js"
 import { breakScope, nextCallIdentity, rootScope, withScope } from "../resume/scope.js"
 import type { Scope } from "../resume/scope.js"
-import { assertWithinBudget, makeBudget } from "./budget.js"
-import type { Budget } from "./budget.js"
+import { assertWithinBudget, makeBudget, makeFamilySpend } from "./budget.js"
+import type { Budget, FamilySpend } from "./budget.js"
 import { createWorktree } from "../bridge/isolation.js"
 import type { Ruleset } from "../bridge/permission.js"
 import type { OpencodeClient } from "../types.js"
@@ -83,6 +83,11 @@ export interface RunOptions {
   resumeSeed?: string | undefined
   /** Output-token ceiling for the run, or null for none. */
   budgetTotal?: number | null | undefined
+  /**
+   * The family spend ledger this run reports into. A nested child receives its parent's, so the
+   * whole family charges one ceiling; a top-level run omits it and owns the family itself.
+   */
+  familySpend?: FamilySpend | undefined
   /** Repository root, enabling `isolation: "worktree"`. */
   worktreeRoot?: string | undefined
 }
@@ -109,6 +114,8 @@ export class Run {
   readonly #rootScope: Scope
   readonly #resumedFrom: string | undefined
   readonly #budget: Budget
+  /** The family ledger every `budget.spent()` in this launch's family reads. */
+  readonly familySpend: FamilySpend
   readonly #worktrees: (() => Promise<void>)[] = []
 
   constructor(options: RunOptions) {
@@ -120,7 +127,13 @@ export class Run {
     // Seeded from the script source, so editing the script anywhere invalidates the root chain
     // and nothing replays against a program that no longer exists.
     this.#rootScope = rootScope(options.resumeSeed ?? "root")
-    this.#budget = makeBudget({ total: options.budgetTotal ?? null, spent: () => this.outputTokens })
+    // One family ledger per launch: the run owns it, and a nested child receives the parent's,
+    // so parent and children draw from one ceiling and the parent's remaining() moves as
+    // children spend. The total is read from the attached runs' records, never accumulated
+    // separately, so it cannot drift from what the records already say.
+    this.familySpend = options.familySpend ?? makeFamilySpend()
+    this.familySpend.attach(this)
+    this.#budget = makeBudget({ total: options.budgetTotal ?? null, spent: () => this.familySpend.spent() })
     if (options.previousEntries) {this.#journal.loadPrevious(options.previousEntries)}
   }
 

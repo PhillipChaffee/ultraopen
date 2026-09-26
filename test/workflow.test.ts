@@ -5,6 +5,7 @@ import { parse } from "../src/server/script/parse.js"
 import { MAX_AGENTS_PER_RUN } from "../src/server/script/limits.js"
 import { registry } from "../src/server/singleton.js"
 import type { OpencodeClient } from "../src/server/types.js"
+import type { ProgressEvent } from "../src/server/runtime/run.js"
 import { existsSync } from "node:fs"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -49,6 +50,24 @@ const META = "export const meta = { name: 'demo', description: 'a demo workflow'
 beforeEach(() => {
   registry.resetForTests()
 })
+
+/** Every live call spends 600 output tokens and records its prompt, for budget and family tests. */
+function liveClient(): { client: OpencodeClient; prompts: string[] } {
+  const prompts: string[] = [],
+    inner = {
+      session: {
+        create: () => Promise.resolve({ data: { id: "child" } }),
+        get: () => Promise.resolve({ data: { id: "child" } }),
+        delete: () => Promise.resolve({}),
+        abort: () => Promise.resolve({}),
+        prompt: (options: { body: { parts: { text?: string }[] } }) => {
+          prompts.push(options.body.parts[0]?.text ?? "")
+          return Promise.resolve({ data: { info: { tokens: { output: 600 } }, parts: [{ type: "text", text: "done" }] } })
+        },
+      },
+    } as unknown as OpencodeClient
+  return { client: inner, prompts }
+}
 
 describe("source resolution", () => {
   test("scriptPath is read through the injected reader", async () => {
@@ -362,5 +381,67 @@ describe("budget — end to end", () => {
     expect(partial.childSessionIDs).toEqual(["child"])
     expect(registry.sessionsOf("wf_test")).toEqual([])
     expect((caught as Error).message).toContain("100 output-token budget")
+  })
+})
+
+describe("budget — nested family", () => {
+  // Every live call spends 600 output tokens against a 100-token cap, so a single call crosses
+  // the ceiling and the next call in the family is refused before it spends anything.
+  const helper = `export const meta = { name: 'helper', description: 'h' }\nawait agent('h1')\n`
+
+  test("a nested child draws the parent's ceiling instead of a fresh one", async () => {
+    // The option docstring and README both promise sharing: the child's spend must reach the
+    // parent's ledger, and both scripts' budget globals must read the same family total.
+    const script = `${META}const child = await workflow({ script: ${JSON.stringify(`${helper}return budget.spent()`)} })\nreturn { child, spent: budget.spent(), remaining: budget.remaining() }\n`
+    const events: ProgressEvent[] = []
+    const result = await execute({ script }, {
+      ...base,
+      client: liveClient().client,
+      budgetTotal: 100,
+      onProgress: (event) => {events.push(event)},
+    })
+    expect(result.value).toEqual({ child: 600, spent: 600, remaining: 0 })
+    // The event-fed total progress.json accumulates (family-wide via the shared onProgress)
+    // agrees with the family ledger instead of contradicting it.
+    const eventFed = events
+      .filter((event) => event.type === "agent-end")
+      .reduce((total, event) => total + ((event as { outputTokens?: number }).outputTokens ?? 0), 0)
+    expect(eventFed).toBe(600)
+  })
+
+  test("the family cannot spend (k+1) × total: a child's later call is refused", async () => {
+    // The bug this closes: runNested passed only the NUMBER into a fresh child Run, so every
+    // nested call re-spent the full ceiling. The child's SECOND call must hit the ceiling, and
+    // the refused call must add nothing to the family's spend.
+    const overflow = `${helper}await agent('h2')\nreturn 'helper done'\n`
+    const script = `${META}try {\n  return await workflow({ script: ${JSON.stringify(overflow)} })\n} catch (e) {\n  const cause = String(e?.cause?.message ?? e?.message)\n  return { refused: cause.includes('100 output-token budget'), spent: budget.spent() }\n}\n`
+    const result = await execute({ script }, { ...base, client: liveClient().client, budgetTotal: 100 })
+    expect(result.value).toEqual({ refused: true, spent: 600 })
+  })
+
+  test("a resumed run's family counts replayed spend against the ceiling", async () => {
+    // Replayed entries are paid: on resume the child replays its entry (zero live calls), the
+    // family still counts that spend, and the parent's next call is refused on it.
+    const named = { helper: `${helper}return 'helper done'\n` },
+      script = `${META}await workflow('helper')\nlet blocked\ntry { await agent('p1') } catch (e) { blocked = String(e.message) }\nreturn { blocked, spent: budget.spent() }\n`
+
+    const first = liveClient(),
+      before = await execute({ script }, { ...base, client: first.client, budgetTotal: 100, named }),
+      firstValue = before.value as { blocked: string; spent: number }
+    // The child spent its 600 live; the parent's own call was refused on the family total.
+    expect(first.prompts).toEqual(["h1"])
+    expect(firstValue.blocked).toContain("100 output-token budget")
+    expect(firstValue.spent).toBe(600)
+
+    const second = liveClient(),
+      after = await execute(
+        { script },
+        { ...base, client: second.client, budgetTotal: 100, named, previousEntries: before.journal, resumedFrom: "wf_test" },
+      ),
+      secondValue = after.value as { blocked: string; spent: number }
+    // Nothing re-spent — the replay alone fills the family ledger and still refuses p1.
+    expect(second.prompts).toEqual([])
+    expect(secondValue.blocked).toContain("100 output-token budget")
+    expect(secondValue.spent).toBe(600)
   })
 })

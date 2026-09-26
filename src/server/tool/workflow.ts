@@ -8,6 +8,7 @@ import type { AgentOptions, ProgressEvent } from "../runtime/run.js"
 import { subagentContract } from "../bridge/contract.js"
 import { makeResolvers } from "../bridge/models.js"
 import { makeBudget } from "../runtime/budget.js"
+import type { FamilySpend } from "../runtime/budget.js"
 import { argsHash } from "../resume/key.js"
 import { runDir } from "../resume/store.js"
 import { MAX_AGENTS_PER_RUN } from "../script/limits.js"
@@ -70,6 +71,12 @@ export interface WorkflowContext {
   resumedFrom?: string | undefined
   /** Output-token ceiling for the run, or null for none. */
   budgetTotal?: number | null | undefined
+  /**
+   * The family spend ledger shared by this launch and its nested children. The launch run
+   * creates it; runNested hands the parent's to each child, so a nested fan-out charges ONE
+   * ceiling instead of a fresh one per child. Absent for a top-level run, which owns the family.
+   */
+  familySpend?: FamilySpend | undefined
   /** Repository root, enabling `isolation: "worktree"`. */
   worktreeRoot?: string | undefined
   /** Depth of nesting. workflow() is one level only, so a child runs at depth 1. */
@@ -292,6 +299,7 @@ async function runPrepared(
     ...optional("previousEntries", context.previousEntries),
     ...optional("resumedFrom", context.resumedFrom),
     ...optional("budgetTotal", context.budgetTotal),
+    ...optional("familySpend", context.familySpend),
     ...optional("worktreeRoot", context.worktreeRoot),
     ...optional("resolveModel", resolvers.resolveModel),
     ...optional("resolveVariant", resolvers.resolveVariant),
@@ -412,7 +420,8 @@ async function resolveSource(args: WorkflowArgs, context: WorkflowContext): Prom
  * Per the spec these failures THROW rather than returning null, unlike `agent()` — a script's
  * try/catch around a nested workflow would otherwise be dead code.
  *
- * The child shares this run's concurrency gate (process-global), agent counter, budget and abort
+ * The child shares this run's concurrency gate (process-global), agent counter, budget ceiling
+ * (one family ledger — each child draws the parent's ceiling, never a fresh one) and abort
  * signal, so nesting cannot be used to escape any of them.
  */
 function makeNested(
@@ -461,8 +470,11 @@ async function runNested(
       {
         ...context,
         depth: (context.depth ?? 0) + 1,
-        // The child's spend counts against the parent's ceiling.
+        // The child's spend counts against the parent's ceiling AND into the parent's family
+        // ledger, so the parent script's budget.remaining() decrements as children spend —
+        // concurrent sibling launches are untouched, each keeps its own family (decided in #32).
         budgetTotal: parentRun.budget.total,
+        familySpend: parentRun.familySpend,
       },
     )
   } catch (error) {
