@@ -45,6 +45,12 @@ export interface StatusReport {
   phases: string[]
   agents: { total: number; running: number; done: number; failed: number }
   outputTokens: number
+  /**
+   * The run's output-token budget and live spend, from the progress snapshot.
+   * `total` null means uncapped — or unknown: a run whose snapshot never
+   * reached disk has no ceiling to report. The render stays silent on null.
+   */
+  budget: { total: number | null; spent: number }
   value?: unknown
   failure?: { message: string; dir: string } | undefined
   logs: string[]
@@ -157,6 +163,13 @@ async function buildSnapshot(input: {
     phases,
     agents: countAgents(progress, entries),
     outputTokens,
+    // The snapshot's own budget record, verbatim — the same field the sidebar
+    // reads. Guarded per-member: a snapshot predating the budget field (or a
+    // torn write) degrades to uncapped-unknown rather than crashing the read.
+    budget: {
+      total: typeof progress?.budget?.total === "number" ? progress.budget.total : null,
+      spent: typeof progress?.budget?.spent === "number" ? progress.budget.spent : 0,
+    },
     logs: (progress?.logs ?? []).slice(-MAX_LOG_LINES),
   }
 

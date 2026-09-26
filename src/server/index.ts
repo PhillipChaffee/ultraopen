@@ -445,7 +445,7 @@ async function launchWorkflow(
       // The blocking contract waits for the run and takes the tool call's abort signal: a
       // parent-turn interrupt unwinds the script it is waiting on.
       const wiring = wireRun({ ...shared, signal: context.abort })
-      const result = await runBlocking(args, { runId, manifest, resume, executeContext: wiring.executeContext, settleRun: wiring.settle })
+      const result = await runBlocking(args, { runId, manifest, resume, executeContext: wiring.executeContext, settleRun: wiring.settle, budgetTokens: options.budgetTokens })
       return [result, ...scanNoteLines].join("\n")
     }
 
@@ -456,7 +456,7 @@ async function launchWorkflow(
     startDetachedRun(shared)
 
     const projection = projectedAgents === undefined ? undefined : { agents: projectedAgents, threshold: options.largeWorkflowAgents }
-    return [renderLaunch(prepared.meta.name, runId, longLived, siblingRunsForSession(context.sessionID, runId), projection), ...scanNoteLines].join("\n")
+    return [renderLaunch(prepared.meta.name, runId, longLived, siblingRunsForSession(context.sessionID, runId), projection, options.budgetTokens), ...scanNoteLines].join("\n")
   } catch (error) {
     // Reached only by the launch phase itself: a parse failure or a rejected
     // permission ask. The run never went live, so the pending entry is dropped.
@@ -474,6 +474,8 @@ interface BlockingRun {
   resume: { entries: JournalEntry[]; argsChanged: boolean } | undefined
   executeContext: Parameters<typeof execute>[1]
   settleRun: SettleRun
+  /** The plugin's per-run ceiling, for the blocking result's budget statement. */
+  budgetTokens: number | null
 }
 
 /**
@@ -487,7 +489,7 @@ interface BlockingRun {
  * finds no residue once it is done.
  */
 async function runBlocking(args: WorkflowArgs, run: BlockingRun): Promise<string> {
-  const { runId, manifest, resume, executeContext, settleRun } = run
+  const { runId, manifest, resume, executeContext, settleRun, budgetTokens } = run
   try {
     const result = await execute(args, executeContext)
     await settleRun({
@@ -503,7 +505,7 @@ async function runBlocking(args: WorkflowArgs, run: BlockingRun): Promise<string
     return renderResult(result, {
       resumed: resume?.entries.length ?? 0,
       argsChanged: resume?.argsChanged === true,
-    }, siblingRunsForSession(manifest.sessionID, runId))
+    }, siblingRunsForSession(manifest.sessionID, runId), budgetTokens)
   } catch (error) {
     const partial = error instanceof WorkflowRunError ? error.partial : undefined
     await settleRun({

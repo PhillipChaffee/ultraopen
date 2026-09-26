@@ -1696,6 +1696,30 @@ describe("safety rails — budget, size advice, script before ask", () => {
       { sessionID: "parent" },
     )
     expect(output).toContain('"capped": false')
+    // Uncapped stays silent: no budget statement on the result (#32).
+    expect(output).not.toContain("Output-token budget")
+  })
+
+  test("a set budgetTokens states the per-run ceiling on the blocking result", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }, { budgetTokens: 50_000 }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}return 'done'\n`, dryRun: true, background: false },
+      { sessionID: "parent" },
+    )
+    expect(output).toContain("Output-token budget: 50000 per run.")
+  })
+
+  test("a set budgetTokens states the per-run ceiling on the launch handle", async () => {
+    const tool = toolOf(ultraopen({ client: hangingClient }, { budgetTokens: 50_000 }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 1\n`, background: true },
+      { sessionID: "parent" },
+    )
+    expect(output).toContain("Output-token budget: 50000 per run.")
+    // The detached task never settles here (the client hangs); the launch-gating
+    // state is reset by the suite's beforeEach, not by the run settling.
   })
 
   test("sizeGuideline appends the advice to the tool description", () => {

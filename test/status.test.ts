@@ -258,6 +258,36 @@ describe("executeStatus — derivations", () => {
   })
 })
 
+describe("executeStatus — budget", () => {
+  test("the snapshot's budget record surfaces verbatim", async () => {
+    // The status tool reads the same field the sidebar reads: budget {total, spent}.
+    const report = await executeStatus({ runId: RUN }, deps({
+      "progress.json": JSON.stringify({ agents: [], logs: [], startedAt: 1, updatedAt: 2, budget: { total: 50_000, spent: 1234 } }),
+    }))
+    expect(report.budget).toEqual({ total: 50_000, spent: 1234 })
+  })
+
+  test("an uncapped snapshot reports total null with its live spend", async () => {
+    const report = await executeStatus({ runId: RUN }, deps({
+      "progress.json": JSON.stringify({ agents: [], logs: [], startedAt: 1, updatedAt: 2, budget: { total: null, spent: 77 } }),
+    }))
+    expect(report.budget).toEqual({ total: null, spent: 77 })
+  })
+
+  test("a snapshot predating the budget field degrades to uncapped-unknown, not a crash", async () => {
+    // Older snapshots on disk lack the field; the read is guarded per member.
+    const report = await executeStatus({ runId: RUN }, deps({
+      "progress.json": JSON.stringify({ agents: [], logs: [], startedAt: 1, updatedAt: 2 }),
+    }))
+    expect(report.budget).toEqual({ total: null, spent: 0 })
+  })
+
+  test("a torn snapshot degrades the same way", async () => {
+    const report = await executeStatus({ runId: RUN }, deps({ "progress.json": "not json" }))
+    expect(report.budget).toEqual({ total: null, spent: 0 })
+  })
+})
+
 describe("executeStatus — wait loop", () => {
   const sleeps: number[] = []
 
