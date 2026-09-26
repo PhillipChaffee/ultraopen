@@ -190,7 +190,10 @@ session that is not in ultracode keeps the one-live-run rule — a second launch
 the active run id. An ultracode-active session (the `ultracode` agent, the keyword, `/ultracode`,
 or the project config flag) may hold up to `ultracodeMaxRuns` (default 8, clamped to 1–32) live
 runs across both contracts: every launch result names its sibling live runs, and a launch at the
-cap is refused naming every live run id — finishing any run frees a slot. Saying "don't fan out"
+cap is refused naming every live run id — finishing any run frees a slot. Budget scales with the
+cap: `budgetTokens` is a per-launch ceiling — one launch and everything it nests share one family
+ceiling, and concurrent launches each hold their own, so N live runs can spend N × ceiling. Saying
+"don't fan out"
 demotes ultracode at the prompt level only: it changes the standing guidance, never the gate, so
 an explicitly requested workflow still launches normally. `dryRun` is exempt from the gate in both
 modes — it is free and spawns nothing. Resuming a run that is still executing is refused in both
@@ -249,9 +252,10 @@ resumable by hand with `resumeFromRunId`.
 `agent()` accepts `label`, `phase`, `schema`, `model`, `effort`, `agentType`, `isolation`,
 `disallowedTools`.
 
-The script `budget` global exists and nested runs share their parent's ceiling, but the top-level
-plugin wires no budget total — the hard ceilings are the per-run agent and per-call item caps
-above.
+The script `budget` global exists and nested runs share their parent's ceiling, but no total is
+wired unless `budgetTokens` is set — the hard ceilings are the per-run agent and per-call item caps
+above. Concurrent launches each hold their own ceiling: a session of N live runs can spend
+N × ceiling.
 
 </details>
 
@@ -291,9 +295,11 @@ above.
      up to 3 times.
    - `keywordBehavior` — how a plain `ultracode` keyword mention behaves: `"one-shot"` (default) fans out
      only that task; `"session"` keeps the mode on for the rest of the session.
-  - `budgetTokens` — an output-token ceiling for one workflow run, shared by nested runs. Once the
-     spend reaches it, further `agent()` calls throw and the nulls list explains why. Unset means
-     no ceiling.
+- `budgetTokens` — an output-token ceiling per launch: one launch and every nested run it spawns
+      share that family ceiling, and concurrent launches each hold their own, so a session of N
+      live runs can spend N × ceiling (intended). Once the spend reaches it, further `agent()`
+      calls throw and the nulls list explains why. Unset means no ceiling; invalid values degrade
+      to uncapped.
   - `sizeGuideline` — size advice appended to the tool description (the same channel as Claude
      Code's size guideline): write what a right-sized run looks like for this project, e.g.
      "keep runs under 10 agents; prefer pipeline stages over wide parallel() bursts".

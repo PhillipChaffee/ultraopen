@@ -54,7 +54,11 @@ Three prior facts constrain the decision:
 - An ultracode user can keep launching workflows while earlier ones run; each launch result names
   what else is live, so the model can track and poll each run.
 - N concurrent runs each get the full `budgetTokens` ceiling — there is no cross-run rollup.
-  Operators should treat the budget as per-run (follow-up ticket #32).
+  Decided in #32: per-launch ceilings are intended — one launch and everything it nests shares one
+  family ceiling, concurrent launches each hold their own (a session of N live runs can spend
+  N × ceiling), and the cannot-silently-exceed risk is cured by required visibility surfaces (the
+  launch ceiling advisory, the sibling N × ceiling math, the status tool's `budget {total, spent}`),
+  not by a session ledger.
 - The gate stays one synchronous step: the refusal check and the pending registration share one
   await-free region, so the check-then-act race cannot admit an at-cap launch.
 - `dryRun` remains exempt in both modes: it is free, stubbed, and the standard mid-run debugging
@@ -64,4 +68,5 @@ Three prior facts constrain the decision:
 
 ## Vocabulary
 
-See `CONTEXT.md` (workflow, run, live run, launch, launch contract, live-run cap, demoted session).
+See `CONTEXT.md` (workflow, run, live run, launch, launch contract, live-run cap, budget ceiling,
+family ceiling, budget script global, demoted session).

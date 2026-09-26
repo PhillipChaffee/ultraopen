@@ -49,9 +49,11 @@ export interface UltraopenOptions {
   /** Extra directories of saved workflow scripts, most specific last. */
   workflowPaths: readonly string[]
   /**
-   * Output-token ceiling for one workflow run, shared by nested runs. Null
-   * means no ceiling — today's behavior. Invalid values mean null rather than
-   * the default, because silently capping an uncapped user is worse than not
+   * Output-token ceiling per launch: one launch and every nested run it spawns
+   * share that family ceiling, and concurrent launches each hold their own —
+   * a session of N live runs can spend N × ceiling, intended. Null means no
+   * ceiling — today's behavior. Invalid values mean null rather than the
+   * default, because silently capping an uncapped user is worse than not
    * capping them.
    */
   budgetTokens: number | null
