@@ -53,6 +53,14 @@ ceiling, the family's output tokens so far, and what remains (Infinity when unca
 A session where the user said some form of "don't fan out". Demotion is prompt-level guidance
 only — the launch gate ignores it, and an explicitly requested workflow launches normally.
 
+**zero-value decoration**
+Model weather: emitting `""`, `"null"`, or `"undefined"` for an absent optional `args` field. The
+`workflow` tool refuses the three strings loudly at the tool boundary (decided in #86) — the
+identity contract is that the script sees exactly what was passed, and a decorated resume hashes
+differently from its source baseline, so the argsChanged guard would refuse the replay and the
+string would run live. A stop call carrying decoration still stops; the auto-resume sweep and
+nested `workflow()` calls are immune by construction.
+
 **leak (e2e)**
 Two distinct senses in the e2e suites — keep them apart. A **process leak** is a test-spawned
 opencode process that outlives the suite (what the cleanup guarantee targets). **Config

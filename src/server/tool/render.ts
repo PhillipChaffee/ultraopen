@@ -258,6 +258,24 @@ export function renderResumeRefusal(runId: string, pid: number | undefined): str
   ].join("\n")
 }
 
+/**
+ * A launch, resume, or dryRun whose `args` carries a model-emitted zero-value decoration.
+ *
+ * The strings "", "null" and "undefined" are the weather: models emit them for an absent
+ * optional field. Refused rather than normalized — the identity contract is that the script
+ * sees exactly what was passed, and a decorated resume hashes differently from its source
+ * baseline, so the argsChanged guard would refuse the replay and the string would run live.
+ * The refusal names the fix so the model self-corrects for the rest of the session.
+ */
+export function renderArgsRefusal(value: string): string {
+  return [
+    "<workflow-refused>",
+    `The \`args\` field was passed as the string "${value}" — a zero-value decoration ("", "null", or "undefined"), not a real argument. The script would receive that string as its global \`args\`, and a resume decorated this way can no longer replay its source run.`,
+    "To pass no arguments, omit the `args` field entirely; otherwise pass real JSON.",
+    "</workflow-refused>",
+  ].join("\n")
+}
+
 /** The status tool's report, for the model. Same uncapped stance as renderResult. */
 export function renderStatus(report: StatusReport): string {
   const lines = [
@@ -294,7 +312,10 @@ export function workflowArgsSchema(): Record<string, unknown> {
   return {
     script: { type: "string", description: "The workflow script. Must begin with `export const meta = {...}`." },
     scriptPath: { type: "string", description: "Path to a persisted script. Takes precedence over `script`." },
-    args: { description: "Value exposed to the script as the global `args`. Pass real JSON, not a JSON string." },
+    args: {
+      description:
+        "Value exposed to the script as the global `args`. Pass real JSON, not a JSON string; the strings \"\", \"null\", and \"undefined\" are refused as zero-value decorations — omit the field for no arguments.",
+    },
     resumeFromRunId: {
       type: "string",
       description: "Resume a previous run from this directory's data: unchanged agent calls replay from its journal instantly, and the first changed call onward runs live. Refused while the source run is still executing.",

@@ -44,7 +44,7 @@ workflow.
 | `pipeline(items, ...stages)` | Each item flows through every stage independently, with NO barrier. Stage callbacks get `(prevResult, originalItem, index)`. |
 | `parallel(thunks)` | A BARRIER over an array of FUNCTIONS (`() => agent(...)`), not promises. |
 | `phase(title)`, `log(msg)` | Progress narration. |
-| `args` | Whatever was passed as `args`, verbatim. |
+| `args` | Whatever was passed as `args`, verbatim. Never `""`, `"null"`, or `"undefined"` — that is zero-value decoration, and the tool refuses it; omit `args` for no arguments. |
 | `budget` | `{ total, spent(), remaining() }`. A hard ceiling per launch — nested child spend counts against the same family ceiling. |
 | `workflow({ script }, args?)` | Runs another workflow inline, `{ script }` form only — the named form throws because the shipped plugin never populates `context.named`. One level only. THROWS on failure, unlike `agent()`. |
 

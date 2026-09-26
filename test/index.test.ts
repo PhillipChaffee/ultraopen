@@ -98,6 +98,15 @@ const waitFor = async (until: () => boolean | Promise<boolean>, what: string): P
 /** The launch result's run id, for tests that need to name a run they launched. */
 const runIdOf = (output: string): string => output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
 
+/** A permission-ask recorder: pass `ask` to the tool context, assert nothing was asked. */
+const askRecorder = () => {
+  const asked: unknown[] = []
+  return {
+    ask: (request: unknown) => { asked.push(request); return Promise.resolve() },
+    assertNoAsk: () => expect(asked).toEqual([]),
+  }
+}
+
 let savedEnv: string | undefined
 
 beforeEach(() => {
@@ -1949,5 +1958,124 @@ describe("stop path — workflow({ stop })", () => {
       expect(call.text).toContain("<workflow-stopped")
       expect(call.text).not.toContain("<workflow-failed")
     }
+  })
+})
+
+describe("args zero-value decoration guard", () => {
+  // Models emit "", "null" or "undefined" for an absent optional `args` field. Decided in
+  // #86: refused loudly at the tool boundary, never normalized — the script must see exactly
+  // what was passed, and a decorated resume hashes differently from its source baseline, so
+  // the argsChanged guard would refuse the replay and the string would run live. Placement
+  // pins: after the stop dispatch, before the launch gate and the permission ask.
+  const decorations = ["", "null", "undefined"]
+
+  test.each(decorations)("a launch whose args is %p is refused before the ask", async (value) => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const { ask, assertNoAsk } = askRecorder()
+    const output = await tool.execute(
+      { script: `${META}return args\n`, args: value, background: true },
+      { sessionID: "parent", ask },
+    )
+    expect(output).toContain("<workflow-refused>")
+    // The refusal is correctable: it names the value it saw and the fix.
+    expect(output).toContain(`"${value}"`)
+    expect(output).toContain("omit the `args` field")
+    // Refused BEFORE the ask: an approval spent on a call that refuses itself
+    // buys nothing and cascades into a re-ask chain (#74's pins).
+    assertNoAsk()
+  })
+
+  test.each(decorations)("a resume whose args is %p is refused even against a settled source run", async (value) => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const launched = await tool.execute({ script: `${META}await agent('a')\nreturn 1\n`, background: true }, { sessionID: "parent" })
+    const runId = runIdOf(launched)
+    await background.settlePromiseOf(runId)
+    const { ask, assertNoAsk } = askRecorder()
+    const output = await tool.execute(
+      { script: `${META}return 2\n`, args: value, resumeFromRunId: runId, background: false },
+      { sessionID: "parent", ask },
+    )
+    // The guard fires before any resume handling: a decorated resume can neither
+    // replay nor run live with the string as its args.
+    expect(output).toContain("<workflow-refused>")
+    assertNoAsk()
+  })
+
+  test("dryRun carries the same guard", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    for (const value of decorations) {
+      const output = await tool.execute({ script: `${META}return args\n`, args: value, dryRun: true }, { sessionID: "parent" })
+      expect(output).toContain("<workflow-refused>")
+    }
+  })
+
+  test("legitimate args values pass through to the script verbatim", async () => {
+    // 0, false and {} stay real JSON; a content-bearing string is not decoration.
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const cases: [unknown, string][] = [[0, "0"], [false, "false"], [{}, "{}"], ["review-targets", "review-targets"]]
+    for (const [value, rendered] of cases) {
+      const output = await tool.execute(
+        { script: `${META}return args\n`, args: value, dryRun: true },
+        { sessionID: "parent" },
+      )
+      expect(output).toContain("<result")
+      expect(output).toContain(rendered)
+    }
+  })
+
+  test("a refused call registers no pending launch entry", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const refused = await tool.execute({ script: `${META}return 1\n`, args: "null", background: true }, { sessionID: "parent" })
+    expect(refused).toContain("<workflow-refused>")
+    expect(background.liveRunsForSession("parent")).toHaveLength(0)
+    // The session is free to launch again at once.
+    const launched = await tool.execute({ script: `${META}await agent('a')\nreturn 1\n`, background: true }, { sessionID: "parent" })
+    expect(launched).toContain("<workflow-launched")
+    await background.settlePromiseOf(runIdOf(launched))
+  })
+
+  test("a stop call carrying decoration still stops the run", async () => {
+    // Placement pin: the guard sits AFTER the stop dispatch — the off-switch is never
+    // blocked by weather on a field the stop path ignores.
+    let release!: () => void
+    const parked = new Promise<void>((resolve) => {release = resolve})
+    const parkClient = {
+      ...stubClient,
+      session: {
+        ...stubClient.session,
+        prompt: (): Promise<unknown> => parked.then(() => ({ data: { info: {}, parts: [] } })),
+      },
+    }
+    const tool = toolOf(ultraopen({ client: parkClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const launched = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 'NEVER-SEEN'\n`, background: true },
+      { sessionID: "parent" },
+    )
+    const runId = runIdOf(launched)
+    const stopped = await tool.execute({ stop: runId, args: "null" }, { sessionID: "parent" })
+    expect(stopped).toContain(`<workflow-stopped run="${runId}"`)
+    release()
+    await background.settlePromiseOf(runId)
+    const manifest = await readManifest(runId)
+    expect(manifest?.status).toBe("cancelled")
+  })
+
+  test("the schema description states the rule, and all three description variants carry the sentence", () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const argsSchema = tool?.args?.["args"] as { description?: string } | undefined
+    expect(argsSchema?.description).toContain("zero-value decorations")
+    expect(argsSchema?.description).toContain("omit the field for no arguments")
+    expect(tool?.description).toContain('refused as zero-value decorations')
+    // The variant paragraphs replace the base contract wholesale, so each carries
+    // the same sentence — a variant swap must not drop the rule.
+    const hooks = ultraopen({ client: stubClient }, { runMode: "blocking" })
+    expect(toolOf(hooks)?.description).toContain('refused as zero-value decorations')
   })
 })
