@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
-import { renderCapRefusal, renderLaunch, renderRefusal, renderResult, renderSiblingAdvisory } from "../src/server/tool/render.js"
+import { renderCapRefusal, renderLaunch, renderRefusal, renderResult, renderSiblingAdvisory, renderStatus } from "../src/server/tool/render.js"
 import type { WorkflowResult } from "../src/server/tool/workflow.js"
+import type { StatusReport } from "../src/server/tool/status.js"
 
 /** A minimal settled result; the advisory pins concern the siblings, not the payload. */
 const result = (over: Partial<WorkflowResult> = {}): WorkflowResult => ({
@@ -35,6 +36,26 @@ describe("renderSiblingAdvisory", () => {
     // One line: no newline inside the advisory itself.
     expect(advisory.includes("\n")).toBe(false)
     expect(advisory).toContain("Sibling runs still live in this session, oldest first:")
+  })
+
+  test("with the budget set, the advisory states the per-run ceiling and the combined math", () => {
+    // The #32 cure for silent multi-run overspend: the N × ceiling math is un-missable.
+    const advisory = renderSiblingAdvisory(siblings, { ceiling: 50_000, liveRuns: 3 })
+    expect(advisory).toContain("Sibling runs still live in this session, oldest first: wf_sibl001 (running), wf_sibl002 (pending).")
+    expect(advisory).toContain("With 3 live runs in this session at 50000 output tokens each, combined ceiling 150000.")
+    // Still one line: the math rides the advisory, it does not add one.
+    expect(advisory.includes("\n")).toBe(false)
+  })
+
+  test("a single live run reads in the singular with the math still spelled out", () => {
+    const advisory = renderSiblingAdvisory([{ runId: "wf_solo0001", status: "running" }], { ceiling: 50_000, liveRuns: 1 })
+    expect(advisory).toContain("With 1 live run in this session at 50000 output tokens each, combined ceiling 50000.")
+  })
+
+  test("without the budget, the advisory stays naming-only", () => {
+    expect(renderSiblingAdvisory(siblings)).toBe(
+      "Sibling runs still live in this session, oldest first: wf_sibl001 (running), wf_sibl002 (pending).",
+    )
   })
 })
 
@@ -128,6 +149,67 @@ describe("renderLaunch", () => {
     const launched = renderLaunch("demo", "wf_proj0002", false, [])
     expect(launched).not.toContain("projected")
     expect(launched).not.toContain("Large workflow")
+  })
+
+  test("a set budget states the per-run ceiling; unset stays byte-identical", () => {
+    const capped = renderLaunch("demo", "wf_budget01", false, [], undefined, 50_000)
+    expect(capped).toContain("Output-token budget: 50000 per run.")
+    // Cost joins size as a pre-flight consideration: the ceiling leads the contract sentence.
+    expect(capped.indexOf("Output-token budget")).toBeLessThan(capped.indexOf("The run is executing"))
+    const uncapped = renderLaunch("demo", "wf_uncap001", false, [], undefined, null)
+    expect(uncapped).not.toContain("Output-token budget")
+    expect(uncapped).toBe(renderLaunch("demo", "wf_uncap001", false))
+  })
+
+  test("with siblings live, the launch advisory states the combined math including this run", () => {
+    // This run just launched and is live, so the math counts it: 2 siblings + 1.
+    const capped = renderLaunch("demo", "wf_budget03", false, siblings, undefined, 50_000)
+    expect(capped).toContain("With 3 live runs in this session at 50000 output tokens each, combined ceiling 150000.")
+  })
+})
+
+describe("renderResult — budget statement", () => {
+  test("a set budget states the ceiling beside the usage line; unset stays byte-identical", () => {
+    const capped = renderResult(result(), undefined, [], 50_000)
+    expect(capped).toContain("Output-token budget: 50000 per run.")
+    // The ceiling is stated where the spend it caps is reported.
+    expect(capped.indexOf("<usage")).toBeLessThan(capped.indexOf("Output-token budget"))
+    const uncapped = renderResult(result(), undefined, [], null)
+    expect(uncapped).not.toContain("budget")
+    expect(uncapped).toBe(renderResult(result()))
+  })
+
+  test("with siblings live, the combined math counts only the live siblings", () => {
+    // The blocking run is settled at render time — its spend is already in the
+    // usage line, so the combined ceiling covers the live siblings alone.
+    const capped = renderResult(result(), undefined, siblings, 50_000)
+    expect(capped).toContain("Output-token budget: 50000 per run.")
+    expect(capped).toContain("With 2 live runs in this session at 50000 output tokens each, combined ceiling 100000.")
+  })
+})
+
+const statusReport = (over: Partial<StatusReport> = {}): StatusReport => ({
+    runId: "wf_status01",
+    dir: "/fake/opencode/tool-output/ultraopen/wf_status01",
+    status: "running",
+    phases: [],
+    agents: { total: 1, running: 1, done: 0, failed: 0 },
+    outputTokens: 120,
+    budget: { total: null, spent: 0 },
+    logs: [],
+    ...over,
+  })
+
+describe("renderStatus", () => {
+  test("a capped run surfaces the budget total and spent beside the spend", () => {
+    const rendered = renderStatus(statusReport({ budget: { total: 50_000, spent: 1234 } }))
+    expect(rendered).toContain("budget total=50000 spent=1234")
+    expect(rendered.indexOf("output_tokens=")).toBeLessThan(rendered.indexOf("budget total="))
+    expect(rendered.indexOf("budget total=")).toBeLessThan(rendered.indexOf("phases:"))
+  })
+
+  test("an uncapped run stays silent — no budget line at all", () => {
+    expect(renderStatus(statusReport())).not.toContain("budget")
   })
 })
 

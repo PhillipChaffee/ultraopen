@@ -28,11 +28,16 @@ import type { StatusReport } from "./status.js"
  *
  * The sibling advisory (when the session still holds live runs) trails the usage line: the
  * blocking call held the turn only for its own run, so the model must know what else is live.
+ *
+ * The per-run budget (when `budgetTokens` is set) is stated beside the spend it caps, and the
+ * advisory carries the combined math — the cure for silent multi-run overspend is visibility,
+ * not prevention (#32). Uncapped stays silent: no budget line when the option is unset.
  */
 export function renderResult(
   result: WorkflowResult,
   resume?: { resumed: number; argsChanged: boolean },
   siblings: readonly RunSummary[] = [],
+  budgetTokens?: number | null | undefined,
 ): string {
   const lines = [
     `<result workflow="${result.meta.name}" run="${result.runId}" agents="${result.agentCount}">`,
@@ -72,7 +77,10 @@ export function renderResult(
     `<usage agents="${result.agentCount}" failed="${result.nulls.length}" replayed="${replayed}" ` +
       `output_tokens="${result.outputTokens}" run_dir="${runDir(result.runId)}" />`,
   )
-  appendAdvisory(lines, siblings)
+  const budgetLine = renderBudgetLine(budgetTokens)
+  if (budgetLine !== undefined) {lines.push(budgetLine)}
+  // The run is settled at render time — the session's live runs are exactly the siblings.
+  appendAdvisory(lines, siblings, budgetMath(budgetTokens, siblings.length))
   return lines.join("\n")
 }
 
@@ -96,6 +104,8 @@ export function renderResult(
  * projected fan-out always shows, and at or above the threshold it renders as
  * a large-workflow advisory — the one place a model sees run size BEFORE
  * agents are scheduled, so it is the model's chance to double-check the script.
+ * The per-run budget statement (when `budgetTokens` is set) rides beside it:
+ * cost joins size as a pre-flight consideration.
  */
 export function renderLaunch(
   workflow: string,
@@ -103,6 +113,7 @@ export function renderLaunch(
   longLived: boolean,
   siblings: readonly RunSummary[] = [],
   projection?: { agents: number; threshold: number } | undefined,
+  budgetTokens?: number | null | undefined,
 ): string {
   let projectionLine: string | undefined
   if (projection === undefined) {
@@ -114,11 +125,13 @@ export function renderLaunch(
   } else {
     projectionLine = `~${projection.agents} agents projected at launch.`
   }
+  const budgetLine = renderBudgetLine(budgetTokens)
   const lines = [
     `<workflow-launched run="${runId}" workflow="${workflow}" dir="${runDir(runId)}">`,
     // First body line, ahead of the contract sentence: size is what the model should
     // reconsider before the fan-out is scheduled.
     ...(projectionLine === undefined ? [] : [projectionLine]),
+    ...(budgetLine === undefined ? [] : [budgetLine]),
     "The run is executing in the background; this message does not contain its outcome.",
     // Sets user-facing expectations: the host's cancel cascade (ESC) cannot
     // reach plugin background runs — the stop argument is the only off switch.
@@ -142,7 +155,8 @@ export function renderLaunch(
       `Poll workflow_status(runId: "${runId}", wait: 120) until the status is not "running" to get the final value or the failure. ${hold}`,
     )
   }
-  appendAdvisory(lines, siblings)
+  // The run just launched and is live, so the combined math counts it: siblings + this one.
+  appendAdvisory(lines, siblings, budgetMath(budgetTokens, siblings.length + 1))
   lines.push("</workflow-launched>")
   return lines.join("\n")
 }
@@ -153,21 +167,49 @@ export interface RunSummary {
   status: string
 }
 
+/** The per-run ceiling statement; null (uncapped) stays silent — the surface is unchanged. */
+export function renderBudgetLine(budgetTokens: number | null | undefined): string | undefined {
+  return typeof budgetTokens === "number" ? `Output-token budget: ${budgetTokens} per run.` : undefined
+}
+
+/** The combined-spend math the sibling advisory appends when the per-run budget is set. */
+interface BudgetMath {
+  /** The per-run output-token ceiling: the plugin's `budgetTokens`, one per run. */
+  ceiling: number
+  /**
+   * Live runs in this session for the combined math. A surface's own run counts
+   * only while it is live: +1 on the launch result, the siblings alone on the
+   * settled blocking result.
+   */
+  liveRuns: number
+}
+
+function budgetMath(budgetTokens: number | null | undefined, liveRuns: number): BudgetMath | undefined {
+  return typeof budgetTokens === "number" ? { ceiling: budgetTokens, liveRuns } : undefined
+}
+
 /**
  * One advisory line naming every sibling live run, oldest first.
  *
  * Empty input renders nothing: an append must add no line, not an empty one.
  * The renderer is naming only — the poll instructions live in the contract
  * sentences around it, which differ per contract.
+ *
+ * When the per-run budget is set, the line also carries the combined math:
+ * every live run holds the same ceiling, so N live runs can spend N × ceiling
+ * — the math made un-missable rather than prevented (#32).
  */
-export function renderSiblingAdvisory(siblings: readonly RunSummary[]): string {
+export function renderSiblingAdvisory(siblings: readonly RunSummary[], budget?: BudgetMath | undefined): string {
   if (siblings.length === 0) {return ""}
   const named = siblings.map((sibling) => `${sibling.runId} (${sibling.status})`).join(", ")
-  return `Sibling runs still live in this session, oldest first: ${named}.`
+  const math = budget === undefined
+    ? ""
+    : ` With ${budget.liveRuns} live run${budget.liveRuns === 1 ? "" : "s"} in this session at ${budget.ceiling} output tokens each, combined ceiling ${budget.liveRuns * budget.ceiling}.`
+  return `Sibling runs still live in this session, oldest first: ${named}.${math}`
 }
 
-function appendAdvisory(lines: string[], siblings: readonly RunSummary[]): void {
-  const advisory = renderSiblingAdvisory(siblings)
+function appendAdvisory(lines: string[], siblings: readonly RunSummary[], budget?: BudgetMath | undefined): void {
+  const advisory = renderSiblingAdvisory(siblings, budget)
   if (advisory !== "") {lines.push(advisory)}
 }
 
@@ -222,6 +264,9 @@ export function renderStatus(report: StatusReport): string {
     `<workflow-status run="${report.runId}" status="${report.status}" dir="${report.dir}">`,
     `agents total=${report.agents.total} running=${report.agents.running} done=${report.agents.done} failed=${report.agents.failed}`,
     `output_tokens=${report.outputTokens}`,
+    // Capped runs surface the ceiling and the live spend against it; uncapped (total
+    // null — unset, or a run whose snapshot never reached disk) stays silent.
+    ...(report.budget.total === null ? [] : [`budget total=${report.budget.total} spent=${report.budget.spent}`]),
     `phases: ${report.phases.length > 0 ? report.phases.join(", ") : "(none)"}`,
   ]
   if (report.phase !== undefined) {lines.push(`current phase: ${report.phase}`)}
