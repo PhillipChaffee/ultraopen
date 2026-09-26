@@ -45,7 +45,7 @@ workflow.
 | `parallel(thunks)` | A BARRIER over an array of FUNCTIONS (`() => agent(...)`), not promises. |
 | `phase(title)`, `log(msg)` | Progress narration. |
 | `args` | Whatever was passed as `args`, verbatim. |
-| `budget` | `{ total, spent(), remaining() }`. A hard ceiling. |
+| `budget` | `{ total, spent(), remaining() }`. A hard ceiling per launch — nested child spend counts against the same family ceiling. |
 | `workflow({ script }, args?)` | Runs another workflow inline, `{ script }` form only — the named form throws because the shipped plugin never populates `context.named`. One level only. THROWS on failure, unlike `agent()`. |
 
 `agent()` opts: `label`, `phase`, `schema`, `model`, `effort`, `agentType`, `isolation`,
@@ -143,4 +143,7 @@ default for the whole host.
 - A pipeline stage that RETURNS `null` drops that item and skips its remaining stages.
 - Guard budget loops on `budget.total`, or with no target set `remaining()` is `Infinity` and the
   loop runs to the agent cap.
+- The budget ceiling is per launch (`budgetTokens`): nested child spend counts against the same
+  family ceiling — `budget.spent()` reads the whole launch family — and concurrent launches each
+  hold their own, so a session of N live runs can spend N × ceiling.
 - Don't ask a subagent for prose — its final text IS the return value.

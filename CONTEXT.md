@@ -34,6 +34,21 @@ The ceiling on live runs in one ultracode-active session: the `ultracodeMaxRuns`
 (default 8). A launch at the cap is refused naming every live run; finishing a run frees a slot.
 Non-ultracode sessions hold exactly one live run regardless of the cap.
 
+**budget ceiling**
+The per-launch output-token ceiling the `budgetTokens` plugin option sets. Once the spend reaches
+it, further `agent()` calls throw and the nulls list explains why. Unset or invalid values mean
+uncapped.
+
+**family ceiling**
+The one ceiling a launch family shares: every nested run the launch spawns attaches to the
+launching run's spend ledger, so `budget.spent()` reads the whole family. Concurrent launches each
+hold their own family ceiling — a session of N live runs can spend N × ceiling, and that is
+intended (decided in #32: per-launch ceilings cured by visibility surfaces, not a session ledger).
+
+**budget script global**
+The `budget` object a workflow script reads: `{ total, spent(), remaining() }` — the run's family
+ceiling, the family's output tokens so far, and what remains (Infinity when uncapped).
+
 **demoted session**
 A session where the user said some form of "don't fan out". Demotion is prompt-level guidance
 only — the launch gate ignores it, and an explicitly requested workflow launches normally.
