@@ -147,3 +147,5 @@ automatically (decided in #103).
 
 - `docs/adr/` — accepted decisions, one file each. ADR-0001 records the launch concurrency policy
   (one-live-run refusal, ultracode live-run cap, demotion neutrality, launch-contract neutrality).
+  ADR-0003 records the npm publishing mechanism (trusted publisher OIDC, no token; v0.1.0's
+  provenance-less exception).
