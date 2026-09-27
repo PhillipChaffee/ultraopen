@@ -1,4 +1,4 @@
-# X thread (draft v1)
+# X thread (draft v2)
 
 **Venue notes:** X has no submission mechanics (research §9), so this is just a well-sized
 thread. Each tweet under 280 characters. Hashtags left off on purpose; add one if you want.
@@ -28,4 +28,4 @@ Runs go in the background. `workflow_status` reads live state from disk, and a n
 
 5/
 
-Install is one command: `opencode plugin ultraopen -g` (needs opencode 1.18.20+). MIT. Repo, with a longer intro and the full feature list: https://github.com/PhillipChaffee/ultraopen
+Same idea as the agent you're thinking of. Different license (MIT). One-command install: `opencode plugin ultraopen -g` (needs opencode 1.18.20+). Repo: https://github.com/PhillipChaffee/ultraopen

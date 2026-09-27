@@ -1,4 +1,4 @@
-# r/opencode post (draft v1)
+# r/opencode post (draft v2)
 
 **Venue notes (from research/opencode-plugin-venues.md §7):** r/opencode's rules could not be
 verified from this environment. Before posting, read the live rules and About/sidebar in a
@@ -52,6 +52,8 @@ What's in 0.1.0:
 
 In the TUI you get a progress strip plus a sidebar panel (Ctrl-x then b) with one row per agent. The plugin ships the workflow-authoring skill too, so the model driving your workflow reads the same reference you would.
 
-Repo (MIT): https://github.com/PhillipChaffee/ultraopen
+If the tool's shape feels familiar, that's not an accident. It's MIT, though.
+
+Repo: https://github.com/PhillipChaffee/ultraopen
 
 It's a community plugin, not made by the opencode team. If you try it and something breaks, an issue with the run directory attached is the fastest way to get it fixed.
