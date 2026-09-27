@@ -40,6 +40,22 @@ suites.
 The task-row, dialog and `$ref` gaps need upstream fixes; the transcript-echo collapse (this
 epic's original upstream PR target) is researched and ready to submit separately.
 
+## Plugin install fails through a symlinked cache path (upstream)
+
+The installer's first `opencode plugin <pkg>` install fails deterministically
+(`NpmInstallFailedError`) when the package cache sits on a symlinked path — any path under
+`/tmp` on macOS (`/tmp` → `/private/tmp`) qualifies. Arborist reify materializes the full tree,
+then rejects it: the tree's `node_modules/.package-lock.json` keys come out as `../`-relative
+escapes (the root in symlink form, the node paths realpath'd) instead of `node_modules/<name>`
+form. A retry short-circuits on the materialized tree and "succeeds", masking the failure.
+Redirecting `XDG_CACHE_HOME` to a symlink-free path installs cleanly; the default `~/.cache`
+never hits it. Isolation evidence on 1.18.32 is filed upstream at
+[anomalyco/opencode#23312](https://github.com/anomalyco/opencode/issues/23312) — that April
+report is Linux/1.4.11 with cache and config symlinked; ours adds the cache-only trigger, the
+lockfile keys, and the retry masking. Harness-relevant: never point `XDG_CACHE_HOME` at a
+symlinked path in install-touching harnesses — the e2e suites redirect `XDG_DATA_HOME` and
+`XDG_CONFIG_HOME` only.
+
 ## Cosmetic limitations (upstream)
 
 - The transcript renderer echoes a tool call's raw arguments, so a `workflow` call displays its
