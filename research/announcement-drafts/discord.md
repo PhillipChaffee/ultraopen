@@ -1,10 +1,11 @@
 # opencode Discord message (draft v4)
 
-**Venue notes (from research/opencode-plugin-venues.md §8):** the server (85.9k members) exposes
-only two channels to non-members; the announcement channel and its etiquette need a human join
-step before this posts. Don't guess a channel name. Chat register: one message, no headers,
-light markdown. Nothing here should post until the v0.1.0 release is actually cut and proven
-installable (#111).
+**Venue notes:** Phillip joined the server (2026-09-27); the full channel list is now known.
+Plugin announcements belong in **#community-projects** (user-made plugins and projects).
+#announcements and #releases are official broadcast channels, not for member posts. Before
+posting: read #rules once and eyeball recent posts in #community-projects for format. Chat
+register: one message, no headers, light markdown. Nothing here should post until the v0.1.0
+release is actually cut and proven installable (#111).
 
 ---
 

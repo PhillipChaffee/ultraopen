@@ -1,10 +1,11 @@
 # r/opencode post (draft v4)
 
-**Venue notes (from research/opencode-plugin-venues.md §7):** r/opencode's rules could not be
-verified from this environment. Before posting, read the live rules and About/sidebar in a
-logged-in browser (https://www.reddit.com/r/opencode/about/rules/) and adjust this draft if they
-restrict tool self-promotion. Markdown mode, link post is fine. Nothing here should post until
-the v0.1.0 release is actually cut and proven installable (#111).
+**Venue notes:** Phillip checked the subreddit logged-in (2026-09-27): no subreddit-specific
+posting rules are surfaced in the sidebar, About card, or the rules page. Sitewide Reddit rules
+(spam, self-promotion) still apply. One thing left to eyeball before posting: open the pinned
+"Welcome to the launch of the r/OpenCode subreddit!" announcement once — any posting norms the
+mods stated would live there. Nothing here should post until the v0.1.0 release is actually cut
+and proven installable (#111).
 
 ---
 
