@@ -50,21 +50,20 @@ return { confirmed: results.flat().filter(Boolean) }
 
 ## 🎬 What a run looks like
 
-Real captures from the live TUI — the same machinery the e2e suites drive: real opencode
-processes, real model calls — re-themed in presentation only.
+Real captures from the live TUI — the same machinery the e2e suites drive — re-themed in
+presentation only.
 
-**1. You hand the model the script; the engine fans out instantly.** The tool call returns at
-once with a `<workflow-launched>` handle — the run is executing in the background — and four
-review agents spawn in parallel: the transcript echoes the raw `workflow` call (an upstream
-renderer quirk, and exactly why the progress surfaces exist), the bottom strip gains one row per
-agent, the sidebar fills in, and `ultracode ⠋ 0/4` appears beside the input.
+**1. Hand the model the script; the engine fans out instantly.** The tool call returns at once
+with a `<workflow-launched>` handle — the run executes in the background — and four review agents
+spawn in parallel: the bottom strip gains one row per agent, the sidebar fills in, and
+`ultracode ⠋ 0/4` appears beside the input. (The transcript also echoes the raw `workflow` call —
+an upstream renderer quirk, and exactly why the progress surfaces exist.)
 
 ![Invoking a workflow](assets/screenshots/01-invoking.png)
 
 **2. The run keeps working.** Two minutes in, the four reviewers have reported (green rows, token
 counts) and a second wave is verifying their findings by execution — real model calls, real file
-reads, progress and elapsed time updating every second. You keep chatting; the run outlives the
-turn that launched it.
+reads. You keep chatting; the run outlives the turn that launched it.
 
 ![The fan-out mid-run](assets/screenshots/02-grinding.png)
 
@@ -74,18 +73,17 @@ one row per agent, glyphs for state.
 ![The sidebar panel](assets/screenshots/03-sidebar.png)
 
 **4. The findings arrive on their own.** When the run settles, a `<workflow-completed>`
-notification is delivered into the transcript — no polling asked for it — and the model reports
-what the run confirmed: here, specific findings about a staged demo diff, from an uncaught fetch
-to the off-by-one loop planted in `src/pagination.ts`.
+notification is delivered into the transcript — no polling asked for — and the model reports
+what the run confirmed: here, concrete findings on a staged demo diff, from an uncaught fetch to
+an off-by-one loop in `src/pagination.ts`.
 
 ![Findings in the transcript](assets/screenshots/04-results.png)
 
-Agents show as `⠋` running, `✓` done, `✗` failed. All three surfaces are served by one shared
-poller — one directory pass per second — so having them all open costs one read. Live rendering
-exists only because of a workaround for an upstream limitation: opencode 1.18.x never re-renders
-external TUI plugin slots after mount (reactive expressions keep their initial value, `Show`/`For`
-insertion no-ops), so the surfaces update imperatively via `node.content` + `requestRender()`
-(src/tui/index.tsx documents the full constraint).
+Agents show as `⠋` running, `✓` done, `✗` failed. All three surfaces (strip, sidebar, prompt
+status) are served by one shared poller — one directory pass per second — so having them all
+open costs one read. The surfaces update imperatively (`node.content` + `requestRender()`) to
+work around an upstream 1.18.x rendering limitation; `src/tui/index.tsx` documents the
+constraint.
 
 <a id="why"></a>
 
@@ -94,10 +92,9 @@ insertion no-ops), so the surfaces update imperatively via `node.content` + `req
 opencode can already spawn subagents. The trouble is orchestration by prompting: ask one model to
 fan out and you get a nondeterministic pile of parallel turns — different every run, unreadable in
 review, and lost the moment a turn stalls. ultraopen makes the fan-out a script: short enough to
-read in one screen, diffable in review, and replayable after a crash.
-
-This is not a framework. There is no DSL, no server, nothing to deploy — the orchestration layer
-is plain JavaScript that runs inside the coding agent you already use.
+read in one screen, diffable in review, and replayable after a crash. This is not a framework —
+no DSL, no server process, nothing to deploy; the orchestration layer is plain JavaScript that
+runs inside the coding agent you already use.
 
 | | Ad-hoc prompt fan-out | Orchestration frameworks | ultraopen |
 | --- | --- | --- | --- |
@@ -114,119 +111,86 @@ ultraopen only tries to be the right tool when the work already happens in openc
 
 ## ✨ What you get
 
-- **`workflow` tool** — runs a JavaScript script that fans out across parallel subagents.
-  Background by default: the tool returns the run id at once and the run continues detached,
-  while `workflow_status` reads its live state on demand. Pass `background: false` to wait for
-  the final result, or set the `runMode` option (or env `ULTRAOPEN_WORKFLOW_SYNC=1`) to flip the
-  default for the host. Scripts pass inline or by path (`scriptPath`), and a previous run replays
-  with `resumeFromRunId`.
-- **`workflow_status` tool** — reads one run's live state from disk: status (`running`,
-  `completed`, `failed`, `cancelled` — stopped by request — or `orphaned`), phase, agent counts,
-  token total, last logs, and (once settled) the final value or the failure text. Pass `wait` to
-  block one call up to 300 s instead of polling. Read-only, and it works across processes and
-  after a crash, because the run directory is the source of truth.
-- **Notifications, not polling** — a background run's outcome is delivered, not requested: a
-  `<workflow-completed>` or `<workflow-failed>` synthetic message lands in the conversation when
-  the run settles (capped at 4096 characters, with a pointer to the full artifact on disk), and
-  an idle nudge re-fires it once if the turn ended exactly as it landed. While a run is live,
-  every turn carries a one-line reminder naming the run. Poll only when you ask for progress.
-- **Stop and auto-resume** — `workflow({ stop: "<runId>" })` aborts a detached run's subagents
-  and records it `cancelled` (interrupting the turn never stops a background run, and the sidebar
-  shows the stop hint). A run its process interrupted auto-resumes on the next start: completed
-  agents replay from the journal, the missing tail re-runs, and the original session is hydrated
-  with the outcome. Stopped runs never resume.
-- **Saved workflows** — a directory of named scripts runs by name: `workflow('deploy-check')` inside
-  any script, one `/workflow-<name>` command per saved file, and `/workflow-resume <runId>` to
-  replay a past run. Default directories: `<config>/ultraopen/workflows` and the project's
+- **`workflow` tool** — runs a JavaScript script that fans out across parallel subagents,
+  background by default: the tool returns the run id at once and the run continues detached.
+  Blocking is one option flip (see [Install](#install)).
+- **`workflow_status` tool** — reads one run's live state from disk — status (`running`,
+  `completed`, `failed`, `cancelled`, `orphaned`), phase, agent counts, token total,
+  `budget { total, spent }`, last logs, and once settled the final value or the failure text. A
+  `wait` blocks one call up to 300 s instead of polling. Read-only, cross-process, crash-safe:
+  the run directory is the source of truth.
+- **Notifications, not polling** — a background run's outcome is delivered, not requested: the
+  `<workflow-completed>` or `<workflow-failed>` message lands in the conversation when the run
+  settles. Mechanics below.
+- **Stop and auto-resume** — `workflow({ stop })` cancels a detached run; a run its process
+  interrupted auto-resumes on the next start. Mechanics below.
+- **Saved workflows** — a directory of named scripts runs by name: `workflow('deploy-check')`
+  inside any script, one `/workflow-<name>` command per saved file, and `/workflow-resume
+  <runId>` to replay a past run. Defaults: `<config>/ultraopen/workflows` and the project's
   `.opencode/ultraopen/workflows` (which wins on a name collision); `workflowPaths` adds more.
-  Scanned per call, so a file saved mid-session runs at once (its slash command appears on the
-  next start).
 - **Schema-forced output** — `agent(prompt, { schema })` returns a validated object; invalid
   output retries up to three attempts in the same session.
 - **Resume** — `resumeFromRunId` replays unchanged calls instantly; the first edited call and
   everything after it in the same scope runs live. Failed runs keep their partial journal, so a
   resume only redoes the unfinished work.
-- **`ultracode` mode** — raises reasoning effort and makes fan-out the default. Four ways in: the
-  `ultracode` agent, the keyword, `/ultracode`, or a project config flag. The keyword is one-shot:
-  it fans out exactly the task that said it, and the next task behaves normally unless you say it
-  again — a filename mention (`src/ultracode.ts`) never triggers at all. `/ultracode` and the
-  `ultracode` agent keep the standing mode for the session. Set `"keywordBehavior": "session"` to
-  restore the old sticky keyword.
-- **Live progress** — the three TUI surfaces above, served by one shared poller.
-- **Safety rails** — a recursion guard (a nested `workflow()` runs one level only), an inactivity
-  deadline plus a wall-clock ceiling per agent, a global concurrency cap, an orphan reaper that
-  releases subagents left by a killed server, retention pruning of finished run directories, and a
-  large-run advisory: when a run crosses the scheduled-agent or projected-token thresholds, the
-  run log, the result, and the strip badge all say so — advice only, nothing stops. Before the
-  ask, the launch path projects the fresh run's fan-out in memory and, at or above
-  `largeWorkflowAgents` (default 25), the prompt and the launch handle both say
-  "Large workflow: ~N agents projected" — advice, never a block.
-- **Run control (in progress)** — `workflow({ stop: "<runId>" })` is the stop surface (above); a
-  run's directory also accepts `control.jsonl` commands (`pause`, `resume`, `stop-run`,
-  `stop-agent`, `restart-agent`), the gate pauses new agents while in-flight work finishes, and
-  `stop-agent` aborts exactly one child. Agent rows show output-token spend. The TUI keys for
-  selection/restart and the drill-down detail view are the next slice.
+- **`ultracode` mode** — raises reasoning effort and makes fan-out the default. Four ways in:
+  the `ultracode` agent, the keyword, `/ultracode`, or a project config flag. The keyword is
+  one-shot by default — a filename mention (`src/ultracode.ts`) never triggers at all
+  (`keywordBehavior` flips it — see [Install](#install)).
+- **Safety rails** — a recursion guard (a nested `workflow()` runs one level only), a per-agent
+  inactivity deadline plus wall-clock ceiling, a global concurrency cap, an orphan reaper,
+  retention pruning of finished run directories, and a large-run advisory — advice only, nothing
+  stops (numbers in the limits table below).
+- **Run control (in progress)** — `stop` is live (above); a run's directory also accepts
+  `control.jsonl` commands: `pause` and `resume` gate new agents while in-flight work finishes,
+  `stop-run` and `stop-agent` abort the run or one child, and `restart-agent` is parsed but not
+  implemented yet. TUI keys for selection/restart and the drill-down view are the next slice.
 - **Approval prompt** — the prompt names the real workflow (not the ignored title), its
   description and phases, the run id, and the projected agent count. The script is persisted to
-  the run directory **before** the prompt appears, so you can open `<run dir>/script.js` and read
-  exactly what will run before approving. `always` is scoped per workflow name.
+  the run directory **before** the prompt appears, so you can open `<run dir>/script.js` and
+  read exactly what will run before approving. `always` is scoped per workflow name.
 
 ### The launch contract
 
 The `workflow` tool returns immediately with a `<workflow-launched>` result naming the run id and
-directory — it never contains the outcome. The result's instruction is host-aware: in a long-lived
-host (the TUI, `opencode serve`, `opencode web`, `opencode acp`, the `--mini` REPL) it tells the
-model to end its turn once the run is launched and to poll `workflow_status(runId, { wait })` when
-you ask about the run — you keep chatting while the run works. In one-shot `opencode run` the
-process exits right after the turn, so the result instead keeps the turn alive: the model polls
-until the run settles — an unsettled run dies with the process (its completed agents survive on
-disk and a later `resumeFromRunId` replays them). If you need the old synchronous behavior, set
-the plugin option `"runMode": "blocking"` or the env `ULTRAOPEN_WORKFLOW_SYNC=1`; `dryRun` always
+directory — it never contains the outcome. In a long-lived host (TUI, `serve`, `web`, `acp`, the
+`--mini` REPL) the result tells the model to end its turn once the run is launched and to poll
+`workflow_status(runId, { wait })` when you ask about the run — you keep chatting while the run
+works. In one-shot `opencode run` the process exits right after the turn, so the result instead
+keeps the turn alive: the model polls until the run settles — an unsettled run dies with the
+process (its completed agents survive on disk and a later `resumeFromRunId` replays them). Old
+synchronous behavior: `"runMode": "blocking"` or env `ULTRAOPEN_WORKFLOW_SYNC=1`; `dryRun` always
 waits.
 
-How many runs one session may hold is conditional on ultracode (policy and rationale in
-[docs/adr/0001-launch-concurrency-policy.md](./docs/adr/0001-launch-concurrency-policy.md)): a
-session that is not in ultracode keeps the one-live-run rule — a second launch is refused naming
-the active run id. An ultracode-active session (the `ultracode` agent, the keyword, `/ultracode`,
-or the project config flag) may hold up to `ultracodeMaxRuns` (default 8, clamped to 1–32) live
-runs across both contracts: every launch result names its sibling live runs, and a launch at the
-cap is refused naming every live run id — finishing any run frees a slot. Budget scales with the
-cap: `budgetTokens` is a per-launch ceiling — one launch and everything it nests share one family
-ceiling, and concurrent launches each hold their own, so N live runs can spend N × ceiling. Saying
-"don't fan out"
-demotes ultracode at the prompt level only: it changes the standing guidance, never the gate, so
-an explicitly requested workflow still launches normally. `dryRun` is exempt from the gate in both
-modes — it is free and spawns nothing. Resuming a run that is still executing is refused in both
-modes for the same reason — two engines would write one journal.
+How many runs one session may hold is ultracode-conditional — policy and rationale in
+[docs/adr/0001-launch-concurrency-policy.md](./docs/adr/0001-launch-concurrency-policy.md): a
+non-ultracode session holds exactly one live run; an ultracode-active session holds up to
+`ultracodeMaxRuns`, and finishing any run frees a slot. Saying
+"don't fan out" changes the standing guidance, never the gate; `dryRun` is exempt; resuming a
+still-executing run is refused — two engines would write one journal.
 
 **Stopping a run.** Interrupting the turn (ESC) never stops a background run — the launch result
 says so, and the sidebar carries the same hint: to stop a detached run, call
-`workflow({ stop: "<runId>" })`. Its subagents abort, the run is recorded `cancelled`
-(`workflow_status` reports it terminal), a `<workflow-stopped>` confirmation hydrates into the
-run's session, and no completion notification follows — a run you stopped must never appear to
-have finished on its own. Completed agents stay on disk for a later `resumeFromRunId`. A run in
-the blocking contract stops by aborting its turn; a run owned by another opencode process must be
-stopped from that session, and a stop call that cannot act (unknown or finished id, cross-process
-owner) returns a clear refusal instead.
+`workflow({ stop: "<runId>" })`. Its subagents abort, the run is recorded `cancelled`, a
+`<workflow-stopped>` confirmation hydrates into the run's session, and no completion
+notification follows — a run you stopped must never appear to have finished on its own. A run
+owned by another process must be stopped from that session, and a stop call that cannot act
+returns a clear refusal.
 
-**The notification.** When a detached run settles, the outcome is delivered to the run's session:
-a `<workflow-completed>` or `<workflow-failed>` synthetic message wrapping the same render the
-blocking result carries, capped at 4096 characters (cut at a line boundary) with a pointer line to
-the full `result.json` or `failure.txt`. If the turn ended exactly as the notification landed, one
-idle nudge re-fires it — once per run, ever. While the run is live, each turn also carries an
-ephemeral one-line reminder naming the run id, the workflow, and its elapsed time (never persisted,
-never duplicated); this is what keeps the model from duplicating work already in flight. One
-visibility caveat: the TUI hides synthetic user messages from the timeline (upstream 1.18.x), so
-the notification never shows as its own row — the turn it starts is what you see.
+**The notification.** When a detached run settles, the outcome is delivered to the run's
+session: a synthetic message wrapping the same render the blocking result carries, capped at
+4096 characters (cut at a line boundary) with a pointer line to the full `result.json` or
+`failure.txt`. If the turn ended exactly as the notification landed, one idle nudge re-fires it
+— once per run, ever. While the run is live, each turn also carries an ephemeral one-line
+reminder naming the run id, the workflow, and its elapsed time — what keeps the model from
+duplicating work already in flight.
 
-**Auto-resume.** A detached run survives process death up to its journal: on the next start, runs
-the dead process interrupted re-execute automatically under the same run id — completed agents
-replay from the journal, the missing tail re-runs, and the original session is hydrated with the
-outcome. Guards keep it safe and bounded: the interruption must be younger than
-`autoResumeTtlHours` (default 24 h), at most `autoResumeMax` (default 1) run adopts per boot
-(oldest first), a run stopped by request never resumes, and the stored args must still hash to
-the run's manifest. `autoResume: false` restores manual-resume-only; runs outside the window stay
-resumable by hand with `resumeFromRunId`.
+**Auto-resume.** A detached run survives process death up to its journal: on the next start,
+runs the dead process interrupted re-execute automatically under the same run id — completed
+agents replay from the journal, the missing tail re-runs, and the original session is hydrated
+with the outcome. Guards keep it bounded: the interruption must be younger than
+`autoResumeTtlHours`, at most `autoResumeMax` runs adopt per boot, oldest first, a run stopped
+by request never resumes, and the stored args must still hash to the run's manifest.
 
 | Global | Behavior |
 | --- | --- |
@@ -235,6 +199,8 @@ resumable by hand with `resumeFromRunId`.
 | `agent(prompt, opts?)` | spawns a subagent; returns a validated object with `{ schema }`, `null` if nothing usable |
 | `phase(title)`, `log(msg)` | progress narration |
 | `budget` | `{ total, spent(), remaining() }` output-token ceiling |
+| `args` | the tool call's `args` value, verbatim — the script sees exactly what was passed |
+| `workflow(...)` | launches a nested run — one level deep, sharing the family budget |
 
 <details>
 <summary>Engine limits and agent options</summary>
@@ -243,19 +209,16 @@ resumable by hand with `resumeFromRunId`.
 | --- | --- |
 | Agents per run | 1,000 |
 | Items per `pipeline`/`parallel` call | 4,096 |
-| Script size | 512 KiB |
+| Script size | 512 KiB (524,288 characters) |
 | Concurrency | 1–32 (default 8) |
 | Per-agent inactivity limit | 5 min without progress (resets on any child event) |
 | Per-agent wall clock | 4 h default, `0` disables |
-| Stall auto-restart | up to 3 restarts per agent after a deadline kill |
+| Stall auto-restart | up to 3 restarts per agent after an idle-limit kill; a wall-clock kill never restarts |
+| Large-run advisory | ≥ 20 scheduled agents or ≥ 500k projected output tokens |
+| Retention | finished run directories pruned after 30 days |
 
 `agent()` accepts `label`, `phase`, `schema`, `model`, `effort`, `agentType`, `isolation`,
 `disallowedTools`.
-
-The script `budget` global exists and nested runs share their parent's ceiling, but no total is
-wired unless `budgetTokens` is set — the hard ceilings are the per-run agent and per-call item caps
-above. Concurrent launches each hold their own ceiling: a session of N live runs can spend
-N × ceiling.
 
 </details>
 
@@ -267,13 +230,10 @@ N × ceiling.
    ```bash
    bun install && bun run build
    ```
-2. Reference it from both config files. TUI plugins are read only from `tui.json`;
-   `opencode.json`'s `plugin` array never reaches the TUI runtime.
+2. Reference it from both config files — the same `plugin` array in each. TUI plugins are read
+   only from `tui.json`; `opencode.json`'s `plugin` array never reaches the TUI runtime.
    ```jsonc
-   // opencode.json
-   { "plugin": ["/absolute/path/to/ultraopen"] }
-
-   // tui.json  — for the progress display
+   // opencode.json and tui.json, both:
    { "plugin": ["/absolute/path/to/ultraopen"] }
    ```
    That's it — opencode loads the plugin on next start.
@@ -283,40 +243,27 @@ N × ceiling.
    ```json
    { "plugin": [["/path/to/ultraopen", { "concurrency": 8, "ultracode": true }]] }
    ```
-   - `concurrency` — global cap on live agents. Default 8, clamped to 1–32, 0 rejected.
-   - `ultracode` or `mode: "ultracode"` — enable `ultracode` effort mode. Default off.
-   - `ultracodeMaxRuns` — how many workflow runs an ultracode-active session may hold at once
-     (pending or running, both contracts). Default 8, clamped to 1–32, 0 rejected. Non-ultracode
-     sessions always hold one, whatever this is set to.
-   - `agentDeadlineMs` — wall-clock ceiling per agent, in milliseconds. Default 4 h; `0` disables
-     it (real agents legitimately run for hours; the wall clock only bounds pathology).
-   - `agentIdleMs` — inactivity limit per agent, in milliseconds. Default 5 min; the timer resets
-     whenever the child makes progress. A stalled agent is killed at the idle limit and restarted
-     up to 3 times.
-   - `keywordBehavior` — how a plain `ultracode` keyword mention behaves: `"one-shot"` (default) fans out
-     only that task; `"session"` keeps the mode on for the rest of the session.
-- `budgetTokens` — an output-token ceiling per launch: one launch and every nested run it spawns
-      share that family ceiling, and concurrent launches each hold their own, so a session of N
-      live runs can spend N × ceiling (intended). Once the spend reaches it, further `agent()`
-      calls throw and the nulls list explains why. Unset means no ceiling; invalid values degrade
-      to uncapped.
-  - `sizeGuideline` — size advice appended to the tool description (the same channel as Claude
-     Code's size guideline): write what a right-sized run looks like for this project, e.g.
-     "keep runs under 10 agents; prefer pipeline stages over wide parallel() bursts".
-- `effortPreference` — the effort ladder tried in order. Default
-      `["xhigh", "max", "high", "medium", "low"]`.
-   - `runMode` — the launch contract: `"background"` (default) returns the run id at once and
-      delivers the outcome as a notification; `"blocking"` waits for the final result. The env
-      `ULTRAOPEN_WORKFLOW_SYNC=1` forces blocking over whatever this says.
-   - `largeWorkflowAgents` — the projected-agent count at which a launch is flagged "Large
-      workflow: ~N agents projected" in the approval prompt and the launch handle. Default 25.
-      Advisory only — it never blocks.
-   - `autoResume` — re-execute interrupted background runs on the next start (default on). A run
-      stopped by request never resumes; `false` restores manual-resume-only.
-   - `autoResumeTtlHours` — how long an interrupted run stays worth auto-resuming. Default 24 h;
-      older runs stay resumable by hand with `resumeFromRunId` until retention prunes them.
-   - `autoResumeMax` — how many interrupted runs may auto-resume at one boot, oldest first.
-      Default 1, minimum 1.
+
+| Option | Default · meaning |
+| --- | --- |
+| `concurrency` | 8 — global cap on live agents; clamped 1–32, `0` rejected |
+| `ultracode` / `mode: "ultracode"` | off — enable the `ultracode` effort mode |
+| `ultracodeMaxRuns` | 8 — live runs an ultracode-active session may hold; clamped 1–32. Non-ultracode sessions always hold one |
+| `agentDeadlineMs` | 4 h — wall-clock ceiling per agent; `0` disables (the wall clock only bounds pathology) |
+| `agentIdleMs` | 5 min — inactivity limit per agent, reset on child progress. Stalled agent: killed at the limit, restarted up to 3 times |
+| `keywordBehavior` | `"one-shot"` — a plain `ultracode` mention fans out only that task; `"session"` keeps the mode on |
+| `budgetTokens` | unset — output-token ceiling per launch: one launch and its nested runs share the family ceiling; concurrent launches each hold their own (N live runs can spend N × ceiling). Reached: further `agent()` calls throw and the run fails. Unset or invalid = uncapped |
+| `sizeGuideline` | unset — size advice appended to the tool description (the same channel as Claude Code's size guideline) |
+| `effortPreference` | `["xhigh", "max", "high", "medium", "low"]` — the effort ladder tried in order |
+| `runMode` | `"background"` — the launch contract (see above); `"blocking"` waits for the final result. Env `ULTRAOPEN_WORKFLOW_SYNC=1` forces blocking |
+| `largeWorkflowAgents` | 25 — projected-agent count at which a launch is flagged "Large workflow: ~N agents projected". Advisory only |
+| `autoResume` | on — re-execute interrupted background runs on the next start; stopped runs never resume. `false` restores manual-resume-only |
+| `autoResumeTtlHours` | 24 — how long an interrupted run stays worth auto-resuming; older runs stay hand-resumable until retention prunes them |
+| `autoResumeMax` | 1 — interrupted runs may auto-resume per boot, oldest first |
+| `workflowPaths` | — — extra saved-workflow directories, added between the two defaults |
+
+The plugin also installs permission defaults — `workflow` asks, `workflow_status` is allowed —
+and ships the workflow-authoring skill (see [Authoring workflows](#authoring)).
 
 <a id="authoring"></a>
 
@@ -324,74 +271,27 @@ N × ceiling.
 
 The full authoring reference lives in this repo at
 [skills/workflow-authoring/SKILL.md](./skills/workflow-authoring/SKILL.md): the globals table,
-the engine-enforced rules, composable patterns (adversarial verify, judge panels,
-loop-until-dry), and debugging/resume notes. It ships inside the installed package too, so the
-model driving your workflow sees the same reference.
-
-The essentials: `meta` must be the first statement and a pure object literal (`name` and
-`description` required); the engine rejects `Date.now()`, `Math.random()`, and other
-resume-breaking constructs at parse time; pass `dryRun: true` to the tool call for a zero-cost
-shape check with `agent()` stubbed. Every run persists its journal, manifest, and result under
-the opencode tool-output dir (`ultraopen/<runId>/`) — read `journal.jsonl` to see each agent's
-recorded value.
+the engine-enforced rules (pure-literal `meta` first, `Date.now()`/`Math.random()` rejected at
+parse time, `dryRun: true` for a free shape check), composable patterns (adversarial verify,
+judge panels, loop-until-dry), the run-directory layout (`journal.jsonl` per run), and
+debugging/resume notes. It ships inside the installed package too, so the model driving your
+workflow sees the same reference.
 
 <a id="compatibility"></a>
 
 ## 🧭 Compatibility and known limits
 
-Verified against opencode 1.18.31 and 1.18.32 by the live e2e suites (`test/e2e`).
+Verified against opencode 1.18.31 by the live e2e suites (`test/e2e`). The full working,
+known-gap, and cosmetic inventory — each probe with its implementation note — lives in
+[docs/compatibility.md](./docs/compatibility.md). Headline gaps:
 
-Working end to end:
-
-- the background contract end to end (launch handle, per-turn live-run reminder, completion
-  notification in the parent session, `workflow({ stop })`, auto-resume after a process death)
-- parallel and pipeline fan-out
-- schema-forced structured output
-- per-model effort resolution
-- resume across processes (journal replay returns the recorded values)
-- nested `workflow({ script })`
-- the per-agent idle limit and wall clock
-- all four ultracode activation surfaces
-- the three TUI progress surfaces
-
-Known gaps the e2e probes confirmed:
-
-- `agent()`'s `isolation: "worktree"` option is inert in the live wiring (`worktreeRoot` is
-  never passed)
-- schema-forced agents (`schema:` on `agent()`) can fail against Together with an empty
-  `APIError` when ANY tool in the session's toolset carries a `$ref` in its JSON Schema (some
-  MCP servers do — Obsidian's `vault_patch` does). Together's grammar compiler misresolves
-  `$ref` pointers under the string form of `tool_choice: "required"` that opencode sends for
-  `format` calls; the identical request succeeds with the object form. Workaround: disable the
-  offending MCP server, or run those agents schema-less.
-
-Each probe carries a `bun run check`-clean implementation note in the suites.
-
-Cosmetic limitations (upstream): the transcript renderer echoes a tool call's raw arguments, so
-a `workflow` call displays its full script (visible in the first screenshot above); and an open
-sidebar renders one blank line when no runs are active. The progress surfaces (strip, sidebar,
-prompt status) are where live state shows: failed agents carry the theme's error color on their
-glyph plus the failure reason, a half-failed run shows a failed count while live, and an
-interrupted run (its process died) shows a once-per-boot resume hint in the strip.
-
-Also upstream: workflow agents do not get transcript task-rows — the renderer builds those only
-from the built-in task tool's parts (the row's child-session id lives in the part's
-`metadata.sessionId`, which only the task tool writes), so a workflow's child sessions show no
-transcript rows no matter what a plugin does. Per-agent progress shows on the three surfaces
-above, and `Ctrl-x` then `down` navigates into each child session today; the upstream proposal to
-render parented children generically is filed (policy and evidence in
-[docs/adr/0002-transcript-task-rows.md](./docs/adr/0002-transcript-task-rows.md)). The permission
-approval dialog renders without the ask's `metadata` (the workflow
-name, description and phases) on 1.18.31, and schema-forced agents fail against Together with an empty
-`APIError` when ANY tool in the session carries a `$ref` in its JSON Schema. The task-row, dialog
-and `$ref` gaps need upstream fixes; the transcript-echo collapse (this epic's original upstream
-PR target) is researched and ready to submit separately.
-
-One more upstream quirk concerns the background notifications specifically: the TUI hides
-synthetic user messages from the visible timeline (`!part.synthetic` filter, 1.18.x), so a
-`<workflow-completed>` notification never renders as its own row — what you see is the turn it
-starts (the model replying to the result), and what you get is the outcome. The e2e suites assert
-the notification at the session-database level for exactly this reason.
+- `agent()`'s `isolation: "worktree"` option is inert in the live wiring — ours to wire, not
+  upstream (`worktreeRoot` is never passed).
+- Schema-forced agents (`schema:` on `agent()`) can fail against Together with an empty
+  `APIError` when ANY tool in the session's toolset carries a `$ref` in its JSON Schema
+  (workarounds in the doc).
+- The TUI hides synthetic user messages from the timeline (upstream 1.18.x), so a completion
+  notification never shows as its own row — the turn it starts is what you see.
 
 <a id="development"></a>
 
@@ -408,30 +308,26 @@ bash test/e2e/tui-dev.sh     # run `opencode` locally with the TUI plugin actual
 
 The e2e suites run in an isolated scratch XDG home (real provider auth, throwaway state) and
 assert on the plugin's own on-disk run artifacts plus captured tmux panes. They make real model
-calls — pennies per run on Together, on the default suite model `togetherai/zai-org/GLM-5.3-Flash`
-(override with `E2E_MODEL`). Measured flake rate: 0 flake events across 87 live turns in one clean
-run of both suites — bad weather is unmeasured, but the watchdog plus per-case retry bound it:
-re-run on flakes, and both suites retry the common cases. The screenshots at the top
-are rendered from `visual.sh` frame captures (see `assets/`).
+calls — pennies per run on Together, on the default suite model (override with `E2E_MODEL`).
+Measured flake rate: zero flake events in one clean run of both suites — bad weather is
+unmeasured, but the watchdog plus per-case retry bound it, and both suites retry the common
+cases. The screenshots at the top are rendered from `visual.sh` frame captures (see `assets/`).
 
-`tui-dev.sh` exists because of an upstream dev-checkout trap: the TUI host injects its own
-Solid/OpenTUI instances into a plugin only when the plugin directory cannot resolve them, and
-`node_modules/solid-js` ships Solid's SSR build under the `node` export condition — signals never
-update, and the progress surfaces silently render nothing. A published install doesn't ship
-`node_modules` and is unaffected; a dev checkout must stash the shadowing packages (the wrapper
-does it for you).
+`tui-dev.sh` exists because of a dev-checkout trap: the TUI host injects its own Solid/OpenTUI
+into a plugin only when the plugin directory cannot resolve them, and `node_modules/solid-js`
+ships Solid's SSR build — signals never update, so the surfaces silently render nothing. A dev
+checkout must stash the shadowing packages (the wrapper does it for you); a published install is
+unaffected.
 
 `bun run m0` is a re-runnable health check for the one interaction that cannot be verified from
-source: that `format: {type:"json_schema"}` works together with a high reasoning variant, and that
-forced tool choice still leaves an agent free to research first. Upstream has no test coverage for
-that path, so it can regress silently in an opencode release.
+source: that `format: {type:"json_schema"}` works together with a high reasoning variant, and
+that forced tool choice still leaves an agent free to research first — a path upstream has no
+test coverage for, so it can regress silently in an opencode release.
 
 CI runs lint, typecheck, the coverage-gated tests, and Node parity on ubuntu and macOS. The
-badges up top are per-workflow: the **Coverage Status** badge is the percentage Coveralls
-computes from each coverage-gated run — Coveralls is free for public repos, registers the repo
-on first upload, and authenticates with the token Actions already provides, so there is no
-secret to set; **Security** is a weekly zizmor audit of the workflow files themselves (CodeQL
-also works on public repos and would be the next step up).
+**Coverage Status** badge is the percentage Coveralls computes from each coverage-gated run
+(free for public repos, no secret to set); **Security** is a weekly zizmor audit of the workflow
+files themselves.
 
 ## ⚖️ License
 

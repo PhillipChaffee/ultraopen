@@ -93,7 +93,7 @@ grep -q "READY" "$OUT/t0.out" \
 section "T2 — parallel fan-out (3 agents, barrier, journal)"
 # First heavyweight case after the slimming (#45): its failure is the suite's
 # triage canary. A schema-forced agent can die on a transient provider
-# api-error (schema-forced $ref against the Together grammar, README:295-300);
+# api-error (schema-forced $ref against the Together grammar, docs/compatibility.md);
 # the parallel barrier and the journal are the contract — a missing answer is
 # provider weather only when the missing agent's journal entry records it.
 runs_snapshot "$OUT/runs-before-t2.txt"

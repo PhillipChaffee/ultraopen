@@ -36,8 +36,8 @@ Non-ultracode sessions hold exactly one live run regardless of the cap.
 
 **budget ceiling**
 The per-launch output-token ceiling the `budgetTokens` plugin option sets. Once the spend reaches
-it, further `agent()` calls throw and the nulls list explains why. Unset or invalid values mean
-uncapped.
+it, further `agent()` calls throw — and the throw fails the run rather than degrading to a
+`null`; the run's failure names the ceiling. Unset or invalid values mean uncapped.
 
 **family ceiling**
 The one ceiling a launch family shares: every nested run the launch spawns attaches to the
