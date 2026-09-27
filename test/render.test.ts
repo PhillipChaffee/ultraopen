@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { renderCapRefusal, renderLaunch, renderRefusal, renderResult, renderSiblingAdvisory, renderStatus } from "../src/server/tool/render.js"
+import { renderCapRefusal, renderLaunch, renderRefusal, renderResult, renderSiblingAdvisory, renderStatus, renderStringifiedArgsRefusal } from "../src/server/tool/render.js"
 import type { WorkflowResult } from "../src/server/tool/workflow.js"
 import type { StatusReport } from "../src/server/tool/status.js"
 
@@ -93,6 +93,30 @@ describe("renderRefusal", () => {
     expect(refused).toContain("<workflow-refused>")
     expect(refused).toContain("already has a workflow run in flight (running): run id wf_solo0002")
     expect(refused).toContain('Poll workflow_status(runId: "wf_solo0002", wait: 120)')
+  })
+})
+
+describe("renderStringifiedArgsRefusal (#78)", () => {
+  test("names what was received, why it failed, and the fix", () => {
+    const out = renderStringifiedArgsRefusal(
+      '{"repo":',
+      "it looks like JSON but does not parse (Expected double-quoted property name in JSON at position 9)",
+    )
+    expect(out).toContain("<workflow-refused>")
+    // The raw payload is previewed JSON-quoted.
+    expect(out).toContain(String.raw`"{\"repo\":"`)
+    expect(out).toContain("does not parse")
+    expect(out).toContain("Expected double-quoted property name")
+    // The contract is stated: parseable JSON strings are hydrated, this one could not be.
+    expect(out).toContain("hydrated")
+    expect(out).toContain("real JSON")
+  })
+
+  test("a long raw string is previewed, not dumped", () => {
+    const long = JSON.stringify({ repo: "x".repeat(400) })
+    const out = renderStringifiedArgsRefusal(long, "it looks like JSON but does not parse (boom)")
+    expect(out).toContain("…")
+    expect(out.length).toBeLessThan(500)
   })
 })
 

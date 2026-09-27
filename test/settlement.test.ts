@@ -35,7 +35,7 @@ let base: string,
  env: NodeJS.ProcessEnv
 
 const wire = (overrides: Partial<Parameters<typeof wireRun>[0]> = {}): ReturnType<typeof wireRun> => {
-  const prepared = { source: SCRIPT, meta: { name: "wired", description: "wiring" }, body: SCRIPT },
+  const prepared = { source: SCRIPT, meta: { name: "wired", description: "wiring" }, body: SCRIPT, argsValue: undefined, argsDereference: undefined, argsHydrated: undefined },
    manifest = {
     runId: RUN_ID,
     bootId: "boot",

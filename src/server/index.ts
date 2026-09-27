@@ -7,6 +7,7 @@ import { registry } from "./singleton.js"
 import { installConfig } from "./ultracode/config.js"
 import type { MutableConfig } from "./ultracode/config.js"
 import { execute, prepare, projectLaunchSize, renderFailure, WorkflowRunError } from "./tool/workflow.js"
+import { inspectArgsTransport } from "./tool/args-transport.js"
 import type { WorkflowArgs } from "./tool/workflow.js"
 import { WORKFLOW_TOOL, STATUS_TOOL } from "./bridge/permission.js"
 import { asClient } from "./types.js"
@@ -34,6 +35,7 @@ import {
   renderCapRefusal,
   renderResumeRefusal,
   renderArgsRefusal,
+  renderStringifiedArgsRefusal,
   renderStatus,
   workflowArgsSchema,
   statusArgsSchema,
@@ -290,6 +292,16 @@ async function launchWorkflow(
     return renderArgsRefusal(args.args)
   }
 
+  // Stringified-JSON transport (#78): a string that LOOKS like JSON but fails to parse is
+  // refused here — same placement pins as the zero-value guard, so the refusal registers no
+  // pending entry and burns no approval. Hydration is NOT done here: prepare() is the single
+  // mutation point, and it runs before the projection, the resume load and beginRun, so every
+  // downstream consumer — hashing included — sees the hydrated value.
+  const transport = inspectArgsTransport(args.args)
+  if (transport.action === "refuse") {
+    return renderStringifiedArgsRefusal(transport.raw, transport.reason)
+  }
+
   const background = args.dryRun !== true && (args.background ?? options.runMode === "background"),
    runId = `wf_${randomUUID().replaceAll("-", "").slice(0, 12)}`,
    // The session's default model, so `effort` resolves against ITS variant set rather
@@ -394,7 +406,7 @@ async function launchWorkflow(
     // free preview, so the pass is skipped for it.
     const projectedAgents = args.dryRun === true
       ? undefined
-      : await projectLaunchSize(prepared, args, named, { signal: context.abort })
+      : await projectLaunchSize(prepared, named, { signal: context.abort })
 
     await context.ask?.({
       permission: WORKFLOW_TOOL,
@@ -415,7 +427,7 @@ async function launchWorkflow(
     // Resume BEFORE the run starts, so replayed calls never spawn anything; the
     // refusal gates above already cleared a live source run.
     const resume = args.resumeFromRunId
-      ? await loadResume(args.resumeFromRunId, args.args, context.sessionID)
+      ? await loadResume(args.resumeFromRunId, prepared.argsValue, context.sessionID)
       : undefined
 
     // The manifest MUST be on disk before this call returns: the launch result
@@ -427,8 +439,12 @@ async function launchWorkflow(
       runId,
       sessionID: context.sessionID,
       source: prepared.source,
-      args: args.args,
+      // The HYDRATED args value (#78): the manifest and its hash describe what the script sees.
+      args: prepared.argsValue,
       bootId,
+      // A hydrated launch records what actually arrived (#78): args holds the hydrated value,
+      // argsRawString preserves the raw string the caller sent.
+      ...(prepared.argsHydrated === undefined ? {} : { argsRawString: prepared.argsHydrated.raw }),
     })
     if (!manifest) {
       dropPending(runId)

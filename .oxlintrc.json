@@ -108,7 +108,9 @@
       "rules": {
         "import/max-dependencies": [
           "error",
-          { "max": 23 }
+          // 24: one slot for the args-transport boundary module (#78) — imported directly, not
+          // laundered through a re-export, so the dependency count stays honest.
+          { "max": 24 }
         ]
       }
     },

@@ -47,6 +47,13 @@ export interface Manifest {
    * pre-feature manifest can never replay against guessed inputs.
    */
   args?: unknown
+  /**
+   * The raw string the boundary received for `args`, recorded ONLY when it hydrated a
+   * stringified JSON payload (#78): `args` then holds the hydrated value, and this field
+   * preserves what the caller actually sent, so the transport repair is diagnosable from the
+   * manifest alone. Absent on non-hydrated launches.
+   */
+  argsRawString?: string
   /** `cancelled` is written by the stop path: the run was stopped by request, not by failure. */
   status: "running" | "completed" | "failed" | "cancelled" | "orphaned"
   childSessionIDs: string[]

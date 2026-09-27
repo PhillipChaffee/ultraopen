@@ -27,6 +27,16 @@ const DENIED_GLOBALS = new Set([
   "importScripts",
 ])
 
+/** The first member dereference on the `args` identifier, reported by the static lint (#78). */
+export interface ArgsDereference {
+  line: number
+  column: number
+  /** The property read, or "" for a computed access (`args[k]`) or a destructuring read. */
+  property: string
+  /** How the read happened, so the launch gate's message can name the shape. */
+  kind: "member" | "destructure"
+}
+
 /**
  * Static determinism + Node-access lint.
  *
@@ -36,8 +46,15 @@ const DENIED_GLOBALS = new Set([
  * The bans are a determinism requirement, not arbitrary restriction: resume replays the script and
  * matches agent() calls against cached results, which only works if the script is a pure function
  * of (source, args).
+ *
+ * Returns the FIRST member dereference on the `args` identifier, when the script contains one
+ * (#78). This is a flag, not a failure: dereferencing `args` is legal when args IS an object.
+ * The sandbox launch gate combines the flag with the runtime args value and throws at script
+ * start when they disagree — naming the received type and a preview instead of letting
+ * `undefined` flow silently into every agent prompt.
  */
-export function lintDeterminism(ast: acorn.Program): void {
+export function lintDeterminism(ast: acorn.Program): ArgsDereference | undefined {
+  let argsDereference: ArgsDereference | undefined
   walk(ast, (node) => {
     if (node.type === "ImportDeclaration" || node.type === "ImportExpression") {
       fail({
@@ -87,6 +104,41 @@ export function lintDeterminism(ast: acorn.Program): void {
       }
     }
 
+    // `args.X`, `args["X"]` and `args?.X` all dereference the args global — every form poisons
+    // prompts with `undefined` when args is not an object. The flag carries the first read so
+    // the runtime gate can point at it; computed accesses report an empty property.
+    //
+    // KNOWN LIMIT — the flag is syntactic, like the Date/Math bans: a nested function or catch
+    // parameter NAMED `args` (`(args) => args.x`) is falsely flagged, and no scope tracking
+    // exists to tell it from the global. The gate message points at the read, so the fix is a
+    // rename; the Date.now ban has the same shape of limit.
+    if (argsDereference === undefined && node.type === "MemberExpression" && node.object.type === "Identifier" && node.object.name === "args") {
+      const position = loc(node)
+      if (position !== undefined) {
+        // A computed access cannot name its property statically; the gate renders it as `args[…]`.
+        let property = ""
+        if (!node.computed && node.property.type === "Identifier") {property = node.property.name}
+        argsDereference = { ...position, property, kind: "member" }
+      }
+    }
+
+    // Destructuring reads (`const { repo } = args`, `for (const x of args)`) poison prompts the
+    // same way a member dereference does and produce no MemberExpression to flag — cover them.
+    if (argsDereference === undefined) {
+      let destructured = false
+      if (node.type === "VariableDeclarator" && node.init?.type === "Identifier" && node.init.name === "args" && (node.id.type === "ObjectPattern" || node.id.type === "ArrayPattern")) {
+        destructured = true
+      } else if ((node.type === "ForOfStatement" || node.type === "ForInStatement") && node.right.type === "Identifier" && node.right.name === "args") {
+        destructured = true
+      } else if (node.type === "AssignmentExpression" && node.operator === "=" && node.right.type === "Identifier" && node.right.name === "args" && (node.left.type === "ObjectPattern" || node.left.type === "ArrayPattern")) {
+        destructured = true
+      }
+      if (destructured) {
+        const position = loc(node)
+        if (position !== undefined) {argsDereference = { ...position, property: "", kind: "destructure" }}
+      }
+    }
+
     if (
       node.type === "NewExpression" &&
       node.callee.type === "Identifier" &&
@@ -110,4 +162,5 @@ export function lintDeterminism(ast: acorn.Program): void {
       })
     }
   })
+  return argsDereference
 }

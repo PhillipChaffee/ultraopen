@@ -61,6 +61,20 @@ differently from its source baseline, so the argsChanged guard would refuse the 
 string would run live. A stop call carrying decoration still stops; the auto-resume sweep and
 nested `workflow()` calls are immune by construction.
 
+**args hydration (transport repair)**
+A stringified-JSON `args` payload — the failure mode behind poisoned agent prompts (#78). Distinct
+from a zero-value decoration: hydration is TRANSPORT repair, restoring the caller's intent, not
+normalizing a decoration. At the engine boundary, a string that parses to an object or array is
+hydrated to that value (loudly: the manifest records the raw string beside the hydrated value, and
+the run log carries the repair line); a string that looks like JSON but fails to parse is refused
+before the launch gate; any other string stays a scalar, exactly as passed. Hydration happens
+before `argsHash`, so a hydrated launch and an object-args resume replay as the same run. A script
+that dereferences `args` (`args.X`, `args["X"]`, `args?.X`, destructuring) is statically flagged,
+and the sandbox launch gate throws at script start — zero tokens — when the runtime args is not an
+object. The auto-resume sweep passes the stored args through the same boundary, so a poisoned-era
+manifest (raw string + string hash) mismatches and stays unadopted — manually resumable — instead
+of executing with a seed its journal never used.
+
 **leak (e2e)**
 Two distinct senses in the e2e suites — keep them apart. A **process leak** is a test-spawned
 opencode process that outlives the suite (what the cleanup guarantee targets). **Config
