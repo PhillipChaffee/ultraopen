@@ -117,12 +117,31 @@ housekeeping; the standing policy is fix forward, gate last (verify upstream maj
 e2e suites proactively, support both lines with compatible code first, touch the range only as a
 last resort — decided in #108, durable record in the README stance line, no ADR).
 
+**sticky cache**
+The opencode package cache tree an npm-name plugin installs into: `~/.cache/opencode/packages/<spec>`,
+one directory per spec (`ultraopen@latest`, or a pin like `ultraopen@0.1.0` in its own versioned
+tree). `@latest` resolves only on first install — a published update never reaches an existing
+install on its own, which is what the refresh instruction works around; `-f` rewrites config
+entries and never refetches a bare `@latest` (decided in #105).
+
 **refresh instruction**
 The canonical sticky-cache refresh shipped with every publish: remove
 `~/.cache/opencode/packages/ultraopen*`, then restart opencode. The npm plugin cache is sticky —
 `@latest` resolves only on first install — so a new release never reaches an existing install on
 its own. Habitual, not situational: it hard-embeds into every release's notes
 (`.github/release-template.md`) and the standing README "Updating" note (decided in #108).
+
+**registry hop**
+The fetch of a published package from the npm registry into the package cache — the one install
+link a packed-tarball proof cannot exercise. Nothing posts or submits anywhere until the hop is
+proven live in a scratch home: the installer exits clean, writes both config files, and the e2e
+suites pass against the registry-installed tree (decided in #111).
+
+**trusted publisher**
+The npmjs.com binding that lets the tag-driven `release.yml` publish to npm via GitHub Actions
+OIDC — no npm token exists, none ever will. The first publish (v0.1.0) necessarily went local
+over 2FA and ships without provenance; every tag-driven publish after it attests provenance
+automatically (decided in #103).
 
 ## Where decisions live
 
