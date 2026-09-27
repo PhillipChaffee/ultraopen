@@ -1,8 +1,11 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test"
-import { execute, prepare, projectAgentCount, renderFailure } from "../src/server/tool/workflow.js"
+import { execute, prepare, projectAgentCount, renderFailure, WorkflowRunError } from "../src/server/tool/workflow.js"
+import type { WorkflowArgs } from "../src/server/tool/workflow.js"
+import { inspectArgsTransport } from "../src/server/tool/args-transport.js"
 import { WorkflowScriptError } from "../src/server/script/errors.js"
 import { parse } from "../src/server/script/parse.js"
 import { MAX_AGENTS_PER_RUN } from "../src/server/script/limits.js"
+import { argsHash } from "../src/server/resume/key.js"
 import { registry } from "../src/server/singleton.js"
 import type { OpencodeClient } from "../src/server/types.js"
 import type { ProgressEvent } from "../src/server/runtime/run.js"
@@ -179,6 +182,141 @@ describe("args", () => {
   })
 })
 
+describe("args transport (#78)", () => {
+  // Layer 1: narrow hydration at the engine boundary. A stringified JSON object or array is
+  // repaired (loudly); a string that looks like JSON but fails to parse is refused; honest
+  // scalar strings — including JSON-parseable scalars like "42" — pass through untouched.
+  test("prepare hydrates a stringified JSON object without mutating the caller's record", async () => {
+    const args: WorkflowArgs = { script: `${META}return args\n`, args: '{"repo":"dot-agents-alignment"}' }
+    const prepared = await prepare(args, base)
+    expect(args.args).toBe('{"repo":"dot-agents-alignment"}')
+    expect(prepared.argsValue).toEqual({ repo: "dot-agents-alignment" })
+    expect(prepared.argsHydrated?.raw).toBe('{"repo":"dot-agents-alignment"}')
+    expect(prepared.argsHydrated?.kind).toBe("object")
+  })
+
+  test("prepare hydrates a stringified JSON array too", async () => {
+    const prepared = await prepare({ script: `${META}return args\n`, args: "[1,2]" }, base)
+    expect(prepared.argsValue).toEqual([1, 2])
+    expect(prepared.argsHydrated?.kind).toBe("array")
+  })
+
+  test("an honest scalar string stays untouched", async () => {
+    for (const scalar of ["42", "review-targets", '"42"']) {
+      const args: WorkflowArgs = { script: `${META}return args\n`, args: scalar }
+      const prepared = await prepare(args, base)
+      expect(prepared.argsValue).toBe(scalar)
+      expect(prepared.argsHydrated).toBeUndefined()
+    }
+  })
+
+  test("a JSON-looking string that fails to parse is refused before anything runs", async () => {
+    const args: WorkflowArgs = { script: `${META}return args\n`, args: '{"repo":' }
+    await expect(prepare(args, base)).rejects.toThrow(/looks like JSON but does not parse/u)
+    expect(args.args).toBe('{"repo":')
+  })
+
+  test("the refuse decision tolerates surrounding whitespace, both ways", () => {
+    // JSON.parse accepts padded payloads, so padded-but-parseable hydrates and padded-but-broken
+    // refuses — the trimStart() guard is load-bearing for the second half.
+    expect(inspectArgsTransport(' {"repo":"r"}').action).toBe("hydrate")
+    expect(inspectArgsTransport('\t[1,2]').action).toBe("hydrate")
+    expect(inspectArgsTransport(' {"repo":').action).toBe("refuse")
+    expect(inspectArgsTransport('{"a":1} ').action).toBe("hydrate")
+  })
+
+  test("a payload too deeply nested to hash is refused before anything runs", async () => {
+    // JSON.parse is iterative and accepts what argsHash's recursion cannot: a deep-but-parseable
+    // payload must refuse at the boundary, not overflow after the permission ask (review finding).
+    const deep = `${"[".repeat(100_000)}1${"]".repeat(100_000)}`
+    const args: WorkflowArgs = { script: `${META}return args\n`, args: deep }
+    await expect(prepare(args, base)).rejects.toThrow(/too deeply nested to hash/u)
+    expect(args.args).toBe(deep)
+  })
+
+  test("execute's own refusal is an unwrapped WorkflowScriptError that renders with the payload", async () => {
+    // Direct engine callers rely on this contract: the refuse branch throws BEFORE the run, so
+    // no WorkflowRunError wrapping exists, and renderFailure shows the previewed payload.
+    const failure = await execute({ script: `${META}return args\n`, args: '{"repo":' }, base).catch(
+      (error: unknown) => error,
+    )
+    expect(failure).toBeInstanceOf(WorkflowScriptError)
+    const rendered = renderFailure(failure, `{"repo":`)
+    expect(rendered).toContain("does not parse")
+    expect(rendered).toContain("real JSON")
+  })
+
+  test("execute hands the hydrated object to the script and logs the repair", async () => {
+    const result = await execute(
+      { script: `${META}return args.repo\n`, args: '{"diff":"none","repo":"dot-agents-alignment"}', dryRun: true },
+      base,
+    )
+    expect(result.value).toBe("dot-agents-alignment")
+    expect(result.logs).toContain("args arrived as a JSON string; hydrated to object")
+  })
+
+  test("execute throws at start for a dereferencing script with non-object args — zero agents", async () => {
+    const prompts: string[] = [],
+     promptClient = {
+      session: {
+        create: () => Promise.resolve({ data: { id: "child" } }),
+        get: () => Promise.resolve({ data: { id: "child" } }),
+        delete: () => Promise.resolve({}),
+        abort: () => Promise.resolve({}),
+        prompt: (options: { body: { parts: { text?: string }[] } }) => {
+          prompts.push(options.body.parts[0]?.text ?? "")
+          return Promise.resolve({ data: { info: {}, parts: [] } })
+        },
+      },
+    } as unknown as OpencodeClient
+    for (const bad of ["review-targets", 42, undefined]) {
+      prompts.length = 0
+      await expect(execute({ script: `${META}log('probe: ' + args.repo)\nreturn 1\n`, args: bad }, { ...base, client: promptClient })).rejects.toThrow(
+        /args arrived as/u,
+      )
+      expect(prompts).toEqual([])
+    }
+  })
+
+  test("the start throw names the received type and a preview, with the dereference line", async () => {
+    const failure = await execute({ script: `${META}return args.repo\n`, args: "review-targets" }, base).catch(
+      (error: unknown) => error,
+    )
+    // execute wraps run failures in WorkflowRunError; the cause carries the script diagnostic,
+    // which the tool layer unwraps for rendering — location included, caret and all.
+    expect(failure).toBeInstanceOf(WorkflowRunError)
+    const cause = (failure as WorkflowRunError).cause
+    expect(cause).toBeInstanceOf(WorkflowScriptError)
+    const diagnostic = (cause as WorkflowScriptError).diagnostic
+    expect(diagnostic.message).toContain("the string")
+    expect(diagnostic.message).toContain("review-targets")
+    expect(diagnostic.location).toEqual({ line: 2, column: 7 })
+  })
+
+  test("a pass-through script keeps scalar args working end to end", async () => {
+    const result = await execute({ script: `${META}return typeof args + ':' + args\n`, args: "42", dryRun: true }, base)
+    expect(result.value).toBe("string:42")
+    expect(result.logs.some((line) => line.includes("hydrated"))).toBe(false)
+  })
+
+  test("the projection degrades when the gate fires, and reads the hydrated args otherwise", async () => {
+    // prepare is pure: the projection reads the hydrated value off the prepared workflow, not
+    // off the args record.
+    const deref = `${META}for (const item of args.items) { await agent('item ' + item) }\n`
+    const hydrated = await prepare({ script: deref, args: '{"items":[1,2]}' }, base)
+    expect(await projectAgentCount(hydrated, undefined)).toBe(2)
+    const scalar = await prepare({ script: deref, args: "42" }, base)
+    await expect(projectAgentCount(scalar, undefined)).rejects.toThrow(/args arrived as/u)
+  })
+
+  test("hydration happens before hashing, so a hydrated launch and an object-args resume agree", async () => {
+    const raw = '{"repo":"dot-agents-alignment"}'
+    const prepared = await prepare({ script: `${META}return args\n`, args: raw }, base)
+    expect(argsHash(prepared.argsValue)).toBe(argsHash({ repo: "dot-agents-alignment" }))
+    expect(argsHash(prepared.argsValue)).not.toBe(argsHash(raw))
+  })
+})
+
 describe("renderFailure", () => {
   test("renders a WorkflowScriptError diagnostic with a caret when source is supplied", () => {
     const error = new WorkflowScriptError({
@@ -240,7 +378,7 @@ describe("projectAgentCount", () => {
     // pass exercises the same globals a live run would.
     const script = `${META}phase('probe')\nlog('projecting')\nawait parallel([() => agent('a'), () => agent('b'), () => agent('c')])\nawait agent('d')\nawait agent('e')\n`
     const prepared = await prepare({ script }, base)
-    expect(await projectAgentCount(prepared, { script }, undefined)).toBe(5)
+    expect(await projectAgentCount(prepared, undefined)).toBe(5)
   })
 
   test("counts agents inside a nested workflow, by name and inline", async () => {
@@ -252,13 +390,13 @@ describe("projectAgentCount", () => {
     },
      script = `${META}await parallel([() => agent('p1'), () => agent('p2')])\nawait workflow('helper')\nawait workflow({ script: ${JSON.stringify(`export const meta = { name: 'x', description: 'x' }\nawait agent('x1')\n`)} })\n`,
      prepared = await prepare({ script }, { ...base, named })
-    expect(await projectAgentCount(prepared, { script }, named)).toBe(5)
+    expect(await projectAgentCount(prepared, named)).toBe(5)
   })
 
   test("reads args like the real run", async () => {
     const script = `${META}for (const item of args.items) { await agent('item ' + item) }\n`,
      prepared = await prepare({ script, args: { items: [1, 2, 3, 4] } }, base)
-    expect(await projectAgentCount(prepared, { script, args: { items: [1, 2, 3, 4] } }, undefined)).toBe(4)
+    expect(await projectAgentCount(prepared, undefined)).toBe(4)
   })
 
   test("runs the budget UNCAPPED, matching an uncapped run's control flow", async () => {
@@ -266,7 +404,7 @@ describe("projectAgentCount", () => {
     // throwing with the values is the only way to observe the global from outside.
     const script = `${META}throw new Error('total=' + budget.total + ' remaining=' + budget.remaining() + ' spent=' + budget.spent())\n`
     const prepared = await prepare({ script }, base)
-    await expect(projectAgentCount(prepared, { script }, undefined)).rejects.toThrow(
+    await expect(projectAgentCount(prepared, undefined)).rejects.toThrow(
       /total=null remaining=Infinity spent=0/u,
     )
   })
@@ -277,8 +415,8 @@ describe("projectAgentCount", () => {
     // the run directory never appears (nothing persisted).
     const script = `${META}await parallel([() => agent('a'), () => agent('b')])\nawait agent('c')\n`,
      prepared = await prepare({ script }, base)
-    expect(await projectAgentCount(prepared, { script }, undefined)).toBe(3)
-    expect(await projectAgentCount(prepared, { script }, undefined)).toBe(3)
+    expect(await projectAgentCount(prepared, undefined)).toBe(3)
+    expect(await projectAgentCount(prepared, undefined)).toBe(3)
     expect(registry.sessionsOf("wf_test")).toEqual([])
     expect(existsSync(join(dataHome, "opencode", "tool-output", "ultraopen", "wf_test"))).toBe(false)
   })
@@ -288,7 +426,7 @@ describe("projectAgentCount", () => {
     // give — the projection and the dry run are the same free preview, from the script's view.
     const script = `${META}const plain = await agent('p')\nconst shaped = await agent('s', { schema: { type: 'object' } })\nthrow new Error(typeof plain + ':' + plain + '|' + JSON.stringify(shaped))\n`
     const prepared = await prepare({ script }, base)
-    await expect(projectAgentCount(prepared, { script }, undefined)).rejects.toThrow(
+    await expect(projectAgentCount(prepared, undefined)).rejects.toThrow(
       /string:\[dryRun\] p\|\{\}/u,
     )
   })
@@ -296,15 +434,15 @@ describe("projectAgentCount", () => {
   test("a script error surfaces so the caller can degrade to no projection", async () => {
     const script = `${META}throw new Error('boom')\n`
     const prepared = await prepare({ script }, base)
-    await expect(projectAgentCount(prepared, { script }, undefined)).rejects.toThrow("boom")
+    await expect(projectAgentCount(prepared, undefined)).rejects.toThrow("boom")
   })
 
   test("a determinism trap surfaces the same way the real run would fail", async () => {
     // The static lint catches literal Date.now() at parse time, so this body arrives via a
     // hand-built PreparedWorkflow — the runtime trap (the guarded Date) is what must surface
     // from the projection pass itself.
-    const prepared = { source: META, meta: parse(META).meta, body: "Date.now()\n" }
-    await expect(projectAgentCount(prepared, { script: META }, undefined)).rejects.toThrow(WorkflowScriptError)
+    const prepared = { source: META, meta: parse(META).meta, body: "Date.now()\n", argsValue: undefined, argsDereference: undefined, argsHydrated: undefined }
+    await expect(projectAgentCount(prepared, undefined)).rejects.toThrow(WorkflowScriptError)
   })
 
   test("an aborted launch stops the projection", async () => {
@@ -312,7 +450,7 @@ describe("projectAgentCount", () => {
     controller.abort()
     const script = `${META}await agent('a')\n`
     const prepared = await prepare({ script }, base)
-    await expect(projectAgentCount(prepared, { script }, undefined, { signal: controller.signal })).rejects.toThrow(
+    await expect(projectAgentCount(prepared, undefined, { signal: controller.signal })).rejects.toThrow(
       /interrupted/u,
     )
   })
@@ -322,14 +460,14 @@ describe("projectAgentCount", () => {
     // run bounds the projection too — the advisory reports the backstop itself.
     const script = `${META}while (true) { await agent('x') }\n`
     const prepared = await prepare({ script }, base)
-    expect(await projectAgentCount(prepared, { script }, undefined)).toBe(MAX_AGENTS_PER_RUN)
+    expect(await projectAgentCount(prepared, undefined)).toBe(MAX_AGENTS_PER_RUN)
   })
 
   test("nested nesting obeys the same one-level rule the engine enforces", async () => {
     const inner = `export const meta = { name: 'inner', description: 'i' }\nreturn await workflow('deeper')\n`,
      script = `${META}return await workflow({ script: ${JSON.stringify(inner)} })\n`
     const prepared = await prepare({ script }, base)
-    await expect(projectAgentCount(prepared, { script }, undefined)).rejects.toThrow(/one level only/u)
+    await expect(projectAgentCount(prepared, undefined)).rejects.toThrow(/one level only/u)
   })
 })
 

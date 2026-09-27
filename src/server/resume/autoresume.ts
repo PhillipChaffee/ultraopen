@@ -5,6 +5,7 @@ import type { OpencodeClient } from "../types.js"
 import { STOP_ABORT_REASON, nameRun, registerPending } from "../tool/background.js"
 import { startDetachedRun } from "../tool/settlement.js"
 import { prepare } from "../tool/workflow.js"
+import { inspectArgsTransport } from "../tool/args-transport.js"
 import type { PreparedWorkflow } from "../tool/workflow.js"
 import { scanNamedWorkflows } from "../tool/named.js"
 import type { Manifest } from "./journal.js"
@@ -158,7 +159,14 @@ export async function resumeInterruptedRuns(deps: AutoResumeDeps): Promise<AutoR
     // The args guard, via loadResume's own hash check — never bypassed: the stored args are
     // re-hashed against the manifest's argsHash, so a tampered manifest (or a pre-args manifest
     // whose args were defined) is skipped rather than replayed against guessed inputs.
-    const resume = await loadResume(runId, candidate.args, candidate.sessionID, env)
+    //
+    // The stored args pass through the SAME boundary the launch used (#78): a pre-hydration
+    // manifest holding the raw stringified payload hashes against its hydrated value and
+    // MISMATCHES, so the poisoned run stays unadopted (still manually resumable) instead of
+    // executing with a seed the old journal never used.
+    const transport = inspectArgsTransport(candidate.args),
+     sweepArgs = transport.action === "hydrate" ? transport.value : candidate.args
+    const resume = await loadResume(runId, sweepArgs, candidate.sessionID, env)
     if (resume.argsChanged) {
       await renameBack()
       return "skipped"
@@ -184,7 +192,7 @@ export async function resumeInterruptedRuns(deps: AutoResumeDeps): Promise<AutoR
     let prepared: PreparedWorkflow
     try {
       prepared = await prepare(
-        { script: await readFile(join(dir, "script.js"), "utf8"), args: candidate.args },
+        { script: await readFile(join(dir, "script.js"), "utf8"), args: sweepArgs },
         { client, sessionID: candidate.sessionID, runId },
       )
     } catch {
@@ -217,7 +225,7 @@ export async function resumeInterruptedRuns(deps: AutoResumeDeps): Promise<AutoR
       sessionID: candidate.sessionID,
       manifest: adopted,
       prepared,
-      args: { script: prepared.source, args: candidate.args },
+      args: { script: prepared.source, args: sweepArgs },
       options,
       previousEntries: resume.entries,
       resumedFrom: runId,

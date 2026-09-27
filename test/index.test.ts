@@ -2079,3 +2079,117 @@ describe("args zero-value decoration guard", () => {
     expect(toolOf(hooks)?.description).toContain('refused as zero-value decorations')
   })
 })
+
+describe("args transport repair (#78)", () => {
+  // Layer 1 at the tool boundary: a host or model serialization slip that stringifies the args
+  // object is repaired when it parses to an object or array, refused when it looks like JSON but
+  // does not parse, and left alone when it is an honest scalar string. Hydration happens before
+  // hashing, so a hydrated launch and an object-args resume replay as the same run.
+  const RAW = '{"diff":"none","repo":"dot-agents-alignment"}'
+
+  test("a stringified JSON object is hydrated: the script sees the object, not undefined", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}return args.repo\n`, args: RAW, dryRun: true },
+      { sessionID: "parent" },
+    )
+    expect(output).toContain("dot-agents-alignment")
+    expect(output).not.toContain("undefined")
+    // The repair is loud: the run log carries the hydration line.
+    expect(output).toContain("args arrived as a JSON string; hydrated to object")
+  })
+
+  test("the manifest records the raw string received and the hydrated value", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const launched = await tool.execute(
+      { script: `${META}return args.repo\n`, args: RAW, background: true },
+      { sessionID: "parent" },
+    )
+    const runId = runIdOf(launched)
+    await background.settlePromiseOf(runId)
+    const manifest = await readManifest(runId)
+    expect(manifest?.args).toEqual({ diff: "none", repo: "dot-agents-alignment" })
+    expect(manifest?.argsRawString).toBe(RAW)
+    expect(manifest?.argsHash).toBe(argsHash({ diff: "none", repo: "dot-agents-alignment" }))
+  })
+
+  test("a JSON-looking string that fails to parse is refused before the ask", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const { ask, assertNoAsk } = askRecorder()
+    const output = await tool.execute(
+      { script: `${META}return args.repo\n`, args: '{"repo":', background: true },
+      { sessionID: "parent", ask },
+    )
+    expect(output).toContain("<workflow-refused>")
+    // The raw payload is previewed JSON-quoted.
+    expect(output).toContain(String.raw`"{\"repo\":"`)
+    expect(output).toContain("real JSON")
+    assertNoAsk()
+    expect(background.liveRunsForSession("parent")).toHaveLength(0)
+  })
+
+  test("honest scalar strings keep working — including JSON-parseable scalars", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    // A non-object string arg: a pass-through script sees it verbatim.
+    const pass = await tool.execute(
+      { script: `${META}return args\n`, args: "42", dryRun: true },
+      { sessionID: "parent" },
+    )
+    expect(pass).toContain("42")
+    expect(pass).not.toContain("hydrated")
+    // A dereferencing script fails at start naming the received type and preview — never
+    // silently reading undefined into prompts.
+    const deref = await tool.execute(
+      { script: `${META}return args.repo\n`, args: "review-targets", background: false },
+      { sessionID: "parent" },
+    )
+    expect(deref).toContain("args arrived as")
+    expect(deref).toContain("the string")
+    expect(deref).toContain("review-targets")
+  })
+
+  test("a hydrated launch and an object-args resume replay as the same run", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const script = `${META}await agent('a')\nreturn args.repo\n`
+    const launched = await tool.execute({ script, args: RAW, background: true }, { sessionID: "parent" })
+    const runId = runIdOf(launched)
+    await background.settlePromiseOf(runId)
+    // The resume re-issues the same agent call, so the journal's entry can replay.
+    const output = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 2\n`, args: { diff: "none", repo: "dot-agents-alignment" }, resumeFromRunId: runId, background: false },
+      { sessionID: "parent" },
+    )
+    expect(output).toContain('replayed="1"')
+    expect(output).not.toContain("args changed")
+  })
+
+  test("an object-args launch resumed with the stringified args replays too", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const launched = await tool.execute(
+      { script: `${META}await agent('a')\nreturn args.repo\n`, args: { diff: "none", repo: "dot-agents-alignment" }, background: true },
+      { sessionID: "parent" },
+    )
+    const runId = runIdOf(launched)
+    await background.settlePromiseOf(runId)
+    const output = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 2\n`, args: RAW, resumeFromRunId: runId, background: false },
+      { sessionID: "parent" },
+    )
+    expect(output).toContain('replayed="1"')
+  })
+
+  test("the schema description states the hydration/refusal/scalar contract", () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const argsSchema = tool?.args?.["args"] as { description?: string } | undefined
+    expect(argsSchema?.description).toContain("hydrated")
+    expect(argsSchema?.description).toContain("refused")
+    expect(argsSchema?.description).toContain("stays a scalar")
+  })
+})

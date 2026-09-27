@@ -57,6 +57,15 @@ describe("beginRun", () => {
     const manifest = await beginRun({ ...record, runId: "wf_../escape" }, env)
     expect(manifest).toBeUndefined()
   })
+
+  test("records the raw args string alongside the hydrated value when hydration fired (#78)", async () => {
+    const manifest = await beginRun({ ...record, args: { a: 1 }, argsRawString: '{"a":1}' }, env)
+    expect(manifest?.args).toEqual({ a: 1 })
+    expect(manifest?.argsRawString).toBe('{"a":1}')
+    // A non-hydrated launch carries no raw-string field, so manifests stay byte-shape stable.
+    const plain = await beginRun({ ...record }, env)
+    expect(plain?.argsRawString).toBeUndefined()
+  })
 })
 
 describe("endRun", () => {

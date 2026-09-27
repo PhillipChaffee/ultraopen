@@ -175,6 +175,56 @@ describe("parse — determinism lint", () => {
   })
 })
 
+describe("parse — args dereference flag", () => {
+  // #78 layer 2, static half: a script that reads properties off `args` requires object args.
+  // The flag is metadata for the sandbox launch gate, not a lint failure — a dereference is
+  // legal when args IS an object.
+  test("a plain args.X dereference is flagged with its location", () => {
+    const { argsDereference } = parse(`${META}return args.repo\n`)
+    expect(argsDereference).toEqual({ line: 2, column: 7, property: "repo", kind: "member" })
+  })
+
+  test("computed and optional dereferences are flagged too", () => {
+    // `args["repo"]` and `args?.repo` poison prompts exactly like `args.repo` when args is a
+    // scalar, so the flag covers every member form.
+    expect(parse(`${META}return args["repo"]\n`).argsDereference?.property).toBe("")
+    expect(parse(`${META}return args?.repo\n`).argsDereference?.property).toBe("repo")
+  })
+
+  test("destructuring reads are flagged too (#78: same poison, no MemberExpression)", () => {
+    for (const source of [
+      `const { repo } = args\n`,
+      `const [first] = args\n`,
+      `for (const item of args) { log(item) }\n`,
+      `for (const key in args) { log(key) }\n`,
+      // The leading semicolon is required: a bare `(` would continue the meta expression (ASI).
+      `;({ repo } = args)\n`,
+    ]) {
+      const flagged = parse(`${META}${source}`).argsDereference
+      expect(flagged?.property).toBe("")
+      expect(flagged?.kind).toBe("destructure")
+    }
+  })
+
+  test("a nested parameter NAMED args is falsely flagged — the documented known limit", () => {
+    // The flag is syntactic, like the Date/Math bans: no scope tracking. A helper whose
+    // parameter is named `args` reads as a dereference of the global. The gate message points
+    // at the read (line:col), so the fix is a rename; this test pins the limit so a future
+    // scope-aware lint can tighten it deliberately.
+    const flagged = parse(`${META}const f = (args) => args.x\nreturn f("scalar")\n`).argsDereference
+    expect(flagged?.property).toBe("x")
+  })
+
+  test("a script that passes args through whole is not flagged", () => {
+    expect(parse(`${META}return args\n`).argsDereference).toBeUndefined()
+  })
+
+  test("a member read on another object is not flagged", () => {
+    expect(parse(`${META}return Object.keys(args).length\n`).argsDereference).toBeUndefined()
+    expect(parse(`${META}const other = { a: 1 }; return other.a\n`).argsDereference).toBeUndefined()
+  })
+})
+
 describe("parse — export blanking preserves offsets", () => {
   test("line numbers are unchanged after blanking", () => {
     const src = `${META}\n\nconst x = 1\n`,
@@ -300,6 +350,72 @@ describe("sandbox — remaining guards", () => {
 
   test("__dirname and __filename are undefined", async () => {
     expect(await run(`return [typeof __dirname, typeof __filename]\n`, noopGlobals)).toEqual(["undefined", "undefined"])
+  })
+})
+
+describe("sandbox — args launch gate (#78)", () => {
+  // #78 layer 2, runtime half: the flag from the lint walk plus the runtime args decide at
+  // script start — before the first agent() dispatch, so a bad call costs zero tokens.
+  const deref = { line: 2, column: 7, property: "repo", kind: "member" } as const,
+   gatedGlobals = (args: unknown, extra: Record<string, unknown> = {}) => {
+    const agents: string[] = []
+    return {
+      globals: {
+        ...noopGlobals,
+        args,
+        agent: (prompt: string): Promise<string> => {
+          agents.push(prompt)
+          return Promise.resolve("done")
+        },
+        ...extra,
+      },
+      agents,
+    }
+  }
+
+  test("a dereferencing script throws at start when args is absent", async () => {
+    const { body } = parse(`${META}return args.repo\n`)
+    const { globals, agents } = gatedGlobals(undefined)
+    await expect(run(body, globals, deref)).rejects.toThrow(/args arrived as nothing/u)
+    expect(agents).toEqual([])
+  })
+
+  test("the throw names the received type and a short preview", async () => {
+    const { body } = parse(`${META}return args.repo\n`)
+    const { globals } = gatedGlobals("review-targets")
+    const failure = (await run(body, globals, deref).catch((error: unknown) => error)) as WorkflowScriptError
+    expect(failure).toBeInstanceOf(WorkflowScriptError)
+    expect(failure.message).toContain("the string")
+    expect(failure.message).toContain("review-targets")
+    expect(failure.diagnostic.location).toEqual({ line: 2, column: 7 })
+  })
+
+  test("object and array args pass and the script reads them", async () => {
+    const objectBody = parse(`${META}return args.repo\n`).body
+    const { globals: objectGlobals } = gatedGlobals({ repo: "r" })
+    expect(await run(objectBody, objectGlobals, deref)).toBe("r")
+    const arrayBody = parse(`${META}return args[0]\n`).body
+    const { globals: arrayGlobals } = gatedGlobals([7, 9])
+    expect(await run(arrayBody, arrayGlobals, { line: 2, column: 7, property: "", kind: "member" })).toBe(7)
+  })
+
+  test("null args throw even though typeof null is object", async () => {
+    const { body } = parse(`${META}return args.repo\n`)
+    const { globals } = gatedGlobals(null)
+    await expect(run(body, globals, deref)).rejects.toThrow(/args arrived as null/u)
+  })
+
+  test("a destructuring read names the shape in the throw", async () => {
+    const { body, argsDereference } = parse(`${META}const { repo } = args\nreturn repo\n`)
+    const { globals } = gatedGlobals("42")
+    await expect(run(body, globals, argsDereference)).rejects.toThrow(/destructuring read off `args`/u)
+  })
+
+  test("a script without dereferences keeps scalar args working", async () => {
+    const { body } = parse(`${META}return args\n`)
+    const { globals } = gatedGlobals("42")
+    expect(await run(body, globals, undefined)).toBe("42")
+    expect(await run(body, globals)).toBe("42")
   })
 })
 

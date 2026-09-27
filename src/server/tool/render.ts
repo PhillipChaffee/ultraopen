@@ -1,5 +1,6 @@
 import { runDir } from "../resume/store.js"
 import { LARGE_RUN_AGENTS } from "../script/limits.js"
+import { stringifiedArgsMessage, stringifiedArgsSuggestion } from "./args-transport.js"
 import type { WorkflowResult } from "./workflow.js"
 import type { StatusReport } from "./status.js"
 
@@ -276,6 +277,24 @@ export function renderArgsRefusal(value: string): string {
   ].join("\n")
 }
 
+/**
+ * A launch, resume, or dryRun whose `args` field is a string that looks like JSON but does not
+ * parse (#78).
+ *
+ * The sibling of the zero-value refusal above, for content-bearing payloads: the refusal names
+ * what was received (previewed, not dumped) and the reason, and states the transport contract —
+ * a JSON string that parses to an object or array is hydrated automatically, so only an
+ * unrepairable one is refused.
+ */
+export function renderStringifiedArgsRefusal(raw: string, reason: string): string {
+  return [
+    "<workflow-refused>",
+    stringifiedArgsMessage(raw, reason),
+    `${stringifiedArgsSuggestion} A JSON string that parses to an object or array is hydrated automatically and the repair is logged; this one could not be repaired, so the script would have received the raw string.`,
+    "</workflow-refused>",
+  ].join("\n")
+}
+
 /** The status tool's report, for the model. Same uncapped stance as renderResult. */
 export function renderStatus(report: StatusReport): string {
   const lines = [
@@ -314,7 +333,7 @@ export function workflowArgsSchema(): Record<string, unknown> {
     scriptPath: { type: "string", description: "Path to a persisted script. Takes precedence over `script`." },
     args: {
       description:
-        "Value exposed to the script as the global `args`. Pass real JSON, not a JSON string; the strings \"\", \"null\", and \"undefined\" are refused as zero-value decorations — omit the field for no arguments.",
+        "Value exposed to the script as the global `args`. Pass real JSON, not a JSON string: a string that parses to an object or array is hydrated to that value (and the repair is logged), one that looks like JSON but fails to parse is refused, and any other string stays a scalar. The strings \"\", \"null\", and \"undefined\" are refused as zero-value decorations — omit the field for no arguments.",
     },
     resumeFromRunId: {
       type: "string",

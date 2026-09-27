@@ -1,4 +1,5 @@
-import { WorkflowScriptError } from "./errors.js"
+import { WorkflowScriptError, previewValue } from "./errors.js"
+import type { ArgsDereference } from "./lint.js"
 
 /**
  * Executes a workflow script body with injected host functions and shadowed globals.
@@ -127,15 +128,54 @@ export interface SandboxGlobals {
   workflow: unknown
 }
 
+/** The args shapes the launch gate accepts: real objects, arrays included. */
+function isObjectArgs(args: unknown): boolean {
+  return typeof args === "object" && args !== null
+}
+
+function describeArgs(args: unknown): string {
+  if (args === undefined) {return "nothing (no args was passed)"}
+  if (args === null) {return "null"}
+  if (typeof args === "string") {return `the string ${previewValue(args)}`}
+  return `a ${typeof args} (${previewValue(args)})`
+}
+
 /**
  * Compiles and runs a workflow body. Returns whatever the script returns.
+ *
+ * `argsDereference` (#78) is set when the static lint flagged a member dereference on the `args`
+ * identifier. The gate then requires the RUNTIME args to be a real object (absent counts as
+ * non-object, and `null` too — `typeof null` lies) and throws at script start, before the first
+ * `agent()` dispatch: zero tokens burned, no `undefined` flowed into any prompt. Scripts that
+ * pass `args` through whole keep working with scalar args.
  *
  * `"use strict"` is prepended with NO trailing newline so every reported line number still matches
  * the persisted script. Strict mode matters: an AsyncFunction body is sloppy by default, so an
  * undeclared `leaked = 42` would write to the real host globalThis — invisible to the static lint,
  * which only catches reads.
  */
-export async function run(body: string, globals: SandboxGlobals): Promise<unknown> {
+export async function run(body: string, globals: SandboxGlobals, argsDereference?: ArgsDereference | undefined): Promise<unknown> {
+  // The args launch gate FIRST: it speaks about the call, not the script, and it must fire
+  // before any execution — a bad call costs zero tokens and zero agent dispatches (#78).
+  const deref = argsDereference
+  if (deref !== undefined && !isObjectArgs(globals.args)) {
+    let expr: string
+    if (deref.kind === "destructure") {expr = "a destructuring read off `args`"}
+    else if (deref.property === "") {expr = "`args[…]`"}
+    else {expr = `\`args.${deref.property}\``}
+    throw new WorkflowScriptError({
+      kind: "RuntimeError",
+      message:
+        `The script reads ${expr} (first at line ${deref.line}:${deref.column}), ` +
+        `but args arrived as ${describeArgs(globals.args)} — those reads would be undefined inside every agent prompt.`,
+      location: { line: deref.line, column: deref.column },
+      suggestions: [
+        "Pass `args` as a real JSON object containing the fields the script reads.",
+        "A script that passes `args` through whole — never reading a property off it — works with any scalar args.",
+      ],
+    })
+  }
+
   // One map, so names and values cannot drift out of alignment.
   //
   // NOTE: `eval` is deliberately absent. Strict mode forbids it as a binding name ("Invalid

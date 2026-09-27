@@ -1,5 +1,6 @@
 import * as acorn from "acorn"
 import { fail } from "./errors.js"
+import type { ArgsDereference } from "./lint.js"
 import { MAX_SCRIPT_CHARS } from "./limits.js"
 import { lintDeterminism } from "./lint.js"
 import { extractMeta } from "./meta.js"
@@ -10,6 +11,11 @@ export interface ParsedScript {
   /** Source with every `export ` keyword blanked in place. Byte offsets are preserved. */
   body: string
   ast: acorn.Program
+  /**
+   * The first member dereference on the `args` identifier (#78), when the script contains one —
+   * the sandbox launch gate keys off it, throwing at start when the runtime args is not an object.
+   */
+  argsDereference: ArgsDereference | undefined
 }
 
 /**
@@ -55,10 +61,10 @@ export function parse(source: string): ParsedScript {
     })
   }
 
-  const meta = extractMeta(ast)
-  lintDeterminism(ast)
+  const meta = extractMeta(ast),
+   argsDereference = lintDeterminism(ast)
 
-  return { meta, body: blankExports(ast, source), ast }
+  return { meta, body: blankExports(ast, source), ast, argsDereference }
 }
 
 /**

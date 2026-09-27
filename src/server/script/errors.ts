@@ -31,6 +31,18 @@ export function fail(diagnostic: Diagnostic): never {
   throw new WorkflowScriptError(diagnostic)
 }
 
+/**
+ * Renders a received value as a short, quoted preview for an error message.
+ *
+ * Strings are JSON-quoted so boundaries and escapes stay visible — the stringified-args
+ * diagnostics (#78) live or die on the caller recognizing its own payload. Longer values are
+ * truncated with an ellipsis; the message names the shape, never the whole payload.
+ */
+export function previewValue(value: unknown, max = 60): string {
+  const rendered = typeof value === "string" ? JSON.stringify(value) : String(value)
+  return rendered.length <= max ? rendered : `${rendered.slice(0, max)}…`
+}
+
 /** Renders a diagnostic with a caret line pointing at the offending source. */
 export function render(diagnostic: Diagnostic, source?: string): string {
   const lines: string[] = [`${diagnostic.kind}: ${diagnostic.message}`]

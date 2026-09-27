@@ -1,6 +1,7 @@
 import { WorkflowScriptError, render } from "../script/errors.js"
 import { parse } from "../script/parse.js"
 import { run as runSandbox } from "../script/sandbox.js"
+import type { ArgsDereference } from "../script/lint.js"
 import { parallel, pipeline } from "../runtime/combinators.js"
 import { Run } from "../runtime/run.js"
 import type { ControlCommand } from "../runtime/control.js"
@@ -16,6 +17,8 @@ import type { JournalEntry } from "../resume/journal.js"
 import { registry } from "../singleton.js"
 import type { Ruleset } from "../bridge/permission.js"
 import type { OpencodeClient } from "../types.js"
+import { inspectArgsTransport, stringifiedArgsMessage, stringifiedArgsSuggestion } from "./args-transport.js"
+
 
 export interface WorkflowArgs {
   script?: string
@@ -135,20 +138,62 @@ export async function execute(args: WorkflowArgs, context: WorkflowContext): Pro
   return await runPrepared(prepared, args, context)
 }
 
-export interface PreparedWorkflow { source: string; meta: ReturnType<typeof parse>["meta"]; body: string }
+/**
+ * A resolved, parsed workflow, ready to run — with the #78 boundary facts the launch path and
+ * the sandbox launch gate read off it.
+ */
+export interface PreparedWorkflow {
+  source: string
+  meta: ReturnType<typeof parse>["meta"]
+  body: string
+  /**
+   * The args value the script actually sees (#78): the hydrated object/array when the boundary
+   * repaired a stringified payload, otherwise the value as passed. Every consumer that hashes
+   * or injects args reads THIS, so a hydrated launch and an object-args resume hash identically.
+   */
+  argsValue: unknown
+  /** First member dereference on `args`, when the script contains one — undefined otherwise. */
+  argsDereference: ArgsDereference | undefined
+  /** Set when the boundary hydrated a stringified JSON args; `raw` is what was received. */
+  argsHydrated: { raw: string; kind: "object" | "array" } | undefined
+}
 
 /**
- * Resolves and parses the script WITHOUT running it.
+ * Resolves and parses the script WITHOUT running it, and settles the args transport (#78).
  *
  * Split out so the permission prompt can name the real workflow and describe what it will do.
  * Parsing is pure and cheap, and `meta` is a pure literal precisely so it can be read before any
  * code executes — which is exactly this use case.
+ *
+ * Hydration happens HERE and stays PURE — the caller's args record is never mutated; the
+ * hydrated value rides the result. Every downstream consumer (projection, resume, manifest,
+ * sandbox) reads `argsValue`, so hashing consumes the hydrated value and a hydrated launch
+ * replays as the same run as an object-args resume. The repair is flagged on the result so the
+ * launch records it loudly.
  */
 export async function prepare(args: WorkflowArgs, context: WorkflowContext): Promise<PreparedWorkflow> {
   assertNotNested(context.sessionID)
+  const transport = inspectArgsTransport(args.args)
+  if (transport.action === "refuse") {
+    throw new WorkflowScriptError({
+      kind: "RuntimeError",
+      message: stringifiedArgsMessage(transport.raw, transport.reason),
+      suggestions: [stringifiedArgsSuggestion],
+    })
+  }
   const source = await resolveSource(args, context),
    parsed = parse(source)
-  return { source, meta: parsed.meta, body: parsed.body }
+  return {
+    source,
+    meta: parsed.meta,
+    body: parsed.body,
+    argsValue: transport.action === "hydrate" ? transport.value : args.args,
+    argsDereference: parsed.argsDereference,
+    argsHydrated:
+      transport.action === "hydrate"
+        ? { raw: transport.raw, kind: Array.isArray(transport.value) ? "array" : "object" }
+        : undefined,
+  }
 }
 
 /** Raised when the projection runs into the lifetime agent backstop and stops counting. */
@@ -182,7 +227,6 @@ const PROJECTION_CAP = Symbol("ultraopen.projection.cap")
  */
 export async function projectAgentCount(
   prepared: PreparedWorkflow,
-  args: WorkflowArgs,
   named: Record<string, string> | undefined,
   options?: { signal?: AbortSignal | undefined },
 ): Promise<number> {
@@ -199,30 +243,36 @@ export async function projectAgentCount(
     claim()
     return Promise.resolve(opts.schema ? {} : `[dryRun] ${prompt.slice(0, 200)}`)
   }
-  const project = (body: string, depth: number): Promise<unknown> =>
-    runSandbox(body, {
-      agent,
-      parallel,
-      pipeline,
-      phase: (): void => {},
-      log: (): void => {},
-      args: args.args,
-      budget: makeBudget({ total: null, spent: () => 0 }),
-      workflow: (nameOrRef: unknown): Promise<unknown> => {
-        // Same one-level rule as the live engine, thrown synchronously like makeNested, so a
-        // projection fails exactly where the real run would.
-        if (depth > 0) {
-          throw new WorkflowScriptError({
-            kind: "RuntimeError",
-            message: "workflow() nesting is one level only — a nested workflow cannot call workflow().",
-          })
-        }
-        const parsed = parse(resolveNamed(nameOrRef, { named }))
-        return project(parsed.body, depth + 1)
+  const project = (body: string, depth: number, deref: ArgsDereference | undefined): Promise<unknown> =>
+    runSandbox(
+      body,
+      {
+        agent,
+        parallel,
+        pipeline,
+        phase: (): void => {},
+        log: (): void => {},
+        args: prepared.argsValue,
+        budget: makeBudget({ total: null, spent: () => 0 }),
+        workflow: (nameOrRef: unknown): Promise<unknown> => {
+          // Same one-level rule as the live engine, thrown synchronously like makeNested, so a
+          // projection fails exactly where the real run would.
+          if (depth > 0) {
+            throw new WorkflowScriptError({
+              kind: "RuntimeError",
+              message: "workflow() nesting is one level only — a nested workflow cannot call workflow().",
+            })
+          }
+          const parsed = parse(resolveNamed(nameOrRef, { named }))
+          return project(parsed.body, depth + 1, parsed.argsDereference)
+        },
       },
-    })
+      // #78: the projection obeys the same args launch gate as a real run — a dereferencing
+      // script with non-object args throws here too, and the launch degrades to no projection.
+      deref,
+    )
   try {
-    await project(prepared.body, 0)
+    await project(prepared.body, 0, prepared.argsDereference)
   } catch (error) {
     // The cap is not a failure: the projection cannot see past the lifetime backstop, and the
     // real run stops at the same line — report the backstop itself as the projection.
@@ -240,12 +290,11 @@ export async function projectAgentCount(
  */
 export async function projectLaunchSize(
   prepared: PreparedWorkflow,
-  args: WorkflowArgs,
   named: Record<string, string> | undefined,
   options?: { signal?: AbortSignal | undefined },
 ): Promise<number | undefined> {
   try {
-    return await projectAgentCount(prepared, args, named, options)
+    return await projectAgentCount(prepared, named, options)
   } catch {
     return undefined
   }
@@ -267,6 +316,12 @@ async function runPrepared(
    note = (message: string): void => {
     if (sink.emit) {sink.emit(message)}
     else {buffered.push(message)}
+  }
+
+  // #78 layer 3: a transport repair is loud. The note buffers until the Run exists, then lands
+  // in the run log — before the script starts, so the repair is the first thing an operator sees.
+  if (prepared.argsHydrated !== undefined) {
+    note(`args arrived as a JSON string; hydrated to ${prepared.argsHydrated.kind}`)
   }
 
   // Read the provider catalog once per run so `effort` resolves against each model's REAL variant
@@ -294,8 +349,9 @@ async function runPrepared(
     // that changes what an agent is asked, and does so incrementally — seeding from the source
     // hash would make ANY edit invalidate the entire run, destroying the longest-unchanged-prefix
     // property that makes resume worth having. `args` is different: it is invisible to the chain
-    // but can change every result, so a change there must invalidate everything.
-    resumeSeed: argsHash(args.args),
+    // but can change every result, so a change there must invalidate everything. The HYDRATED
+    // value is what seeds it (#78): a hydrated launch and an object-args resume agree.
+    resumeSeed: argsHash(prepared.argsValue),
     ...optional("previousEntries", context.previousEntries),
     ...optional("resumedFrom", context.resumedFrom),
     ...optional("budgetTotal", context.budgetTotal),
@@ -334,18 +390,25 @@ async function runPrepared(
   try {
     // The sandbox runs INSIDE the root resume scope, so every agent() call — including those
     // reached through combinator callbacks — sees a scope and gets a stable key.
+    // #78 layer 2: when the script statically dereferences `args`, the sandbox launch gate
+    // requires the runtime args to be a real object — throwing at script start (zero tokens)
+    // instead of letting `undefined` flow into every agent prompt.
     const value = await run.withRootScope(
       async () =>
-        await runSandbox(prepared.body, {
-          agent,
-          parallel,
-          pipeline,
-          phase: run.phase,
-          log: run.log,
-          args: args.args,
-          budget: run.budget,
-          workflow: makeNested(context, run, args.dryRun === true),
-        }),
+        await runSandbox(
+          prepared.body,
+          {
+            agent,
+            parallel,
+            pipeline,
+            phase: run.phase,
+            log: run.log,
+            args: prepared.argsValue,
+            budget: run.budget,
+            workflow: makeNested(context, run, args.dryRun === true),
+          },
+          prepared.argsDereference,
+        ),
     )
 
     return {

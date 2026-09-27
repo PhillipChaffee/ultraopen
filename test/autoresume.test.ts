@@ -240,6 +240,39 @@ describe("resumeInterruptedRuns", () => {
     expect(await readMarker(RUN_ID)).toBe(RUN_ID)
   })
 
+  test("adopts a hydrated run: the stored args pass the same boundary the launch used (#78)", async () => {
+    // Post-#78 manifests store the hydrated object + the raw string; the sweep's re-hash and
+    // the re-executed run must agree, so the journal replays instead of re-spending.
+    const entry = await seedCandidate({
+      args: { repo: "dot-agents-alignment" },
+      argsHash: argsHash({ repo: "dot-agents-alignment" }),
+      argsRawString: '{"repo":"dot-agents-alignment"}',
+    }),
+     { fn, calls } = makeExecute()
+
+    const result = await resumeInterruptedRuns({ ...deps({ executeFn: fn }), candidates: [entry] })
+    expect(result).toEqual({ resumed: [RUN_ID], skipped: 0, failed: 0 })
+    await settlePromiseOf(RUN_ID)
+    expect(calls[0]?.args.args).toEqual({ repo: "dot-agents-alignment" })
+    const after = await readManifest(RUN_ID, env)
+    expect(after?.argsRawString).toBe('{"repo":"dot-agents-alignment"}')
+    expect(after?.argsHash).toBe(argsHash({ repo: "dot-agents-alignment" }))
+  })
+
+  test("skips a pre-hydration manifest whose stored args is the raw stringified payload", async () => {
+    // A poisoned-era manifest hashes its raw STRING; the boundary now hydrates, so the re-hash
+    // mismatches and the run stays unadopted (manually resumable) rather than executing with a
+    // seed the old journal never used.
+    const raw = '{"repo":"dot-agents-alignment"}',
+     entry = await seedCandidate({ args: raw, argsHash: argsHash(raw) }),
+     { fn } = makeExecute()
+
+    const result = await resumeInterruptedRuns({ ...deps({ executeFn: fn }), candidates: [entry] })
+    expect(result).toEqual({ resumed: [], skipped: 1, failed: 0 })
+    expect(await statusOf(RUN_ID)).toBe("orphaned")
+    expect(await readMarker(RUN_ID)).toBe(RUN_ID)
+  })
+
   test("skips a run whose original session no longer exists", async () => {
     const entry = await seedCandidate(),
      { client, prompts } = makeClient({ sessionGone: true }),
