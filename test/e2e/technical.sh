@@ -6,7 +6,7 @@
 #
 # Usage:  bash test/e2e/technical.sh [--keep]
 #   --keep   keep the scratch XDG home for post-mortem (path printed at exit)
-# Env:     E2E_MODEL, E2E_WAIT_TIMEOUT, E2E_CURL_TIMEOUT
+# Env:     E2E_PLUGIN_PATH, E2E_MODEL, E2E_WAIT_TIMEOUT, E2E_CURL_TIMEOUT
 #
 # Echo ceiling (#54): the headless argument echo is byte-faithful to ~700B on
 # Flash — above ~1KB the model's own transcription of verbatim literals fails
