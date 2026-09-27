@@ -232,6 +232,7 @@ known-gap, and cosmetic inventory â€” each probe with its implementation note â€
 bun run check   # lint + strict typecheck + tests (95% coverage gate) + Node parity
 bun run m0      # provider smoke test against a live model
 
+bash test/e2e/probe-timeout-test.sh   # harness regression test: bounded curl probes, no live processes
 bash test/e2e/technical.sh   # live end-to-end: real opencode processes, real model calls
 bash test/e2e/visual.sh      # live TUI in tmux: all three progress surfaces, permission flow
 bash test/e2e/tui-dev.sh     # run `opencode` locally with the TUI plugin actually rendering

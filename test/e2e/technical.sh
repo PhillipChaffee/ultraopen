@@ -6,7 +6,7 @@
 #
 # Usage:  bash test/e2e/technical.sh [--keep]
 #   --keep   keep the scratch XDG home for post-mortem (path printed at exit)
-# Env:     E2E_MODEL, E2E_WAIT_TIMEOUT
+# Env:     E2E_MODEL, E2E_WAIT_TIMEOUT, E2E_CURL_TIMEOUT
 #
 # Echo ceiling (#54): the headless argument echo is byte-faithful to ~700B on
 # Flash — above ~1KB the model's own transcription of verbatim literals fails
@@ -829,7 +829,7 @@ else
   opencode serve --port "$T12_PORT" >"$OUT/t12-serve.log" 2>&1 &
   T12_SERVE_PID=$!
   manifest_pid "$T12_SERVE_PID" "opencode serve --port $T12_PORT (t12 resume host)"
-  t12_health_ok() { curl -sf "http://127.0.0.1:$T12_PORT/global/health" >/dev/null 2>&1; }
+  t12_health_ok() { curl -sf -m "$E2E_CURL_TIMEOUT" "http://127.0.0.1:$T12_PORT/global/health" >/dev/null 2>&1; }
   if wait_for "$E2E_WAIT_TIMEOUT" t12_health_ok; then
     ok "the relaunched server is up (the boot sweep runs at plugin init)"
   else
@@ -839,7 +839,7 @@ else
   # `opencode serve` defers its server instance (and the plugin init that runs the boot sweep)
   # until the first instance-scoped request — /global/health is server-level and never creates
   # one, so touch the instance explicitly and give the sweep a beat.
-  curl -sf "http://127.0.0.1:$T12_PORT/session" >/dev/null 2>&1 || true
+  curl -sf -m "$E2E_CURL_TIMEOUT" "http://127.0.0.1:$T12_PORT/session" >/dev/null 2>&1 || true
   sleep 2
 
   t12_settled() { [ "$(manifest_status "$RUN12")" = "completed" ]; }
@@ -862,7 +862,7 @@ else
   if [ -z "$SESSION12" ]; then
     bad "no session id in the launch stream" "cannot address the original session"
   else
-    curl -sf "http://127.0.0.1:$T12_PORT/session/$SESSION12/message" >"$OUT/t12-messages.json" 2>/dev/null || true
+    curl -sf -m "$E2E_CURL_TIMEOUT" "http://127.0.0.1:$T12_PORT/session/$SESSION12/message" >"$OUT/t12-messages.json" 2>/dev/null || true
     if [ -f "$OUT/t12-messages.json" ] && grep -q "workflow-completed" "$OUT/t12-messages.json" && grep -qF "$RUN12" "$OUT/t12-messages.json"; then
       ok "the original session received the completion notification"
     else

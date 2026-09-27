@@ -33,6 +33,13 @@ E2E_PORT="${E2E_PORT:-18888}"
 E2E_TMUX_SOCKET="${E2E_TMUX_SOCKET:-ultraopen-e2e}"
 E2E_WAIT_TIMEOUT="${E2E_WAIT_TIMEOUT:-120}"   # seconds, default for wait_for
 E2E_POLL_INTERVAL="${E2E_POLL_INTERVAL:-1}"   # seconds between polls
+# seconds, hard max-time on every harness curl probe (#89): a wedged server
+# (accepts, never responds) must degrade to a failed probe — which the bounded
+# waits turn into a failed case with a frame — never an unbounded hang. Note
+# the tradeoff: single-shot probes (tui_http_prompt, current_session) convert
+# a slow-but-healthy >5s response into a failure too; raise this if localhost
+# p95 approaches the default.
+E2E_CURL_TIMEOUT="${E2E_CURL_TIMEOUT:-5}"
 
 PASS=0
 FAIL=0
@@ -518,9 +525,9 @@ pane_matches()  { tui_capture | grep -qE -- "$1"; }   # anchored/regex variant
 tui_http_prompt() { # tui_http_prompt TEXT
   local payload
   payload="$(printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps({"text": sys.stdin.read()}))')"
-  curl -sf -X POST "http://127.0.0.1:$E2E_PORT/tui/append-prompt" -H 'Content-Type: application/json' -d "$payload" >/dev/null
+  curl -sf -m "$E2E_CURL_TIMEOUT" -X POST "http://127.0.0.1:$E2E_PORT/tui/append-prompt" -H 'Content-Type: application/json' -d "$payload" >/dev/null
   sleep 0.5
-  curl -sf -X POST "http://127.0.0.1:$E2E_PORT/tui/submit-prompt" >/dev/null
+  curl -sf -m "$E2E_CURL_TIMEOUT" -X POST "http://127.0.0.1:$E2E_PORT/tui/submit-prompt" >/dev/null
 }
 
 # Compose a prompt that makes the model call the workflow tool with a fixture
@@ -565,14 +572,14 @@ assert_pane_lacks() { # desc text [timeout] — asserts the text disappears
   fi
 }
 
-health_ok() { curl -sf "http://127.0.0.1:$E2E_PORT/global/health" >/dev/null 2>&1; }
+health_ok() { curl -sf -m "$E2E_CURL_TIMEOUT" "http://127.0.0.1:$E2E_PORT/global/health" >/dev/null 2>&1; }
 
 # Session rows from the TUI's own server, ids extracted tolerantly (the
 # response shape varies across opencode releases). The snapshot/new-since pair
 # mirrors runs_snapshot/runs_new_since; a NEW session row is the honest verify
 # that a prompt landed, because sessions persist in the scratch across reboots
 # and a plain any-session check is pre-satisfied on V4/V5 boots.
-sessions_list() { curl -sf "http://127.0.0.1:$E2E_PORT/session" 2>/dev/null | grep -oE 'ses_[A-Za-z0-9]+' | sort -u || true; }
+sessions_list() { curl -sf -m "$E2E_CURL_TIMEOUT" "http://127.0.0.1:$E2E_PORT/session" 2>/dev/null | grep -oE 'ses_[A-Za-z0-9]+' | sort -u || true; }
 sessions_snapshot() { sessions_list > "$1"; }                  # usage: sessions_snapshot file
 sessions_new_since() { comm -13 "$1" <(sessions_list) | grep -v '^$' || true; }
 session_landed_since() { [ -n "$(sessions_new_since "$1")" ]; }
@@ -599,7 +606,7 @@ tmx_has_session_tui_gone() { ! tmx has-session -t tui 2>/dev/null; }
 # Current session id from the TUI's own server (response shape varies across
 # opencode releases; parse tolerantly and print the newest session id).
 current_session() {
-  curl -sf "http://127.0.0.1:$E2E_PORT/session" | python3 -c '
+  curl -sf -m "$E2E_CURL_TIMEOUT" "http://127.0.0.1:$E2E_PORT/session" | python3 -c '
 import json, sys
 data = json.load(sys.stdin)
 sessions = data if isinstance(data, list) else data.get("sessions") or list(data.values())
