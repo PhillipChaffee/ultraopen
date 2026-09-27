@@ -29,6 +29,8 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: "1.4.0"
+          # Release workflows must not restore cached build state (zizmor cache-poisoning).
+          no-cache: true
 
       - run: bun install --frozen-lockfile
 
@@ -52,8 +54,10 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "24"
+          package-manager-cache: false
 
-      - run: npm install -g npm@latest
+      # Locked by the release-shape spec: npm@latest guarantees npm >= 11.5.1 for OIDC.
+      - run: npm install -g npm@latest # zizmor: ignore[adhoc-packages] global CLI bump, not a project dependency
 
       # Idempotent re-tags: v0.1.0 publishes locally first (the trusted
       # publisher can only be configured on an existing package), so a re-push
