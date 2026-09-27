@@ -24,7 +24,13 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 E2E_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # absolute: CWD changes after scratch_new
-PLUGIN_PATH="$REPO_ROOT"
+# PLUGIN_PATH — the tree opencode loads as the plugin. Defaults to this
+# checkout; E2E_PLUGIN_PATH overrides it to any installed tree so a re-proof
+# runs the real suites against that tree with zero copies (#113), e.g. the
+# registry install:
+#   E2E_PLUGIN_PATH=~/.cache/opencode/packages/ultraopen@latest/node_modules/ultraopen \
+#     bash test/e2e/technical.sh
+PLUGIN_PATH="${E2E_PLUGIN_PATH:-$REPO_ROOT}"
 ARTIFACTS_ROOT="$REPO_ROOT/test/e2e/artifacts"
 
 # Config knobs ----------------------------------------------------------------
