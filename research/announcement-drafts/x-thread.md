@@ -1,4 +1,4 @@
-# X thread (draft v3)
+# X thread (draft v4)
 
 **Venue notes:** X has no submission mechanics (research §9), so this is just a well-sized
 thread. Each tweet under 280 characters. Hashtags left off on purpose; add one if you want.
@@ -12,11 +12,11 @@ say the word and it gets ruled out instead.
 
 1/
 
-Same idea as the agent you're thinking of. Different license (MIT). ultraopen v0.1.0: multi-agent workflows for opencode, written as plain JS scripts.
+opencode agents can already spawn subagents. The fan-out lives in the model's head, though: ask for parallel work and every run comes out different, and a stall at turn 40 means starting over.
 
 2/
 
-ultraopen makes the orchestration a plain JS script. `agent()` is the only nondeterministic call in it. Loops, fan-out, thresholds, early exit: real code. Same script, same flow, reviewable like any diff.
+ultraopen (new plugin, v0.1.0) makes the orchestration a plain JS script. `agent()` is the only nondeterministic call in it. Loops, fan-out, thresholds, early exit: real code. Same script, same flow, reviewable like any diff.
 
 3/
 
@@ -30,4 +30,4 @@ Runs go in the background. `workflow_status` reads live state from disk, and a n
 
 5/
 
-Install is one command: `opencode plugin ultraopen -g` (needs opencode 1.18.20+). Repo with the full feature list: https://github.com/PhillipChaffee/ultraopen
+Install is one command: `opencode plugin ultraopen -g` (needs opencode 1.18.20+). MIT. Repo, with a longer intro and the full feature list: https://github.com/PhillipChaffee/ultraopen

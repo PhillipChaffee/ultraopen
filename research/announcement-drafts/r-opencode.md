@@ -1,4 +1,4 @@
-# r/opencode post (draft v3)
+# r/opencode post (draft v4)
 
 **Venue notes (from research/opencode-plugin-venues.md §7):** r/opencode's rules could not be
 verified from this environment. Before posting, read the live rules and About/sidebar in a
@@ -10,7 +10,7 @@ the v0.1.0 release is actually cut and proven installable (#111).
 
 **Title:**
 
-If the workflow tool's shape feels familiar, that's not an accident: ultraopen v0.1.0, multi-agent workflows for opencode as plain JS scripts (npm, MIT)
+ultraopen v0.1.0: multi-agent workflows for opencode as plain JS scripts (npm plugin)
 
 **Body:**
 
