@@ -46,7 +46,7 @@ workflow.
 | `phase(title)`, `log(msg)` | Progress narration. |
 | `args` | Whatever was passed as `args`, verbatim. Never `""`, `"null"`, or `"undefined"` — that is zero-value decoration, and the tool refuses it; omit `args` for no arguments. |
 | `budget` | `{ total, spent(), remaining() }`. A hard ceiling per launch — nested child spend counts against the same family ceiling. |
-| `workflow({ script }, args?)` | Runs another workflow inline, `{ script }` form only — the named form throws because the shipped plugin never populates `context.named`. One level only. THROWS on failure, unlike `agent()`. |
+| `workflow({ script } \| 'name', args?)` | Runs another workflow inline — by inline script or by saved name (the shipped plugin populates `context.named`, and the e2e suite exercises the named form live). One level only. THROWS on failure, unlike `agent()`. |
 
 `agent()` opts: `label`, `phase`, `schema`, `model`, `effort`, `agentType`, `isolation`,
 `disallowedTools`.
