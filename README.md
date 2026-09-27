@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="./assets/logo.svg" width="72" alt="ultraopen logo" />
+<img src="https://github.com/PhillipChaffee/ultraopen/raw/main/assets/logo.svg" width="72" alt="ultraopen logo" />
 
 # ultraopen
 
@@ -50,23 +50,51 @@ return { confirmed: results.flat().filter(Boolean) }
 
 ## 📦 Install
 
-1. Build:
-   ```bash
-   bun install && bun run build
-   ```
-2. Reference it from both config files — the same `plugin` array in each. TUI plugins are read
-   only from `tui.json`; `opencode.json`'s `plugin` array never reaches the TUI runtime.
-   ```jsonc
-   // opencode.json and tui.json, both:
-   { "plugin": ["/absolute/path/to/ultraopen"] }
-   ```
-   That's it — opencode loads the plugin on next start.
-3. An absolute path is classified as a file plugin, which skips the version-compatibility gate,
-   so there is no publish step while iterating.
-4. Options go through the tuple form — never a new top-level key, which opencode hard-rejects:
-   ```json
-   { "plugin": [["/path/to/ultraopen", { "concurrency": 8, "ultracode": true }]] }
-   ```
+```bash
+opencode plugin ultraopen -g
+```
+
+One command: it installs the package and registers it in both config files — `opencode.json` for
+the server (the tools), `tui.json` for the TUI surfaces — then restart opencode. Without `-g` the
+plugin scopes to the project's `.opencode/` configs instead.
+
+The first boot pays the registry fetch — the TUI's startup window may stretch while the package
+downloads. After that, everything is local.
+
+Options go through the tuple form — never a new top-level key, which opencode hard-rejects:
+
+```json
+{ "plugin": [["ultraopen", { "concurrency": 8, "ultracode": true }]] }
+```
+
+<details>
+<summary>Manual install — write the config yourself</summary>
+
+The `plugin` array lives in both `opencode.json` and `tui.json` — TUI plugins are read only from
+`tui.json`; `opencode.json`'s array never reaches the TUI runtime:
+
+```jsonc
+// opencode.json and tui.json, both:
+{ "plugin": ["ultraopen"] }
+```
+
+`opencode plugin` does exactly this — it reads the package's manifest (its `./server` and `./tui`
+exports) and patches each config file.
+
+</details>
+
+### Updating
+
+Published installs are cached and `@latest` resolves only on first install — a new release doesn't
+reach an existing install on its own. To pick one up:
+
+```bash
+rm -rf ~/.cache/opencode/packages/ultraopen*
+```
+
+then restart opencode. To pin a version instead, name it: `plugin: ["ultraopen@0.1.0"]` installs
+into a versioned cache tree, and `opencode plugin ultraopen@0.2.0 -g -f` rewrites the pin (`-f`
+rewrites config entries; it never refetches a bare `@latest`).
 
 | Option | Default · meaning |
 | --- | --- |
@@ -152,25 +180,25 @@ gains one row per agent, the sidebar fills in, and `ultracode ⠋ 0/4` appears b
 (The transcript also echoes the raw `workflow` call — an upstream renderer quirk, and exactly why
 the progress surfaces exist.)
 
-![Invoking a workflow](assets/screenshots/01-invoking.png)
+![Invoking a workflow](https://github.com/PhillipChaffee/ultraopen/raw/main/assets/screenshots/01-invoking.png)
 
 **2. The run keeps working.** Two minutes in, the four reviewers have reported (green rows, token
 counts) and a second wave is verifying their findings by execution — real model calls, real file
 reads.
 
-![The fan-out mid-run](assets/screenshots/02-grinding.png)
+![The fan-out mid-run](https://github.com/PhillipChaffee/ultraopen/raw/main/assets/screenshots/02-grinding.png)
 
 **3. Up close: the sidebar panel.** Opened with `Ctrl-x` then `b` — one summary line per run,
 one row per agent, glyphs for state.
 
-![The sidebar panel](assets/screenshots/03-sidebar.png)
+![The sidebar panel](https://github.com/PhillipChaffee/ultraopen/raw/main/assets/screenshots/03-sidebar.png)
 
 **4. The findings arrive on their own.** When the run settles, a `<workflow-completed>`
 notification is delivered into the transcript, and the model reports what the run confirmed:
 here, concrete findings on a staged demo diff, from an uncaught fetch to an off-by-one loop in
 `src/pagination.ts`.
 
-![Findings in the transcript](assets/screenshots/04-results.png)
+![Findings in the transcript](https://github.com/PhillipChaffee/ultraopen/raw/main/assets/screenshots/04-results.png)
 
 Agents show as `⠋` running, `✓` done, `✗` failed. All three surfaces (strip, sidebar, prompt
 status) are served by one shared poller — one directory pass per second — so having them all
@@ -212,9 +240,12 @@ reference.
 
 ## 🧭 Compatibility and known limits
 
-Verified against opencode 1.18.31 by the live e2e suites (`test/e2e`). The full working,
+ultraopen is tested against opencode 1.18.x and aims to keep current with opencode releases; 0.1.0
+was verified against opencode 1.18.31 by the live e2e suites (`test/e2e`). The full working,
 known-gap, and cosmetic inventory — each probe with its implementation note — lives in
-[docs/compatibility.md](./docs/compatibility.md). Headline gaps:
+[docs/compatibility.md](./docs/compatibility.md). On an opencode older than 1.18.20, the npm
+install loads nothing: the version gate skips the plugin at boot with a version error (path
+installs skip this gate). Headline gaps:
 
 - `agent()`'s `isolation: "worktree"` option is inert in the live wiring — ours to wire, not
   upstream (`worktreeRoot` is never passed).
@@ -227,6 +258,28 @@ known-gap, and cosmetic inventory — each probe with its implementation note �
 <a id="development"></a>
 
 ## 🛠️ Development
+
+### Local development install
+
+1. Build:
+   ```bash
+   bun install && bun run build
+   ```
+2. Reference it from both config files — the same `plugin` array in each. TUI plugins are read
+   only from `tui.json`; `opencode.json`'s `plugin` array never reaches the TUI runtime.
+   ```jsonc
+   // opencode.json and tui.json, both:
+   { "plugin": ["/absolute/path/to/ultraopen"] }
+   ```
+   That's it — opencode loads the plugin on next start.
+3. An absolute path is classified as a file plugin, which skips the version-compatibility gate,
+   so there is no publish step while iterating.
+4. Options go through the tuple form — never a new top-level key, which opencode hard-rejects:
+   ```json
+   { "plugin": [["/path/to/ultraopen", { "concurrency": 8, "ultracode": true }]] }
+   ```
+
+### Testing
 
 ```bash
 bun run check   # lint + strict typecheck + tests (95% coverage gate) + Node parity

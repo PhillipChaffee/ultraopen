@@ -109,6 +109,21 @@ for fixed settle sleeps, because no upstream signal marks the end of the input-d
 Gated once per boot, before the first input-bearing step; later keystrokes are outside the
 window.
 
+**open floor**
+The `engines.opencode` lower bound, `>=1.18.20`, declared with no ceiling: an opencode older than
+the floor loads nothing — the version gate skips the plugin at boot with a version error. The
+floor moves only when a feature requires a newer opencode API, never for compatibility
+housekeeping; the standing policy is fix forward, gate last (verify upstream majors against the
+e2e suites proactively, support both lines with compatible code first, touch the range only as a
+last resort — decided in #108, durable record in the README stance line, no ADR).
+
+**refresh instruction**
+The canonical sticky-cache refresh shipped with every publish: remove
+`~/.cache/opencode/packages/ultraopen*`, then restart opencode. The npm plugin cache is sticky —
+`@latest` resolves only on first install — so a new release never reaches an existing install on
+its own. Habitual, not situational: it hard-embeds into every release's notes
+(`.github/release-template.md`) and the standing README "Updating" note (decided in #108).
+
 ## Where decisions live
 
 - `docs/adr/` — accepted decisions, one file each. ADR-0001 records the launch concurrency policy

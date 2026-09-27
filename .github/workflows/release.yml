@@ -1,0 +1,99 @@
+name: Release
+
+# Tag-driven release: push a `v<semver>` tag and this publishes to npm (trusted
+# publishing, OIDC — no NPM_TOKEN) and creates the GitHub Release. The tag must
+# equal package.json's version, checked below, fail-fast. e2e never runs on the
+# tag: both suites stay the local close-out gate (AGENTS.md) — they need
+# provider auth and make live model calls.
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub Release
+      id-token: write # npm trusted publishing (OIDC)
+
+    steps:
+      # fetch-depth: 0 so the release notes can render the commit log between
+      # this tag and the previous one; no authenticated git access is needed
+      # after checkout (persist-credentials: false).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: "1.4.0"
+          # Release workflows must not restore cached build state (zizmor cache-poisoning).
+          no-cache: true
+
+      - run: bun install --frozen-lockfile
+
+      - name: Assert tag matches package.json version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(jq -r .version package.json)"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $PKG_VERSION — refusing to release"
+            exit 1
+          fi
+
+      - name: Check (lint + typecheck + coverage-gated tests + Node parity)
+        run: bun run check
+
+      - name: Build
+        run: bun run build
+
+      # Trusted publishing requires npm >= 11.5.1 and node >= 22.14; npm@latest
+      # on node 24 guarantees both.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      # Locked by the release-shape spec: npm@latest guarantees npm >= 11.5.1 for OIDC.
+      - run: npm install -g npm@latest # zizmor: ignore[adhoc-packages] global CLI bump, not a project dependency
+
+      # Idempotent re-tags: v0.1.0 publishes locally first (the trusted
+      # publisher can only be configured on an existing package), so a re-push
+      # of that tag must run green with publish skipped.
+      - name: Publish guard
+        id: publish-guard
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if npm view "ultraopen@$VERSION" version >/dev/null 2>&1; then
+            echo "ultraopen@$VERSION is already published — skipping npm publish"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to npm
+        if: steps.publish-guard.outputs.skip == 'false'
+        run: npm publish
+
+      - name: Render release notes
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          PREV="$(git describe --abbrev=0 --tags "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+          {
+            sed "s/{{VERSION}}/$VERSION/g" .github/release-template.md
+            echo
+            echo "## Commits"
+            echo
+            if [ -n "$PREV" ]; then
+              git log --oneline --no-decorate "$PREV..${GITHUB_REF_NAME}"
+            else
+              git log --oneline --no-decorate "${GITHUB_REF_NAME}"
+            fi
+          } > release-notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --title "ultraopen ${GITHUB_REF_NAME#v}" --notes-file release-notes.md
