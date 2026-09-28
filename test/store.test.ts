@@ -262,6 +262,20 @@ describe("killed-write atomicity (#136 review)", () => {
     if (survivor.state === "ok") {expect(survivor.manifest.argsHash).toBe("v1")}
   })
 
+  test("a manifest write killed THROUGH writeManifest leaves the previous manifest whole", async () => {
+    // The seam the two killed-write tests below/above bypass: they drive atomicWriteFile
+    // directly, so a writeManifest regressed to a truncate-write leaves them all green. This
+    // call rides the production entry point through the same test-only failRename pass-through
+    // the ProgressWriter default flush got in round 3, so the canonical invariant — a killed
+    // manifest write destroys nothing — discriminates at writeManifest itself.
+    await ensureRunDir("wf_abc123", env)
+    await writeManifest("wf_abc123", manifest({ argsHash: "v1" }), env)
+    await expect(writeManifest("wf_abc123", manifest({ argsHash: "v2" }), env, { failRename: true })).rejects.toThrow(/injected rename failure/u)
+    const survivor = await readManifestState("wf_abc123", env)
+    expect(survivor.state).toBe("ok")
+    if (survivor.state === "ok") {expect(survivor.manifest.argsHash).toBe("v1")}
+  })
+
   test("the same killed-write guarantee holds for a progress file", async () => {
     await ensureRunDir("wf_abc123", env)
     const progressPath = join(dirname(artifactPaths("wf_abc123", env).manifestPath), "progress.json")

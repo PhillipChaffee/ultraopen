@@ -106,9 +106,17 @@ export async function atomicWriteFile(
   }
 }
 
-export async function writeManifest(runId: string, manifest: Manifest, env?: NodeJS.ProcessEnv): Promise<void> {
+export async function writeManifest(
+  runId: string,
+  manifest: Manifest,
+  env?: NodeJS.ProcessEnv,
+  /** Test-only fault injection (#136): the killed-write seam discriminates HERE, at the
+   * production entry point — a writeManifest regressed to a truncate-write fails this test
+   * even though the direct atomicWriteFile tests stay green. */
+  inject?: { failRename?: boolean } | undefined,
+): Promise<void> {
   const paths = artifactPaths(runId, env)
-  await atomicWriteFile(paths.manifestPath, JSON.stringify(manifest, null, 2))
+  await atomicWriteFile(paths.manifestPath, JSON.stringify(manifest, null, 2), inject)
 }
 
 export async function writeResult(runId: string, value: unknown, env?: NodeJS.ProcessEnv): Promise<string> {
