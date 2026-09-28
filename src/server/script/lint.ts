@@ -177,8 +177,81 @@ export function lintDeterminism(ast: acorn.Program): ArgsDereference | undefined
   return argsDereference
 }
 
+/** Node keys that carry position/structure metadata rather than child nodes. */
+const SKIP_KEYS = new Set(["type", "loc", "range", "start", "end"])
+
 /** Names the launch injects as function parameters (SandboxGlobals) — always resolvable. */
 const PROVIDED_GLOBALS = new Set(["agent", "parallel", "pipeline", "phase", "log", "args", "budget", "workflow", "arguments"])
+
+/** Collects the names a binding pattern declares, into the given set. */
+const collectPatternNames = (pattern: unknown, into: Set<string>): void => {
+  if (!pattern || typeof pattern !== "object" || !("type" in pattern)) {return}
+  const node = pattern as acorn.AnyNode
+  switch (node.type) {
+    case "Identifier": {into.add((node as acorn.Identifier).name); break}
+    case "ObjectPattern": {
+      for (const prop of (node as acorn.ObjectPattern).properties) {
+        if (prop.type === "Property") {collectPatternNames((prop as acorn.Property).value, into)}
+        else {collectPatternNames((prop as acorn.RestElement).argument, into)}
+      }
+      break
+    }
+    case "ArrayPattern": {for (const el of (node as acorn.ArrayPattern).elements) {collectPatternNames(el, into)}; break}
+    case "AssignmentPattern": {collectPatternNames((node as acorn.AssignmentPattern).left, into); break}
+    case "RestElement": {collectPatternNames((node as acorn.RestElement).argument, into); break}
+  }
+}
+
+/**
+ * var is function-scoped and hoisted: collect every var name in the subtree, without descending
+ * into nested functions (their vars are their own scope).
+ */
+const hoistVarNames = (input: unknown, into: Set<string>): void => {
+  if (!input || typeof input !== "object") {return}
+  if (Array.isArray(input)) {for (const child of input) {hoistVarNames(child, into)}; return}
+  if (!("type" in input)) {return}
+  const node = input as acorn.AnyNode
+  switch (node.type) {
+    case "FunctionDeclaration": case "FunctionExpression": case "ArrowFunctionExpression": case "ClassDeclaration": case "ClassExpression": {return}
+    case "VariableDeclaration": {
+      const declaration = node as acorn.VariableDeclaration
+      if (declaration.kind === "var") {for (const d of declaration.declarations) {collectPatternNames(d.id, into)}}
+      for (const d of declaration.declarations) {hoistVarNames(d.init, into)}
+      return
+    }
+    default: {
+      const record = node as unknown as Record<string, unknown>
+      for (const key of Object.keys(record)) {
+        if (SKIP_KEYS.has(key)) {continue}
+        hoistVarNames(record[key], into)
+      }
+    }
+  }
+}
+
+/**
+ * Block-entry pre-registration: let/const/class/function declarations at the immediate level of
+ * a block register before its statements are walked, so hoisted-function use and any declaration
+ * order pass. (TDZ violations pass too — a documented limit, not a bug.)
+ */
+const registerBlockDeclarations = (statements: unknown[], into: Set<string>): void => {
+  for (const statement of statements) {
+    if (!statement || typeof statement !== "object" || !("type" in statement)) {continue}
+    let node = statement as acorn.AnyNode
+    if (node.type === "ExportNamedDeclaration" && (node as acorn.ExportNamedDeclaration).declaration) {
+      node = (node as acorn.ExportNamedDeclaration).declaration as acorn.AnyNode
+    }
+    if (node.type === "VariableDeclaration" && (node as acorn.VariableDeclaration).kind !== "var") {
+      for (const d of (node as acorn.VariableDeclaration).declarations) {collectPatternNames(d.id, into)}
+    } else if (node.type === "FunctionDeclaration") {
+      const id = (node as acorn.FunctionDeclaration).id
+      if (id) {into.add(id.name)}
+    } else if (node.type === "ClassDeclaration") {
+      const id = (node as acorn.ClassDeclaration).id
+      if (id) {into.add(id.name)}
+    }
+  }
+}
 
 /**
  * Static undefined-identifier refusal (#144).
@@ -201,71 +274,18 @@ const PROVIDED_GLOBALS = new Set(["agent", "parallel", "pipeline", "phase", "log
 export function lintUndefinedIdentifiers(ast: acorn.Program): void {
   interface Scope { names: Set<string> }
 
-  const collectPatternNames = (pattern: any, into: Set<string>): void => {
-    if (!pattern) {return}
-    switch (pattern.type) {
-      case "Identifier": {into.add(pattern.name); break}
-      case "ObjectPattern": {
-        for (const prop of pattern.properties) {
-          if (prop.type === "Property") {collectPatternNames(prop.value, into)}
-          else if (prop.type === "RestElement") {collectPatternNames(prop.argument, into)}
-        }
-        break
-      }
-      case "ArrayPattern": {for (const el of pattern.elements) {collectPatternNames(el, into)}; break}
-      case "AssignmentPattern": {collectPatternNames(pattern.left, into); break}
-      case "RestElement": {collectPatternNames(pattern.argument, into); break}
-    }
-  }
-
-  // var is function-scoped and hoisted: collect every var name in the subtree, without
-  // descending into nested functions (their vars are their own scope).
-  const hoistVarNames = (node: any, into: Set<string>): void => {
-    if (!node || typeof node !== "object") {return}
-    if (Array.isArray(node)) {for (const child of node) {hoistVarNames(child, into)}; return}
-    switch (node.type) {
-      case "FunctionDeclaration": case "FunctionExpression": case "ArrowFunctionExpression": case "ClassDeclaration": case "ClassExpression": {return}
-      case "VariableDeclaration": {
-        if (node.kind === "var") {for (const d of node.declarations) {collectPatternNames(d.id, into)}}
-        for (const d of node.declarations) {hoistVarNames(d.init, into)}
-        return
-      }
-      default: {
-        for (const key of Object.keys(node)) {
-          if (key === "type" || key === "loc" || key === "range" || key === "start" || key === "end") {continue}
-          hoistVarNames(node[key], into)
-        }
-      }
-    }
-  }
-
-  // Block-entry pre-registration: let/const/class/function declarations at the immediate level
-  // of a block register before its statements are walked, so hoisted-function use and any
-  // declaration order pass. (TDZ violations pass too — a documented limit, not a bug.)
-  const registerBlockDeclarations = (statements: any[], into: Set<string>): void => {
-    for (const statement of statements) {
-      let node = statement
-      if (node.type === "ExportNamedDeclaration" && node.declaration) {node = node.declaration}
-      if (node.type === "VariableDeclaration" && node.kind !== "var") {
-        for (const d of node.declarations) {collectPatternNames(d.id, into)}
-      } else if (node.type === "FunctionDeclaration" && node.id) {
-        into.add(node.id.name)
-      } else if (node.type === "ClassDeclaration" && node.id) {
-        into.add(node.id.name)
-      }
-    }
-  }
-
   const resolves = (name: string, scopes: Scope[]): boolean => {
     for (let i = scopes.length - 1; i >= 0; i--) {
-      if (scopes[i].names.has(name)) {return true}
+      const scope = scopes[i]
+      if (scope && scope.names.has(name)) {return true}
     }
     if (PROVIDED_GLOBALS.has(name)) {return true}
     return typeof globalThis === "object" && globalThis !== null && name in globalThis
   }
 
-  const visit = (node: any, scopes: Scope[]): void => {
-    if (!node || typeof node !== "object") {return}
+  const visit = (input: unknown, scopes: Scope[]): void => {
+    if (!input || typeof input !== "object" || !("type" in input)) {return}
+    const node = input as acorn.AnyNode
     switch (node.type) {
       case "Identifier": {
         if (!resolves(node.name, scopes)) {
@@ -391,12 +411,14 @@ export function lintUndefinedIdentifiers(ast: acorn.Program): void {
           visit(node.left.object, scopes)
           if (node.left.computed) {visit(node.left.property, scopes)}
         } else if (node.left.type === "Identifier") {
-          scopes.at(-1).names.add(node.left.name)
+          const inner = scopes.at(-1)
+          if (inner) {inner.names.add(node.left.name)}
         } else {
-          collectPatternNames(node.left, scopes.at(-1).names)
+          const inner = scopes.at(-1)
+          if (inner) {collectPatternNames(node.left, inner.names)}
         }
         visit(node.right, scopes)
-        return
+        break
       }
       case "UpdateExpression": {return}
       case "UnaryExpression": {
@@ -411,7 +433,7 @@ export function lintUndefinedIdentifiers(ast: acorn.Program): void {
         visit(node.argument, scopes)
         return
       }
-      case "LabeledStatement": {visit(node.body, scopes); return}
+      case "LabeledStatement": {visit(node.body, scopes); break}
       case "BreakStatement": case "ContinueStatement": case "ThisExpression": case "Super": case "MetaProperty": case "PrivateIdentifier": {return}
       case "VariableDeclaration": {
         for (const d of node.declarations) {visit(d.init, scopes)}
@@ -437,11 +459,12 @@ export function lintUndefinedIdentifiers(ast: acorn.Program): void {
       default: {
         // Unknown node type: descend generically — every child that carries a `type` gets
         // visited as its own node, so Identifier reads inside still resolve through the rules.
-        for (const key of Object.keys(node)) {
-          if (key === "type" || key === "loc" || key === "range" || key === "start" || key === "end") {continue}
-          const child = node[key]
+        const record = node as unknown as Record<string, unknown>
+        for (const key of Object.keys(record)) {
+          if (SKIP_KEYS.has(key)) {continue}
+          const child = record[key]
           if (Array.isArray(child)) {for (const c of child) {visit(c, scopes)}}
-          else if (child && typeof child === "object" && typeof child.type === "string") {visit(child, scopes)}
+          else if (child && typeof child === "object" && typeof (child as Record<string, unknown>)["type"] === "string") {visit(child, scopes)}
         }
       }
     }

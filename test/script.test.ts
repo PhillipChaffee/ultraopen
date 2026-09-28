@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { parse } from "../src/server/script/parse.js"
+import { lintUndefinedIdentifiers } from "../src/server/script/lint.js"
+import type * as acorn from "acorn"
 import { run } from "../src/server/script/sandbox.js"
 import { WorkflowScriptError } from "../src/server/script/errors.js"
 import { MAX_SCRIPT_CHARS } from "../src/server/script/limits.js"
@@ -309,6 +311,40 @@ describe("parse — undefined-identifier refusal (#144)", () => {
     expect(() => parse(`${META}for (let i = 0; i < 3; i++) { log(i) }\n`)).not.toThrow()
     expect(() => parse(`${META}for (const item of [1, 2]) { log(item) }\n`)).not.toThrow()
     expect(() => parse(`${META}function f() { var scoped = 1; return scoped }\nreturn f()\n`)).not.toThrow()
+  })
+
+  test("var escapes blocks to function scope; loop updates and computed members resolve", () => {
+    expect(() => parse(`${META}function f() { { var leaked = 1 } return leaked }\nreturn f()\n`)).not.toThrow()
+    expect(() => parse(`${META}const list = [1, 2, 3]\nlet total = 0\nfor (let i = 0; i < list.length; i++) { total += list[i] }\nreturn total\n`)).not.toThrow()
+    expect(() => parse(`${META}const key = "repo"\nreturn args[key]\n`)).not.toThrow()
+  })
+
+  test("classes, methods, static blocks, and property definitions resolve", () => {
+    expect(() => parse(`${META}const Klass = class Inner { static tag = 1; render() { return this.tag } }\nreturn new Klass().render()\n`)).not.toThrow()
+    expect(() => parse(`${META}class Repo { static #count = 0; static get count() { return Repo.#count } }\nreturn Repo.count\n`)).not.toThrow()
+    expect(() => parse(`${META}class Config { static x = 0; static { Config.x = 1 } }\nreturn Config.x\n`)).not.toThrow()
+  })
+
+  test("switch, catch, rest, assignment patterns, labels, shorthand, meta pass", () => {
+    expect(() => parse(`${META}const kind = "a"\nswitch (kind) { case "a": { const local = 1; log(local); break } default: break }\n`)).not.toThrow()
+    expect(() => parse(`${META}try { JSON.parse("{") } catch (err) { log(err.message) }\n`)).not.toThrow()
+    expect(() => parse(`${META}const [first, ...others] = [1, 2, 3]\nreturn first + others.length\n`)).not.toThrow()
+    expect(() => parse(`${META}let assigned\n;({ assigned = 1 } = { assigned: 2 })\nreturn assigned\n`)).not.toThrow()
+    expect(() => parse(`${META}outer: for (const i of [1]) { break outer }\n`)).not.toThrow()
+    expect(() => parse(`${META}const a = 1\nconst wrap = { a }\nreturn wrap.a\n`)).not.toThrow()
+    expect(() => parse(`${META}const f = function named() { return named }\nreturn f()\n`)).not.toThrow()
+    expect(() => parse(`${META}const f = function () { return new.target }\nreturn f()\n`)).not.toThrow()
+    expect(() => parse(`${META}const v = typeof (1 + 1)\nreturn v\n`)).not.toThrow()
+  })
+
+  test("unknown node types descend generically (#144 synthetic AST)", () => {
+    // Direct call with a node type acorn never emits: the generic-descent branch must still
+    // visit Identifier reads inside it and resolve them through the same rules.
+    const fake = {
+      type: "Program",
+      body: [{ type: "TotallyUnknownNode", kids: [{ type: "Identifier", name: "undeclaredThing", loc: { start: { line: 1, column: 0 } } }] }],
+    }
+    expect(() => lintUndefinedIdentifiers(fake as unknown as acorn.Program)).toThrow(/undeclaredThing/u)
   })
 })
 

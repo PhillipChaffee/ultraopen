@@ -59,12 +59,12 @@ describe("parallel", () => {
     // Passing promises instead of thunks is the most common authoring error. Degrading it to a row
     // of nulls would leave the author with no explanation for why nothing ran. The error rides the
     // same diagnostic contract as every other authoring error (#145): suggestions render.
-    const error = await parallel([Promise.resolve(1) as unknown as () => unknown]).then(
+    const thrown = await parallel([Promise.resolve(1) as unknown as () => unknown]).then(
       () => undefined,
       (error: unknown) => error,
     )
-    expect(error).toBeInstanceOf(WorkflowScriptError)
-    const diagnostic = (error as WorkflowScriptError).diagnostic
+    expect(thrown).toBeInstanceOf(WorkflowScriptError)
+    const diagnostic = (thrown as WorkflowScriptError).diagnostic
     expect(diagnostic.message).toContain("not promises")
     expect(diagnostic.suggestions?.length ?? 0).toBeGreaterThan(0)
     expect(diagnostic.suggestions?.join(" ")).toContain("() =>")
