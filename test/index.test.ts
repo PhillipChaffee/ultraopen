@@ -1183,6 +1183,30 @@ describe("background launch contract", () => {
     expect(background.liveRunsForSession("parent")).toHaveLength(0)
   })
 
+  test("a well-formed resume id with no run refuses at the gate with the run-list hint, before the ask", async () => {
+    // The bug (#131): a well-formed but nonexistent id (typo'd or pruned) fell
+    // through the gate, spent the approval, and then loadResume turned the
+    // missing manifest into a silent empty replay — a fresh launch at full
+    // price dressed as a resume. The refusal must point at the status tool's
+    // run listing, where valid ids come from.
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    // Well-formed per the id shape (wf_ + [a-z0-9]{6,}), never launched here.
+    const missingId = "wf_nomach1"
+    const { ask, assertNoAsk } = askRecorder()
+    const output = await tool.execute(
+      { script: `${META}return 2\n`, resumeFromRunId: missingId, background: false },
+      { sessionID: "parent", ask },
+    )
+    expect(output).toContain("<workflow-refused>")
+    expect(output).toContain(missingId)
+    expect(output).toContain("workflow_status")
+    // Refused BEFORE the permission ask: no approval is consumed by a call
+    // that refuses itself, and nothing launches.
+    assertNoAsk()
+    expect(background.liveRunsForSession("parent")).toHaveLength(0)
+  })
+
   test("executeStatus can be driven directly against real run artifacts", async () => {
     const tool = toolOf(ultraopen({ client: stubClient }))
     if (!tool) {throw new Error("tool was not registered")}

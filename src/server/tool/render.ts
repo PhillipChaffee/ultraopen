@@ -277,6 +277,21 @@ export function renderForeignSessionResumeRefusal(runId: string, sessionID: stri
 }
 
 /**
+ * A resume whose id is well-formed but whose run directory is gone (#131): a
+ * typo'd id or a pruned run. Refused before the ask — the silent alternative
+ * replayed nothing and read as a fresh launch at full price. The hint points at
+ * the status tool's run listing, where valid ids come from.
+ */
+export function renderMissingRunResumeRefusal(runId: string): string {
+  return [
+    "<workflow-refused>",
+    `No run exists with id "${runId}" — the id may be mistyped or its run directory has been pruned.`,
+    "Poll workflow_status for the ids of recent runs, and resume one of those; a launch result also reports its run id.",
+    "</workflow-refused>",
+  ].join("\n")
+}
+
+/**
  * A launch, resume, or dryRun whose `args` carries a model-emitted zero-value decoration.
  *
  * The strings "", "null" and "undefined" are the weather: models emit them for an absent
