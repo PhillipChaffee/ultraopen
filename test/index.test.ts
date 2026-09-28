@@ -2320,6 +2320,18 @@ describe("scriptPath + script together (#143)", () => {
     expect(fromDisk).toContain("<workflow-launched")
     await background.settlePromiseOf(runIdOf(fromDisk))
   })
+
+  test("the schema description states the rule", () => {
+    // The schema is model-facing: a model that keeps passing both keeps getting refused,
+    // so the scriptPath description teaches the drop-one rule (#86's and #132's
+    // precedent). The old "Takes precedence over `script`" sentence actively licensed
+    // the both-supplied call and must go.
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const scriptPathSchema = tool?.args?.["scriptPath"] as { description?: string } | undefined
+    expect(scriptPathSchema?.description).toContain("Passing both `script` and `scriptPath` is refused")
+    expect(scriptPathSchema?.description).not.toContain("Takes precedence over")
+  })
 })
 
 describe("args transport repair (#78)", () => {

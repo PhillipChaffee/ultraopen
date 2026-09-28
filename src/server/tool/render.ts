@@ -420,7 +420,7 @@ export function workflowArgsSchema(): Record<string, unknown> {
     script: { type: "string", description: "The workflow script. Must begin with `export const meta = {...}`." },
     scriptPath: {
       type: "string",
-      description: "Path to a persisted script. Takes precedence over `script`. The strings \"\", \"null\", and \"undefined\" are refused as zero-value decorations — omit the field to run the script passed in `script`.",
+      description: "Path to a persisted script. Passing both `script` and `scriptPath` is refused — keep one source: `script` inline, or `scriptPath` and delete the `script` field. The strings \"\", \"null\", and \"undefined\" are refused as zero-value decorations — omit the field to run the script passed in `script`.",
     },
     args: {
       description:
