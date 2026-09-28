@@ -2238,6 +2238,35 @@ describe("scriptPath zero-value decoration guard (#141)", () => {
     expect(argsSchema?.description).toContain("zero-value decorations")
     expect(argsSchema?.description).toContain("omit the field")
   })
+
+  test("a real scriptPath still resolves and runs (real paths untouched)", async () => {
+    // The guard fires on the three decoration strings only: a real path to a persisted
+    // script passes the boundary exactly as before, asks for permission like any launch,
+    // and runs to its value.
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    await ensureRunDir("wf_pathreal01", undefined)
+    const paths = await writeScript("wf_pathreal01", `${META}return 'real path intact'\n`)
+    const asked: unknown[] = []
+    const output = await tool.execute(
+      { scriptPath: paths, background: false },
+      { sessionID: "parent", ask: (request: unknown) => { asked.push(request); return Promise.resolve() } },
+    )
+    expect(output).not.toContain("<workflow-refused>")
+    expect(output).toContain("real path intact")
+    expect(asked).toHaveLength(1)
+  })
+
+  test("an omitted scriptPath still launches fresh (the omit-it fix works)", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const launched = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 1\n`, scriptPath: undefined, background: true },
+      { sessionID: "parent" },
+    )
+    expect(launched).toContain("<workflow-launched")
+    await background.settlePromiseOf(runIdOf(launched))
+  })
 })
 
 describe("args transport repair (#78)", () => {
