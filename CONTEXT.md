@@ -25,9 +25,10 @@ entry synchronously before its first await, so the check-then-act race cannot ad
 
 **launch contract**
 Which wait shape a launch follows: `background` (return the run id at once; the run outlives the
-tool call) or `blocking` (wait for the final result). Chosen by config precedence — env kill
-switch `ULTRAOPEN_WORKFLOW_SYNC=1` > project option `runMode` > home-dir option `runMode` >
-built-in default `background` — never by ultracode.
+tool call) or `blocking` (wait for the final result). Chosen by precedence — env kill switch
+`ULTRAOPEN_WORKFLOW_SYNC=1` (absolute: an explicit per-call `background` argument cannot argue
+with it, decided in #146) > per-call `background` argument > project option `runMode` > home-dir
+option `runMode` > built-in default `background` — never by ultracode.
 
 **live-run cap**
 The ceiling on live runs in one ultracode-active session: the `ultracodeMaxRuns` plugin option

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto"
 import { readFile } from "node:fs/promises"
 import { join } from "node:path"
-import { resolveOptions } from "./options.js"
+import { resolveLaunchContract, resolveOptions } from "./options.js"
 import type { UltraopenOptions } from "./options.js"
 import { registry } from "./singleton.js"
 import { installConfig } from "./ultracode/config.js"
@@ -34,11 +34,17 @@ import {
   renderRefusal,
   renderCapRefusal,
   renderResumeRefusal,
+  renderForeignSessionResumeRefusal,
+  renderUnrecordedSessionResumeRefusal,
+  renderMissingRunResumeRefusal,
   renderArgsRefusal,
+  renderResumeDecorationRefusal,
+  renderScriptPathDecorationRefusal,
   renderStringifiedArgsRefusal,
   renderStatus,
   workflowArgsSchema,
   statusArgsSchema,
+  renderBothSourceRefusal,
 } from "./tool/render.js"
 import { listSavedWorkflows, scanNamedWorkflows } from "./tool/named.js"
 import { wireRun, startDetachedRun } from "./tool/settlement.js"
@@ -258,6 +264,15 @@ function toolDescription(options: UltraopenOptions, longLived: boolean): string 
 }
 
 /**
+ * The model-emitted zero-value decorations (#86): "", "null" and "undefined".
+ *
+ * One predicate for every field the launch boundary guards against decoration weather —
+ * the decoration set is a single decided contract, not per-field trivia.
+ */
+const isZeroValueDecoration = (value: string): boolean =>
+  value === "" || value === "null" || value === "undefined"
+
+/**
  * Launches one workflow run.
  *
  * Two contracts share this path. `background` — the default — returns the run id
@@ -288,8 +303,42 @@ async function launchWorkflow(
   // pins: after the stop dispatch (a stop call carrying decoration still stops), before the
   // launch gate and the permission ask (a refused call registers no pending entry and burns
   // no approval, #74's precedent). One guard covers launch, resume, and dryRun.
-  if (typeof args.args === "string" && (args.args === "" || args.args === "null" || args.args === "undefined")) {
+  if (typeof args.args === "string" && isZeroValueDecoration(args.args)) {
     return renderArgsRefusal(args.args)
+  }
+
+  // The same weather on `resumeFromRunId` (#132): the empty string is falsy and would
+  // otherwise skip the resume gate entirely — no refusal, no resume, no note — reading as
+  // a fresh launch; "null" and "undefined" would reach the gate only to be refused as
+  // malformed ids. Same placement pins as the args guard: refused before the launch gate,
+  // so the call registers no pending entry and burns no approval. A caller who means a
+  // fresh launch omits the field.
+  if (typeof args.resumeFromRunId === "string" && isZeroValueDecoration(args.resumeFromRunId)) {
+    return renderResumeDecorationRefusal(args.resumeFromRunId)
+  }
+
+  // The same weather on `scriptPath` (#141): a decorated scriptPath is a truthy string, so
+  // it wins the source precedence (scriptPath > script > name) and reaches script
+  // resolution, failing there with a bare filesystem error (observed: ENOENT open 'null')
+  // that never names the decoration. Same placement pins as the args and resumeFromRunId
+  // guards: refused before the launch gate, so the call registers no pending entry and
+  // burns no approval. A caller who means the inline script omits the field.
+  if (typeof args.scriptPath === "string" && isZeroValueDecoration(args.scriptPath)) {
+    return renderScriptPathDecorationRefusal(args.scriptPath)
+  }
+
+  // Both source fields (#143): the precedence is scriptPath > script, so a call carrying
+  // both silently discarded the inline script — usually the fuller source text — and a
+  // wrong or stale path killed it with a bare filesystem error naming neither field.
+  // Refused loudly at the boundary, same placement pins as the guards above: after the
+  // stop dispatch, before the launch gate and the permission ask, so the refusal
+  // registers no pending entry and burns no approval. The precedence itself is
+  // unchanged — a single-source call resolves exactly as before, and a decorated
+  // scriptPath above still takes the decoration treatment first. The truthiness test
+  // mirrors resolveSource's own, so the refusal fires exactly where the discard would
+  // have happened.
+  if (args.script && args.scriptPath) {
+    return renderBothSourceRefusal()
   }
 
   // Stringified-JSON transport (#78): a string that LOOKS like JSON but fails to parse is
@@ -302,7 +351,8 @@ async function launchWorkflow(
     return renderStringifiedArgsRefusal(transport.raw, transport.reason)
   }
 
-  const background = args.dryRun !== true && (args.background ?? options.runMode === "background"),
+  const background = args.dryRun !== true &&
+    resolveLaunchContract(args.background, options) === "background",
    runId = `wf_${randomUUID().replaceAll("-", "").slice(0, 12)}`,
    // The session's default model, so `effort` resolves against ITS variant set rather
    // than a guess. A failure here is non-fatal: effort simply goes unapplied, and the run
@@ -348,6 +398,60 @@ async function launchWorkflow(
   }
 
   try {
+    // A resume that will be refused is refused BEFORE the permission ask: a call
+    // with a malformed resumeFromRunId, one whose source run is live elsewhere,
+    // one whose source run belongs to a different session, or one whose source
+    // run directory is gone (#131), would otherwise render
+    // the approval dialog, consume the user's approval, and only then refuse —
+    // nothing launches, and the approval is spent (the burned approval also
+    // cascades into a re-ask chain, since models retry after the refusal). The
+    // journal rationale still holds: two writers on one journal would interleave
+    // appends and race the endRun rewrite.
+    //
+    // The gate stands FIRST in the launch — before prepare() and before the run
+    // directory is created. It needs only the resume id and this session's
+    // identity, so running it after ensureRunDir/writeScript manufactured a
+    // manifest-less directory on every refusal: a phantom that executeStatus
+    // reads as "no run found" and pruneRuns can never remove, because pruning
+    // keys on a manifest — one leaked directory per refused resume, forever.
+    if (args.resumeFromRunId) {
+      // The id is model-supplied input and joins into a filesystem path below,
+      // exactly like the status tool's runId: rejected before any read.
+      if (!isSafeRunId(args.resumeFromRunId)) {
+        dropPending(runId)
+        return renderResumeRefusal(args.resumeFromRunId, undefined)
+      }
+      const source = await readManifest(args.resumeFromRunId)
+      // A well-formed id whose run directory or manifest is gone (#131): a typo'd
+      // id or a pruned run. Refused here rather than falling through to the ask
+      // and the silent empty replay that read as a fresh launch at full price.
+      if (!source) {
+        dropPending(runId)
+        return renderMissingRunResumeRefusal(args.resumeFromRunId)
+      }
+      if (isLiveAnywhere(source, bootId)) {
+        dropPending(runId)
+        return renderResumeRefusal(source.runId, source.pid)
+      }
+      // A manifest that records no session cannot prove provenance. The Manifest
+      // schema REQUIRES sessionID and every manifest writer since the first run
+      // store has recorded it, so a manifest without one is corrupt — not a
+      // pre-upgrade format — and the comparison below would refuse it as a
+      // foreign session whose id is "undefined", naming a session it never saw.
+      if (typeof source.sessionID !== "string") {
+        dropPending(runId)
+        return renderUnrecordedSessionResumeRefusal(source.runId)
+      }
+      // Cross-session refusal (#147), AFTER the live check: a foreign run that is
+      // still executing reports the live refusal, the more dangerous condition;
+      // a settled foreign run reports the cross-session situation instead of the
+      // silent empty replay that read as a successful empty resume.
+      if (source.sessionID !== context.sessionID) {
+        dropPending(runId)
+        return renderForeignSessionResumeRefusal(source.runId, source.sessionID)
+      }
+    }
+
     // Parse BEFORE asking, so the permission prompt names the real workflow and can show
     // what it intends to do. `meta` is a pure literal specifically so it can be read
     // without running anything. Using the tool's `title` argument here instead would be
@@ -371,29 +475,10 @@ async function launchWorkflow(
     // directory must exist for the write — created here, best-effort like the
     // write itself: a failed write must not block the prompt, and a failure
     // here resurfaces through beginRun's friendly launch-failure message.
+    // Reached only past the resume gate above, so a refused resume manufactures
+    // no directory of its own: no refusal leaves a manifest-less run behind.
     await ensureRunDir(runId).catch(() => undefined)
     await writeScript(runId, prepared.source).catch(() => undefined)
-
-    // A resume that will be refused is refused BEFORE the permission ask: a call
-    // with a malformed resumeFromRunId, or one whose source run is live elsewhere,
-    // would otherwise render the approval dialog, consume the user's approval, and
-    // only then refuse — nothing launches, and the approval is spent (the burned
-    // approval also cascades into a re-ask chain, since models retry after the
-    // refusal). The journal rationale still holds: two writers on one journal
-    // would interleave appends and race the endRun rewrite.
-    if (args.resumeFromRunId) {
-      // The id is model-supplied input and joins into a filesystem path below,
-      // exactly like the status tool's runId: rejected before any read.
-      if (!isSafeRunId(args.resumeFromRunId)) {
-        dropPending(runId)
-        return renderResumeRefusal(args.resumeFromRunId, undefined)
-      }
-      const source = await readManifest(args.resumeFromRunId)
-      if (source && isLiveAnywhere(source, bootId)) {
-        dropPending(runId)
-        return renderResumeRefusal(source.runId, source.pid)
-      }
-    }
 
     // `always` is scoped to this workflow's name rather than "*": an "always" grant is
     // stored instance-wide, so approving once with "*" would permanently disable the

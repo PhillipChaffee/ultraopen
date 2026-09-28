@@ -260,6 +260,56 @@ export function renderResumeRefusal(runId: string, pid: number | undefined): str
 }
 
 /**
+ * A resume whose source run belongs to a DIFFERENT session (#147).
+ *
+ * Resume is same-session by design — a foreign journal would replay results produced for
+ * another conversation's context. The refusal names the situation so the caller can tell it
+ * apart from a successful empty resume; the silence was the bug, re-running every agent at
+ * full price with no note.
+ */
+export function renderForeignSessionResumeRefusal(runId: string, sessionID: string): string {
+  return [
+    "<workflow-refused>",
+    `Run ${runId} was launched in a different session (${sessionID}); its journal cannot be replayed here — resume is same-session by design, because results produced for another conversation's context are not valid answers in this one.`,
+    "Launch the workflow fresh in this session, or resume it from the session that launched it.",
+    "</workflow-refused>",
+  ].join("\n")
+}
+
+/**
+ * A resume whose source run's manifest records no session at all.
+ *
+ * The Manifest schema REQUIRES sessionID and every manifest writer since the first run store
+ * has recorded it, so a manifest without one is corrupt — not a pre-upgrade format. Resume is
+ * same-session by design, and provenance that cannot be read cannot be verified: refused with
+ * the truthful message rather than the foreign-session render, whose message would name
+ * "(undefined)" as the session that owns the run — a session it never saw.
+ */
+export function renderUnrecordedSessionResumeRefusal(runId: string): string {
+  return [
+    "<workflow-refused>",
+    `Run ${runId}'s manifest does not record the session that launched it, so it cannot be verified as same-session — resume is same-session by design, because results produced for another conversation's context are not valid answers in this one.`,
+    "Launch the workflow fresh in this session.",
+    "</workflow-refused>",
+  ].join("\n")
+}
+
+/**
+ * A resume whose id is well-formed but whose run directory is gone (#131): a
+ * typo'd id or a pruned run. Refused before the ask — the silent alternative
+ * replayed nothing and read as a fresh launch at full price. The hint points at
+ * the status tool's run listing, where valid ids come from.
+ */
+export function renderMissingRunResumeRefusal(runId: string): string {
+  return [
+    "<workflow-refused>",
+    `No run exists with id "${runId}" — the id may be mistyped or its run directory has been pruned.`,
+    "Poll workflow_status for the ids of recent runs, and resume one of those; a launch result also reports its run id.",
+    "</workflow-refused>",
+  ].join("\n")
+}
+
+/**
  * A launch, resume, or dryRun whose `args` carries a model-emitted zero-value decoration.
  *
  * The strings "", "null" and "undefined" are the weather: models emit them for an absent
@@ -273,6 +323,62 @@ export function renderArgsRefusal(value: string): string {
     "<workflow-refused>",
     `The \`args\` field was passed as the string "${value}" — a zero-value decoration ("", "null", or "undefined"), not a real argument. The script would receive that string as its global \`args\`, and a resume decorated this way can no longer replay its source run.`,
     "To pass no arguments, omit the `args` field entirely; otherwise pass real JSON.",
+    "</workflow-refused>",
+  ].join("\n")
+}
+
+/**
+ * A launch or dryRun whose `resumeFromRunId` carries a model-emitted zero-value
+ * decoration (#132).
+ *
+ * The empty string is falsy, so without this refusal it silently skips the resume gate
+ * and reads as a fresh launch; "null" and "undefined" reach the gate only to be refused
+ * as malformed ids, never named as the decoration they are. Refused loudly instead —
+ * nothing was resumed, and the caller who means a fresh launch omits the field.
+ */
+export function renderResumeDecorationRefusal(value: string): string {
+  return [
+    "<workflow-refused>",
+    `The \`resumeFromRunId\` field was passed as the string "${value}" — a zero-value decoration ("", "null", or "undefined"), not a run id, so no resume was attempted.`,
+    "To launch fresh, omit the `resumeFromRunId` field entirely; otherwise pass the run id exactly as a launch result reported it.",
+    "</workflow-refused>",
+  ].join("\n")
+}
+
+/**
+ * A launch or dryRun whose `scriptPath` carries a model-emitted zero-value decoration (#141).
+ *
+ * A decorated scriptPath is a truthy string, so it wins the source precedence
+ * (scriptPath > script > name) and reaches script resolution, failing there with a bare
+ * filesystem error (observed: ENOENT open 'null') that never names the decoration it is.
+ * Refused loudly at the boundary instead — the same treatment `args` and `resumeFromRunId`
+ * get, with the same placement pins: after the stop dispatch, before the launch gate and
+ * the permission ask. A caller who means the inline script omits the field.
+ */
+export function renderScriptPathDecorationRefusal(value: string): string {
+  return [
+    "<workflow-refused>",
+    `The \`scriptPath\` field was passed as the string "${value}" — a zero-value decoration ("", "null", or "undefined"), not a script path, so no script was resolved.`,
+    "To run the script passed in `script`, omit the `scriptPath` field entirely; otherwise pass a real path to a persisted script.",
+    "</workflow-refused>",
+  ].join("\n")
+}
+
+/**
+ * A launch whose `script` and `scriptPath` arrive together (#143).
+ *
+ * The resolution precedence is scriptPath > script, so the inline script — usually the
+ * fuller source text — was silently discarded, and a wrong or stale path killed it with
+ * a bare filesystem error naming neither field. Refused loudly at the boundary instead,
+ * with the same placement pins as the other boundary guards: after the stop dispatch,
+ * before the launch gate and the permission ask. The precedence itself is unchanged;
+ * the refusal replaces only the silent discard.
+ */
+export function renderBothSourceRefusal(): string {
+  return [
+    "<workflow-refused>",
+    "Both `script` and `scriptPath` were supplied. The resolution precedence is scriptPath > script, so the inline `script` would be discarded and only the file would run.",
+    "Pass one source: keep `script` (omit `scriptPath`), or keep `scriptPath` and delete the `script` field.",
     "</workflow-refused>",
   ].join("\n")
 }
@@ -330,14 +436,17 @@ export function renderStatus(report: StatusReport): string {
 export function workflowArgsSchema(): Record<string, unknown> {
   return {
     script: { type: "string", description: "The workflow script. Must begin with `export const meta = {...}`." },
-    scriptPath: { type: "string", description: "Path to a persisted script. Takes precedence over `script`." },
+    scriptPath: {
+      type: "string",
+      description: "Path to a persisted script. Passing both `script` and `scriptPath` is refused — keep one source: `script` inline, or `scriptPath` and delete the `script` field. The strings \"\", \"null\", and \"undefined\" are refused as zero-value decorations — omit the field to run the script passed in `script`.",
+    },
     args: {
       description:
         "Value exposed to the script as the global `args`. Pass real JSON, not a JSON string: a string that parses to an object or array is hydrated to that value (and the repair is logged), one that looks like JSON but fails to parse is refused, and any other string stays a scalar. The strings \"\", \"null\", and \"undefined\" are refused as zero-value decorations — omit the field for no arguments.",
     },
     resumeFromRunId: {
       type: "string",
-      description: "Resume a previous run from this directory's data: unchanged agent calls replay from its journal instantly, and the first changed call onward runs live. Refused while the source run is still executing.",
+      description: "Resume a previous run from this directory's data: unchanged agent calls replay from its journal instantly, and the first changed call onward runs live. Refused while the source run is still executing. The strings \"\", \"null\", and \"undefined\" are refused as zero-value decorations — omit the field for a fresh launch.",
     },
     dryRun: { type: "boolean", description: "Run the script with agent() stubbed out, for zero tokens. Always waits for the result." },
     background: {
