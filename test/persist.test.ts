@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
-import { chmod, mkdir, mkdtemp, readdir, rm } from "node:fs/promises"
+import { chmod, mkdtemp, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { beginRun, endRun, loadResume, markCancelled, writeTerminalManifest } from "../src/server/resume/persist.js"
@@ -263,7 +263,8 @@ test("the checked terminal write refuses when the manifest already settled (#136
   if (!manifest) {throw new Error("the run did not open")}
   await markCancelled(manifest, [], env)
   expect(await writeTerminalManifest("wf_abc123", { ...manifest, status: "completed", endedAt: Date.now() }, env)).toBe(false)
-  expect((await readManifest("wf_abc123", env))?.status).toBe("cancelled")
+  const standing = await readManifest("wf_abc123", env)
+  expect(standing?.status).toBe("cancelled")
   const entries = await readdir(dirname(artifactPaths("wf_abc123", env).manifestPath))
   expect(entries.filter((e) => e.includes(".tmp"))).toEqual([])
 })
