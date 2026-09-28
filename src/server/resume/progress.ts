@@ -1,6 +1,5 @@
-import { writeFile } from "node:fs/promises"
 import { join } from "node:path"
-import { runDir } from "./store.js"
+import { atomicWriteFile, runDir } from "./store.js"
 import type { ProgressEvent } from "../runtime/run.js"
 
 /**
@@ -83,7 +82,8 @@ export class ProgressWriter {
       budget: { total: options.budgetTotal ?? null, spent: 0 },
     }
     this.#env = options.env
-    this.#flush = options.write ?? ((path, body) => writeFile(path, body, "utf8"))
+    // The default flush is atomic (#136): a torn progress file would blind the TUI and the status poll.
+    this.#flush = options.write ?? ((path, body) => atomicWriteFile(path, body))
   }
 
   /** Folds one event into the snapshot. */

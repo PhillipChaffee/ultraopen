@@ -394,3 +394,9 @@ describe("executeStatus — real disk layout", () => {
     expect(Date.now() - started).toBeGreaterThanOrEqual(2000)
   })
 })
+test("a corrupt manifest reports the corrupt state, never an unknown run (#136)", async () => {
+  const report = await executeStatus({ runId: "wf_status01" }, deps({ "manifest.json": "{torn", "progress.json": "{torn" }))
+  expect(report.status).toBe("corrupt")
+  expect(report.failure?.message).toContain("unreadable")
+  expect(report.failure?.dir).toContain("wf_status01")
+})

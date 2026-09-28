@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
-import { chmod, mkdtemp, readFile, readdir, rm } from "node:fs/promises"
+import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { defaultProcessAlive, newBootId, pruneRuns, reapOrphans } from "../src/server/resume/reaper.js"
@@ -55,7 +55,11 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-  // Restore write permission before cleanup: one test makes a run directory read-only.
+  // Restore write permission before cleanup: tests make run DIRECTORIES read-only (atomic
+  // writes are blocked by the directory), and rm needs the write back.
+  await chmod(join(base, "opencode", "tool-output", "ultraopen", "wf_dead001"), 0o700).catch(
+    () => undefined,
+  )
   await chmod(join(base, "opencode", "tool-output", "ultraopen", "wf_dead001", "manifest.json"), 0o600).catch(
     () => undefined,
   )
@@ -256,9 +260,9 @@ describe("failure tolerance", () => {
     const entry = manifest()
     await ensureRunDir(entry.runId, env)
     await writeManifest(entry.runId, entry, env)
-    // Make the manifest FILE read-only. Directory permissions would not be enough — overwriting
-    // an existing file only needs write permission on the file itself.
-    await chmod(join(base, "opencode", "tool-output", "ultraopen", entry.runId, "manifest.json"), 0o400)
+    // Atomic writes (#136) rename over the target, so the DIRECTORY permission is what blocks
+    // the write: an unwritable run dir makes the tombstone write fail while aborts still land.
+    await chmod(join(base, "opencode", "tool-output", "ultraopen", entry.runId), 0o500)
 
     const { client, aborted } = makeClient(),
      result = await reapOrphans(client, "current-boot", { env, isProcessAlive: DEAD })
@@ -275,7 +279,7 @@ describe("non-throwing contract", () => {
     const entry = manifest()
     await ensureRunDir(entry.runId, env)
     await writeManifest(entry.runId, entry, env)
-    await chmod(join(base, "opencode", "tool-output", "ultraopen", entry.runId, "manifest.json"), 0o400)
+    await chmod(join(base, "opencode", "tool-output", "ultraopen", entry.runId), 0o500)
 
     const { client } = makeClient(() => Promise.reject(new Error("everything is broken")))
     await expect(reapOrphans(client, "current-boot", { env, isProcessAlive: DEAD })).resolves.toBeDefined()
@@ -328,4 +332,16 @@ describe("pruneRuns", () => {
     const broken = join(base, "not-a-dir")
     await expect(pruneRuns({ env: { XDG_DATA_HOME: broken } as NodeJS.ProcessEnv })).resolves.toBe(0)
   })
+})
+
+test("a run with an unreadable manifest is quarantined, not skipped (#136)", async () => {
+  const { manifestPath } = await ensureRunDir("wf_dead001", env)
+  await writeFile(manifestPath, "{torn", "utf8")
+  const { client } = makeClient()
+  const result = await reapOrphans(client, "fresh-boot", { env, isProcessAlive: DEAD })
+  expect(result.runs).toBe(1)
+  const m = await readManifest("wf_dead001", env)
+  expect(m?.status).toBe("orphaned")
+  const pruned = await pruneRuns({ env, now: Date.now() + 31 * 24 * 60 * 60 * 1000, autoResumeTtlHours: 24 })
+  expect(pruned).toBe(1)
 })

@@ -34,8 +34,9 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-  // Restore write permission before cleanup: one test makes a manifest read-only.
-  await chmod(join(base, "opencode", "tool-output", "ultraopen", "wf_abc123", "manifest.json"), 0o600).catch(
+  // Restore write permission before cleanup: tests make the run DIRECTORY read-only (atomic
+  // writes are blocked by the directory, not the file), and rm needs the write back.
+  await chmod(join(base, "opencode", "tool-output", "ultraopen", "wf_abc123"), 0o700).catch(
     () => undefined,
   )
   await chmod(base, 0o755).catch(() => undefined)
@@ -126,10 +127,10 @@ describe("endRun", () => {
   })
 
   test("a disk-write failure is swallowed, so a completed run is never lost to a persistence error", async () => {
-    // The manifest FILE is made read-only: overwriting an existing file needs write permission on
-    // the file itself, which makes every endRun write fail while the directory stays usable.
+    // Writes are atomic (temp + rename, #136), so blocking them means blocking the DIRECTORY:
+    // the temp file cannot be created, every endRun write fails, and the error stays swallowed.
     const manifest = await beginRun(record, env)
-    await chmod(artifactPaths("wf_abc123", env).manifestPath, 0o400)
+    await chmod(join(base, "opencode", "tool-output", "ultraopen", "wf_abc123"), 0o500)
 
     await expect(
       endRun(manifest, { status: "completed", entries: [entry], value: 1, childSessionIDs: [] }, env),
@@ -185,7 +186,7 @@ describe("markCancelled — the stop path's terminal write", () => {
   test("a disk-write failure reports undefined instead of lying about a cancel that never landed", async () => {
     const manifest = await beginRun(record, env)
     if (!manifest) {throw new Error("the run did not open")}
-    await chmod(artifactPaths("wf_abc123", env).manifestPath, 0o400)
+    await chmod(join(base, "opencode", "tool-output", "ultraopen", "wf_abc123"), 0o500)
 
     expect(await markCancelled(manifest, [], env)).toBeUndefined()
   })

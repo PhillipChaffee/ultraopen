@@ -1,6 +1,6 @@
 import { readdir, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
-import { dataRoot, findOrphans, readManifest, runDir, writeManifest } from "./store.js"
+import { dataRoot, findOrphans, isSafeRunId, readManifest, readManifestState, runDir, writeManifest } from "./store.js"
 import type { Manifest } from "./journal.js"
 import type { OpencodeClient } from "../types.js"
 
@@ -79,9 +79,13 @@ export async function reapOrphans(
   } = {},
 ): Promise<ReapResult> {
   try {
+    // Quarantine pass FIRST (#136): a run whose manifest is unreadable is invisible to every
+    // reader — status answers "no run found", findOrphans skips it, and nothing would ever stop
+    // or prune it. Tombstone it orphaned so it surfaces and prunes like any interrupted run.
+    const quarantined = await quarantineCorruptRuns(options.env)
     // findOrphans swallows its own I/O errors and returns [], so no catch is needed here.
     const orphans = await findOrphans(bootId, options.env)
-    if (orphans.length === 0) {return { runs: 0, sessions: 0, failures: 0, live: 0, orphaned: [] }}
+    if (orphans.length === 0) {return { runs: quarantined, sessions: 0, failures: 0, live: 0, orphaned: [] }}
 
     const alive = options.isProcessAlive ?? defaultProcessAlive,
     // A live pid means the run may still be executing in another concurrent process. Skip it —
@@ -130,12 +134,53 @@ export async function reapOrphans(
       )
     }
 
-    return { runs: reapable.length, sessions, failures, live, orphaned: reapable }
+    return { runs: reapable.length + quarantined, sessions, failures, live, orphaned: reapable }
   } catch {
     // Any unexpected failure (e.g. a malformed manifest that findOrphans let through) must not
     // break the contract above — a crashed sweep leaves money burning either way.
     return { runs: 0, sessions: 0, failures: 0, live: 0, orphaned: [] }
   }
+}
+
+/**
+ * Tombstones every run whose manifest is unreadable (#136).
+ *
+ * The tombstone is a fresh orphaned manifest: the run surfaces in status (`corrupt` before this
+ * sweep runs, `orphaned` after), the interrupted.txt marker appears so the boot hint names it,
+ * and the retention window can prune it. The journal/result beside it stay untouched. The
+ * original hashes are lost with the torn manifest, so the run is NOT a resume candidate — the
+ * auto-resume sweep skips unhashable manifests by construction.
+ */
+async function quarantineCorruptRuns(env?: NodeJS.ProcessEnv): Promise<number> {
+  const root = dataRoot(env)
+  let names: string[]
+  try {
+    names = await readdir(root)
+  } catch {
+    return 0
+  }
+  let quarantined = 0
+for (const name of names) {
+    if (!isSafeRunId(name)) {continue}
+    const read = await readManifestState(name, env)
+    if (read.state !== "corrupt") {continue}
+    const now = Date.now()
+    await writeManifest(name, {
+      runId: name,
+      bootId: "corrupt",
+      pid: Number.NaN,
+      sessionID: "",
+      sourceHash: "",
+      argsHash: "",
+      status: "orphaned",
+      childSessionIDs: [],
+      startedAt: now,
+      endedAt: now,
+    }, env).catch(ignore)
+    await writeFile(join(runDir(name, env), "interrupted.txt"), name, "utf8").catch(ignore)
+    quarantined++
+  }
+  return quarantined
 }
 
 /**

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import {
   appendJournal,
   appendJournalEntry,
@@ -13,6 +13,7 @@ import {
   isSafeRunId,
   readJournal,
   readManifest,
+  readManifestState,
   runDir,
   writeManifest,
   writeResult,
@@ -203,5 +204,46 @@ describe("orphan detection", () => {
 
   test("returns nothing when the data root does not exist yet", async () => {
     expect(await findOrphans("boot", { XDG_DATA_HOME: join(base, "absent") } as NodeJS.ProcessEnv)).toEqual([])
+  })
+})
+
+describe("corrupt-state reads (#136)", () => {
+  test("readManifestState distinguishes missing, corrupt, and ok", async () => {
+    await ensureRunDir("wf_abc123", env)
+    expect(await readManifestState("wf_abc123", env)).toEqual({ state: "missing" })
+    const paths = artifactPaths("wf_abc123", env)
+    await writeFile(paths.manifestPath, '{"runId": "wf_abc', "utf8")
+    const corrupt = await readManifestState("wf_abc123", env)
+    expect(corrupt.state).toBe("corrupt")
+    if (corrupt.state === "corrupt") { expect(corrupt.dir).toBe(paths.dir) }
+    await writeManifest("wf_abc123", manifest(), env)
+    const ok = await readManifestState("wf_abc123", env)
+    expect(ok.state).toBe("ok")
+    if (ok.state === "ok") { expect(ok.manifest.status).toBe("running") }
+  })
+
+  test("readManifest stays undefined for missing and corrupt runs (#136 compat)", async () => {
+    await ensureRunDir("wf_abc123", env)
+    expect(await readManifest("wf_abc123", env)).toBeUndefined()
+    await writeFile(artifactPaths("wf_abc123", env).manifestPath, "{torn", "utf8")
+    expect(await readManifest("wf_abc123", env)).toBeUndefined()
+  })
+})
+
+describe("atomic artifact writes (#136)", () => {
+  test("concurrent manifest writes leave a whole parseable manifest", async () => {
+    await ensureRunDir("wf_abc123", env)
+    const bigManifest = manifest({ childSessionIDs: Array.from({ length: 4000 }, (_u, i) => `ses_child${i}`) })
+    await Promise.all(Array.from({ length: 6 }, (_u, i) => writeManifest("wf_abc123", { ...bigManifest, argsHash: `v${i}` }, env)))
+    const m = await readManifest("wf_abc123", env)
+    expect(m?.childSessionIDs.length).toBe(4000)
+  })
+
+  test("a completed write leaves no temp file beside the artifact", async () => {
+    await ensureRunDir("wf_abc123", env)
+    await writeManifest("wf_abc123", manifest(), env)
+    await writeResult("wf_abc123", { ok: true }, env)
+    const entries = await readdir(dirname(artifactPaths("wf_abc123", env).manifestPath))
+    expect(entries.filter((e) => e.includes(".tmp"))).toEqual([])
   })
 })

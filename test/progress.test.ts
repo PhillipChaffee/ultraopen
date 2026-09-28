@@ -3,7 +3,7 @@ import { ProgressWriter } from "../src/server/resume/progress.js"
 import { LARGE_RUN_AGENTS } from "../src/server/script/limits.js"
 import { RunPoller, activeRuns, agentRowText, dataRoot, formatElapsed, glyph, hintLine, loadAllRuns, loadFailedReasons, loadInterruptedRuns, summarize, toView } from "../src/tui/data.js"
 import type { RunView } from "../src/tui/data.js"
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -590,5 +590,25 @@ describe("large-run badge in the strip summary", () => {
   test("a small run carries no badge", () => {
     const view = toView({ runId: "wf_a", workflow: "demo", startedAt: 0, agents: [{ index: 0, label: "a", status: "running" }] }, 0)
     expect(summarize(view)).not.toContain("large run")
+  })
+})
+
+describe("ProgressWriter — atomic flush (#136)", () => {
+  test("a torn progress file is repaired by the next flush; flushes leave no temp file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ultraopen-progress-"))
+    const env = { XDG_DATA_HOME: root } as NodeJS.ProcessEnv
+    try {
+      await mkdir(join(root, "opencode", "tool-output", "ultraopen", "wf_prog01"), { recursive: true })
+      await writeFile(join(root, "opencode", "tool-output", "ultraopen", "wf_prog01", "progress.json"), "{torn", "utf8")
+      const flusher = new ProgressWriter({ runId: "wf_prog01", workflow: "w", sessionID: "s", startedAt: 1, env })
+      flusher.apply({ type: "log", message: "one" }, 2)
+      await flusher.flush()
+      const snap = JSON.parse(await readFile(join(root, "opencode", "tool-output", "ultraopen", "wf_prog01", "progress.json"), "utf8"))
+      expect(snap.logs).toEqual(["one"])
+      const entries = await readdir(join(root, "opencode", "tool-output", "ultraopen", "wf_prog01"))
+      expect(entries.filter((e) => e.includes(".tmp"))).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 })

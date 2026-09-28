@@ -1,4 +1,5 @@
-import { appendFile, mkdir, readFile, readdir, writeFile } from "node:fs/promises"
+import { randomUUID } from "node:crypto"
+import { appendFile, mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { parseJournal } from "./journal.js"
@@ -75,18 +76,86 @@ export async function ensureRunDir(runId: string, env?: NodeJS.ProcessEnv): Prom
   return paths
 }
 
+/**
+ * Atomic artifact write (#136): temp file + rename.
+ *
+ * A plain truncate-write killed mid-way leaves a torn file that every reader then swallows — the
+ * run vanishes from status, the reaper skips it, its children keep billing. The rename(2) is
+ * atomic: a reader either sees the previous file whole or the new file whole, never a tear. The
+ * temp name is unique per write, so concurrent writers cannot interleave into one temp; a failed
+ * write unlinks its own temp best-effort.
+ */
+export async function atomicWriteFile(path: string, body: string): Promise<void> {
+  const tmp = `${path}.${randomUUID().slice(0, 8)}.tmp`
+  try {
+    await writeFile(tmp, body, "utf8")
+    await rename(tmp, path)
+  } catch (error) {
+    await unlink(tmp).catch(() => undefined)
+    throw error
+  }
+}
+
 export async function writeManifest(runId: string, manifest: Manifest, env?: NodeJS.ProcessEnv): Promise<void> {
   const paths = artifactPaths(runId, env)
-  await writeFile(paths.manifestPath, JSON.stringify(manifest, null, 2), "utf8")
+  await atomicWriteFile(paths.manifestPath, JSON.stringify(manifest, null, 2))
+}
+
+export async function writeResult(runId: string, value: unknown, env?: NodeJS.ProcessEnv): Promise<string> {
+  const paths = artifactPaths(runId, env)
+  await atomicWriteFile(paths.resultPath, JSON.stringify(value, null, 2))
+  return paths.resultPath
+}
+
+export async function writeScript(runId: string, source: string, env?: NodeJS.ProcessEnv): Promise<string> {
+  const paths = artifactPaths(runId, env)
+  await atomicWriteFile(paths.scriptPath, source)
+  return paths.scriptPath
+}
+
+/**
+ * Persists a failed run's rendered failure text.
+ *
+ * In the blocking contract the failure reached the model as the tool result; a
+ * detached run outlives that call, so the text must land on disk for the status
+ * tool to surface. Best-effort like everything here.
+ */
+export async function writeFailure(runId: string, text: string, env?: NodeJS.ProcessEnv): Promise<string> {
+  const paths = artifactPaths(runId, env)
+  await atomicWriteFile(paths.failurePath, text)
+  return paths.failurePath
+}
+
+/**
+ * The three states a manifest read can be in, distinguished (#136).
+ *
+ * `readManifest` collapses corrupt into missing (its callers treat both as "no manifest"), which
+ * is exactly how a torn write made a live run invisible to every surface. The status tool and the
+ * reaper use THIS read: corrupt is a distinct, surfaced, quarantinable state.
+ */
+export type ManifestRead =
+  | { state: "missing" }
+  | { state: "corrupt"; dir: string }
+  | { state: "ok"; manifest: Manifest }
+
+export async function readManifestState(runId: string, env?: NodeJS.ProcessEnv): Promise<ManifestRead> {
+  const paths = artifactPaths(runId, env)
+  let text: string
+  try {
+    text = await readFile(paths.manifestPath, "utf8")
+  } catch {
+    return { state: "missing" }
+  }
+  try {
+    return { state: "ok", manifest: JSON.parse(text) as Manifest }
+  } catch {
+    return { state: "corrupt", dir: paths.dir }
+  }
 }
 
 export async function readManifest(runId: string, env?: NodeJS.ProcessEnv): Promise<Manifest | undefined> {
-  try {
-    const paths = artifactPaths(runId, env)
-    return JSON.parse(await readFile(paths.manifestPath, "utf8")) as Manifest
-  } catch {
-    return undefined
-  }
+  const read = await readManifestState(runId, env)
+  return read.state === "ok" ? read.manifest : undefined
 }
 
 export async function appendJournal(runId: string, text: string, env?: NodeJS.ProcessEnv): Promise<void> {
@@ -140,31 +209,6 @@ export async function readJournal(runId: string, env?: NodeJS.ProcessEnv): Promi
   } catch {
     return []
   }
-}
-
-export async function writeResult(runId: string, value: unknown, env?: NodeJS.ProcessEnv): Promise<string> {
-  const paths = artifactPaths(runId, env)
-  await writeFile(paths.resultPath, JSON.stringify(value, null, 2), "utf8")
-  return paths.resultPath
-}
-
-export async function writeScript(runId: string, source: string, env?: NodeJS.ProcessEnv): Promise<string> {
-  const paths = artifactPaths(runId, env)
-  await writeFile(paths.scriptPath, source, "utf8")
-  return paths.scriptPath
-}
-
-/**
- * Persists a failed run's rendered failure text.
- *
- * In the blocking contract the failure reached the model as the tool result; a
- * detached run outlives that call, so the text must land on disk for the status
- * tool to surface. Best-effort like everything here.
- */
-export async function writeFailure(runId: string, text: string, env?: NodeJS.ProcessEnv): Promise<string> {
-  const paths = artifactPaths(runId, env)
-  await writeFile(paths.failurePath, text, "utf8")
-  return paths.failurePath
 }
 
 /**
