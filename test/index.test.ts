@@ -6,9 +6,9 @@ import { STATUS_TOOL, WORKFLOW_TOOL } from "../src/server/bridge/permission.js"
 import { executeStatus } from "../src/server/tool/status.js"
 import { mode } from "../src/server/ultracode/mode.js"
 import type { MutableConfig } from "../src/server/ultracode/config.js"
-import { ensureRunDir, artifactPaths, readJournal, readManifest, writeManifest, writeScript } from "../src/server/resume/store.js"
+import { ensureRunDir, artifactPaths, dataRoot, readJournal, readManifest, writeManifest, writeScript } from "../src/server/resume/store.js"
 import { argsHash } from "../src/server/resume/key.js"
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -106,6 +106,13 @@ const askRecorder = () => {
     assertNoAsk: () => expect(asked).toEqual([]),
   }
 }
+
+/**
+ * Lists the run directories under the data root.
+ *
+ * The root may not exist until a run is first written; an absent root lists as empty.
+ */
+const listRoot = async (): Promise<string[]> => await readdir(dataRoot(undefined)).catch(() => [])
 
 let savedEnv: string | undefined
 
@@ -1155,6 +1162,121 @@ describe("background launch contract", () => {
     expect(asked).toEqual([])
   })
 
+  test("a resume id whose run belongs to a DIFFERENT session is refused at the gate, before the ask", async () => {
+    // Same-session resume is by design; the bug was the SILENCE (#147): a foreign
+    // run's journal replayed nothing and looked exactly like a same-session resume
+    // with nothing replayable, then re-ran every agent at full price with no note.
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const launched = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 'SOURCE-VALUE'\n`, background: true },
+      { sessionID: "other-session" },
+    )
+    const runId = runIdOf(launched)
+    await background.settlePromiseOf(runId)
+    const { ask, assertNoAsk } = askRecorder()
+    const output = await tool.execute(
+      { script: `${META}return 2\n`, resumeFromRunId: runId, background: false },
+      { sessionID: "parent", ask },
+    )
+    expect(output).toContain("<workflow-refused>")
+    // The refusal names the cross-session situation, the run, and who owns it.
+    expect(output).toContain("different session")
+    expect(output).toContain(runId)
+    expect(output).toContain("other-session")
+    // Refused BEFORE the permission ask: no approval is consumed by a call that
+    // refuses itself, and nothing launches.
+    assertNoAsk()
+    expect(background.liveRunsForSession("parent")).toHaveLength(0)
+  })
+
+  test("a well-formed resume id with no run refuses at the gate with the run-list hint, before the ask", async () => {
+    // The bug (#131): a well-formed but nonexistent id (typo'd or pruned) fell
+    // through the gate, spent the approval, and then loadResume turned the
+    // missing manifest into a silent empty replay — a fresh launch at full
+    // price dressed as a resume. The refusal must point at the status tool's
+    // run listing, where valid ids come from.
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    // Well-formed per the id shape (wf_ + [a-z0-9]{6,}), never launched here.
+    const missingId = "wf_nomach1"
+    const { ask, assertNoAsk } = askRecorder()
+    const output = await tool.execute(
+      { script: `${META}return 2\n`, resumeFromRunId: missingId, background: false },
+      { sessionID: "parent", ask },
+    )
+    expect(output).toContain("<workflow-refused>")
+    expect(output).toContain(missingId)
+    expect(output).toContain("workflow_status")
+    // Refused BEFORE the permission ask: no approval is consumed by a call
+    // that refuses itself, and nothing launches.
+    assertNoAsk()
+    expect(background.liveRunsForSession("parent")).toHaveLength(0)
+  })
+
+  test("a refused resume never manufactures a run directory of its own", async () => {
+    // The gate needs only the resume id and this session's identity — no prepared
+    // workflow, no run directory. It used to run AFTER ensureRunDir/writeScript, so
+    // every refused resume left a manifest-less directory behind: executeStatus reads
+    // it as "no run found" (clean, but useless) and pruneRuns can never remove it,
+    // because pruning keys on a manifest — one leaked directory per refusal, forever.
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const missingId = "wf_nodir001"
+    const before = new Set(await listRoot())
+    const { ask, assertNoAsk } = askRecorder()
+    const output = await tool.execute(
+      { script: `${META}return 2\n`, resumeFromRunId: missingId, background: false },
+      { sessionID: "parent", ask },
+    )
+    expect(output).toContain("<workflow-refused>")
+    assertNoAsk()
+    const after = await listRoot()
+    const added = after.filter((name) => !before.has(name))
+    expect(added).toEqual([])
+  })
+
+  test("a source manifest that records no session refuses honestly, not as a foreign session", async () => {
+    // The Manifest schema REQUIRES sessionID, and every manifest writer since the first
+    // run store has recorded it (traced through the store's history), so a manifest
+    // without one is corrupt — not a pre-upgrade format. readManifest trusts the disk
+    // with a plain cast, so the gate must not read the missing field as provenance:
+    // undefined !== sessionID would refuse with the foreign-session render, whose message
+    // names "(undefined)" as the session that owns the run — a session it never saw.
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const unrecorded = "wf_noses001"
+    await ensureRunDir(unrecorded, undefined)
+    const paths = artifactPaths(unrecorded, undefined)
+    await writeFile(
+      paths.manifestPath,
+      JSON.stringify({
+        runId: unrecorded,
+        bootId: "boot-x",
+        pid: 1,
+        sourceHash: "sha-x",
+        argsHash: argsHash(undefined),
+        status: "completed",
+        childSessionIDs: [],
+        startedAt: 1,
+        endedAt: 2,
+      }),
+      "utf8",
+    )
+    const { ask, assertNoAsk } = askRecorder()
+    const output = await tool.execute(
+      { script: `${META}return 2\n`, resumeFromRunId: unrecorded, background: false },
+      { sessionID: "parent", ask },
+    )
+    expect(output).toContain("<workflow-refused>")
+    expect(output).toContain(unrecorded)
+    expect(output).toContain("does not record")
+    // The lie must not fire: a manifest that names no session is not a DIFFERENT session.
+    expect(output).not.toContain("different session")
+    assertNoAsk()
+    expect(background.liveRunsForSession("parent")).toHaveLength(0)
+  })
+
   test("executeStatus can be driven directly against real run artifacts", async () => {
     const tool = toolOf(ultraopen({ client: stubClient }))
     if (!tool) {throw new Error("tool was not registered")}
@@ -1211,9 +1333,12 @@ describe("blocking launch registration", () => {
     // A settled blocking launch leaves no stale entry for the next launch to trip on.
     expect(background.liveRunsForSession("blocker")).toHaveLength(0)
     const settledRunId = asked[0]?.metadata?.runId ?? ""
+    // Resumed from the LAUNCHING session (#147): resume is same-session by design, and a
+    // different session's attempt is now refused at the gate instead of silently replaying
+    // nothing — this positive path pins that the gate reopens after settle.
     const resumed = await tool.execute(
       { script: `${META}await agent('a')\nreturn 2\n`, resumeFromRunId: settledRunId, background: false },
-      { sessionID: "parent" },
+      { sessionID: "blocker" },
     )
     expect(resumed).toContain("<result")
   })
@@ -2080,6 +2205,205 @@ describe("args zero-value decoration guard", () => {
   })
 })
 
+describe("resumeFromRunId zero-value decoration guard (#132)", () => {
+  // The same weather on the resume id (decided in #132): models emit "", "null" or
+  // "undefined" for the optional `resumeFromRunId` field. The empty string is falsy, so
+  // without a guard it skips the resume gate entirely and reads as a fresh launch;
+  // "null" and "undefined" reach the gate only to be refused as malformed ids, never as
+  // the decoration they are. Refused loudly at the boundary — the same treatment `args`
+  // gets — with the same placement pins: after the stop dispatch, before the launch gate
+  // and the permission ask, so the refusal registers no pending entry and burns no
+  // approval. Callers who mean a fresh launch omit the field.
+  const decorations = ["", "null", "undefined"]
+
+  test.each(decorations)("a launch whose resumeFromRunId is %p is refused as decoration before the ask", async (value) => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const { ask, assertNoAsk } = askRecorder()
+    const output = await tool.execute(
+      { script: `${META}return 1\n`, resumeFromRunId: value, background: true },
+      { sessionID: "parent", ask },
+    )
+    expect(output).toContain("<workflow-refused>")
+    // The decoration treatment, not the malformed-id one: the refusal names the
+    // zero-value decoration, the value it saw, the field, and the omit-it fix.
+    expect(output).toContain("zero-value decoration")
+    expect(output).toContain(`"${value}"`)
+    expect(output).toContain("`resumeFromRunId`")
+    expect(output).toContain("omit the `resumeFromRunId` field")
+    // Refused BEFORE the ask: an approval spent on a call that refuses itself buys
+    // nothing and cascades into a re-ask chain (#74's pins).
+    assertNoAsk()
+    expect(background.liveRunsForSession("parent")).toHaveLength(0)
+  })
+
+  test("a refused decoration registers no pending entry, and an omitted resumeFromRunId still launches fresh", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const refused = await tool.execute(
+      { script: `${META}return 1\n`, resumeFromRunId: "", background: true },
+      { sessionID: "parent" },
+    )
+    expect(refused).toContain("<workflow-refused>")
+    expect(background.liveRunsForSession("parent")).toHaveLength(0)
+    // Omitting the field — explicitly undefined here — behaves exactly as before:
+    // a fresh launch, never a decorated-refusal casualty.
+    const launched = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 1\n`, resumeFromRunId: undefined, background: true },
+      { sessionID: "parent" },
+    )
+    expect(launched).toContain("<workflow-launched")
+    await background.settlePromiseOf(runIdOf(launched))
+  })
+
+  test("the schema description states the rule", () => {
+    // The schema is model-facing: a model that never learns the rule keeps emitting the
+    // decoration. The args field's description carries the same sentence (#86's precedent).
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const argsSchema = tool?.args?.["resumeFromRunId"] as { description?: string } | undefined
+    expect(argsSchema?.description).toContain("zero-value decorations")
+    expect(argsSchema?.description).toContain("omit the field for a fresh launch")
+  })
+})
+
+describe("scriptPath zero-value decoration guard (#141)", () => {
+  // The same weather on `scriptPath` (decided in #141): a decorated scriptPath is a truthy
+  // string, so it wins the source precedence (scriptPath > script > name) and reaches script
+  // resolution, failing there with a bare filesystem error (observed: ENOENT open 'null')
+  // that never names the decoration it is. Refused loudly at the boundary — the same
+  // treatment `args` and `resumeFromRunId` get — with the same placement pins: after the
+  // stop dispatch, before the launch gate and the permission ask. A caller who means the
+  // inline script omits the field.
+  const decorations = ["", "null", "undefined"]
+
+  test.each(decorations)("a launch whose scriptPath is %p is refused as decoration before the ask", async (value) => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const { ask, assertNoAsk } = askRecorder()
+    const output = await tool.execute(
+      { scriptPath: value, background: true },
+      { sessionID: "parent", ask },
+    )
+    expect(output).toContain("<workflow-refused>")
+    // The decoration treatment, not the bare file error it read as before the guard: the
+    // refusal names the zero-value decoration, the value it saw, the field, and the fix.
+    expect(output).toContain("zero-value decoration")
+    expect(output).toContain(`"${value}"`)
+    expect(output).toContain("`scriptPath`")
+    expect(output).toContain("omit the `scriptPath` field")
+    // Refused BEFORE the ask: an approval spent on a call that refuses itself buys
+    // nothing and cascades into a re-ask chain (#74's pins).
+    assertNoAsk()
+    expect(background.liveRunsForSession("parent")).toHaveLength(0)
+  })
+
+  test("the schema description states the rule", () => {
+    // The schema is model-facing: a model that never learns the rule keeps emitting the
+    // decoration. The args and resumeFromRunId fields' descriptions carry the same
+    // sentence (#86's and #132's precedent).
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const argsSchema = tool?.args?.["scriptPath"] as { description?: string } | undefined
+    expect(argsSchema?.description).toContain("zero-value decorations")
+    expect(argsSchema?.description).toContain("omit the field")
+  })
+
+  test("a real scriptPath still resolves and runs (real paths untouched)", async () => {
+    // The guard fires on the three decoration strings only: a real path to a persisted
+    // script passes the boundary exactly as before, asks for permission like any launch,
+    // and runs to its value.
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    await ensureRunDir("wf_pathreal01", undefined)
+    const paths = await writeScript("wf_pathreal01", `${META}return 'real path intact'\n`)
+    const asked: unknown[] = []
+    const output = await tool.execute(
+      { scriptPath: paths, background: false },
+      { sessionID: "parent", ask: (request: unknown) => { asked.push(request); return Promise.resolve() } },
+    )
+    expect(output).not.toContain("<workflow-refused>")
+    expect(output).toContain("real path intact")
+    expect(asked).toHaveLength(1)
+  })
+
+  test("an omitted scriptPath still launches fresh (the omit-it fix works)", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const launched = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 1\n`, scriptPath: undefined, background: true },
+      { sessionID: "parent" },
+    )
+    expect(launched).toContain("<workflow-launched")
+    await background.settlePromiseOf(runIdOf(launched))
+  })
+})
+
+describe("scriptPath + script together (#143)", () => {
+  // The precedence is scriptPath > script, so a call carrying both silently discarded the
+  // inline script — usually the fuller source text — and a stale path killed it with no
+  // signal. Refused loudly at the launch boundary, the same treatment and placement pins
+  // as the other boundary guards (#86, #132, #141): after the stop dispatch, before the
+  // launch gate and the permission ask. The precedence itself is unchanged; a
+  // single-source call resolves exactly as before.
+  test("a launch carrying both `script` and `scriptPath` refuses naming both fields and the precedence, before the ask", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const { ask, assertNoAsk } = askRecorder()
+    const output = await tool.execute(
+      // The scriptPath need not exist: the refusal fires before any read, which is the
+      // point — a stale path must not take the inline script down with it.
+      { script: `${META}await agent('a')\nreturn 1\n`, scriptPath: "wf_neverread/script.js", background: true },
+      { sessionID: "parent", ask },
+    )
+    expect(output).toContain("<workflow-refused>")
+    // The refusal names BOTH fields, the precedence that made one win, and the drop-one
+    // fix the brief pins: keep `script` inline, or keep `scriptPath` and delete the other.
+    expect(output).toContain("Both `script` and `scriptPath`")
+    expect(output).toContain("scriptPath > script")
+    expect(output).toContain("keep `script`")
+    expect(output).toContain("delete the `script` field")
+    // Refused BEFORE the ask: an approval spent on a call that refuses itself buys
+    // nothing and cascades into a re-ask chain (#74's pins).
+    assertNoAsk()
+    expect(background.liveRunsForSession("parent")).toHaveLength(0)
+  })
+
+  test("single-source launches are untouched: script only, and scriptPath only from disk", async () => {
+    // The refusal fires on BOTH-supplied calls only. A script-only launch resolves the
+    // inline source exactly as before, and a scriptPath-only launch resolves the file
+    // exactly as before — neither asks about the other, and neither is refused.
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const inline = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 1\n`, background: true },
+      { sessionID: "parent" },
+    )
+    expect(inline).toContain("<workflow-launched")
+    await background.settlePromiseOf(runIdOf(inline))
+    await ensureRunDir("wf_single143", undefined)
+    const paths = await writeScript("wf_single143", `${META}return 'single source from disk'\n`)
+    const fromDisk = await tool.execute(
+      { scriptPath: paths, background: true },
+      { sessionID: "parent" },
+    )
+    expect(fromDisk).toContain("<workflow-launched")
+    await background.settlePromiseOf(runIdOf(fromDisk))
+  })
+
+  test("the schema description states the rule", () => {
+    // The schema is model-facing: a model that keeps passing both keeps getting refused,
+    // so the scriptPath description teaches the drop-one rule (#86's and #132's
+    // precedent). The old "Takes precedence over `script`" sentence actively licensed
+    // the both-supplied call and must go.
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const scriptPathSchema = tool?.args?.["scriptPath"] as { description?: string } | undefined
+    expect(scriptPathSchema?.description).toContain("Passing both `script` and `scriptPath` is refused")
+    expect(scriptPathSchema?.description).not.toContain("Takes precedence over")
+  })
+})
+
 describe("args transport repair (#78)", () => {
   // Layer 1 at the tool boundary: a host or model serialization slip that stringifies the args
   // object is repaired when it parses to an object or array, refused when it looks like JSON but
@@ -2191,5 +2515,46 @@ describe("args transport repair (#78)", () => {
     expect(argsSchema?.description).toContain("hydrated")
     expect(argsSchema?.description).toContain("refused")
     expect(argsSchema?.description).toContain("stays a scalar")
+  })
+})
+
+describe("launch contract precedence (#146)", () => {
+  // The env kill switch is ABSOLUTE (decided in #146): before the fix the per-call
+  // `background` flag was consulted after the switch had already forced the blocking
+  // contract, so a model-supplied argument silently beat the user's one-line emergency
+  // switch. The precedence is: env kill switch > per-call `background` arg > project
+  // option `runMode` > home-dir option `runMode` > built-in default `background`.
+  test("with the kill switch set, an explicit background:true launch takes the blocking contract", async () => {
+    process.env["ULTRAOPEN_WORKFLOW_SYNC"] = "1"
+    try {
+      const tool = toolOf(ultraopen({ client: stubClient }))
+      if (!tool) {throw new Error("tool was not registered")}
+      const output = await tool.execute(
+        { script: `${META}await agent('a')\nreturn 'SWITCH-WINS'\n`, background: true },
+        { sessionID: "parent" },
+      )
+      // The blocking contract waits: the final result arrives in the tool call itself,
+      // not as a launch handle for a run the host may kill when the turn ends.
+      expect(output).toContain("SWITCH-WINS")
+      expect(output).not.toContain("<workflow-launched")
+    } finally {
+      delete process.env["ULTRAOPEN_WORKFLOW_SYNC"]
+    }
+  })
+
+  test("without the switch, the per-call flag beats the configured option — unchanged", async () => {
+    // Pinned untouched: the switch's new absoluteness must not disturb the
+    // no-switch precedence. A configured `runMode: "blocking"` still yields to
+    // an explicit `background: true`. The option row itself (no flag, option
+    // wins over the default) is pinned by "the blocking option restores the
+    // pre-async contract".
+    const tool = toolOf(ultraopen({ client: stubClient }, { runMode: "blocking" }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 'FLAG-WINS'\n`, background: true },
+      { sessionID: "parent" },
+    )
+    expect(output).toContain("<workflow-launched")
+    await background.settlePromiseOf(runIdOf(output))
   })
 })

@@ -36,6 +36,13 @@ export interface Manifest {
   runId: string
   bootId: string
   pid: number
+  /**
+   * The session that launched the run. REQUIRED — written by every manifest writer since
+   * the first run store (M3), so a manifest on disk without it is corrupt, not a
+   * pre-upgrade format; the resume gate refuses such a manifest as unverifiable
+   * provenance rather than reporting it as a foreign session ("different session
+   * (undefined)").
+   */
   sessionID: string
   sourceHash: string
   argsHash: string
