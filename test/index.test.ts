@@ -2471,4 +2471,20 @@ describe("launch contract precedence (#146)", () => {
       delete process.env["ULTRAOPEN_WORKFLOW_SYNC"]
     }
   })
+
+  test("without the switch, the per-call flag beats the configured option — unchanged", async () => {
+    // Pinned untouched: the switch's new absoluteness must not disturb the
+    // no-switch precedence. A configured `runMode: "blocking"` still yields to
+    // an explicit `background: true`. The option row itself (no flag, option
+    // wins over the default) is pinned by "the blocking option restores the
+    // pre-async contract".
+    const tool = toolOf(ultraopen({ client: stubClient }, { runMode: "blocking" }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 'FLAG-WINS'\n`, background: true },
+      { sessionID: "parent" },
+    )
+    expect(output).toContain("<workflow-launched")
+    await background.settlePromiseOf(runIdOf(output))
+  })
 })
