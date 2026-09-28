@@ -1,6 +1,6 @@
-import { readdir, rm, writeFile } from "node:fs/promises"
+import { readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
-import { dataRoot, findOrphans, isSafeRunId, readManifest, readManifestState, runDir, writeManifest } from "./store.js"
+import { artifactPaths, dataRoot, findOrphans, isSafeRunId, readManifest, readManifestState, runDir, writeManifest } from "./store.js"
 import type { Manifest } from "./journal.js"
 import type { OpencodeClient } from "../types.js"
 
@@ -61,6 +61,37 @@ export function defaultProcessAlive(pid: number): boolean {
 const ignore = (): undefined => undefined
 
 /**
+ * Salvages the owner pid out of torn manifest text (#136).
+ *
+ * A torn manifest usually tears in the TAIL (the verbatim args field is the big one), so the
+ * head — runId, bootId, pid — usually survives intact and is recoverable by pattern. Absent,
+ * malformed, or out-of-range pids salvage to undefined: no veto.
+ */
+export function salvagePid(text: string | undefined): number | undefined {
+  if (text === undefined) {return undefined}
+  const match = /"pid"\s*:\s*(?<pid>\d+)/u.exec(text)
+  if (!match) {return undefined}
+  const pid = Number(match.groups?.["pid"])
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined
+}
+
+/**
+ * Salvages child session ids out of torn manifest text (#136).
+ *
+ * Takes ids ONLY from the childSessionIDs region — the run's own sessionID is the parent
+ * conversation and must never be aborted. A manifest torn before that region yields nothing:
+ * its children are unknown and stay unabortable (the honest limit).
+ */
+export function salvageSessionIDs(text: string | undefined): string[] {
+  if (text === undefined) {return []}
+  const region = /"childSessionIDs"\s*:\s*\[(?<ids>[^\]]*)/u.exec(text)
+  if (!region) {return []}
+  const ids = region.groups?.["ids"]
+  const found = ids === undefined ? null : ids.match(/ses_[A-Za-z0-9]+/gu)
+  return found === null ? [] : [...new Set(found)]
+}
+
+/**
  * Aborts orphaned children, marks their runs orphaned, and reports the fresh resume candidates.
  *
  * NEVER REJECTS. A session may already be gone, the server may reject the abort, the data root may
@@ -82,19 +113,22 @@ export async function reapOrphans(
     // Quarantine pass FIRST (#136): a run whose manifest is unreadable is invisible to every
     // reader — status answers "no run found", findOrphans skips it, and nothing would ever stop
     // or prune it. Tombstone it orphaned so it surfaces and prunes like any interrupted run.
-    const quarantined = await quarantineCorruptRuns(options.env)
+    const alive = options.isProcessAlive ?? defaultProcessAlive
+    const quarantine = await quarantineCorruptRuns(client, { env: options.env, isProcessAlive: alive })
     // findOrphans swallows its own I/O errors and returns [], so no catch is needed here.
     const orphans = await findOrphans(bootId, options.env)
-    if (orphans.length === 0) {return { runs: quarantined, sessions: 0, failures: 0, live: 0, orphaned: [] }}
-
-    const alive = options.isProcessAlive ?? defaultProcessAlive,
+    if (orphans.length === 0) {
+      const note = quarantineNote(quarantine)
+      if (note !== "") {options.onNote?.(note)}
+      return { runs: quarantine.quarantined, sessions: quarantine.sessions, failures: quarantine.failures, live: quarantine.live, orphaned: [] }
+    }
     // A live pid means the run may still be executing in another concurrent process. Skip it —
     // the reaper's whole job is to stop billing, never to kill work in progress.
-     reapable = orphans.filter((manifest) => !Number.isInteger(manifest.pid) || !alive(manifest.pid)),
+    const reapable = orphans.filter((manifest) => !Number.isInteger(manifest.pid) || !alive(manifest.pid)),
      live = orphans.length - reapable.length
 
-    let sessions = 0,
-     failures = 0
+    let sessions = quarantine.sessions,
+     failures = quarantine.failures
 
     for (const manifest of reapable) {
       for (const sessionID of manifest.childSessionIDs ?? []) {
@@ -126,15 +160,21 @@ export async function reapOrphans(
       ).catch(ignore)
     }
 
-    if (reapable.length > 0 || live > 0) {
-      options.onNote?.(
-        `ultraopen: released ${sessions} subagent session(s) from ${reapable.length} interrupted run(s)${ 
-          failures > 0 ? ` (${failures} could not be aborted)` : "" 
-          }${live > 0 ? ` (${live} run(s) skipped — their process is still alive)` : ""}`,
-      )
+    const liveTotal = live + quarantine.live
+    if (reapable.length > 0 || liveTotal > 0 || quarantine.quarantined > 0) {
+      const parts: string[] = []
+      if (reapable.length > 0 || quarantine.quarantined > 0) {
+        parts.push(
+          `ultraopen: released ${sessions} subagent session(s) from ${reapable.length + quarantine.quarantined} interrupted run(s)${failures > 0 ? ` (${failures} could not be aborted)` : ""}`,
+        )
+      }
+      if (liveTotal > 0) {
+        parts.push(`${liveTotal} run(s) skipped — their process is still alive`)
+      }
+      options.onNote?.(parts.join("; "))
     }
 
-    return { runs: reapable.length + quarantined, sessions, failures, live, orphaned: reapable }
+    return { runs: reapable.length + quarantine.quarantined, sessions, failures, live: liveTotal, orphaned: reapable }
   } catch {
     // Any unexpected failure (e.g. a malformed manifest that findOrphans let through) must not
     // break the contract above — a crashed sweep leaves money burning either way.
@@ -142,28 +182,82 @@ export async function reapOrphans(
   }
 }
 
+interface QuarantineOutcome {
+  quarantined: number
+  /** Vetoed torn runs: their salvaged pid is alive — the owner may be mid-recovery. */
+  live: number
+  sessions: number
+  failures: number
+}
+
+/** One line for the quarantine pass's outcome; empty when nothing happened. */
+function quarantineNote(q: QuarantineOutcome): string {
+  const parts: string[] = []
+  if (q.quarantined > 0) {
+    parts.push(`ultraopen: quarantined ${q.quarantined} corrupt-manifest run(s)${q.failures > 0 ? ` (${q.failures} child abort(s) failed)` : ""}`)
+  }
+  if (q.live > 0) {
+    parts.push(`${q.live} run(s) skipped — their process is still alive`)
+  }
+  return parts.join("; ")
+}
+
 /**
- * Tombstones every run whose manifest is unreadable (#136).
+ * Tombstones every run whose manifest is unreadable (#136), with the orphan pass's protections.
  *
- * The tombstone is a fresh orphaned manifest: the run surfaces in status (`corrupt` before this
- * sweep runs, `orphaned` after), the interrupted.txt marker appears so the boot hint names it,
- * and the retention window can prune it. The journal/result beside it stay untouched. The
- * original hashes are lost with the torn manifest, so the run is NOT a resume candidate — the
- * auto-resume sweep skips unhashable manifests by construction.
+ * Per torn run, in order:
+ * 1. LIVE-PID VETO — the pid is salvaged from the torn bytes; a live owner means the process may
+ *    be mid-write-recovery, and tombstoning it would permanently block its settlement (every
+ *    terminal write refuses a non-running manifest) and hang an interrupted marker on working
+ *    work. Vetoed runs count in `live`, exactly like the readable orphan pass's live skips.
+ * 2. PRESERVE the torn bytes as `manifest.corrupt.bak` — the tombstone must not destroy the only
+ *    record of what the run was.
+ * 3. SALVAGE the child session ids from the torn text's childSessionIDs region and abort them
+ *    best-effort — the children of a corrupt-manifest run keep billing otherwise; ids torn away
+ *    mean children unknown (never the parent session).
+ * 4. TOMBSTONE orphaned (+ the interrupted.txt marker) so the run surfaces and prunes like any
+ *    interrupted run. The lost hashes make it NOT a resume candidate; the auto-resume sweep
+ *    skips unhashable manifests by construction.
  */
-async function quarantineCorruptRuns(env?: NodeJS.ProcessEnv): Promise<number> {
-  const root = dataRoot(env)
+async function quarantineCorruptRuns(
+  client: OpencodeClient,
+  options: { env?: NodeJS.ProcessEnv | undefined; isProcessAlive: (pid: number) => boolean },
+): Promise<QuarantineOutcome> {
+  const outcome: QuarantineOutcome = { quarantined: 0, live: 0, sessions: 0, failures: 0 }
+  const root = dataRoot(options.env)
   let names: string[]
   try {
     names = await readdir(root)
   } catch {
-    return 0
+    return outcome
   }
-  let quarantined = 0
-for (const name of names) {
+  for (const name of names) {
     if (!isSafeRunId(name)) {continue}
-    const read = await readManifestState(name, env)
+    const read = await readManifestState(name, options.env)
     if (read.state !== "corrupt") {continue}
+    const paths = artifactPaths(name, options.env)
+    let torn: string | undefined
+    try {
+      torn = await readFile(paths.manifestPath, "utf8")
+    } catch {
+      torn = undefined
+    }
+    const pid = salvagePid(torn)
+    if (pid !== undefined && options.isProcessAlive(pid)) {
+      outcome.live++
+      continue
+    }
+    if (torn !== undefined) {
+      await writeFile(join(paths.dir, "manifest.corrupt.bak"), torn, "utf8").catch(ignore)
+    }
+    for (const sessionID of salvageSessionIDs(torn)) {
+      try {
+        await client.session.abort({ path: { id: sessionID } })
+        outcome.sessions++
+      } catch {
+        outcome.failures++
+      }
+    }
     const now = Date.now()
     await writeManifest(name, {
       runId: name,
@@ -176,11 +270,11 @@ for (const name of names) {
       childSessionIDs: [],
       startedAt: now,
       endedAt: now,
-    }, env).catch(ignore)
-    await writeFile(join(runDir(name, env), "interrupted.txt"), name, "utf8").catch(ignore)
-    quarantined++
+    }, options.env).catch(ignore)
+    await writeFile(join(runDir(name, options.env), "interrupted.txt"), name, "utf8").catch(ignore)
+    outcome.quarantined++
   }
-  return quarantined
+  return outcome
 }
 
 /**
