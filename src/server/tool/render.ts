@@ -399,7 +399,10 @@ export function renderStatus(report: StatusReport): string {
 export function workflowArgsSchema(): Record<string, unknown> {
   return {
     script: { type: "string", description: "The workflow script. Must begin with `export const meta = {...}`." },
-    scriptPath: { type: "string", description: "Path to a persisted script. Takes precedence over `script`." },
+    scriptPath: {
+      type: "string",
+      description: "Path to a persisted script. Takes precedence over `script`. The strings \"\", \"null\", and \"undefined\" are refused as zero-value decorations — omit the field to run the script passed in `script`.",
+    },
     args: {
       description:
         "Value exposed to the script as the global `args`. Pass real JSON, not a JSON string: a string that parses to an object or array is hydrated to that value (and the repair is logged), one that looks like JSON but fails to parse is refused, and any other string stays a scalar. The strings \"\", \"null\", and \"undefined\" are refused as zero-value decorations — omit the field for no arguments.",

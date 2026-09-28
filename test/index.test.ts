@@ -2227,6 +2227,17 @@ describe("scriptPath zero-value decoration guard (#141)", () => {
     assertNoAsk()
     expect(background.liveRunsForSession("parent")).toHaveLength(0)
   })
+
+  test("the schema description states the rule", () => {
+    // The schema is model-facing: a model that never learns the rule keeps emitting the
+    // decoration. The args and resumeFromRunId fields' descriptions carry the same
+    // sentence (#86's and #132's precedent).
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const argsSchema = tool?.args?.["scriptPath"] as { description?: string } | undefined
+    expect(argsSchema?.description).toContain("zero-value decorations")
+    expect(argsSchema?.description).toContain("omit the field")
+  })
 })
 
 describe("args transport repair (#78)", () => {
