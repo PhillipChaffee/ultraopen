@@ -37,6 +37,7 @@ import {
   renderForeignSessionResumeRefusal,
   renderMissingRunResumeRefusal,
   renderArgsRefusal,
+  renderResumeDecorationRefusal,
   renderStringifiedArgsRefusal,
   renderStatus,
   workflowArgsSchema,
@@ -260,6 +261,15 @@ function toolDescription(options: UltraopenOptions, longLived: boolean): string 
 }
 
 /**
+ * The model-emitted zero-value decorations (#86): "", "null" and "undefined".
+ *
+ * One predicate for every field the launch boundary guards against decoration weather —
+ * the decoration set is a single decided contract, not per-field trivia.
+ */
+const isZeroValueDecoration = (value: string): boolean =>
+  value === "" || value === "null" || value === "undefined"
+
+/**
  * Launches one workflow run.
  *
  * Two contracts share this path. `background` — the default — returns the run id
@@ -290,8 +300,18 @@ async function launchWorkflow(
   // pins: after the stop dispatch (a stop call carrying decoration still stops), before the
   // launch gate and the permission ask (a refused call registers no pending entry and burns
   // no approval, #74's precedent). One guard covers launch, resume, and dryRun.
-  if (typeof args.args === "string" && (args.args === "" || args.args === "null" || args.args === "undefined")) {
+  if (typeof args.args === "string" && isZeroValueDecoration(args.args)) {
     return renderArgsRefusal(args.args)
+  }
+
+  // The same weather on `resumeFromRunId` (#132): the empty string is falsy and would
+  // otherwise skip the resume gate entirely — no refusal, no resume, no note — reading as
+  // a fresh launch; "null" and "undefined" would reach the gate only to be refused as
+  // malformed ids. Same placement pins as the args guard: refused before the launch gate,
+  // so the call registers no pending entry and burns no approval. A caller who means a
+  // fresh launch omits the field.
+  if (typeof args.resumeFromRunId === "string" && isZeroValueDecoration(args.resumeFromRunId)) {
+    return renderResumeDecorationRefusal(args.resumeFromRunId)
   }
 
   // Stringified-JSON transport (#78): a string that LOOKS like JSON but fails to parse is

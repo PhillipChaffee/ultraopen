@@ -2135,6 +2135,58 @@ describe("args zero-value decoration guard", () => {
   })
 })
 
+describe("resumeFromRunId zero-value decoration guard (#132)", () => {
+  // The same weather on the resume id (decided in #132): models emit "", "null" or
+  // "undefined" for the optional `resumeFromRunId` field. The empty string is falsy, so
+  // without a guard it skips the resume gate entirely and reads as a fresh launch;
+  // "null" and "undefined" reach the gate only to be refused as malformed ids, never as
+  // the decoration they are. Refused loudly at the boundary — the same treatment `args`
+  // gets — with the same placement pins: after the stop dispatch, before the launch gate
+  // and the permission ask, so the refusal registers no pending entry and burns no
+  // approval. Callers who mean a fresh launch omit the field.
+  const decorations = ["", "null", "undefined"]
+
+  test.each(decorations)("a launch whose resumeFromRunId is %p is refused as decoration before the ask", async (value) => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const { ask, assertNoAsk } = askRecorder()
+    const output = await tool.execute(
+      { script: `${META}return 1\n`, resumeFromRunId: value, background: true },
+      { sessionID: "parent", ask },
+    )
+    expect(output).toContain("<workflow-refused>")
+    // The decoration treatment, not the malformed-id one: the refusal names the
+    // zero-value decoration, the value it saw, the field, and the omit-it fix.
+    expect(output).toContain("zero-value decoration")
+    expect(output).toContain(`"${value}"`)
+    expect(output).toContain("`resumeFromRunId`")
+    expect(output).toContain("omit the `resumeFromRunId` field")
+    // Refused BEFORE the ask: an approval spent on a call that refuses itself buys
+    // nothing and cascades into a re-ask chain (#74's pins).
+    assertNoAsk()
+    expect(background.liveRunsForSession("parent")).toHaveLength(0)
+  })
+
+  test("a refused decoration registers no pending entry, and an omitted resumeFromRunId still launches fresh", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const refused = await tool.execute(
+      { script: `${META}return 1\n`, resumeFromRunId: "", background: true },
+      { sessionID: "parent" },
+    )
+    expect(refused).toContain("<workflow-refused>")
+    expect(background.liveRunsForSession("parent")).toHaveLength(0)
+    // Omitting the field — explicitly undefined here — behaves exactly as before:
+    // a fresh launch, never a decorated-refusal casualty.
+    const launched = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 1\n`, resumeFromRunId: undefined, background: true },
+      { sessionID: "parent" },
+    )
+    expect(launched).toContain("<workflow-launched")
+    await background.settlePromiseOf(runIdOf(launched))
+  })
+})
+
 describe("args transport repair (#78)", () => {
   // Layer 1 at the tool boundary: a host or model serialization slip that stringifies the args
   // object is repaired when it parses to an object or array, refused when it looks like JSON but

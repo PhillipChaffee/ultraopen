@@ -310,6 +310,24 @@ export function renderArgsRefusal(value: string): string {
 }
 
 /**
+ * A launch or dryRun whose `resumeFromRunId` carries a model-emitted zero-value
+ * decoration (#132).
+ *
+ * The empty string is falsy, so without this refusal it silently skips the resume gate
+ * and reads as a fresh launch; "null" and "undefined" reach the gate only to be refused
+ * as malformed ids, never named as the decoration they are. Refused loudly instead —
+ * nothing was resumed, and the caller who means a fresh launch omits the field.
+ */
+export function renderResumeDecorationRefusal(value: string): string {
+  return [
+    "<workflow-refused>",
+    `The \`resumeFromRunId\` field was passed as the string "${value}" — a zero-value decoration ("", "null", or "undefined"), not a run id, so no resume was attempted.`,
+    "To launch fresh, omit the `resumeFromRunId` field entirely; otherwise pass the run id exactly as a launch result reported it.",
+    "</workflow-refused>",
+  ].join("\n")
+}
+
+/**
  * A launch, resume, or dryRun whose `args` field is a string that looks like JSON but does not
  * parse (#78).
  *
