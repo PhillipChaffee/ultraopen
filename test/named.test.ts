@@ -22,9 +22,12 @@ import { join } from "node:path"
 const META = "export const meta = { name: 'x', description: 'x' }\n"
 
 /**
- * The execute-driven tests here persist REAL run artifacts (manifest, journal, result). Without
- * this guard they land in the user's production data root — seven `sessionID: "parent"` fixture
- * manifests were found in the wild root exactly this way (#137). Same guard as index.test.ts.
+ * Defensive guard (#137): THIS FILE persists nothing today — its execute calls run with dryRun
+ * and no persistence wiring (beginRun lives only in the launch path), verified by pointing
+ * XDG_DATA_HOME at a fresh scratch root during a full run of this file: zero files created. The
+ * guard costs nothing and makes any FUTURE persistence wiring here safe. The seven wild
+ * `sessionID: "parent"` manifests came from outside the repo (one-off manual probes against the
+ * default root); the stray dirs were removed and the rule is: probe against a scratch XDG home.
  */
 let scratchHome: string,
  savedDataHome: string | undefined

@@ -85,10 +85,20 @@ export async function ensureRunDir(runId: string, env?: NodeJS.ProcessEnv): Prom
  * temp name is unique per write, so concurrent writers cannot interleave into one temp; a failed
  * write unlinks its own temp best-effort.
  */
-export async function atomicWriteFile(path: string, body: string): Promise<void> {
+export async function atomicWriteFile(
+  path: string,
+  body: string,
+  /** Test-only fault injection (#136): fail AFTER the temp write, BEFORE the rename — the exact
+   * killed-mid-write shape, so tests can prove the previous file survives whole. */
+  inject?: { failRename?: boolean } | undefined,
+): Promise<void> {
   const tmp = `${path}.${randomUUID().slice(0, 8)}.tmp`
   try {
     await writeFile(tmp, body, "utf8")
+    if (inject?.failRename) {
+      await unlink(tmp).catch(() => undefined)
+      throw new Error("injected rename failure (#136 test seam)")
+    }
     await rename(tmp, path)
   } catch (error) {
     await unlink(tmp).catch(() => undefined)

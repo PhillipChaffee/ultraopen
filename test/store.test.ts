@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import {
@@ -12,6 +12,7 @@ import {
   flushJournalEntry,
   isSafeRunId,
   readJournal,
+  atomicWriteFile,
   readManifest,
   readManifestState,
   runDir,
@@ -245,5 +246,39 @@ describe("atomic artifact writes (#136)", () => {
     await writeResult("wf_abc123", { ok: true }, env)
     const entries = await readdir(dirname(artifactPaths("wf_abc123", env).manifestPath))
     expect(entries.filter((e) => e.includes(".tmp"))).toEqual([])
+  })
+})
+
+describe("killed-write atomicity (#136 review)", () => {
+  test("a write that dies between the temp write and the rename leaves the previous manifest whole", async () => {
+    // The discriminator: non-atomic truncate-writes destroy the previous file when the write dies
+    // mid-way; the rename-based write fails BEFORE touching the target, so v1 survives intact.
+    await ensureRunDir("wf_abc123", env)
+    const paths = artifactPaths("wf_abc123", env)
+    await writeManifest("wf_abc123", manifest({ argsHash: "v1" }), env)
+    await expect(atomicWriteFile(paths.manifestPath, "{torn", { failRename: true })).rejects.toThrow(/injected rename failure/u)
+    const survivor = await readManifestState("wf_abc123", env)
+    expect(survivor.state).toBe("ok")
+    if (survivor.state === "ok") {expect(survivor.manifest.argsHash).toBe("v1")}
+  })
+
+  test("the same killed-write guarantee holds for a progress file", async () => {
+    await ensureRunDir("wf_abc123", env)
+    const progressPath = join(dirname(artifactPaths("wf_abc123", env).manifestPath), "progress.json")
+    await atomicWriteFile(progressPath, JSON.stringify({ runId: "wf_abc123", spent: 0 }), undefined)
+    await expect(atomicWriteFile(progressPath, "{torn", { failRename: true })).rejects.toThrow(/injected rename failure/u)
+    expect(JSON.parse(await readFile(progressPath, "utf8"))).toEqual({ runId: "wf_abc123", spent: 0 })
+  })
+
+  test("artifact writes land under the scratch XDG root, never the default (#137 regression)", async () => {
+    // The routing guarantee: a write with an explicit env lands verbatim under that env data
+    // root. Fixture/probe writers route through this; the default root is only ever used when
+    // XDG is unset (real launches).
+    await ensureRunDir("wf_abc123", env)
+    await writeManifest("wf_abc123", manifest(), env)
+    const paths = artifactPaths("wf_abc123", env)
+    await expect(Bun.file(paths.manifestPath).exists()).resolves.toBe(true)
+    expect(paths.dir.startsWith(base)).toBe(true)
+    expect(paths.dir.startsWith("/Users/")).toBe(false)
   })
 })

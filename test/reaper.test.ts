@@ -345,3 +345,22 @@ test("a run with an unreadable manifest is quarantined, not skipped (#136)", asy
   const pruned = await pruneRuns({ env, now: Date.now() + 31 * 24 * 60 * 60 * 1000, autoResumeTtlHours: 24 })
   expect(pruned).toBe(1)
 })
+
+test("an unexpected failure inside the sweep returns the zero result instead of throwing (#136)", async () => {
+  // A live run makes the sweep take the note path; a THROWING onNote detonates the sweep's own
+  // try — the outer catch must return the zero-shape result, never reject (index.ts starts the
+  // sweep with no .catch()).
+  const entry = manifest({ pid: process.pid })
+  await ensureRunDir(entry.runId, env)
+  await writeManifest(entry.runId, entry, env)
+  const { client } = makeClient()
+  await expect(
+    reapOrphans(client, "other-boot", {
+      env,
+      isProcessAlive: () => true,
+      onNote: () => {
+        throw new Error("detonate")
+      },
+    }),
+  ).resolves.toEqual({ runs: 0, sessions: 0, failures: 0, live: 0, orphaned: [] })
+})
