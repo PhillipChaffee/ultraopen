@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
-import { chmod, mkdtemp, rm } from "node:fs/promises"
+import { chmod, mkdir, mkdtemp, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
-import { beginRun, endRun, loadResume, markCancelled } from "../src/server/resume/persist.js"
+import { dirname, join } from "node:path"
+import { beginRun, endRun, loadResume, markCancelled, writeTerminalManifest } from "../src/server/resume/persist.js"
 import { artifactPaths, appendJournalEntry, ensureRunDir, readJournal, readManifest, writeManifest } from "../src/server/resume/store.js"
 import type { JournalEntry } from "../src/server/resume/journal.js"
 
@@ -254,4 +254,16 @@ describe("loadResume", () => {
     const resume = await loadResume("wf_prev001", { a: 1 }, "ses_1", env)
     expect(resume.entries).toEqual([])
   })
+})
+
+test("the checked terminal write refuses when the manifest already settled (#136)", async () => {
+  // The commit-point refuse branch: a late settle's staged write sees the cancellation and
+  // abandons — nothing on disk is overwritten, no temp is left behind.
+  const manifest = await beginRun(record, env)
+  if (!manifest) {throw new Error("the run did not open")}
+  await markCancelled(manifest, [], env)
+  expect(await writeTerminalManifest("wf_abc123", { ...manifest, status: "completed", endedAt: Date.now() }, env)).toBe(false)
+  expect((await readManifest("wf_abc123", env))?.status).toBe("cancelled")
+  const entries = await readdir(dirname(artifactPaths("wf_abc123", env).manifestPath))
+  expect(entries.filter((e) => e.includes(".tmp"))).toEqual([])
 })

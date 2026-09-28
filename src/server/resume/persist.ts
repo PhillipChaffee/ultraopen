@@ -88,7 +88,7 @@ export async function beginRun(record: RunRecord, env?: NodeJS.ProcessEnv): Prom
  * window to two consecutive syscalls: if another terminal record landed since the caller's
  * check, this write abandons instead of overwriting it.
  */
-async function writeTerminalManifest(
+export async function writeTerminalManifest(
   runId: string,
   manifest: Manifest,
   env?: NodeJS.ProcessEnv,
