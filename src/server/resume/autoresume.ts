@@ -141,10 +141,14 @@ export async function resumeInterruptedRuns(deps: AutoResumeDeps): Promise<AutoR
 
     // The claim: renaming the marker is atomic, so two boots racing to adopt the same run
     // resolve to one winner and one clean skip. No marker means someone else already claimed it.
+    // (#136) ENOENT is the raced shape — the marker is gone. ANYTHING else (EACCES/EPERM/ENOSPC)
+    // is this attempt genuinely failing: reporting it "skipped" would hide an unwritable data
+    // root behind a benign count.
     try {
       await rename(join(dir, INTERRUPTED_MARKER), join(dir, CLAIM_MARKER))
-    } catch {
-      return "skipped"
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") {return "skipped"}
+      return "failed"
     }
 
     // Stopped runs never resume: if any child recorded the stop path's abort reason, the user

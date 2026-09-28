@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import {
@@ -20,6 +20,29 @@ import { join } from "node:path"
  */
 
 const META = "export const meta = { name: 'x', description: 'x' }\n"
+
+/**
+ * Defensive guard (#137): THIS FILE persists nothing today — its execute calls run with dryRun
+ * and no persistence wiring (beginRun lives only in the launch path), verified by pointing
+ * XDG_DATA_HOME at a fresh scratch root during a full run of this file: zero files created. The
+ * guard costs nothing and makes any FUTURE persistence wiring here safe. The seven wild
+ * `sessionID: "parent"` manifests came from outside the repo (one-off manual probes against the
+ * default root); the stray dirs were removed and the rule is: probe against a scratch XDG home.
+ */
+let scratchHome: string,
+ savedDataHome: string | undefined
+
+beforeAll(async () => {
+  scratchHome = await mkdtemp(join(tmpdir(), "ultraopen-named-"))
+  savedDataHome = process.env["XDG_DATA_HOME"]
+  process.env["XDG_DATA_HOME"] = scratchHome
+})
+
+afterAll(async () => {
+  if (savedDataHome === undefined) {delete process.env["XDG_DATA_HOME"]}
+  else {process.env["XDG_DATA_HOME"] = savedDataHome}
+  await rm(scratchHome, { recursive: true, force: true })
+})
 
 const fakeFs = (dirs: Record<string, Record<string, string>>) => ({
   readDir: (path: string): Promise<string[]> => {

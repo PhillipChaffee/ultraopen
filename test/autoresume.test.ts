@@ -38,6 +38,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+  await chmod(join(base, "opencode", "tool-output", "ultraopen", RUN_ID), 0o700).catch(() => undefined)
   await chmod(join(base, "opencode", "tool-output", "ultraopen", RUN_ID, "manifest.json"), 0o600).catch(() => undefined)
   await rm(base, { recursive: true, force: true })
 })
@@ -349,7 +350,9 @@ describe("resumeInterruptedRuns", () => {
     // An unwritable manifest cannot be re-stamped; the run keeps its hint so the user — not an
     // invisible boot loop — decides what happens to it.
     const entry = await seedCandidate()
-    await chmod(join(dirOf(RUN_ID), "manifest.json"), 0o400)
+    // Atomic writes (#136) are blocked by the DIRECTORY, not the file: an unwritable run dir
+    // makes the adoption re-stamp fail.
+    await chmod(dirOf(RUN_ID), 0o500)
     const { fn } = makeExecute()
 
     const result = await resumeInterruptedRuns({ ...deps({ executeFn: fn }), candidates: [entry] })

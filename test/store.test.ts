@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import {
   appendJournal,
   appendJournalEntry,
@@ -12,7 +12,9 @@ import {
   flushJournalEntry,
   isSafeRunId,
   readJournal,
+  atomicWriteFile,
   readManifest,
+  readManifestState,
   runDir,
   writeManifest,
   writeResult,
@@ -203,5 +205,96 @@ describe("orphan detection", () => {
 
   test("returns nothing when the data root does not exist yet", async () => {
     expect(await findOrphans("boot", { XDG_DATA_HOME: join(base, "absent") } as NodeJS.ProcessEnv)).toEqual([])
+  })
+})
+
+describe("corrupt-state reads (#136)", () => {
+  test("readManifestState distinguishes missing, corrupt, and ok", async () => {
+    await ensureRunDir("wf_abc123", env)
+    expect(await readManifestState("wf_abc123", env)).toEqual({ state: "missing" })
+    const paths = artifactPaths("wf_abc123", env)
+    await writeFile(paths.manifestPath, '{"runId": "wf_abc', "utf8")
+    const corrupt = await readManifestState("wf_abc123", env)
+    expect(corrupt.state).toBe("corrupt")
+    if (corrupt.state === "corrupt") { expect(corrupt.dir).toBe(paths.dir) }
+    await writeManifest("wf_abc123", manifest(), env)
+    const ok = await readManifestState("wf_abc123", env)
+    expect(ok.state).toBe("ok")
+    if (ok.state === "ok") { expect(ok.manifest.status).toBe("running") }
+  })
+
+  test("readManifest stays undefined for missing and corrupt runs (#136 compat)", async () => {
+    await ensureRunDir("wf_abc123", env)
+    expect(await readManifest("wf_abc123", env)).toBeUndefined()
+    await writeFile(artifactPaths("wf_abc123", env).manifestPath, "{torn", "utf8")
+    expect(await readManifest("wf_abc123", env)).toBeUndefined()
+  })
+})
+
+describe("atomic artifact writes (#136)", () => {
+  test("concurrent manifest writes leave a whole parseable manifest", async () => {
+    await ensureRunDir("wf_abc123", env)
+    const bigManifest = manifest({ childSessionIDs: Array.from({ length: 4000 }, (_u, i) => `ses_child${i}`) })
+    await Promise.all(Array.from({ length: 6 }, (_u, i) => writeManifest("wf_abc123", { ...bigManifest, argsHash: `v${i}` }, env)))
+    const m = await readManifest("wf_abc123", env)
+    expect(m?.childSessionIDs.length).toBe(4000)
+  })
+
+  test("a completed write leaves no temp file beside the artifact", async () => {
+    await ensureRunDir("wf_abc123", env)
+    await writeManifest("wf_abc123", manifest(), env)
+    await writeResult("wf_abc123", { ok: true }, env)
+    const entries = await readdir(dirname(artifactPaths("wf_abc123", env).manifestPath))
+    expect(entries.filter((e) => e.includes(".tmp"))).toEqual([])
+  })
+})
+
+describe("killed-write atomicity (#136 review)", () => {
+  test("a write that dies between the temp write and the rename leaves the previous manifest whole", async () => {
+    // The discriminator: non-atomic truncate-writes destroy the previous file when the write dies
+    // mid-way; the rename-based write fails BEFORE touching the target, so v1 survives intact.
+    await ensureRunDir("wf_abc123", env)
+    const paths = artifactPaths("wf_abc123", env)
+    await writeManifest("wf_abc123", manifest({ argsHash: "v1" }), env)
+    await expect(atomicWriteFile(paths.manifestPath, "{torn", { failRename: true })).rejects.toThrow(/injected rename failure/u)
+    const survivor = await readManifestState("wf_abc123", env)
+    expect(survivor.state).toBe("ok")
+    if (survivor.state === "ok") {expect(survivor.manifest.argsHash).toBe("v1")}
+  })
+
+  test("a manifest write killed THROUGH writeManifest leaves the previous manifest whole", async () => {
+    // The seam the two killed-write tests below/above bypass: they drive atomicWriteFile
+    // directly, so a writeManifest regressed to a truncate-write leaves them all green. This
+    // call rides the production entry point through the same test-only failRename pass-through
+    // the ProgressWriter default flush got in round 3, so the canonical invariant — a killed
+    // manifest write destroys nothing — discriminates at writeManifest itself.
+    await ensureRunDir("wf_abc123", env)
+    await writeManifest("wf_abc123", manifest({ argsHash: "v1" }), env)
+    await expect(writeManifest("wf_abc123", manifest({ argsHash: "v2" }), env, { failRename: true })).rejects.toThrow(/injected rename failure/u)
+    const survivor = await readManifestState("wf_abc123", env)
+    expect(survivor.state).toBe("ok")
+    if (survivor.state === "ok") {expect(survivor.manifest.argsHash).toBe("v1")}
+  })
+
+  test("the same killed-write guarantee holds for a progress file", async () => {
+    await ensureRunDir("wf_abc123", env)
+    const progressPath = join(dirname(artifactPaths("wf_abc123", env).manifestPath), "progress.json")
+    await atomicWriteFile(progressPath, JSON.stringify({ runId: "wf_abc123", spent: 0 }), undefined)
+    await expect(atomicWriteFile(progressPath, "{torn", { failRename: true })).rejects.toThrow(/injected rename failure/u)
+    expect(JSON.parse(await readFile(progressPath, "utf8"))).toEqual({ runId: "wf_abc123", spent: 0 })
+  })
+
+  test("artifact writes land under the scratch XDG root, never the default (#137 regression)", async () => {
+    // The routing guarantee: a write with an explicit env lands verbatim under that env data
+    // root. Fixture/probe writers route through this; the default root is only ever used when
+    // XDG is unset (real launches).
+    await ensureRunDir("wf_abc123", env)
+    await writeManifest("wf_abc123", manifest(), env)
+    const paths = artifactPaths("wf_abc123", env)
+    await expect(Bun.file(paths.manifestPath).exists()).resolves.toBe(true)
+    expect(paths.dir.startsWith(base)).toBe(true)
+    // Platform-independent: the write must NOT land in the DEFAULT root (whatever HOME is on
+    // this platform — the /Users/ proxy proved nothing on ubuntu CI).
+    expect(paths.dir.startsWith(dataRoot({}))).toBe(false)
   })
 })

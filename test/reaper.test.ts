@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
-import { chmod, mkdtemp, readFile, readdir, rm } from "node:fs/promises"
+import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { defaultProcessAlive, newBootId, pruneRuns, reapOrphans } from "../src/server/resume/reaper.js"
-import { ensureRunDir, readManifest, writeManifest } from "../src/server/resume/store.js"
+import { defaultProcessAlive, newBootId, pruneRuns, reapOrphans, salvagePid } from "../src/server/resume/reaper.js"
+import { ensureRunDir, readManifest, readManifestState, writeManifest } from "../src/server/resume/store.js"
 import type { Manifest } from "../src/server/resume/journal.js"
 import type { OpencodeClient } from "../src/server/types.js"
 
@@ -55,7 +55,11 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-  // Restore write permission before cleanup: one test makes a run directory read-only.
+  // Restore write permission before cleanup: tests make run DIRECTORIES read-only (atomic
+  // writes are blocked by the directory), and rm needs the write back.
+  await chmod(join(base, "opencode", "tool-output", "ultraopen", "wf_dead001"), 0o700).catch(
+    () => undefined,
+  )
   await chmod(join(base, "opencode", "tool-output", "ultraopen", "wf_dead001", "manifest.json"), 0o600).catch(
     () => undefined,
   )
@@ -256,9 +260,9 @@ describe("failure tolerance", () => {
     const entry = manifest()
     await ensureRunDir(entry.runId, env)
     await writeManifest(entry.runId, entry, env)
-    // Make the manifest FILE read-only. Directory permissions would not be enough — overwriting
-    // an existing file only needs write permission on the file itself.
-    await chmod(join(base, "opencode", "tool-output", "ultraopen", entry.runId, "manifest.json"), 0o400)
+    // Atomic writes (#136) rename over the target, so the DIRECTORY permission is what blocks
+    // the write: an unwritable run dir makes the tombstone write fail while aborts still land.
+    await chmod(join(base, "opencode", "tool-output", "ultraopen", entry.runId), 0o500)
 
     const { client, aborted } = makeClient(),
      result = await reapOrphans(client, "current-boot", { env, isProcessAlive: DEAD })
@@ -275,7 +279,7 @@ describe("non-throwing contract", () => {
     const entry = manifest()
     await ensureRunDir(entry.runId, env)
     await writeManifest(entry.runId, entry, env)
-    await chmod(join(base, "opencode", "tool-output", "ultraopen", entry.runId, "manifest.json"), 0o400)
+    await chmod(join(base, "opencode", "tool-output", "ultraopen", entry.runId), 0o500)
 
     const { client } = makeClient(() => Promise.reject(new Error("everything is broken")))
     await expect(reapOrphans(client, "current-boot", { env, isProcessAlive: DEAD })).resolves.toBeDefined()
@@ -327,5 +331,175 @@ describe("pruneRuns", () => {
   test("never rejects, so callers can fire-and-forget without a handler", async () => {
     const broken = join(base, "not-a-dir")
     await expect(pruneRuns({ env: { XDG_DATA_HOME: broken } as NodeJS.ProcessEnv })).resolves.toBe(0)
+  })
+})
+
+test("a run with an unreadable manifest is quarantined, not skipped (#136)", async () => {
+  const { manifestPath } = await ensureRunDir("wf_dead001", env)
+  await writeFile(manifestPath, "{torn", "utf8")
+  const { client } = makeClient()
+  const result = await reapOrphans(client, "fresh-boot", { env, isProcessAlive: DEAD })
+  expect(result.runs).toBe(1)
+  const m = await readManifest("wf_dead001", env)
+  expect(m?.status).toBe("orphaned")
+  const pruned = await pruneRuns({ env, now: Date.now() + 31 * 24 * 60 * 60 * 1000, autoResumeTtlHours: 24 })
+  expect(pruned).toBe(1)
+})
+
+describe("quarantine respects the live-pid veto (#136 review)", () => {
+  const seedTorn = async (body: string, runId = "wf_dead001"): Promise<void> => {
+    const { manifestPath } = await ensureRunDir(runId, env)
+    await writeFile(manifestPath, body, "utf8")
+  }
+
+  test("a torn manifest whose pid is salvageable and alive is left untouched — no tombstone, no marker", async () => {
+    // The veto the orphan pass applies to readable manifests must apply to torn ones too: a
+    // live owner (mid-write-recovery in a concurrent process) would find its settlement
+    // permanently blocked by a tombstone — endRun refuses any non-running status — and its
+    // dir would wear an interrupted marker while it is still working.
+    await seedTorn('{\n  "runId": "wf_dead001",\n  "bootId": "old-boot",\n  "pid": 4242,')
+    const { client } = makeClient()
+    expect(await reapOrphans(client, "fresh-boot", { env, isProcessAlive: () => true })).toEqual({
+      runs: 0,
+      sessions: 0,
+      failures: 0,
+      live: 1,
+      orphaned: [],
+    })
+    const tornState = await readManifestState("wf_dead001", env)
+    expect(tornState.state).toBe("corrupt")
+    const files = await readdir(join(base, "opencode", "tool-output", "ultraopen", "wf_dead001"))
+    expect(files).not.toContain("interrupted.txt")
+  })
+
+  test("a torn manifest whose salvaged pid is dead is still quarantined", async () => {
+    await seedTorn('{\n  "runId": "wf_dead001",\n  "bootId": "old-boot",\n  "pid": 4242,')
+    const { client } = makeClient()
+    expect(await reapOrphans(client, "fresh-boot", { env, isProcessAlive: DEAD })).toEqual({
+      runs: 1,
+      sessions: 0,
+      failures: 0,
+      live: 0,
+      orphaned: [],
+    })
+    const settled = await readManifest("wf_dead001", env)
+    expect(settled?.status).toBe("orphaned")
+  })
+
+  test("no salvageable pid means no veto — the same rule as the orphan pass with a missing pid", async () => {
+    await seedTorn("{torn")
+    const { client } = makeClient()
+    expect(await reapOrphans(client, "fresh-boot", { env, isProcessAlive: () => true })).toEqual({
+      runs: 1,
+      sessions: 0,
+      failures: 0,
+      live: 0,
+      orphaned: [],
+    })
+  })
+
+  test("the veto rides the default process probe too", async () => {
+    // This test's own process is alive, so the un-injected probe must veto — no isProcessAlive.
+    await seedTorn(`{\n  "runId": "wf_dead001",\n  "pid": ${String(process.pid)},`)
+    const { client } = makeClient()
+    const probed = await reapOrphans(client, "fresh-boot", { env })
+    expect(probed.live).toBe(1)
+    const stillTorn = await readManifestState("wf_dead001", env)
+    expect(stillTorn.state).toBe("corrupt")
+  })
+
+  test("a salvageable-but-impossible pid (overflow) is no veto", async () => {
+    await seedTorn(`{\n  "pid": ${"9".repeat(400)},`)
+    const { client } = makeClient()
+    const overflowResult = await reapOrphans(client, "fresh-boot", { env, isProcessAlive: () => true })
+    expect(overflowResult.runs).toBe(1)
+  })
+
+  test("a quarantine veto surfaces in the same live-skip accounting as an orphan-pass skip", async () => {
+    // One readable live orphan plus one vetoed torn run: both skip for the same reason, so the
+    // result must count both and the note must say so — the skip is visible, never silent.
+    await seedTorn('{\n  "runId": "wf_torn001",\n  "pid": 4242,', "wf_torn001")
+    await ensureRunDir("wf_dead001", env)
+    await writeManifest("wf_dead001", manifest({ pid: 424_242 }), env)
+    const notes: string[] = [],
+      { client } = makeClient()
+    expect(await reapOrphans(client, "fresh-boot", { env, isProcessAlive: () => true, onNote: (note) => notes.push(note) })).toEqual({
+      runs: 0,
+      sessions: 0,
+      failures: 0,
+      live: 2,
+      orphaned: [],
+    })
+    expect(notes[0]).toContain("2 run(s) skipped")
+    expect(notes[0]).toContain("still alive")
+  })
+})
+
+describe("salvagePid", () => {
+  test("reads the pid out of torn manifest text; absent or malformed pids salvage to nothing", () => {
+    expect(salvagePid('{\n  "runId": "wf_x",\n  "bootId": "b",\n  "pid": 4242,')).toBe(4242)
+    expect(salvagePid("{torn")).toBeUndefined()
+    expect(salvagePid(undefined)).toBeUndefined()
+    expect(salvagePid('{"pid": NaN}')).toBeUndefined()
+    expect(salvagePid(`{"pid": ${"9".repeat(400)}}`)).toBeUndefined()
+  })
+})
+
+test("an unexpected failure inside the sweep returns the zero result instead of throwing (#136)", async () => {
+  // A live run makes the sweep take the note path; a THROWING onNote detonates the sweep's own
+  // try — the outer catch must return the zero-shape result, never reject (index.ts starts the
+  // sweep with no .catch()).
+  const entry = manifest({ pid: process.pid })
+  await ensureRunDir(entry.runId, env)
+  await writeManifest(entry.runId, entry, env)
+  const { client } = makeClient()
+  await expect(
+    reapOrphans(client, "other-boot", {
+      env,
+      isProcessAlive: () => true,
+      onNote: () => {
+        throw new Error("detonate")
+      },
+    }),
+  ).resolves.toEqual({ runs: 0, sessions: 0, failures: 0, live: 0, orphaned: [] })
+})
+
+describe("quarantine salvage and preservation (#136 review round 2)", () => {
+  const seedTorn = async (body: string, runId = "wf_dead001"): Promise<void> => {
+    const { manifestPath } = await ensureRunDir(runId, env)
+    await writeFile(manifestPath, body, "utf8")
+  }
+
+  test("the torn bytes are preserved and salvageable children are aborted before tombstoning", async () => {
+    // Torn AFTER the childSessionIDs region: the children are the only billing record — they get
+    // salvaged from the corrupt bytes, aborted, and the torn manifest itself is preserved beside
+    // the tombstone instead of being destroyed in place.
+    const torn = '{\n  "runId": "wf_dead001",\n  "bootId": "old-boot",\n  "pid": 4242,\n  "sessionID": "ses_parent",\n  "childSessionIDs": ["ses_kid1", "ses_kid2"],'
+    await seedTorn(torn)
+    const { client, aborted } = makeClient()
+    const result = await reapOrphans(client, "fresh-boot", { env, isProcessAlive: DEAD })
+    expect(result.runs).toBe(1)
+    expect(result.sessions).toBe(2)
+    expect(aborted).toEqual(["ses_kid1", "ses_kid2"])
+    const dir = join(base, "opencode", "tool-output", "ultraopen", "wf_dead001")
+    const files = await readdir(dir)
+    expect(files).toContain("manifest.corrupt.bak")
+    expect(await readFile(join(dir, "manifest.corrupt.bak"), "utf8")).toBe(torn)
+    const preserved = await readManifest("wf_dead001", env)
+    expect(preserved?.status).toBe("orphaned")
+  })
+
+  test("a manifest torn before the child list salvages nothing — the parent session is never touched", async () => {
+    // The salvage takes ids from the childSessionIDs REGION only; the run's own sessionID is the
+    // parent conversation — aborting it would kill the user's session. Torn before the region
+    // means the children are unknown and stay unabortable (documented limit).
+    const torn = '{\n  "runId": "wf_dead001",\n  "sessionID": "ses_parent",\n  "args": {"payload"'
+    await seedTorn(torn)
+    const { client, aborted } = makeClient()
+    const result = await reapOrphans(client, "fresh-boot", { env, isProcessAlive: DEAD })
+    expect(result.sessions).toBe(0)
+    expect(aborted).toEqual([])
+    const orphaned = await readManifest("wf_dead001", env)
+    expect(orphaned?.status).toBe("orphaned")
   })
 })

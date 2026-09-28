@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
-import { chmod, mkdtemp, rm } from "node:fs/promises"
+import { chmod, mkdir, mkdtemp, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
-import { beginRun, endRun, loadResume, markCancelled } from "../src/server/resume/persist.js"
+import { dirname, join } from "node:path"
+import { beginRun, endRun, loadResume, markCancelled, writeTerminalManifest } from "../src/server/resume/persist.js"
 import { artifactPaths, appendJournalEntry, ensureRunDir, readJournal, readManifest, writeManifest } from "../src/server/resume/store.js"
 import type { JournalEntry } from "../src/server/resume/journal.js"
 
@@ -34,8 +34,9 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-  // Restore write permission before cleanup: one test makes a manifest read-only.
-  await chmod(join(base, "opencode", "tool-output", "ultraopen", "wf_abc123", "manifest.json"), 0o600).catch(
+  // Restore write permission before cleanup: tests make the run DIRECTORY read-only (atomic
+  // writes are blocked by the directory, not the file), and rm needs the write back.
+  await chmod(join(base, "opencode", "tool-output", "ultraopen", "wf_abc123"), 0o700).catch(
     () => undefined,
   )
   await chmod(base, 0o755).catch(() => undefined)
@@ -126,10 +127,10 @@ describe("endRun", () => {
   })
 
   test("a disk-write failure is swallowed, so a completed run is never lost to a persistence error", async () => {
-    // The manifest FILE is made read-only: overwriting an existing file needs write permission on
-    // the file itself, which makes every endRun write fail while the directory stays usable.
+    // Writes are atomic (temp + rename, #136), so blocking them means blocking the DIRECTORY:
+    // the temp file cannot be created, every endRun write fails, and the error stays swallowed.
     const manifest = await beginRun(record, env)
-    await chmod(artifactPaths("wf_abc123", env).manifestPath, 0o400)
+    await chmod(join(base, "opencode", "tool-output", "ultraopen", "wf_abc123"), 0o500)
 
     await expect(
       endRun(manifest, { status: "completed", entries: [entry], value: 1, childSessionIDs: [] }, env),
@@ -185,7 +186,7 @@ describe("markCancelled — the stop path's terminal write", () => {
   test("a disk-write failure reports undefined instead of lying about a cancel that never landed", async () => {
     const manifest = await beginRun(record, env)
     if (!manifest) {throw new Error("the run did not open")}
-    await chmod(artifactPaths("wf_abc123", env).manifestPath, 0o400)
+    await chmod(join(base, "opencode", "tool-output", "ultraopen", "wf_abc123"), 0o500)
 
     expect(await markCancelled(manifest, [], env)).toBeUndefined()
   })
@@ -253,4 +254,38 @@ describe("loadResume", () => {
     const resume = await loadResume("wf_prev001", { a: 1 }, "ses_1", env)
     expect(resume.entries).toEqual([])
   })
+})
+
+test("the checked terminal write refuses when the manifest already settled (#136)", async () => {
+  // The commit-point refuse branch: a late settle's staged write sees the cancellation and
+  // abandons — nothing on disk is overwritten, no temp is left behind.
+  const manifest = await beginRun(record, env)
+  if (!manifest) {throw new Error("the run did not open")}
+  await markCancelled(manifest, [], env)
+  expect(await writeTerminalManifest("wf_abc123", { ...manifest, status: "completed", endedAt: Date.now() }, env)).toBe(false)
+  const standing = await readManifest("wf_abc123", env)
+  expect(standing?.status).toBe("cancelled")
+  const entries = await readdir(dirname(artifactPaths("wf_abc123", env).manifestPath))
+  expect(entries.filter((e) => e.includes(".tmp"))).toEqual([])
+})
+
+test("markCancelled never rejects, even on a caller error (#136)", async () => {
+  // The reaper's fire-and-forget contract applies to the stop path too: the TUI stop and the
+  // tool stop both call this without a handler, so a caller error (a missing manifest record)
+  // must surface as undefined, never a rejection.
+  expect(await markCancelled(undefined as unknown as Parameters<typeof markCancelled>[0], [], env)).toBeUndefined()
+})
+
+test("beginRun stays honest when the run dir cannot be created (#136)", async () => {
+  // The launch's contract: a beginRun failure aborts the launch with a friendly message —
+  // which requires beginRun itself to return undefined instead of rejecting when the run dir
+  // is unwritable (the checked-write's refusal path starts here, at creation).
+  const root = join(base, "opencode", "tool-output", "ultraopen")
+  await mkdir(root, { recursive: true })
+  await chmod(root, 0o500)
+  try {
+    expect(await beginRun(record, env)).toBeUndefined()
+  } finally {
+    await chmod(root, 0o700)
+  }
 })

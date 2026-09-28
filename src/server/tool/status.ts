@@ -1,6 +1,7 @@
 import { parseJournal } from "../resume/journal.js"
 import type { Manifest } from "../resume/journal.js"
 import { artifactPaths, isSafeRunId, runDir } from "../resume/store.js"
+import type { ManifestRead } from "../resume/store.js"
 import type { ProgressSnapshot } from "../resume/progress.js"
 import { isProcessAlive } from "./background.js"
 
@@ -40,7 +41,11 @@ export interface StatusDeps {
 export interface StatusReport {
   runId: string
   dir: string
-  status: "running" | "completed" | "failed" | "cancelled" | "orphaned"
+  /**
+   * `corrupt` (#136): the run dir exists but its manifest is unreadable — a distinct, surfaced
+   * state, never collapsed into "no run found". The journal may still be intact beside it.
+   */
+  status: "running" | "completed" | "failed" | "cancelled" | "orphaned" | "corrupt"
   phase?: string | undefined
   phases: string[]
   agents: { total: number; running: number; done: number; failed: number }
@@ -85,12 +90,44 @@ export async function executeStatus(args: StatusArgs, deps: StatusDeps = {}): Pr
    readJson = async <T>(path: string): Promise<T | undefined> => {
     try {return JSON.parse(await readFile(path)) as T} catch {return undefined}
    },
+   // JSON.parse throws SyntaxError on torn content; a failed READ (ENOENT) rejects instead —
+   // the distinction IS the corrupt state (#136). The injected test reader rejects for missing
+   // files and resolves garbage for planted corruption, so both paths are exercisable.
+   readManifestRead = async (): Promise<ManifestRead> => {
+    try {
+      return { state: "ok", manifest: JSON.parse(await readFile(paths.manifestPath)) as Manifest }
+    } catch (error) {
+      if (error instanceof SyntaxError) {return { state: "corrupt", dir }}
+      return { state: "missing" }
+    }
+   },
    cap = Math.min(MAX_WAIT_SECONDS, Math.max(0, args.wait ?? 0)),
    deadline = now() + cap * 1000
 
   for (;;) {
-    const manifest = await readJson<Manifest>(paths.manifestPath),
+    const manifestRead: ManifestRead = await readManifestRead(),
+     manifest = manifestRead.state === "ok" ? manifestRead.manifest : undefined,
      progress = await readJson<ProgressSnapshot>(paths.progressPath)
+
+    if (manifestRead.state === "corrupt") {
+      // Terminal: polling cannot repair a torn file. Surface the state distinctly (#136) —
+      // never "No run found" for a dir that exists.
+      return {
+        runId: args.runId,
+        dir,
+        status: "corrupt",
+        phases: [],
+        agents: { total: 0, running: 0, done: 0, failed: 0 },
+        outputTokens: 0,
+        budget: { total: null, spent: 0 },
+        failure: {
+          message: "The run directory exists but its manifest is unreadable (a torn or corrupt write). " +
+            "The journal beside it may still be intact — inspect the directory manually.",
+          dir,
+        },
+        logs: [],
+      }
+    }
 
     if (manifest === undefined && progress === undefined) {
       throw new Error(unknownRunMessage(args.runId, env))

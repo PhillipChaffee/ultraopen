@@ -3,7 +3,7 @@ import { ProgressWriter } from "../src/server/resume/progress.js"
 import { LARGE_RUN_AGENTS } from "../src/server/script/limits.js"
 import { RunPoller, activeRuns, agentRowText, dataRoot, formatElapsed, glyph, hintLine, loadAllRuns, loadFailedReasons, loadInterruptedRuns, summarize, toView } from "../src/tui/data.js"
 import type { RunView } from "../src/tui/data.js"
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -590,5 +590,74 @@ describe("large-run badge in the strip summary", () => {
   test("a small run carries no badge", () => {
     const view = toView({ runId: "wf_a", workflow: "demo", startedAt: 0, agents: [{ index: 0, label: "a", status: "running" }] }, 0)
     expect(summarize(view)).not.toContain("large run")
+  })
+})
+
+describe("ProgressWriter — atomic flush (#136)", () => {
+  test("a killed DEFAULT flush leaves the previous snapshot whole, no temp behind", async () => {
+    // Discriminator for the regressable path: every test above injects a fake writer, so they all
+    // pass even if the default flush were a plain truncate-write — the killed-write guarantee then
+    // rests on nothing. Here no `write` is supplied, so the DEFAULT flush runs; the inject object
+    // is shared by reference so one writer can land v1 normally and then attempt v2 with the rename
+    // failing — the exact killed-mid-write shape. A non-atomic default replaces the file (test
+    // fails); the atomic one fails before touching the target, so v1 survives whole.
+    const root = await mkdtemp(join(tmpdir(), "ultraopen-progress-")),
+      env = { XDG_DATA_HOME: root } as NodeJS.ProcessEnv,
+      dir = join(root, "opencode", "tool-output", "ultraopen", "wf_prog02")
+    try {
+      await mkdir(dir, { recursive: true })
+      const inject = { failRename: false }
+      const flusher = new ProgressWriter({ runId: "wf_prog02", workflow: "w", sessionID: "s", startedAt: 1, env, inject })
+      flusher.apply({ type: "log", message: "v1" }, 2)
+      await flusher.flush()
+      inject.failRename = true
+      flusher.apply({ type: "log", message: "v2" }, 3)
+      await flusher.flush()
+      const survived = JSON.parse(await readFile(join(dir, "progress.json"), "utf8"))
+      expect(survived.logs).toEqual(["v1"])
+      expect(await readdir(dir).then((e) => e.filter((n) => n.includes(".tmp")))).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("a torn progress file is repaired by the next flush; flushes leave no temp file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ultraopen-progress-"))
+    const env = { XDG_DATA_HOME: root } as NodeJS.ProcessEnv
+    try {
+      await mkdir(join(root, "opencode", "tool-output", "ultraopen", "wf_prog01"), { recursive: true })
+      await writeFile(join(root, "opencode", "tool-output", "ultraopen", "wf_prog01", "progress.json"), "{torn", "utf8")
+      const flusher = new ProgressWriter({ runId: "wf_prog01", workflow: "w", sessionID: "s", startedAt: 1, env })
+      flusher.apply({ type: "log", message: "one" }, 2)
+      await flusher.flush()
+      const snap = JSON.parse(await readFile(join(root, "opencode", "tool-output", "ultraopen", "wf_prog01", "progress.json"), "utf8"))
+      expect(snap.logs).toEqual(["one"])
+      const entries = await readdir(join(root, "opencode", "tool-output", "ultraopen", "wf_prog01"))
+      expect(entries.filter((e) => e.includes(".tmp"))).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("ProgressWriter — default flush atomicity (#136 review)", () => {
+  test("a default flush that dies between the temp write and the rename leaves the previous snapshot whole", async () => {
+    // The discriminator: under a non-atomic default (truncate + die mid-write) the previous
+    // snapshot is destroyed; the atomic flush fails BEFORE touching the target, so v1 survives.
+    const root = await mkdtemp(join(tmpdir(), "ultraopen-progress-"))
+    const env = { XDG_DATA_HOME: root } as NodeJS.ProcessEnv
+    try {
+      await mkdir(join(root, "opencode", "tool-output", "ultraopen", "wf_prog01"), { recursive: true })
+      const baseline = new ProgressWriter({ runId: "wf_prog01", workflow: "w", sessionID: "s", startedAt: 1, env })
+      baseline.apply({ type: "log", message: "v1" }, 2)
+      await baseline.flush()
+      const killer = new ProgressWriter({ runId: "wf_prog01", workflow: "w", sessionID: "s", startedAt: 1, env, inject: { failRename: true } })
+      killer.apply({ type: "log", message: "v2" }, 3)
+      await killer.flush()
+      const snap = JSON.parse(await readFile(join(root, "opencode", "tool-output", "ultraopen", "wf_prog01", "progress.json"), "utf8"))
+      expect(snap.logs).toEqual(["v1"])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 })
