@@ -234,6 +234,36 @@ describe("parse — args dereference flag", () => {
     expect(flagged).toEqual({ line: 3, column: 7, property: "repo", kind: "member" })
   })
 
+  test("a destructuring read through an alias is flagged too (#139)", () => {
+    // `const a = args; const { repo } = a` poisons prompts the same way — the destructure
+    // branch must admit alias names, not just the literal args identifier.
+    const flagged = parse(`${META}const a = args\nconst { repo } = a\nreturn repo\n`).argsDereference
+    expect(flagged?.kind).toBe("destructure")
+    expect(flagged?.property).toBe("")
+  })
+
+  test("an alias bound by assignment is flagged too (#139)", () => {
+    // `a = args` (assignment form) binds the alias without a declarator; reads through it
+    // poison prompts identically.
+    const flagged = parse(`${META}let a\na = args\nreturn a.repo\n`).argsDereference
+    expect(flagged?.kind).toBe("member")
+    expect(flagged?.property).toBe("repo")
+  })
+
+  test("a re-bound alias is still flagged — the documented limit (#139)", () => {
+    // Re-binding is not tracked: `let a = args; a = { repo: 1 }; a.repo` is legal with scalar
+    // args but stays flagged (the launch gate false-refuses it). Pinned so a future scope-aware
+    // lint can tighten this deliberately.
+    const flagged = parse(`${META}let a = args\na = { repo: 1 }\nreturn a.repo\n`).argsDereference
+    expect(flagged?.property).toBe("repo")
+  })
+
+  test("a nested parameter shadowing an alias name is falsely flagged — the documented limit (#139)", () => {
+    // Same syntactic-limit class as the args-shadowing note: no scope tracking for alias names.
+    const flagged = parse(`${META}const a = args\nconst g = (a) => a.x\nreturn g(args)\n`).argsDereference
+    expect(flagged?.property).toBe("x")
+  })
+
   test("an alias of args that is never member-read is not flagged (#139)", () => {
     // Binding an alias and passing it through whole is not a dereference.
     expect(parse(`${META}const a = args\nreturn a\n`).argsDereference).toBeUndefined()
@@ -277,10 +307,18 @@ describe("parse — undefined-identifier refusal (#144)", () => {
     expect(() => parse(`${META}return helper()\nfunction helper() { return 1 }\n`)).not.toThrow()
   })
 
+  test("an export-default declaration is not a false refusal (#144 review blocker)", () => {
+    // `export default function f() {}` blanks cleanly (blankExports supports it) and runs —
+    // the undefined-identifier pass must not refuse it.
+    expect(() => parse(`${META}export default function f() { return 1 }\nreturn f()\n`)).not.toThrow()
+    expect(() => parse(`${META}export default class Repo { static tag = 1 }\nreturn Repo.tag\n`)).not.toThrow()
+  })
+
   test("standard intrinsics pass — the sandbox compiles into the host realm", () => {
     expect(() => parse(`${META}return JSON.stringify({ now: Date.parse(args.at ?? 0), max: Math.max(1, 2) })\n`)).not.toThrow()
     expect(() => parse(`${META}const set = new Map([["k", new Set([1])]])\nreturn set\n`)).not.toThrow()
     expect(() => parse(`${META}return [Object, Array, Promise, Number, String, Boolean, RegExp, Error, TypeError, Symbol, Proxy, Reflect, WeakMap].length\n`)).not.toThrow()
+    expect(() => parse(`${META}return [Infinity, NaN, undefined, 1, null].length\n`)).not.toThrow()
   })
 
   test("member property names are not identifier reads", () => {
@@ -288,9 +326,16 @@ describe("parse — undefined-identifier refusal (#144)", () => {
     expect(() => parse(`${META}return args.impossiblePropertyName\n`)).not.toThrow()
   })
 
+  test("a shorthand object property is a read of its name (#144 review finding)", () => {
+    // `{ missing }` reads `missing` — acorn shares the key/value node, so the read must be
+    // visited like any identifier read.
+    expect(() => parse(`${META}const wrap = { missing }\nreturn 1\n`)).toThrow(/missing/u)
+  })
+
   test("the eight injected globals pass", () => {
     expect(() => parse(`${META}phase("p")\nlog("l")\nconst budgetCheck = budget.total\nreturn await agent("x")\n`)).not.toThrow()
     expect(() => parse(`${META}const results = await parallel([() => agent("a")])\nreturn results.filter(Boolean).length\n`)).not.toThrow()
+    expect(() => parse(`${META}const out = await pipeline([1], (prev) => prev)\nawait workflow({ script: "x" })\nreturn out.length\n`)).not.toThrow()
     expect(() => parse(`${META}return args\n`)).not.toThrow()
   })
 
@@ -339,10 +384,17 @@ describe("parse — undefined-identifier refusal (#144)", () => {
 
   test("unknown node types descend generically (#144 synthetic AST)", () => {
     // Direct call with a node type acorn never emits: the generic-descent branch must still
-    // visit Identifier reads inside it and resolve them through the same rules.
+    // visit Identifier reads inside it and resolve them through the same rules. A nested
+    // VariableDeclarator exercises the declarator case the real walk never reaches directly.
     const fake = {
       type: "Program",
-      body: [{ type: "TotallyUnknownNode", kids: [{ type: "Identifier", name: "undeclaredThing", loc: { start: { line: 1, column: 0 } } }] }],
+      body: [{
+        type: "TotallyUnknownNode",
+        kids: [
+          { type: "VariableDeclarator", id: { type: "Identifier", name: "bound" }, init: { type: "Identifier", name: "JSON", loc: { start: { line: 1, column: 0 } } } },
+          { type: "Identifier", name: "undeclaredThing", loc: { start: { line: 1, column: 0 } } },
+        ],
+      }],
     }
     expect(() => lintUndefinedIdentifiers(fake as unknown as acorn.Program)).toThrow(/undeclaredThing/u)
   })

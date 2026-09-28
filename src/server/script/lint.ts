@@ -129,20 +129,29 @@ export function lintDeterminism(ast: acorn.Program): ArgsDereference | undefined
 
     // Alias binding: a plain identifier initialized to the args global (#139). Recorded BEFORE
     // the member checks above in walk order — source order guarantees a legal binding precedes
-    // its reads, so the set is populated by the time an aliased read is visited.
+    // its reads, so the set is populated by the time an aliased read is visited. KNOWN LIMIT:
+    // re-binding (`a = { x: 1 }` after `const a = args`) is not tracked — reads through the
+    // alias stay flagged even when the re-bound value is a real object; and alias-of-alias
+    // chains (`const b = a`) bind nothing. Pinned by tests in the script test file.
     if (node.type === "VariableDeclarator" && node.init?.type === "Identifier" && node.init.name === "args" && node.id.type === "Identifier") {
       argsAliases.add(node.id.name)
     }
 
+    // Alias by assignment (#139): `a = args` binds the alias without a declarator.
+    if (node.type === "AssignmentExpression" && node.operator === "=" && node.left.type === "Identifier" && node.right.type === "Identifier" && node.right.name === "args") {
+      argsAliases.add(node.left.name)
+    }
+
     // Destructuring reads (`const { repo } = args`, `for (const x of args)`) poison prompts the
-    // same way a member dereference does and produce no MemberExpression to flag — cover them.
+    // same way a member dereference does and produce no MemberExpression to flag — cover them,
+    // including destructures off an args ALIAS (#139: `const a = args; const { repo } = a`).
     if (argsDereference === undefined) {
       let destructured = false
-      if (node.type === "VariableDeclarator" && node.init?.type === "Identifier" && node.init.name === "args" && (node.id.type === "ObjectPattern" || node.id.type === "ArrayPattern")) {
+      if (node.type === "VariableDeclarator" && node.init?.type === "Identifier" && (node.init.name === "args" || argsAliases.has(node.init.name)) && (node.id.type === "ObjectPattern" || node.id.type === "ArrayPattern")) {
         destructured = true
-      } else if ((node.type === "ForOfStatement" || node.type === "ForInStatement") && node.right.type === "Identifier" && node.right.name === "args") {
+      } else if ((node.type === "ForOfStatement" || node.type === "ForInStatement") && node.right.type === "Identifier" && (node.right.name === "args" || argsAliases.has(node.right.name))) {
         destructured = true
-      } else if (node.type === "AssignmentExpression" && node.operator === "=" && node.right.type === "Identifier" && node.right.name === "args" && (node.left.type === "ObjectPattern" || node.left.type === "ArrayPattern")) {
+      } else if (node.type === "AssignmentExpression" && node.operator === "=" && node.right.type === "Identifier" && (node.right.name === "args" || argsAliases.has(node.right.name)) && (node.left.type === "ObjectPattern" || node.left.type === "ArrayPattern")) {
         destructured = true
       }
       if (destructured) {
@@ -238,8 +247,9 @@ const registerBlockDeclarations = (statements: unknown[], into: Set<string>): vo
   for (const statement of statements) {
     if (!statement || typeof statement !== "object" || !("type" in statement)) {continue}
     let node = statement as acorn.AnyNode
-    if (node.type === "ExportNamedDeclaration" && (node as acorn.ExportNamedDeclaration).declaration) {
-      node = (node as acorn.ExportNamedDeclaration).declaration as acorn.AnyNode
+    const decl = node as acorn.ExportNamedDeclaration | acorn.ExportDefaultDeclaration
+    if ((node.type === "ExportNamedDeclaration" || node.type === "ExportDefaultDeclaration") && decl.declaration) {
+      node = decl.declaration as acorn.AnyNode
     }
     if (node.type === "VariableDeclaration" && (node as acorn.VariableDeclaration).kind !== "var") {
       for (const d of (node as acorn.VariableDeclaration).declarations) {collectPatternNames(d.id, into)}
@@ -393,10 +403,11 @@ export function lintUndefinedIdentifiers(ast: acorn.Program): void {
         return
       }
       case "Property": {
-        // `{ a: expr }` — the key is a name, not a read. `{ a }` shorthand — the value IS the
-        // read. Computed keys are expressions.
+        // `{ a: expr }` — the key is a name, not a read. `{ a }` shorthand — acorn shares the
+        // key/value node, so visiting the value reads the name it names. Computed keys are
+        // expressions and get visited.
         if (node.computed) {visit(node.key, scopes)}
-        if (!node.shorthand) {visit(node.value, scopes)}
+        visit(node.value, scopes)
         return
       }
       case "PropertyDefinition": case "MethodDefinition": {
