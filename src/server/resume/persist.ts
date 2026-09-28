@@ -75,6 +75,27 @@ export async function beginRun(record: RunRecord, env?: NodeJS.ProcessEnv): Prom
  * failed-write must never overwrite `cancelled`. The journal and result are skipped with
  * the status: the first terminal record settles the run's whole settlement.
  */
+/**
+ * The terminal write WITH a last-instant re-check (#136).
+ *
+ * The atomic write widened the check-to-rename window (the temp write sits between the status
+ * read and the rename), so a concurrent terminal write — a stop's `cancelled` landing while a
+ * settle's `failed` was in flight — could land inside the gap and be clobbered by this rename,
+ * breaking first-terminal-write-wins. The re-read immediately before the rename collapses the
+ * window to two consecutive syscalls: if another terminal record landed since the caller's
+ * check, this write abandons instead of overwriting it.
+ */
+async function writeTerminalManifest(
+  runId: string,
+  manifest: Manifest,
+  env?: NodeJS.ProcessEnv,
+): Promise<boolean> {
+  const current = await readManifest(runId, env)
+  if (current !== undefined && current.status !== "running") {return false}
+  await writeManifest(runId, manifest, env)
+  return true
+}
+
 export async function endRun(
   manifest: Manifest | undefined,
   outcome: {
@@ -93,7 +114,7 @@ export async function endRun(
     if (current !== undefined && current.status !== "running") {return}
     await appendJournal(manifest.runId, outcome.entries.map((entry) => JSON.stringify(entry)).join("\n"), env)
     await writeResult(manifest.runId, outcome.value, env)
-    await writeManifest(
+    const won = await writeTerminalManifest(
       manifest.runId,
       {
         ...manifest,
@@ -103,6 +124,7 @@ export async function endRun(
       },
       env,
     )
+    if (!won) {return}
   } catch {
     // See the note above: a persistence failure must not lose a completed run.
   }
@@ -153,11 +175,12 @@ export async function markCancelled(
     for (let attempt = 0; attempt < 3; attempt++) {
       const current = await readManifest(manifest.runId, env)
       if (current === undefined || current.status !== "running") {return current}
-      await writeManifest(
+      const won = await writeTerminalManifest(
         manifest.runId,
         { ...manifest, status: "cancelled", childSessionIDs, endedAt: Date.now() },
         env,
       )
+      if (!won) {continue}
       const after = await readManifest(manifest.runId, env)
       if (after === undefined || after.status !== "running") {return after}
     }
