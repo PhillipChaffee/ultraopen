@@ -279,6 +279,8 @@ describe("killed-write atomicity (#136 review)", () => {
     const paths = artifactPaths("wf_abc123", env)
     await expect(Bun.file(paths.manifestPath).exists()).resolves.toBe(true)
     expect(paths.dir.startsWith(base)).toBe(true)
-    expect(paths.dir.startsWith("/Users/")).toBe(false)
+    // Platform-independent: the write must NOT land in the DEFAULT root (whatever HOME is on
+    // this platform — the /Users/ proxy proved nothing on ubuntu CI).
+    expect(paths.dir.startsWith(dataRoot({}))).toBe(false)
   })
 })

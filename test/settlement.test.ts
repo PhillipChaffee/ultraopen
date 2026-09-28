@@ -113,7 +113,15 @@ describe("wireRun", () => {
       await new Promise((resolve) => {setTimeout(resolve, 10)})
     }
     expect(dispatches).toHaveLength(1)
-    const snapshot = await flushSnapshot()
+    // The note reaches the snapshot through the coalesced flush — a timer, not the dispatch —
+    // so the assertion must WAIT for it instead of racing the coalescer (the dispatch is
+    // event-driven and can land long before the flush timer fires).
+    let snapshot: Awaited<ReturnType<typeof flushSnapshot>>
+    for (let i = 0; i < 200; i++) {
+      snapshot = await flushSnapshot()
+      if (snapshot?.logs.some((line) => line.includes("run-control: stop-run"))) {break}
+      await new Promise((resolve) => {setTimeout(resolve, 10)})
+    }
     expect(snapshot?.logs.some((line) => line.includes("run-control: stop-run"))).toBe(true)
 
     // Settling clears the watcher: the settled rewrite must never race a late control read.
