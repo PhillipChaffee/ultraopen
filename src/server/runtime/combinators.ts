@@ -29,7 +29,13 @@ function assertWithinLimit(count: number, caller: "parallel" | "pipeline"): void
  */
 export async function parallel(thunks: readonly (() => unknown)[]): Promise<unknown[]> {
   if (!Array.isArray(thunks)) {
-    throw new TypeError("parallel() expects an array of functions, not promises. Wrap each call: () => agent(...)")
+    // Rides the diagnostic contract (#145): a bare TypeError never reaches the render's
+    // suggestion surface, and fed-promises is the single most common authoring mistake.
+    fail({
+      kind: "RuntimeError",
+      message: "parallel() expects an array of functions, not promises. Wrap each call: () => agent(...)",
+      suggestions: ["Wrap each item: parallel([() => agent(...)]) — the call takes thunks so it can hold work back until a slot frees."],
+    })
   }
   assertWithinLimit(thunks.length, "parallel")
 
@@ -37,7 +43,11 @@ export async function parallel(thunks: readonly (() => unknown)[]): Promise<unkn
   // single most common authoring error, and swallowing it into a row of nulls leaves the author
   // with no explanation for why nothing ran.
   if (thunks.some((thunk) => typeof thunk !== "function")) {
-    throw new TypeError("parallel() expects an array of functions, not promises. Wrap each call: () => agent(...)")
+    fail({
+      kind: "RuntimeError",
+      message: "parallel() expects an array of functions, not promises. Wrap each call: () => agent(...)",
+      suggestions: ["Wrap each item: parallel([() => agent(...)]) — a bare Promise would start immediately instead of waiting for a slot."],
+    })
   }
 
   // One frame for the whole call, so every thunk shares it and a sibling parallel() gets its own.
@@ -84,7 +94,11 @@ export async function pipeline(
   ...stages: readonly ((prev: unknown, item: unknown, index: number) => unknown)[]
 ): Promise<unknown[]> {
   if (!Array.isArray(items)) {
-    throw new TypeError("pipeline() expects an array of items as its first argument.")
+    fail({
+      kind: "RuntimeError",
+      message: "pipeline() expects an array of items as its first argument.",
+      suggestions: ["Pass the items as a real array: pipeline([itemA, itemB], stageOne, stageTwo)."],
+    })
   }
   assertWithinLimit(items.length, "pipeline")
 
