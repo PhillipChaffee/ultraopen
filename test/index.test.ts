@@ -2185,6 +2185,16 @@ describe("resumeFromRunId zero-value decoration guard (#132)", () => {
     expect(launched).toContain("<workflow-launched")
     await background.settlePromiseOf(runIdOf(launched))
   })
+
+  test("the schema description states the rule", () => {
+    // The schema is model-facing: a model that never learns the rule keeps emitting the
+    // decoration. The args field's description carries the same sentence (#86's precedent).
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const argsSchema = tool?.args?.["resumeFromRunId"] as { description?: string } | undefined
+    expect(argsSchema?.description).toContain("zero-value decorations")
+    expect(argsSchema?.description).toContain("omit the field for a fresh launch")
+  })
 })
 
 describe("args transport repair (#78)", () => {

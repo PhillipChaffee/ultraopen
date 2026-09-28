@@ -387,7 +387,7 @@ export function workflowArgsSchema(): Record<string, unknown> {
     },
     resumeFromRunId: {
       type: "string",
-      description: "Resume a previous run from this directory's data: unchanged agent calls replay from its journal instantly, and the first changed call onward runs live. Refused while the source run is still executing.",
+      description: "Resume a previous run from this directory's data: unchanged agent calls replay from its journal instantly, and the first changed call onward runs live. Refused while the source run is still executing. The strings \"\", \"null\", and \"undefined\" are refused as zero-value decorations — omit the field for a fresh launch.",
     },
     dryRun: { type: "boolean", description: "Run the script with agent() stubbed out, for zero tokens. Always waits for the result." },
     background: {
