@@ -1,7 +1,10 @@
+import { randomUUID } from "node:crypto"
+import { rename, unlink, writeFile } from "node:fs/promises"
 import { argsHash, sourceHash } from "./key.js"
 import type { JournalEntry, Manifest } from "./journal.js"
 import {
   appendJournal,
+  artifactPaths,
   ensureRunDir,
   readJournal,
   readManifest,
@@ -90,9 +93,19 @@ async function writeTerminalManifest(
   manifest: Manifest,
   env?: NodeJS.ProcessEnv,
 ): Promise<boolean> {
+  // (#136) STAGE the content first, THEN re-check, THEN rename: the gap between the status
+  // read and the rename collapses to two consecutive syscalls, so a concurrent terminal write
+  // (a stop landing while a settle is in flight) can no longer hide inside the window and be
+  // clobbered — first-terminal-write-wins holds on disk.
+  const paths = artifactPaths(runId, env)
+  const tmp = `${paths.manifestPath}.${randomUUID().slice(0, 8)}.tmp`
+  await writeFile(tmp, JSON.stringify(manifest, null, 2), "utf8")
   const current = await readManifest(runId, env)
-  if (current !== undefined && current.status !== "running") {return false}
-  await writeManifest(runId, manifest, env)
+  if (current !== undefined && current.status !== "running") {
+    await unlink(tmp).catch(() => undefined)
+    return false
+  }
+  await rename(tmp, paths.manifestPath)
   return true
 }
 
@@ -112,9 +125,11 @@ export async function endRun(
     // is a terminal record that already won.
     const current = await readManifest(manifest.runId, env)
     if (current !== undefined && current.status !== "running") {return}
-    await appendJournal(manifest.runId, outcome.entries.map((entry) => JSON.stringify(entry)).join("\n"), env)
-    await writeResult(manifest.runId, outcome.value, env)
-    await writeTerminalManifest(
+    // The terminal manifest is the COMMIT POINT and comes FIRST (#136): a settle that loses the
+    // race against a stop's cancellation must write NOTHING — the previous order published this
+    // settle's journal rewrite and result.json beside a manifest it never won, and a cancelled
+    // run then "invented" a result.json (caught live by the e2e stop-path assertion).
+    const won = await writeTerminalManifest(
       manifest.runId,
       {
         ...manifest,
@@ -124,6 +139,9 @@ export async function endRun(
       },
       env,
     )
+    if (!won) {return}
+    await appendJournal(manifest.runId, outcome.entries.map((entry) => JSON.stringify(entry)).join("\n"), env)
+    await writeResult(manifest.runId, outcome.value, env)
   } catch {
     // See the note above: a persistence failure must not lose a completed run.
   }
