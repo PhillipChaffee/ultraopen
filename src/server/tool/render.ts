@@ -328,6 +328,25 @@ export function renderResumeDecorationRefusal(value: string): string {
 }
 
 /**
+ * A launch or dryRun whose `scriptPath` carries a model-emitted zero-value decoration (#141).
+ *
+ * A decorated scriptPath is a truthy string, so it wins the source precedence
+ * (scriptPath > script > name) and reaches script resolution, failing there with a bare
+ * filesystem error (observed: ENOENT open 'null') that never names the decoration it is.
+ * Refused loudly at the boundary instead — the same treatment `args` and `resumeFromRunId`
+ * get, with the same placement pins: after the stop dispatch, before the launch gate and
+ * the permission ask. A caller who means the inline script omits the field.
+ */
+export function renderScriptPathDecorationRefusal(value: string): string {
+  return [
+    "<workflow-refused>",
+    `The \`scriptPath\` field was passed as the string "${value}" — a zero-value decoration ("", "null", or "undefined"), not a script path, so no script was resolved.`,
+    "To run the script passed in `script`, omit the `scriptPath` field entirely; otherwise pass a real path to a persisted script.",
+    "</workflow-refused>",
+  ].join("\n")
+}
+
+/**
  * A launch, resume, or dryRun whose `args` field is a string that looks like JSON but does not
  * parse (#78).
  *

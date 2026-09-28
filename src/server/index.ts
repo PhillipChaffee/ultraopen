@@ -38,6 +38,7 @@ import {
   renderMissingRunResumeRefusal,
   renderArgsRefusal,
   renderResumeDecorationRefusal,
+  renderScriptPathDecorationRefusal,
   renderStringifiedArgsRefusal,
   renderStatus,
   workflowArgsSchema,
@@ -312,6 +313,16 @@ async function launchWorkflow(
   // fresh launch omits the field.
   if (typeof args.resumeFromRunId === "string" && isZeroValueDecoration(args.resumeFromRunId)) {
     return renderResumeDecorationRefusal(args.resumeFromRunId)
+  }
+
+  // The same weather on `scriptPath` (#141): a decorated scriptPath is a truthy string, so
+  // it wins the source precedence (scriptPath > script > name) and reaches script
+  // resolution, failing there with a bare filesystem error (observed: ENOENT open 'null')
+  // that never names the decoration. Same placement pins as the args and resumeFromRunId
+  // guards: refused before the launch gate, so the call registers no pending entry and
+  // burns no approval. A caller who means the inline script omits the field.
+  if (typeof args.scriptPath === "string" && isZeroValueDecoration(args.scriptPath)) {
+    return renderScriptPathDecorationRefusal(args.scriptPath)
   }
 
   // Stringified-JSON transport (#78): a string that LOOKS like JSON but fails to parse is

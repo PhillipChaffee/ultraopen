@@ -2197,6 +2197,38 @@ describe("resumeFromRunId zero-value decoration guard (#132)", () => {
   })
 })
 
+describe("scriptPath zero-value decoration guard (#141)", () => {
+  // The same weather on `scriptPath` (decided in #141): a decorated scriptPath is a truthy
+  // string, so it wins the source precedence (scriptPath > script > name) and reaches script
+  // resolution, failing there with a bare filesystem error (observed: ENOENT open 'null')
+  // that never names the decoration it is. Refused loudly at the boundary — the same
+  // treatment `args` and `resumeFromRunId` get — with the same placement pins: after the
+  // stop dispatch, before the launch gate and the permission ask. A caller who means the
+  // inline script omits the field.
+  const decorations = ["", "null", "undefined"]
+
+  test.each(decorations)("a launch whose scriptPath is %p is refused as decoration before the ask", async (value) => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const { ask, assertNoAsk } = askRecorder()
+    const output = await tool.execute(
+      { scriptPath: value, background: true },
+      { sessionID: "parent", ask },
+    )
+    expect(output).toContain("<workflow-refused>")
+    // The decoration treatment, not the bare file error it read as before the guard: the
+    // refusal names the zero-value decoration, the value it saw, the field, and the fix.
+    expect(output).toContain("zero-value decoration")
+    expect(output).toContain(`"${value}"`)
+    expect(output).toContain("`scriptPath`")
+    expect(output).toContain("omit the `scriptPath` field")
+    // Refused BEFORE the ask: an approval spent on a call that refuses itself buys
+    // nothing and cascades into a re-ask chain (#74's pins).
+    assertNoAsk()
+    expect(background.liveRunsForSession("parent")).toHaveLength(0)
+  })
+})
+
 describe("args transport repair (#78)", () => {
   // Layer 1 at the tool boundary: a host or model serialization slip that stringifies the args
   // object is repaired when it parses to an object or array, refused when it looks like JSON but
