@@ -215,6 +215,22 @@ describe("parse — args dereference flag", () => {
     expect(flagged?.property).toBe("x")
   })
 
+  test("an aliased read is flagged like a direct dereference (#139)", () => {
+    // `const a = args; a.x` poisons prompts exactly like `args.x` when args is a scalar —
+    // the alias must carry the same flag kind so the sandbox start-gate treats it identically.
+    const flagged = parse(`${META}const a = args\nreturn a.repo\n`).argsDereference
+    expect(flagged).toEqual({ line: 3, column: 7, property: "repo", kind: "member" })
+  })
+
+  test("an alias of args that is never member-read is not flagged (#139)", () => {
+    // Binding an alias and passing it through whole is not a dereference.
+    expect(parse(`${META}const a = args\nreturn a\n`).argsDereference).toBeUndefined()
+  })
+
+  test("a local object that is not an alias is not flagged (#139)", () => {
+    expect(parse(`${META}const a = { repo: 1 }\nreturn a.repo\n`).argsDereference).toBeUndefined()
+  })
+
   test("a script that passes args through whole is not flagged", () => {
     expect(parse(`${META}return args\n`).argsDereference).toBeUndefined()
   })
@@ -409,6 +425,14 @@ describe("sandbox — args launch gate (#78)", () => {
     const { body, argsDereference } = parse(`${META}const { repo } = args\nreturn repo\n`)
     const { globals } = gatedGlobals("42")
     await expect(run(body, globals, argsDereference)).rejects.toThrow(/destructuring read off `args`/u)
+  })
+
+  test("an aliased-read script throws identically when args is absent (#139)", async () => {
+    // Same gate, same zero-token cost: the alias must reach the gate as a member dereference.
+    const { body, argsDereference } = parse(`${META}const a = args\nreturn a.repo\n`)
+    const { globals, agents } = gatedGlobals(undefined)
+    await expect(run(body, globals, argsDereference)).rejects.toThrow(/args arrived as nothing/u)
+    expect(agents).toEqual([])
   })
 
   test("a script without dereferences keeps scalar args working", async () => {

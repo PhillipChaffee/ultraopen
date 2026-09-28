@@ -55,6 +55,11 @@ export interface ArgsDereference {
  */
 export function lintDeterminism(ast: acorn.Program): ArgsDereference | undefined {
   let argsDereference: ArgsDereference | undefined
+  // Aliases bound directly to args (`const a = args`, #139): member reads through the alias
+  // poison prompts the same way a direct read does. One-hop only — alias-of-alias, reads that
+  // precede the binding in source order, and re-binding after the initial alias stay unflagged;
+  // same syntactic-limit class as the shadowing note below.
+  const argsAliases = new Set<string>()
   walk(ast, (node) => {
     if (node.type === "ImportDeclaration" || node.type === "ImportExpression") {
       fail({
@@ -109,10 +114,10 @@ export function lintDeterminism(ast: acorn.Program): ArgsDereference | undefined
     // the runtime gate can point at it; computed accesses report an empty property.
     //
     // KNOWN LIMIT — the flag is syntactic, like the Date/Math bans: a nested function or catch
-    // parameter NAMED `args` (`(args) => args.x`) is falsely flagged, and no scope tracking
+    // parameter NAMED `args` (or an alias name, #139) is falsely flagged, and no scope tracking
     // exists to tell it from the global. The gate message points at the read, so the fix is a
     // rename; the Date.now ban has the same shape of limit.
-    if (argsDereference === undefined && node.type === "MemberExpression" && node.object.type === "Identifier" && node.object.name === "args") {
+    if (argsDereference === undefined && node.type === "MemberExpression" && node.object.type === "Identifier" && (node.object.name === "args" || argsAliases.has(node.object.name))) {
       const position = loc(node)
       if (position !== undefined) {
         // A computed access cannot name its property statically; the gate renders it as `args[…]`.
@@ -120,6 +125,13 @@ export function lintDeterminism(ast: acorn.Program): ArgsDereference | undefined
         if (!node.computed && node.property.type === "Identifier") {property = node.property.name}
         argsDereference = { ...position, property, kind: "member" }
       }
+    }
+
+    // Alias binding: a plain identifier initialized to the args global (#139). Recorded BEFORE
+    // the member checks above in walk order — source order guarantees a legal binding precedes
+    // its reads, so the set is populated by the time an aliased read is visited.
+    if (node.type === "VariableDeclarator" && node.init?.type === "Identifier" && node.init.name === "args" && node.id.type === "Identifier") {
+      argsAliases.add(node.id.name)
     }
 
     // Destructuring reads (`const { repo } = args`, `for (const x of args)`) poison prompts the
