@@ -342,11 +342,11 @@ describe("renderFailure", () => {
     // WorkflowScriptError would be green on arrival, since renderFailure already renders
     // suggestions for that type. Today this is red: the bare TypeError carries no suggestions.
     const { parallel } = await import("../src/server/runtime/combinators.js")
-    const error = await parallel([Promise.resolve(1) as unknown as () => unknown]).then(
+    const thrown = await parallel([Promise.resolve(1) as unknown as () => unknown]).then(
       () => undefined,
-      (e: unknown) => e,
+      (error: unknown) => error,
     )
-    const out = renderFailure(error as Error)
+    const out = renderFailure(thrown as Error)
     expect(out).toContain("RuntimeError")
     expect(out).toContain("not promises")
     expect(out).toContain("→")

@@ -176,3 +176,276 @@ export function lintDeterminism(ast: acorn.Program): ArgsDereference | undefined
   })
   return argsDereference
 }
+
+/** Names the launch injects as function parameters (SandboxGlobals) — always resolvable. */
+const PROVIDED_GLOBALS = new Set(["agent", "parallel", "pipeline", "phase", "log", "args", "budget", "workflow", "arguments"])
+
+/**
+ * Static undefined-identifier refusal (#144).
+ *
+ * A script that reads a name it never declared dies at first reference — mid-run, after the
+ * approval and often after spend. This pass walks with a scope stack and refuses the FIRST read
+ * that resolves nowhere: not a declaration in scope, not a provided global, and not on the host
+ * globalThis. The sandbox compiles with `new AsyncFunction` into the HOST realm, so
+ * `name in globalThis` here is exactly the resolution the running body will get — standard
+ * intrinsics and host-provided names pass without an enumerated list, and the check is
+ * self-consistent per runtime (bun vs node parity: each environment judges its own globals).
+ *
+ * Lenient by design — a false refusal blocks a legal script, a false negative just leaves the
+ * runtime ReferenceError where it is today. KNOWN LIMITS, each documented rather than solved:
+ * TDZ use-before-let/const passes (declarations pre-register at scope entry); writes to
+ * undeclared names (`x = 1`, `x++`) pass (strict mode catches them at runtime); `typeof x`
+ * guards pass; unknown node types descend generically; alias-of-alias chains and dynamic
+ * construction (`globalThis[name]`) are invisible to a static pass.
+ */
+export function lintUndefinedIdentifiers(ast: acorn.Program): void {
+  interface Scope { names: Set<string> }
+
+  const collectPatternNames = (pattern: any, into: Set<string>): void => {
+    if (!pattern) {return}
+    switch (pattern.type) {
+      case "Identifier": {into.add(pattern.name); break}
+      case "ObjectPattern": {
+        for (const prop of pattern.properties) {
+          if (prop.type === "Property") {collectPatternNames(prop.value, into)}
+          else if (prop.type === "RestElement") {collectPatternNames(prop.argument, into)}
+        }
+        break
+      }
+      case "ArrayPattern": {for (const el of pattern.elements) {collectPatternNames(el, into)}; break}
+      case "AssignmentPattern": {collectPatternNames(pattern.left, into); break}
+      case "RestElement": {collectPatternNames(pattern.argument, into); break}
+    }
+  }
+
+  // var is function-scoped and hoisted: collect every var name in the subtree, without
+  // descending into nested functions (their vars are their own scope).
+  const hoistVarNames = (node: any, into: Set<string>): void => {
+    if (!node || typeof node !== "object") {return}
+    if (Array.isArray(node)) {for (const child of node) {hoistVarNames(child, into)}; return}
+    switch (node.type) {
+      case "FunctionDeclaration": case "FunctionExpression": case "ArrowFunctionExpression": case "ClassDeclaration": case "ClassExpression": {return}
+      case "VariableDeclaration": {
+        if (node.kind === "var") {for (const d of node.declarations) {collectPatternNames(d.id, into)}}
+        for (const d of node.declarations) {hoistVarNames(d.init, into)}
+        return
+      }
+      default: {
+        for (const key of Object.keys(node)) {
+          if (key === "type" || key === "loc" || key === "range" || key === "start" || key === "end") {continue}
+          hoistVarNames(node[key], into)
+        }
+      }
+    }
+  }
+
+  // Block-entry pre-registration: let/const/class/function declarations at the immediate level
+  // of a block register before its statements are walked, so hoisted-function use and any
+  // declaration order pass. (TDZ violations pass too — a documented limit, not a bug.)
+  const registerBlockDeclarations = (statements: any[], into: Set<string>): void => {
+    for (const statement of statements) {
+      let node = statement
+      if (node.type === "ExportNamedDeclaration" && node.declaration) {node = node.declaration}
+      if (node.type === "VariableDeclaration" && node.kind !== "var") {
+        for (const d of node.declarations) {collectPatternNames(d.id, into)}
+      } else if (node.type === "FunctionDeclaration" && node.id) {
+        into.add(node.id.name)
+      } else if (node.type === "ClassDeclaration" && node.id) {
+        into.add(node.id.name)
+      }
+    }
+  }
+
+  const resolves = (name: string, scopes: Scope[]): boolean => {
+    for (let i = scopes.length - 1; i >= 0; i--) {
+      if (scopes[i].names.has(name)) {return true}
+    }
+    if (PROVIDED_GLOBALS.has(name)) {return true}
+    return typeof globalThis === "object" && globalThis !== null && name in globalThis
+  }
+
+  const visit = (node: any, scopes: Scope[]): void => {
+    if (!node || typeof node !== "object") {return}
+    switch (node.type) {
+      case "Identifier": {
+        if (!resolves(node.name, scopes)) {
+          const position = loc(node)
+          fail({
+            kind: "RuntimeError",
+            message:
+              `\`${node.name}\` is not defined — the script reads it${ 
+              position ? ` (first at line ${position.line}:${position.column})` : "" 
+              }, but nothing declares it, no launch global provides it, and the host realm has no such name.`,
+            location: position,
+            suggestions: [
+              `Declare it before use: \`const ${node.name} = ...\`.`,
+              "If the value comes from outside the script, pass it in via the `args` object.",
+            ],
+          })
+        }
+        return
+      }
+      case "Program": {
+        const scope: Scope = { names: new Set() }
+        hoistVarNames(node.body, scope.names)
+        registerBlockDeclarations(node.body, scope.names)
+        scopes.push(scope)
+        for (const statement of node.body) {visit(statement, scopes)}
+        scopes.pop()
+        return
+      }
+      case "BlockStatement": {
+        const scope: Scope = { names: new Set() }
+        registerBlockDeclarations(node.body, scope.names)
+        scopes.push(scope)
+        for (const statement of node.body) {visit(statement, scopes)}
+        scopes.pop()
+        return
+      }
+      case "FunctionDeclaration": case "FunctionExpression": case "ArrowFunctionExpression": {
+        const scope: Scope = { names: new Set() }
+        if (node.type === "FunctionExpression" && node.id) {scope.names.add(node.id.name)}
+        for (const param of node.params) {collectPatternNames(param, scope.names)}
+        hoistVarNames(node.body, scope.names)
+        scopes.push(scope)
+        for (const param of node.params) {visit(param, scopes)}
+        visit(node.body, scopes)
+        scopes.pop()
+        return
+      }
+      case "ForStatement": {
+        const scope: Scope = { names: new Set() }
+        if (node.init && node.init.type === "VariableDeclaration") {
+          for (const d of node.init.declarations) {collectPatternNames(d.id, scope.names)}
+        }
+        scopes.push(scope)
+        visit(node.init, scopes)
+        visit(node.test, scopes)
+        visit(node.update, scopes)
+        visit(node.body, scopes)
+        scopes.pop()
+        return
+      }
+      case "ForInStatement": case "ForOfStatement": {
+        const scope: Scope = { names: new Set() }
+        if (node.left.type === "VariableDeclaration") {
+          for (const d of node.left.declarations) {collectPatternNames(d.id, scope.names)}
+        }
+        scopes.push(scope)
+        visit(node.left, scopes)
+        visit(node.right, scopes)
+        visit(node.body, scopes)
+        scopes.pop()
+        return
+      }
+      case "SwitchStatement": {
+        const scope: Scope = { names: new Set() }
+        for (const c of node.cases) {registerBlockDeclarations(c.consequent, scope.names)}
+        scopes.push(scope)
+        visit(node.discriminant, scopes)
+        for (const c of node.cases) {
+          visit(c.test, scopes)
+          for (const statement of c.consequent) {visit(statement, scopes)}
+        }
+        scopes.pop()
+        return
+      }
+      case "CatchClause": {
+        const scope: Scope = { names: new Set() }
+        if (node.param) {collectPatternNames(node.param, scope.names)}
+        scopes.push(scope)
+        visit(node.body, scopes)
+        scopes.pop()
+        return
+      }
+      case "ClassDeclaration": case "ClassExpression": {
+        const scope: Scope = { names: new Set() }
+        if (node.type === "ClassExpression" && node.id) {scope.names.add(node.id.name)}
+        scopes.push(scope)
+        visit(node.superClass, scopes)
+        visit(node.body, scopes)
+        scopes.pop()
+        return
+      }
+      case "MemberExpression": {
+        visit(node.object, scopes)
+        if (node.computed) {visit(node.property, scopes)}
+        return
+      }
+      case "Property": {
+        // `{ a: expr }` — the key is a name, not a read. `{ a }` shorthand — the value IS the
+        // read. Computed keys are expressions.
+        if (node.computed) {visit(node.key, scopes)}
+        if (!node.shorthand) {visit(node.value, scopes)}
+        return
+      }
+      case "PropertyDefinition": case "MethodDefinition": {
+        if (node.computed) {visit(node.key, scopes)}
+        visit(node.value, scopes)
+        return
+      }
+      case "AssignmentExpression": {
+        // Writes are not reads: an Identifier or pattern on the left declares leniently (strict
+        // mode catches illegal writes at runtime), but a member path's BASE is read.
+        if (node.left.type === "MemberExpression") {
+          visit(node.left.object, scopes)
+          if (node.left.computed) {visit(node.left.property, scopes)}
+        } else if (node.left.type === "Identifier") {
+          scopes.at(-1).names.add(node.left.name)
+        } else {
+          collectPatternNames(node.left, scopes.at(-1).names)
+        }
+        visit(node.right, scopes)
+        return
+      }
+      case "UpdateExpression": {return}
+      case "UnaryExpression": {
+        // `typeof x` is the classic guard: the probe itself is not a read, AND a name probed
+        // this way is guarded at runtime — later reads of it only happen when it exists. The
+        // pass registers the probed name leniently (a false negative here is the safe direction).
+        const inner = scopes.at(-1)
+        if (node.operator === "typeof" && node.argument.type === "Identifier" && inner) {
+          inner.names.add(node.argument.name)
+          return
+        }
+        visit(node.argument, scopes)
+        return
+      }
+      case "LabeledStatement": {visit(node.body, scopes); return}
+      case "BreakStatement": case "ContinueStatement": case "ThisExpression": case "Super": case "MetaProperty": case "PrivateIdentifier": {return}
+      case "VariableDeclaration": {
+        for (const d of node.declarations) {visit(d.init, scopes)}
+        return
+      }
+      case "VariableDeclarator": {
+        // Reached directly only outside the guarded cases: init is a read; the id is a binding.
+        visit(node.init, scopes)
+        break
+      }
+      case "ObjectPattern": case "ArrayPattern": case "AssignmentPattern": case "RestElement": case "ImportDeclaration": case "ExportAllDeclaration": {break}
+      case "ExportNamedDeclaration": {
+        visit(node.declaration, scopes)
+        return
+      }
+      case "StaticBlock": {
+        const scope: Scope = { names: new Set() }
+        scopes.push(scope)
+        for (const statement of node.body) {visit(statement, scopes)}
+        scopes.pop()
+        return
+      }
+      default: {
+        // Unknown node type: descend generically — every child that carries a `type` gets
+        // visited as its own node, so Identifier reads inside still resolve through the rules.
+        for (const key of Object.keys(node)) {
+          if (key === "type" || key === "loc" || key === "range" || key === "start" || key === "end") {continue}
+          const child = node[key]
+          if (Array.isArray(child)) {for (const c of child) {visit(c, scopes)}}
+          else if (child && typeof child === "object" && typeof child.type === "string") {visit(child, scopes)}
+        }
+      }
+    }
+  }
+
+  visit(ast, [])
+}

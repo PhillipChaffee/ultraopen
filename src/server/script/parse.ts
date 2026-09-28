@@ -2,7 +2,7 @@ import * as acorn from "acorn"
 import { fail } from "./errors.js"
 import type { ArgsDereference } from "./lint.js"
 import { MAX_SCRIPT_CHARS } from "./limits.js"
-import { lintDeterminism } from "./lint.js"
+import { lintDeterminism, lintUndefinedIdentifiers } from "./lint.js"
 import { extractMeta } from "./meta.js"
 import type { Meta } from "./meta.js"
 
@@ -63,6 +63,9 @@ export function parse(source: string): ParsedScript {
 
   const meta = extractMeta(ast),
    argsDereference = lintDeterminism(ast)
+  // The undefined-identifier refusal (#144) runs LAST: a script that reads a name nothing
+  // declares is refused here — at prepare, before the permission ask, so the cost stays zero.
+  lintUndefinedIdentifiers(ast)
 
   return { meta, body: blankExports(ast, source), ast, argsDereference }
 }

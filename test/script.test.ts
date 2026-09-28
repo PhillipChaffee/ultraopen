@@ -4,7 +4,17 @@ import { run } from "../src/server/script/sandbox.js"
 import { WorkflowScriptError } from "../src/server/script/errors.js"
 import { MAX_SCRIPT_CHARS } from "../src/server/script/limits.js"
 
-const META = `export const meta = { name: 'x', description: 'y' }\n`,
+const META = `export const meta = { name: 'x', description: 'y' }\n`
+
+const parseThrow = (source: string): WorkflowScriptError => {
+  try {
+    parse(source)
+    throw new Error("expected parse() to refuse the script")
+  } catch (error) {
+    if (error instanceof WorkflowScriptError) {return error}
+    throw error
+  }
+},
 
  diag = (fn: () => unknown) => {
   try {
@@ -238,6 +248,67 @@ describe("parse — args dereference flag", () => {
   test("a member read on another object is not flagged", () => {
     expect(parse(`${META}return Object.keys(args).length\n`).argsDereference).toBeUndefined()
     expect(parse(`${META}const other = { a: 1 }; return other.a\n`).argsDereference).toBeUndefined()
+  })
+})
+
+describe("parse — undefined-identifier refusal (#144)", () => {
+  // Layer 3: a script referencing an undeclared identifier is refused at PREPARE — zero tokens —
+  // instead of dying mid-run at first reference (four organic instances in the corpus). The pass
+  // is scope-aware: declarations resolve, intrinsics resolve (the sandbox compiles into the HOST
+  // realm, so the runtime resolution is `name in globalThis`), the eight injected globals resolve.
+
+  test("a read of an undeclared identifier throws naming it", () => {
+    const error = parseThrow(`${META}return UNIT_RESULT.summary\n`)
+    expect(error).toBeInstanceOf(WorkflowScriptError)
+    expect(error.message).toContain("UNIT_RESULT")
+    expect(error.diagnostic.kind).toBe("RuntimeError")
+    expect(error.diagnostic.suggestions?.length ?? 0).toBeGreaterThan(0)
+  })
+
+  test("a read of an undeclared identifier inside a nested block or function throws too", () => {
+    expect(() => parse(`${META}if (true) { log(LENSES[0]) }\n`)).toThrow(/LENSES/u)
+    expect(() => parse(`${META}const f = () => DEFAULT_ROSTER.map(() => null)\nreturn f()\n`)).toThrow(/DEFAULT_ROSTER/u)
+  })
+
+  test("declared identifiers pass — including use-after-declare and function declarations", () => {
+    expect(() => parse(`${META}const roster = ["a"]\nreturn roster.length\n`)).not.toThrow()
+    expect(() => parse(`${META}return helper()\nfunction helper() { return 1 }\n`)).not.toThrow()
+  })
+
+  test("standard intrinsics pass — the sandbox compiles into the host realm", () => {
+    expect(() => parse(`${META}return JSON.stringify({ now: Date.parse(args.at ?? 0), max: Math.max(1, 2) })\n`)).not.toThrow()
+    expect(() => parse(`${META}const set = new Map([["k", new Set([1])]])\nreturn set\n`)).not.toThrow()
+    expect(() => parse(`${META}return [Object, Array, Promise, Number, String, Boolean, RegExp, Error, TypeError, Symbol, Proxy, Reflect, WeakMap].length\n`)).not.toThrow()
+  })
+
+  test("member property names are not identifier reads", () => {
+    expect(() => parse(`${META}const wrap = { repo: 1 }\nreturn wrap.repo\n`)).not.toThrow()
+    expect(() => parse(`${META}return args.impossiblePropertyName\n`)).not.toThrow()
+  })
+
+  test("the eight injected globals pass", () => {
+    expect(() => parse(`${META}phase("p")\nlog("l")\nconst budgetCheck = budget.total\nreturn await agent("x")\n`)).not.toThrow()
+    expect(() => parse(`${META}const results = await parallel([() => agent("a")])\nreturn results.filter(Boolean).length\n`)).not.toThrow()
+    expect(() => parse(`${META}return args\n`)).not.toThrow()
+  })
+
+  test("typeof guards and writes to undeclared names do not false-flag", () => {
+    // Reads only: `typeof x` is the classic guard, and writes to undeclared names are caught by
+    // strict mode at runtime — the lint stays out of both.
+    expect(() => parse(`${META}if (typeof maybeMissing !== "undefined") { return maybeMissing }\nreturn null\n`)).not.toThrow()
+    expect(() => parse(`${META}undeclaredWrite = 1\nreturn undeclaredWrite\n`)).not.toThrow()
+  })
+
+  test("function params and shadowing resolve — no false flags", () => {
+    expect(() => parse(`${META}const f = (x) => x + 1\nreturn f(1)\n`)).not.toThrow()
+    expect(() => parse(`${META}const x = 1\nconst g = () => { const x = 2; return x }\nreturn g() + x\n`)).not.toThrow()
+    expect(() => parse(`${META}try { throw new Error("e") } catch (err) { return err.message }\n`)).not.toThrow()
+  })
+
+  test("var scoping and loop declarations pass", () => {
+    expect(() => parse(`${META}for (let i = 0; i < 3; i++) { log(i) }\n`)).not.toThrow()
+    expect(() => parse(`${META}for (const item of [1, 2]) { log(item) }\n`)).not.toThrow()
+    expect(() => parse(`${META}function f() { var scoped = 1; return scoped }\nreturn f()\n`)).not.toThrow()
   })
 })
 

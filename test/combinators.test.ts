@@ -61,7 +61,7 @@ describe("parallel", () => {
     // same diagnostic contract as every other authoring error (#145): suggestions render.
     const error = await parallel([Promise.resolve(1) as unknown as () => unknown]).then(
       () => undefined,
-      (e: unknown) => e,
+      (error: unknown) => error,
     )
     expect(error).toBeInstanceOf(WorkflowScriptError)
     const diagnostic = (error as WorkflowScriptError).diagnostic
@@ -74,12 +74,12 @@ describe("parallel", () => {
     // parallel() is an `async function`, so a synchronous throw inside it surfaces as a
     // rejected promise, not a synchronous throw from the call site — must await it.
     const notAnArray = Promise.resolve([1, 2, 3]) as unknown as readonly (() => unknown)[]
-    const error = await parallel(notAnArray).then(
+    const thrown = await parallel(notAnArray).then(
       () => undefined,
-      (e: unknown) => e,
+      (error: unknown) => error,
     )
-    expect(error).toBeInstanceOf(WorkflowScriptError)
-    const diagnostic = (error as WorkflowScriptError).diagnostic
+    expect(thrown).toBeInstanceOf(WorkflowScriptError)
+    const diagnostic = (thrown as WorkflowScriptError).diagnostic
     expect(diagnostic.message).toContain("not promises")
     expect(diagnostic.message).toContain("() => agent(...)")
     expect(diagnostic.suggestions?.length ?? 0).toBeGreaterThan(0)
@@ -240,12 +240,12 @@ describe("pipeline", () => {
     // pipeline() is also an `async function` — same synchronous-throw-becomes-rejection caveat.
     // Rides the diagnostic contract (#145): suggestions must survive to the failure render.
     const notAnArray = Promise.resolve([1, 2]) as unknown as readonly unknown[]
-    const error = await pipeline(notAnArray, (prev) => prev).then(
+    const thrown = await pipeline(notAnArray, (prev) => prev).then(
       () => undefined,
-      (e: unknown) => e,
+      (error: unknown) => error,
     )
-    expect(error).toBeInstanceOf(WorkflowScriptError)
-    const diagnostic = (error as WorkflowScriptError).diagnostic
+    expect(thrown).toBeInstanceOf(WorkflowScriptError)
+    const diagnostic = (thrown as WorkflowScriptError).diagnostic
     expect(diagnostic.message).toContain("array of items")
     expect(diagnostic.suggestions?.length ?? 0).toBeGreaterThan(0)
   })
