@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import {
@@ -20,6 +20,26 @@ import { join } from "node:path"
  */
 
 const META = "export const meta = { name: 'x', description: 'x' }\n"
+
+/**
+ * The execute-driven tests here persist REAL run artifacts (manifest, journal, result). Without
+ * this guard they land in the user's production data root — seven `sessionID: "parent"` fixture
+ * manifests were found in the wild root exactly this way (#137). Same guard as index.test.ts.
+ */
+let scratchHome: string,
+ savedDataHome: string | undefined
+
+beforeAll(async () => {
+  scratchHome = await mkdtemp(join(tmpdir(), "ultraopen-named-"))
+  savedDataHome = process.env["XDG_DATA_HOME"]
+  process.env["XDG_DATA_HOME"] = scratchHome
+})
+
+afterAll(async () => {
+  if (savedDataHome === undefined) {delete process.env["XDG_DATA_HOME"]}
+  else {process.env["XDG_DATA_HOME"] = savedDataHome}
+  await rm(scratchHome, { recursive: true, force: true })
+})
 
 const fakeFs = (dirs: Record<string, Record<string, string>>) => ({
   readDir: (path: string): Promise<string[]> => {
