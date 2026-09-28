@@ -56,6 +56,7 @@ export function progressPath(runId: string, env?: NodeJS.ProcessEnv): string {
 export class ProgressWriter {
   readonly snapshot: ProgressSnapshot
   readonly #env: NodeJS.ProcessEnv | undefined
+  readonly #inject: { failRename?: boolean } | undefined
   readonly #flush: (path: string, body: string) => Promise<void>
   #dirty = false
   #writing = false
@@ -70,6 +71,12 @@ export class ProgressWriter {
     env?: NodeJS.ProcessEnv | undefined
     /** Injectable for tests. Defaults to a real file write. */
     write?: ((path: string, body: string) => Promise<void>) | undefined
+    /**
+     * Test-only fault injection, passed to the DEFAULT write (#136 review): lets a test fail the
+     * rename after the temp write — the killed-mid-write shape — and so pin that the default
+     * flush is atomic rather than a truncate-write. Unused when `write` is supplied.
+     */
+    inject?: { failRename?: boolean } | undefined
   }) {
     this.snapshot = {
       runId: options.runId,
@@ -82,8 +89,10 @@ export class ProgressWriter {
       budget: { total: options.budgetTotal ?? null, spent: 0 },
     }
     this.#env = options.env
-    // The default flush is atomic (#136): a torn progress file would blind the TUI and the status poll.
-    this.#flush = options.write ?? ((path, body) => atomicWriteFile(path, body))
+    this.#inject = options.inject
+    // The default flush is atomic (#136): a torn progress file would blind the TUI and the status
+    // poll. The fault-inject seam rides along so tests can kill this exact path mid-write.
+    this.#flush = options.write ?? ((path, body) => atomicWriteFile(path, body, this.#inject))
   }
 
   /** Folds one event into the snapshot. */
