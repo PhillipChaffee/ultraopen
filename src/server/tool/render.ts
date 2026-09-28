@@ -347,6 +347,25 @@ export function renderScriptPathDecorationRefusal(value: string): string {
 }
 
 /**
+ * A launch whose `script` and `scriptPath` arrive together (#143).
+ *
+ * The resolution precedence is scriptPath > script, so the inline script — usually the
+ * fuller source text — was silently discarded, and a wrong or stale path killed it with
+ * a bare filesystem error naming neither field. Refused loudly at the boundary instead,
+ * with the same placement pins as the other boundary guards: after the stop dispatch,
+ * before the launch gate and the permission ask. The precedence itself is unchanged;
+ * the refusal replaces only the silent discard.
+ */
+export function renderBothSourceRefusal(): string {
+  return [
+    "<workflow-refused>",
+    "Both `script` and `scriptPath` were supplied. The resolution precedence is scriptPath > script, so the inline `script` would be discarded and only the file would run.",
+    "Pass one source: keep `script` (omit `scriptPath`), or keep `scriptPath` and delete the `script` field.",
+    "</workflow-refused>",
+  ].join("\n")
+}
+
+/**
  * A launch, resume, or dryRun whose `args` field is a string that looks like JSON but does not
  * parse (#78).
  *

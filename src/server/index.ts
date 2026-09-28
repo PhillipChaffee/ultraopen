@@ -43,6 +43,7 @@ import {
   renderStatus,
   workflowArgsSchema,
   statusArgsSchema,
+  renderBothSourceRefusal,
 } from "./tool/render.js"
 import { listSavedWorkflows, scanNamedWorkflows } from "./tool/named.js"
 import { wireRun, startDetachedRun } from "./tool/settlement.js"
@@ -323,6 +324,20 @@ async function launchWorkflow(
   // burns no approval. A caller who means the inline script omits the field.
   if (typeof args.scriptPath === "string" && isZeroValueDecoration(args.scriptPath)) {
     return renderScriptPathDecorationRefusal(args.scriptPath)
+  }
+
+  // Both source fields (#143): the precedence is scriptPath > script, so a call carrying
+  // both silently discarded the inline script — usually the fuller source text — and a
+  // wrong or stale path killed it with a bare filesystem error naming neither field.
+  // Refused loudly at the boundary, same placement pins as the guards above: after the
+  // stop dispatch, before the launch gate and the permission ask, so the refusal
+  // registers no pending entry and burns no approval. The precedence itself is
+  // unchanged — a single-source call resolves exactly as before, and a decorated
+  // scriptPath above still takes the decoration treatment first. The truthiness test
+  // mirrors resolveSource's own, so the refusal fires exactly where the discard would
+  // have happened.
+  if (args.script && args.scriptPath) {
+    return renderBothSourceRefusal()
   }
 
   // Stringified-JSON transport (#78): a string that LOOKS like JSON but fails to parse is

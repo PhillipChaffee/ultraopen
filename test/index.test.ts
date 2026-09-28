@@ -2269,6 +2269,37 @@ describe("scriptPath zero-value decoration guard (#141)", () => {
   })
 })
 
+describe("scriptPath + script together (#143)", () => {
+  // The precedence is scriptPath > script, so a call carrying both silently discarded the
+  // inline script — usually the fuller source text — and a stale path killed it with no
+  // signal. Refused loudly at the launch boundary, the same treatment and placement pins
+  // as the other boundary guards (#86, #132, #141): after the stop dispatch, before the
+  // launch gate and the permission ask. The precedence itself is unchanged; a
+  // single-source call resolves exactly as before.
+  test("a launch carrying both `script` and `scriptPath` refuses naming both fields and the precedence, before the ask", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const { ask, assertNoAsk } = askRecorder()
+    const output = await tool.execute(
+      // The scriptPath need not exist: the refusal fires before any read, which is the
+      // point — a stale path must not take the inline script down with it.
+      { script: `${META}await agent('a')\nreturn 1\n`, scriptPath: "wf_neverread/script.js", background: true },
+      { sessionID: "parent", ask },
+    )
+    expect(output).toContain("<workflow-refused>")
+    // The refusal names BOTH fields, the precedence that made one win, and the drop-one
+    // fix the brief pins: keep `script` inline, or keep `scriptPath` and delete the other.
+    expect(output).toContain("Both `script` and `scriptPath`")
+    expect(output).toContain("scriptPath > script")
+    expect(output).toContain("keep `script`")
+    expect(output).toContain("delete the `script` field")
+    // Refused BEFORE the ask: an approval spent on a call that refuses itself buys
+    // nothing and cascades into a re-ask chain (#74's pins).
+    assertNoAsk()
+    expect(background.liveRunsForSession("parent")).toHaveLength(0)
+  })
+})
+
 describe("args transport repair (#78)", () => {
   // Layer 1 at the tool boundary: a host or model serialization slip that stringifies the args
   // object is repaired when it parses to an object or array, refused when it looks like JSON but
