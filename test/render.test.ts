@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { renderCapRefusal, renderLaunch, renderRefusal, renderResult, renderSiblingAdvisory, renderStatus, renderStringifiedArgsRefusal } from "../src/server/tool/render.js"
+import { renderCapRefusal, renderForeignSessionResumeRefusal, renderLaunch, renderRefusal, renderResult, renderSiblingAdvisory, renderStatus, renderStringifiedArgsRefusal, renderUnrecordedSessionResumeRefusal } from "../src/server/tool/render.js"
 import type { WorkflowResult } from "../src/server/tool/workflow.js"
 import type { StatusReport } from "../src/server/tool/status.js"
 
@@ -93,6 +93,30 @@ describe("renderRefusal", () => {
     expect(refused).toContain("<workflow-refused>")
     expect(refused).toContain("already has a workflow run in flight (running): run id wf_solo0002")
     expect(refused).toContain('Poll workflow_status(runId: "wf_solo0002", wait: 120)')
+  })
+})
+
+describe("renderForeignSessionResumeRefusal (#147)", () => {
+  test("names the situation, the run, and the session that owns it", () => {
+    const refused = renderForeignSessionResumeRefusal("wf_fore001", "other-session")
+    expect(refused).toContain("<workflow-refused>")
+    expect(refused).toContain("Run wf_fore001 was launched in a different session (other-session)")
+    expect(refused).toContain("Launch the workflow fresh in this session")
+  })
+})
+
+describe("renderUnrecordedSessionResumeRefusal", () => {
+  test("names the unrecorded provenance without inventing a session", () => {
+    // The gate refuses a corrupt manifest here — one that records no session. The
+    // message must never read as a foreign-session refusal: no session was ever
+    // seen, so none may be named.
+    const refused = renderUnrecordedSessionResumeRefusal("wf_noses01")
+    expect(refused).toContain("<workflow-refused>")
+    expect(refused).toContain("Run wf_noses01's manifest does not record the session that launched it")
+    expect(refused).toContain("cannot be verified as same-session")
+    expect(refused).toContain("Launch the workflow fresh in this session")
+    expect(refused).not.toContain("different session")
+    expect(refused).not.toContain("undefined")
   })
 })
 

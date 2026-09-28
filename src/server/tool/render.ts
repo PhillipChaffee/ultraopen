@@ -277,6 +277,24 @@ export function renderForeignSessionResumeRefusal(runId: string, sessionID: stri
 }
 
 /**
+ * A resume whose source run's manifest records no session at all.
+ *
+ * The Manifest schema REQUIRES sessionID and every manifest writer since the first run store
+ * has recorded it, so a manifest without one is corrupt — not a pre-upgrade format. Resume is
+ * same-session by design, and provenance that cannot be read cannot be verified: refused with
+ * the truthful message rather than the foreign-session render, whose message would name
+ * "(undefined)" as the session that owns the run — a session it never saw.
+ */
+export function renderUnrecordedSessionResumeRefusal(runId: string): string {
+  return [
+    "<workflow-refused>",
+    `Run ${runId}'s manifest does not record the session that launched it, so it cannot be verified as same-session — resume is same-session by design, because results produced for another conversation's context are not valid answers in this one.`,
+    "Launch the workflow fresh in this session.",
+    "</workflow-refused>",
+  ].join("\n")
+}
+
+/**
  * A resume whose id is well-formed but whose run directory is gone (#131): a
  * typo'd id or a pruned run. Refused before the ask — the silent alternative
  * replayed nothing and read as a fresh launch at full price. The hint points at

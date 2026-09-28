@@ -35,6 +35,7 @@ import {
   renderCapRefusal,
   renderResumeRefusal,
   renderForeignSessionResumeRefusal,
+  renderUnrecordedSessionResumeRefusal,
   renderMissingRunResumeRefusal,
   renderArgsRefusal,
   renderResumeDecorationRefusal,
@@ -397,6 +398,60 @@ async function launchWorkflow(
   }
 
   try {
+    // A resume that will be refused is refused BEFORE the permission ask: a call
+    // with a malformed resumeFromRunId, one whose source run is live elsewhere,
+    // one whose source run belongs to a different session, or one whose source
+    // run directory is gone (#131), would otherwise render
+    // the approval dialog, consume the user's approval, and only then refuse —
+    // nothing launches, and the approval is spent (the burned approval also
+    // cascades into a re-ask chain, since models retry after the refusal). The
+    // journal rationale still holds: two writers on one journal would interleave
+    // appends and race the endRun rewrite.
+    //
+    // The gate stands FIRST in the launch — before prepare() and before the run
+    // directory is created. It needs only the resume id and this session's
+    // identity, so running it after ensureRunDir/writeScript manufactured a
+    // manifest-less directory on every refusal: a phantom that executeStatus
+    // reads as "no run found" and pruneRuns can never remove, because pruning
+    // keys on a manifest — one leaked directory per refused resume, forever.
+    if (args.resumeFromRunId) {
+      // The id is model-supplied input and joins into a filesystem path below,
+      // exactly like the status tool's runId: rejected before any read.
+      if (!isSafeRunId(args.resumeFromRunId)) {
+        dropPending(runId)
+        return renderResumeRefusal(args.resumeFromRunId, undefined)
+      }
+      const source = await readManifest(args.resumeFromRunId)
+      // A well-formed id whose run directory or manifest is gone (#131): a typo'd
+      // id or a pruned run. Refused here rather than falling through to the ask
+      // and the silent empty replay that read as a fresh launch at full price.
+      if (!source) {
+        dropPending(runId)
+        return renderMissingRunResumeRefusal(args.resumeFromRunId)
+      }
+      if (isLiveAnywhere(source, bootId)) {
+        dropPending(runId)
+        return renderResumeRefusal(source.runId, source.pid)
+      }
+      // A manifest that records no session cannot prove provenance. The Manifest
+      // schema REQUIRES sessionID and every manifest writer since the first run
+      // store has recorded it, so a manifest without one is corrupt — not a
+      // pre-upgrade format — and the comparison below would refuse it as a
+      // foreign session whose id is "undefined", naming a session it never saw.
+      if (typeof source.sessionID !== "string") {
+        dropPending(runId)
+        return renderUnrecordedSessionResumeRefusal(source.runId)
+      }
+      // Cross-session refusal (#147), AFTER the live check: a foreign run that is
+      // still executing reports the live refusal, the more dangerous condition;
+      // a settled foreign run reports the cross-session situation instead of the
+      // silent empty replay that read as a successful empty resume.
+      if (source.sessionID !== context.sessionID) {
+        dropPending(runId)
+        return renderForeignSessionResumeRefusal(source.runId, source.sessionID)
+      }
+    }
+
     // Parse BEFORE asking, so the permission prompt names the real workflow and can show
     // what it intends to do. `meta` is a pure literal specifically so it can be read
     // without running anything. Using the tool's `title` argument here instead would be
@@ -420,46 +475,10 @@ async function launchWorkflow(
     // directory must exist for the write — created here, best-effort like the
     // write itself: a failed write must not block the prompt, and a failure
     // here resurfaces through beginRun's friendly launch-failure message.
+    // Reached only past the resume gate above, so a refused resume manufactures
+    // no directory of its own: no refusal leaves a manifest-less run behind.
     await ensureRunDir(runId).catch(() => undefined)
     await writeScript(runId, prepared.source).catch(() => undefined)
-
-    // A resume that will be refused is refused BEFORE the permission ask: a call
-    // with a malformed resumeFromRunId, one whose source run is live elsewhere,
-    // one whose source run belongs to a different session, or one whose source
-    // run directory is gone (#131), would otherwise render
-    // the approval dialog, consume the user's approval, and only then refuse —
-    // nothing launches, and the approval is spent (the burned approval also
-    // cascades into a re-ask chain, since models retry after the refusal). The
-    // journal rationale still holds: two writers on one journal would interleave
-    // appends and race the endRun rewrite.
-    if (args.resumeFromRunId) {
-      // The id is model-supplied input and joins into a filesystem path below,
-      // exactly like the status tool's runId: rejected before any read.
-      if (!isSafeRunId(args.resumeFromRunId)) {
-        dropPending(runId)
-        return renderResumeRefusal(args.resumeFromRunId, undefined)
-      }
-      const source = await readManifest(args.resumeFromRunId)
-      // A well-formed id whose run directory or manifest is gone (#131): a typo'd
-      // id or a pruned run. Refused here rather than falling through to the ask
-      // and the silent empty replay that read as a fresh launch at full price.
-      if (!source) {
-        dropPending(runId)
-        return renderMissingRunResumeRefusal(args.resumeFromRunId)
-      }
-      if (isLiveAnywhere(source, bootId)) {
-        dropPending(runId)
-        return renderResumeRefusal(source.runId, source.pid)
-      }
-      // Cross-session refusal (#147), AFTER the live check: a foreign run that is
-      // still executing reports the live refusal, the more dangerous condition;
-      // a settled foreign run reports the cross-session situation instead of the
-      // silent empty replay that read as a successful empty resume.
-      if (source.sessionID !== context.sessionID) {
-        dropPending(runId)
-        return renderForeignSessionResumeRefusal(source.runId, source.sessionID)
-      }
-    }
 
     // `always` is scoped to this workflow's name rather than "*": an "always" grant is
     // stored instance-wide, so approving once with "*" would permanently disable the

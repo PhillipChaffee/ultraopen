@@ -6,9 +6,9 @@ import { STATUS_TOOL, WORKFLOW_TOOL } from "../src/server/bridge/permission.js"
 import { executeStatus } from "../src/server/tool/status.js"
 import { mode } from "../src/server/ultracode/mode.js"
 import type { MutableConfig } from "../src/server/ultracode/config.js"
-import { ensureRunDir, artifactPaths, readJournal, readManifest, writeManifest, writeScript } from "../src/server/resume/store.js"
+import { ensureRunDir, artifactPaths, dataRoot, readJournal, readManifest, writeManifest, writeScript } from "../src/server/resume/store.js"
 import { argsHash } from "../src/server/resume/key.js"
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -106,6 +106,13 @@ const askRecorder = () => {
     assertNoAsk: () => expect(asked).toEqual([]),
   }
 }
+
+/**
+ * Lists the run directories under the data root.
+ *
+ * The root may not exist until a run is first written; an absent root lists as empty.
+ */
+const listRoot = async (): Promise<string[]> => await readdir(dataRoot(undefined)).catch(() => [])
 
 let savedEnv: string | undefined
 
@@ -1203,6 +1210,69 @@ describe("background launch contract", () => {
     expect(output).toContain("workflow_status")
     // Refused BEFORE the permission ask: no approval is consumed by a call
     // that refuses itself, and nothing launches.
+    assertNoAsk()
+    expect(background.liveRunsForSession("parent")).toHaveLength(0)
+  })
+
+  test("a refused resume never manufactures a run directory of its own", async () => {
+    // The gate needs only the resume id and this session's identity — no prepared
+    // workflow, no run directory. It used to run AFTER ensureRunDir/writeScript, so
+    // every refused resume left a manifest-less directory behind: executeStatus reads
+    // it as "no run found" (clean, but useless) and pruneRuns can never remove it,
+    // because pruning keys on a manifest — one leaked directory per refusal, forever.
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const missingId = "wf_nodir001"
+    const before = new Set(await listRoot())
+    const { ask, assertNoAsk } = askRecorder()
+    const output = await tool.execute(
+      { script: `${META}return 2\n`, resumeFromRunId: missingId, background: false },
+      { sessionID: "parent", ask },
+    )
+    expect(output).toContain("<workflow-refused>")
+    assertNoAsk()
+    const after = await listRoot()
+    const added = after.filter((name) => !before.has(name))
+    expect(added).toEqual([])
+  })
+
+  test("a source manifest that records no session refuses honestly, not as a foreign session", async () => {
+    // The Manifest schema REQUIRES sessionID, and every manifest writer since the first
+    // run store has recorded it (traced through the store's history), so a manifest
+    // without one is corrupt — not a pre-upgrade format. readManifest trusts the disk
+    // with a plain cast, so the gate must not read the missing field as provenance:
+    // undefined !== sessionID would refuse with the foreign-session render, whose message
+    // names "(undefined)" as the session that owns the run — a session it never saw.
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const unrecorded = "wf_noses001"
+    await ensureRunDir(unrecorded, undefined)
+    const paths = artifactPaths(unrecorded, undefined)
+    await writeFile(
+      paths.manifestPath,
+      JSON.stringify({
+        runId: unrecorded,
+        bootId: "boot-x",
+        pid: 1,
+        sourceHash: "sha-x",
+        argsHash: argsHash(undefined),
+        status: "completed",
+        childSessionIDs: [],
+        startedAt: 1,
+        endedAt: 2,
+      }),
+      "utf8",
+    )
+    const { ask, assertNoAsk } = askRecorder()
+    const output = await tool.execute(
+      { script: `${META}return 2\n`, resumeFromRunId: unrecorded, background: false },
+      { sessionID: "parent", ask },
+    )
+    expect(output).toContain("<workflow-refused>")
+    expect(output).toContain(unrecorded)
+    expect(output).toContain("does not record")
+    // The lie must not fire: a manifest that names no session is not a DIFFERENT session.
+    expect(output).not.toContain("different session")
     assertNoAsk()
     expect(background.liveRunsForSession("parent")).toHaveLength(0)
   })
