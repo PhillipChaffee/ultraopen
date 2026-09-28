@@ -648,9 +648,9 @@ describe("ProgressWriter — default flush atomicity (#136 review)", () => {
     const env = { XDG_DATA_HOME: root } as NodeJS.ProcessEnv
     try {
       await mkdir(join(root, "opencode", "tool-output", "ultraopen", "wf_prog01"), { recursive: true })
-      const writer = new ProgressWriter({ runId: "wf_prog01", workflow: "w", sessionID: "s", startedAt: 1, env })
-      writer.apply({ type: "log", message: "v1" }, 2)
-      await writer.flush()
+      const baseline = new ProgressWriter({ runId: "wf_prog01", workflow: "w", sessionID: "s", startedAt: 1, env })
+      baseline.apply({ type: "log", message: "v1" }, 2)
+      await baseline.flush()
       const killer = new ProgressWriter({ runId: "wf_prog01", workflow: "w", sessionID: "s", startedAt: 1, env, inject: { failRename: true } })
       killer.apply({ type: "log", message: "v2" }, 3)
       await killer.flush()
