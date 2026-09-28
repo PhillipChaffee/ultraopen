@@ -53,6 +53,6 @@ What's in 0.1.0:
 
 In the TUI you get a progress strip plus a sidebar panel (Ctrl-x then b) with one row per agent. The plugin ships the workflow-authoring skill too, so the model driving your workflow reads the same reference you would.
 
-Repo (MIT): https://github.com/PhillipChaffee/ultraopen
+Repo (MIT): https://github.com/PhillipChaffee/ultraopen · npm: https://www.npmjs.com/package/ultraopen
 
 It's a community plugin, not made by the opencode team. If you try it and something breaks, an issue with the run directory attached is the fastest way to get it fixed.
