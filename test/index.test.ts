@@ -2447,3 +2447,28 @@ describe("args transport repair (#78)", () => {
     expect(argsSchema?.description).toContain("stays a scalar")
   })
 })
+
+describe("launch contract precedence (#146)", () => {
+  // The env kill switch is ABSOLUTE (decided in #146): before the fix the per-call
+  // `background` flag was consulted after the switch had already forced the blocking
+  // contract, so a model-supplied argument silently beat the user's one-line emergency
+  // switch. The precedence is: env kill switch > per-call `background` arg > project
+  // option `runMode` > home-dir option `runMode` > built-in default `background`.
+  test("with the kill switch set, an explicit background:true launch takes the blocking contract", async () => {
+    process.env["ULTRAOPEN_WORKFLOW_SYNC"] = "1"
+    try {
+      const tool = toolOf(ultraopen({ client: stubClient }))
+      if (!tool) {throw new Error("tool was not registered")}
+      const output = await tool.execute(
+        { script: `${META}await agent('a')\nreturn 'SWITCH-WINS'\n`, background: true },
+        { sessionID: "parent" },
+      )
+      // The blocking contract waits: the final result arrives in the tool call itself,
+      // not as a launch handle for a run the host may kill when the turn ends.
+      expect(output).toContain("SWITCH-WINS")
+      expect(output).not.toContain("<workflow-launched")
+    } finally {
+      delete process.env["ULTRAOPEN_WORKFLOW_SYNC"]
+    }
+  })
+})

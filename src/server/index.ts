@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto"
 import { readFile } from "node:fs/promises"
 import { join } from "node:path"
-import { resolveOptions } from "./options.js"
+import { resolveLaunchContract, resolveOptions } from "./options.js"
 import type { UltraopenOptions } from "./options.js"
 import { registry } from "./singleton.js"
 import { installConfig } from "./ultracode/config.js"
@@ -350,7 +350,8 @@ async function launchWorkflow(
     return renderStringifiedArgsRefusal(transport.raw, transport.reason)
   }
 
-  const background = args.dryRun !== true && (args.background ?? options.runMode === "background"),
+  const background = args.dryRun !== true &&
+    resolveLaunchContract(args.background, options) === "background",
    runId = `wf_${randomUUID().replaceAll("-", "").slice(0, 12)}`,
    // The session's default model, so `effort` resolves against ITS variant set rather
    // than a guess. A failure here is non-fatal: effort simply goes unapplied, and the run

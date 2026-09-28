@@ -198,6 +198,25 @@ function resolveAutoResumeMax(value: unknown): number {
  */
 export const SYNC_ENV = "ULTRAOPEN_WORKFLOW_SYNC"
 
+/**
+ * Resolves ONE call's launch contract.
+ *
+ * The env kill switch is ABSOLUTE (#146): when `ULTRAOPEN_WORKFLOW_SYNC=1`,
+ * every launch takes the blocking contract regardless of the per-call
+ * `background` argument — the model must not be able to argue with a one-line
+ * emergency switch. Otherwise the per-call flag wins over the configured
+ * option, whose own precedence (project > home-dir > built-in default)
+ * resolveOptions folded into `runMode` already.
+ */
+export function resolveLaunchContract(
+  perCallBackground: boolean | undefined,
+  options: Pick<UltraopenOptions, "runMode">,
+): "background" | "blocking" {
+  if (process.env[SYNC_ENV] === "1") {return "blocking"}
+  if (perCallBackground !== undefined) {return perCallBackground ? "background" : "blocking"}
+  return options.runMode
+}
+
 function resolveRunMode(value: unknown): "background" | "blocking" {
   if (process.env[SYNC_ENV] === "1") {return "blocking"}
   const normalized = typeof value === "string" ? value.trim().toLowerCase() : undefined
