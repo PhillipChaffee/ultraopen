@@ -260,6 +260,23 @@ export function renderResumeRefusal(runId: string, pid: number | undefined): str
 }
 
 /**
+ * A resume whose source run belongs to a DIFFERENT session (#147).
+ *
+ * Resume is same-session by design — a foreign journal would replay results produced for
+ * another conversation's context. The refusal names the situation so the caller can tell it
+ * apart from a successful empty resume; the silence was the bug, re-running every agent at
+ * full price with no note.
+ */
+export function renderForeignSessionResumeRefusal(runId: string, sessionID: string): string {
+  return [
+    "<workflow-refused>",
+    `Run ${runId} was launched in a different session (${sessionID}); its journal cannot be replayed here — resume is same-session by design, because results produced for another conversation's context are not valid answers in this one.`,
+    "Launch the workflow fresh in this session, or resume it from the session that launched it.",
+    "</workflow-refused>",
+  ].join("\n")
+}
+
+/**
  * A launch, resume, or dryRun whose `args` carries a model-emitted zero-value decoration.
  *
  * The strings "", "null" and "undefined" are the weather: models emit them for an absent

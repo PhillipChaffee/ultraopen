@@ -1155,6 +1155,34 @@ describe("background launch contract", () => {
     expect(asked).toEqual([])
   })
 
+  test("a resume id whose run belongs to a DIFFERENT session is refused at the gate, before the ask", async () => {
+    // Same-session resume is by design; the bug was the SILENCE (#147): a foreign
+    // run's journal replayed nothing and looked exactly like a same-session resume
+    // with nothing replayable, then re-ran every agent at full price with no note.
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const launched = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 'SOURCE-VALUE'\n`, background: true },
+      { sessionID: "other-session" },
+    )
+    const runId = runIdOf(launched)
+    await background.settlePromiseOf(runId)
+    const { ask, assertNoAsk } = askRecorder()
+    const output = await tool.execute(
+      { script: `${META}return 2\n`, resumeFromRunId: runId, background: false },
+      { sessionID: "parent", ask },
+    )
+    expect(output).toContain("<workflow-refused>")
+    // The refusal names the cross-session situation, the run, and who owns it.
+    expect(output).toContain("different session")
+    expect(output).toContain(runId)
+    expect(output).toContain("other-session")
+    // Refused BEFORE the permission ask: no approval is consumed by a call that
+    // refuses itself, and nothing launches.
+    assertNoAsk()
+    expect(background.liveRunsForSession("parent")).toHaveLength(0)
+  })
+
   test("executeStatus can be driven directly against real run artifacts", async () => {
     const tool = toolOf(ultraopen({ client: stubClient }))
     if (!tool) {throw new Error("tool was not registered")}
@@ -1211,9 +1239,12 @@ describe("blocking launch registration", () => {
     // A settled blocking launch leaves no stale entry for the next launch to trip on.
     expect(background.liveRunsForSession("blocker")).toHaveLength(0)
     const settledRunId = asked[0]?.metadata?.runId ?? ""
+    // Resumed from the LAUNCHING session (#147): resume is same-session by design, and a
+    // different session's attempt is now refused at the gate instead of silently replaying
+    // nothing — this positive path pins that the gate reopens after settle.
     const resumed = await tool.execute(
       { script: `${META}await agent('a')\nreturn 2\n`, resumeFromRunId: settledRunId, background: false },
-      { sessionID: "parent" },
+      { sessionID: "blocker" },
     )
     expect(resumed).toContain("<result")
   })

@@ -34,6 +34,7 @@ import {
   renderRefusal,
   renderCapRefusal,
   renderResumeRefusal,
+  renderForeignSessionResumeRefusal,
   renderArgsRefusal,
   renderStringifiedArgsRefusal,
   renderStatus,
@@ -375,12 +376,13 @@ async function launchWorkflow(
     await writeScript(runId, prepared.source).catch(() => undefined)
 
     // A resume that will be refused is refused BEFORE the permission ask: a call
-    // with a malformed resumeFromRunId, or one whose source run is live elsewhere,
-    // would otherwise render the approval dialog, consume the user's approval, and
-    // only then refuse — nothing launches, and the approval is spent (the burned
-    // approval also cascades into a re-ask chain, since models retry after the
-    // refusal). The journal rationale still holds: two writers on one journal
-    // would interleave appends and race the endRun rewrite.
+    // with a malformed resumeFromRunId, one whose source run is live elsewhere, or
+    // one whose source run belongs to a different session, would otherwise render
+    // the approval dialog, consume the user's approval, and only then refuse —
+    // nothing launches, and the approval is spent (the burned approval also
+    // cascades into a re-ask chain, since models retry after the refusal). The
+    // journal rationale still holds: two writers on one journal would interleave
+    // appends and race the endRun rewrite.
     if (args.resumeFromRunId) {
       // The id is model-supplied input and joins into a filesystem path below,
       // exactly like the status tool's runId: rejected before any read.
@@ -392,6 +394,14 @@ async function launchWorkflow(
       if (source && isLiveAnywhere(source, bootId)) {
         dropPending(runId)
         return renderResumeRefusal(source.runId, source.pid)
+      }
+      // Cross-session refusal (#147), AFTER the live check: a foreign run that is
+      // still executing reports the live refusal, the more dangerous condition;
+      // a settled foreign run reports the cross-session situation instead of the
+      // silent empty replay that read as a successful empty resume.
+      if (source && source.sessionID !== context.sessionID) {
+        dropPending(runId)
+        return renderForeignSessionResumeRefusal(source.runId, source.sessionID)
       }
     }
 
