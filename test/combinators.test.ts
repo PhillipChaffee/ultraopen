@@ -55,25 +55,34 @@ describe("parallel", () => {
     expect(results).toEqual([null, 1])
   })
 
-  test("a non-function entry THROWS rather than resolving to null", async () => {
+  test("a non-function entry THROWS a diagnostic with suggestions rather than resolving to null", async () => {
     // Passing promises instead of thunks is the most common authoring error. Degrading it to a row
-    // of nulls would leave the author with no explanation for why nothing ran.
-    await expect(parallel([Promise.resolve(1) as unknown as () => unknown])).rejects.toThrow(/not promises/u)
+    // of nulls would leave the author with no explanation for why nothing ran. The error rides the
+    // same diagnostic contract as every other authoring error (#145): suggestions render.
+    const thrown = await parallel([Promise.resolve(1) as unknown as () => unknown]).then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+    expect(thrown).toBeInstanceOf(WorkflowScriptError)
+    const diagnostic = (thrown as WorkflowScriptError).diagnostic
+    expect(diagnostic.message).toContain("not promises")
+    expect(diagnostic.suggestions?.length ?? 0).toBeGreaterThan(0)
+    expect(diagnostic.suggestions?.join(" ")).toContain("() =>")
   })
 
-  test("passing a non-array throws a TypeError naming the authoring mistake", async () => {
+  test("passing a non-array throws a diagnostic with suggestions naming the authoring mistake", async () => {
     // parallel() is an `async function`, so a synchronous throw inside it surfaces as a
     // rejected promise, not a synchronous throw from the call site — must await it.
     const notAnArray = Promise.resolve([1, 2, 3]) as unknown as readonly (() => unknown)[]
-    try {
-      await parallel(notAnArray)
-      throw new Error("expected parallel() to reject")
-    } catch (error) {
-      expect(error).toBeInstanceOf(TypeError)
-      const {message} = (error as TypeError)
-      expect(message).toContain("not promises")
-      expect(message).toContain("() => agent(...)")
-    }
+    const thrown = await parallel(notAnArray).then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+    expect(thrown).toBeInstanceOf(WorkflowScriptError)
+    const diagnostic = (thrown as WorkflowScriptError).diagnostic
+    expect(diagnostic.message).toContain("not promises")
+    expect(diagnostic.message).toContain("() => agent(...)")
+    expect(diagnostic.suggestions?.length ?? 0).toBeGreaterThan(0)
   })
 
   test("an empty array resolves to []", async () => {
@@ -227,10 +236,18 @@ describe("pipeline", () => {
     expect(results).toEqual([])
   })
 
-  test("passing a non-array as items throws a TypeError", async () => {
+  test("passing a non-array as items throws a diagnostic with suggestions", async () => {
     // pipeline() is also an `async function` — same synchronous-throw-becomes-rejection caveat.
+    // Rides the diagnostic contract (#145): suggestions must survive to the failure render.
     const notAnArray = Promise.resolve([1, 2]) as unknown as readonly unknown[]
-    await expect(pipeline(notAnArray, (prev) => prev)).rejects.toThrow(TypeError)
+    const thrown = await pipeline(notAnArray, (prev) => prev).then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+    expect(thrown).toBeInstanceOf(WorkflowScriptError)
+    const diagnostic = (thrown as WorkflowScriptError).diagnostic
+    expect(diagnostic.message).toContain("array of items")
+    expect(diagnostic.suggestions?.length ?? 0).toBeGreaterThan(0)
   })
 
   test("exactly MAX_ITEMS_PER_CALL items is allowed", async () => {

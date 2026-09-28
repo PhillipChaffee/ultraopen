@@ -336,6 +336,22 @@ describe("renderFailure", () => {
   test("stringifies a non-Error throw", () => {
     expect(renderFailure("just a string")).toBe("just a string")
   })
+
+  test("renders the suggestions of a fed-promises authoring error obtained by real invocation (#145)", async () => {
+    // The error must come from a REAL parallel() call fed promises — a hand-constructed
+    // WorkflowScriptError would be green on arrival, since renderFailure already renders
+    // suggestions for that type. Today this is red: the bare TypeError carries no suggestions.
+    const { parallel } = await import("../src/server/runtime/combinators.js")
+    const thrown = await parallel([Promise.resolve(1) as unknown as () => unknown]).then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+    const out = renderFailure(thrown as Error)
+    expect(out).toContain("RuntimeError")
+    expect(out).toContain("not promises")
+    expect(out).toContain("→")
+    expect(out).toContain("() =>")
+  })
 })
 
 describe("cleanup", () => {
