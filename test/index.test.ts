@@ -2298,6 +2298,28 @@ describe("scriptPath + script together (#143)", () => {
     assertNoAsk()
     expect(background.liveRunsForSession("parent")).toHaveLength(0)
   })
+
+  test("single-source launches are untouched: script only, and scriptPath only from disk", async () => {
+    // The refusal fires on BOTH-supplied calls only. A script-only launch resolves the
+    // inline source exactly as before, and a scriptPath-only launch resolves the file
+    // exactly as before — neither asks about the other, and neither is refused.
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const inline = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 1\n`, background: true },
+      { sessionID: "parent" },
+    )
+    expect(inline).toContain("<workflow-launched")
+    await background.settlePromiseOf(runIdOf(inline))
+    await ensureRunDir("wf_single143", undefined)
+    const paths = await writeScript("wf_single143", `${META}return 'single source from disk'\n`)
+    const fromDisk = await tool.execute(
+      { scriptPath: paths, background: true },
+      { sessionID: "parent" },
+    )
+    expect(fromDisk).toContain("<workflow-launched")
+    await background.settlePromiseOf(runIdOf(fromDisk))
+  })
 })
 
 describe("args transport repair (#78)", () => {
