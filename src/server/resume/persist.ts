@@ -114,7 +114,7 @@ export async function endRun(
     if (current !== undefined && current.status !== "running") {return}
     await appendJournal(manifest.runId, outcome.entries.map((entry) => JSON.stringify(entry)).join("\n"), env)
     await writeResult(manifest.runId, outcome.value, env)
-    const won = await writeTerminalManifest(
+    await writeTerminalManifest(
       manifest.runId,
       {
         ...manifest,
@@ -124,7 +124,6 @@ export async function endRun(
       },
       env,
     )
-    if (!won) {return}
   } catch {
     // See the note above: a persistence failure must not lose a completed run.
   }
