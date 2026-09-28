@@ -99,10 +99,19 @@ export async function writeTerminalManifest(
   // clobbered — first-terminal-write-wins holds on disk.
   const paths = artifactPaths(runId, env)
   const tmp = `${paths.manifestPath}.${randomUUID().slice(0, 8)}.tmp`
-  await writeFile(tmp, JSON.stringify(manifest, null, 2), "utf8")
+  try {
+    await writeFile(tmp, JSON.stringify(manifest, null, 2), "utf8")
+  } catch {
+    // A stage failure (unwritable dir, ENOSPC) is "not won", not a throw: the caller's retry
+    // accounting sees the honest refusal and the exhausted-retry fallthrough reports it.
+    await unlink(tmp).catch(() => undefined)
+    return false
+  }
   const current = await readManifest(runId, env)
   if (current !== undefined && current.status !== "running") {
-    await unlink(tmp).catch(() => undefined)
+    // No .catch here: the stage just succeeded, so an unlink failure is a real error worth
+    // rejecting into the callers' honest-failure paths — not a best-effort cleanup.
+    await unlink(tmp)
     return false
   }
   await rename(tmp, paths.manifestPath)

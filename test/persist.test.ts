@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
-import { chmod, mkdtemp, readdir, rm } from "node:fs/promises"
+import { chmod, mkdir, mkdtemp, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { beginRun, endRun, loadResume, markCancelled, writeTerminalManifest } from "../src/server/resume/persist.js"
@@ -267,4 +267,25 @@ test("the checked terminal write refuses when the manifest already settled (#136
   expect(standing?.status).toBe("cancelled")
   const entries = await readdir(dirname(artifactPaths("wf_abc123", env).manifestPath))
   expect(entries.filter((e) => e.includes(".tmp"))).toEqual([])
+})
+
+test("markCancelled never rejects, even on a caller error (#136)", async () => {
+  // The reaper's fire-and-forget contract applies to the stop path too: the TUI stop and the
+  // tool stop both call this without a handler, so a caller error (a missing manifest record)
+  // must surface as undefined, never a rejection.
+  expect(await markCancelled(undefined as unknown as Parameters<typeof markCancelled>[0], [], env)).toBeUndefined()
+})
+
+test("beginRun stays honest when the run dir cannot be created (#136)", async () => {
+  // The launch's contract: a beginRun failure aborts the launch with a friendly message —
+  // which requires beginRun itself to return undefined instead of rejecting when the run dir
+  // is unwritable (the checked-write's refusal path starts here, at creation).
+  const root = join(base, "opencode", "tool-output", "ultraopen")
+  await mkdir(root, { recursive: true })
+  await chmod(root, 0o500)
+  try {
+    expect(await beginRun(record, env)).toBeUndefined()
+  } finally {
+    await chmod(root, 0o700)
+  }
 })
