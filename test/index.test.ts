@@ -598,7 +598,7 @@ describe("startup orphan sweep", () => {
     // delivery is a fire-and-forget prompt — it can land after the settle — so wait for it
     // instead of racing it (CI's slower runner lost this race once).
     let delivery: { sessionID?: string; text: string } | undefined
-    await waitFor(async () => {
+    await waitFor(() => {
       delivery = hydrationCalls.find((call) => call.text.includes(`run="${runId}"`))
       return delivery !== undefined
     }, "the resume story to hydrate into the original session")
