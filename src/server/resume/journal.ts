@@ -32,6 +32,13 @@ export interface JournalEntry {
   attempt?: number | undefined
 }
 
+/**
+ * The abort reason the stop path carries on its signal; the journal records it per aborted
+ * agent, which is how a deliberate stop is told apart from a parent-turn interrupt — and how
+ * the stop's own cancellation is told apart from a run that failed for its own reasons.
+ */
+export const STOP_ABORT_REASON = "stopped by request"
+
 export interface Manifest {
   runId: string
   bootId: string

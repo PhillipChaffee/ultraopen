@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto"
 import { rename, unlink, writeFile } from "node:fs/promises"
 import { argsHash, sourceHash } from "./key.js"
+import { STOP_ABORT_REASON } from "./journal.js"
 import type { JournalEntry, Manifest } from "./journal.js"
 import {
   appendJournal,
@@ -198,17 +199,44 @@ export async function markCancelled(
   env?: NodeJS.ProcessEnv,
 ): Promise<Manifest | undefined> {
   try {
+    const first = await readManifest(manifest.runId, env)
+    if (first === undefined) {return first}
+    if (first.status === "cancelled") {return first}
+    // A terminal that already stands is the honest loss — UNLESS the run's journal records the
+    // stop's own abort reason: then the terminal is the abort's echo (the settle racing the
+    // stop that authored it, at CI speed the stop's abort precedes its manifest write), and
+    // the stop's cancellation re-claims. The journal is the discriminator: it survives the
+    // torn-write and clobber scenarios the manifest does not.
+    if (first.status !== "running") {
+      const journal = await readJournal(manifest.runId, env)
+      if (!journal.some((entry) => entry.detail === STOP_ABORT_REASON)) {return first}
+    }
     for (let attempt = 0; attempt < 3; attempt++) {
       const current = await readManifest(manifest.runId, env)
-      if (current === undefined || current.status !== "running") {return current}
-      const won = await writeTerminalManifest(
+      if (current === undefined) {return current}
+      if (current.status === "cancelled") {return current}
+      if (current.status === "running") {
+        const won = await writeTerminalManifest(
+          manifest.runId,
+          { ...manifest, status: "cancelled", childSessionIDs, endedAt: Date.now() },
+          env,
+        )
+        if (won) {
+          const after = await readManifest(manifest.runId, env)
+          if (after === undefined || after.status !== "running") {return after}
+          continue
+        }
+      }
+      // The disk moved under the stop (a checkpoint's running rewrite, or the abort's echoed
+      // settle): the stop authored this cancellation, so it re-claims directly over whatever
+      // stands. The manifest-only write keeps the journal/result the run already flushed.
+      await writeManifest(
         manifest.runId,
         { ...manifest, status: "cancelled", childSessionIDs, endedAt: Date.now() },
         env,
       )
-      if (!won) {continue}
       const after = await readManifest(manifest.runId, env)
-      if (after === undefined || after.status !== "running") {return after}
+      if (after !== undefined && after.status === "cancelled") {return after}
     }
     return undefined
   } catch {

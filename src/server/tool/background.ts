@@ -1,10 +1,15 @@
 import type { Manifest } from "../resume/journal.js"
+import { STOP_ABORT_REASON } from "../resume/journal.js"
 import { endRun, markCancelled } from "../resume/persist.js"
 import { artifactPaths, isSafeRunId, readManifest, runDir, writeFailure } from "../resume/store.js"
 import { registry } from "../singleton.js"
 import type { OpencodeClient } from "../types.js"
 import { renderResult } from "./render.js"
 import type { WorkflowResult } from "./workflow.js"
+
+// The constant lives in the journal module (the stop reason is journal-recorded state);
+// re-exported for the callers that read it off this module.
+export { STOP_ABORT_REASON } from "../resume/journal.js"
 
 /**
  * Which launch contract the host process can honor, decided from the process shape.
@@ -138,7 +143,7 @@ export function dropSettled(runId: string): void {
  * and its never-auto-resume invariant land with ticket #11; the marker exists
  * from here so that work has a single definition to read.
  */
-export const STOP_ABORT_REASON = "stopped by request"
+
 
 /** runId -> the controller whose signal drives that detached run's engine. */
 const stopHandles = new Map<string, AbortController>()
