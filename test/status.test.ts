@@ -400,3 +400,24 @@ test("a corrupt manifest reports the corrupt state, never an unknown run (#136)"
   expect(report.failure?.message).toContain("unreadable")
   expect(report.failure?.dir).toContain("wf_status01")
 })
+
+test("a settled-completed report waits for its result file to land (#136 coherence)", async () => {
+  // The terminal manifest is the settle's commit point; result.json lands right after it. A read
+  // that races the settle must NOT return a completed report with no value — the tool waits for
+  // the artifact within a short grace, then returns whatever stands.
+  let reads = 0
+  const base = files({ "manifest.json": JSON.stringify({ ...MANIFEST_RUNNING, status: "completed" }) })
+  const lateResult = (path: string): Promise<string> => {
+    const name = path.split("/").pop() ?? ""
+    if (name === "result.json") {
+      reads++
+      if (reads < 3) {return Promise.reject(new Error("ENOENT: not yet"))}
+    }
+    const body = base[name]
+    if (body === undefined) {return Promise.reject(new Error(`ENOENT: ${path}`))}
+    return Promise.resolve(body)
+  }
+  const report = await executeStatus({ runId: RUN, wait: 5 }, { ...deps(), readFile: lateResult })
+  expect(report.status).toBe("completed")
+  expect(report.value).toEqual({ final: "value" })
+})

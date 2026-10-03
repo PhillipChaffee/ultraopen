@@ -23,6 +23,13 @@ export interface StatusArgs {
 
 export const MAX_WAIT_SECONDS = 300
 const POLL_INTERVAL_MS = 1000
+/**
+ * (#136) The terminal manifest is the settle's commit point; its artifacts (result.json for
+ * completed, failure.txt for failed) land right after it. A read that races the settle would
+ * return a settled report with its value missing — so a terminal report whose artifact has not
+ * landed keeps polling within this grace, then returns whatever stands.
+ */
+const COHERENCE_GRACE_MS = 2000
 /** Snapshot logs are capped for the same reason ProgressWriter caps its own. */
 const MAX_LOG_LINES = 20
 
@@ -103,6 +110,7 @@ export async function executeStatus(args: StatusArgs, deps: StatusDeps = {}): Pr
    },
    cap = Math.min(MAX_WAIT_SECONDS, Math.max(0, args.wait ?? 0)),
    deadline = now() + cap * 1000
+  let coherenceDeadline: number | undefined
 
   for (;;) {
     const manifestRead: ManifestRead = await readManifestRead(),
@@ -135,7 +143,25 @@ export async function executeStatus(args: StatusArgs, deps: StatusDeps = {}): Pr
 
     const entries = await parseJournalSafe(await readFile(paths.journalPath).catch(() => ""))
     const report = await buildSnapshot({ args, manifest, progress, entries, deps, isAlive, dir, resultPath: paths.resultPath, failurePath: paths.failurePath, readFile })
-    const settled = report.status !== "running" || deps.signal?.aborted === true || now() >= deadline
+
+    let artifactPath: string | undefined
+    if (report.status === "completed") {artifactPath = paths.resultPath}
+    else if (report.status === "failed") {artifactPath = paths.failurePath}
+    let artifactPresent = true
+    if (artifactPath !== undefined) {
+      try {
+        await readFile(artifactPath)
+      } catch {
+        artifactPresent = false
+      }
+    }
+    if (!artifactPresent && coherenceDeadline === undefined) {coherenceDeadline = now() + COHERENCE_GRACE_MS}
+    const graceExpired = coherenceDeadline !== undefined && now() >= coherenceDeadline
+    const settled =
+      (report.status !== "running" && (artifactPresent || graceExpired)) ||
+      deps.signal?.aborted === true ||
+      graceExpired ||
+      (now() >= deadline && report.status === "running")
     if (settled) {return report}
     const remaining = deadline - now()
     await sleep(Math.min(POLL_INTERVAL_MS, Math.max(1, remaining)))
