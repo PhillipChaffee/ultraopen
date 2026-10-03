@@ -594,8 +594,14 @@ describe("startup orphan sweep", () => {
 
     const settled = await readManifest(runId)
     expect(settled?.status).toBe("completed")
-    // Hydrated the original session, with the resume story attached to the result.
-    const delivery = hydrationCalls.find((call) => call.text.includes(`run="${runId}"`))
+    // Hydrated the original session, with the resume story attached to the result. The
+    // delivery is a fire-and-forget prompt — it can land after the settle — so wait for it
+    // instead of racing it (CI's slower runner lost this race once).
+    let delivery: { sessionID?: string; text: string } | undefined
+    await waitFor(async () => {
+      delivery = hydrationCalls.find((call) => call.text.includes(`run="${runId}"`))
+      return delivery !== undefined
+    }, "the resume story to hydrate into the original session")
     expect(delivery?.sessionID).toBe(sessionID)
     expect(delivery?.text).toContain("<workflow-completed")
     expect(delivery?.text).toContain(`${runId} was interrupted when opencode exited; it has been resumed`)
