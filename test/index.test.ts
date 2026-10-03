@@ -971,8 +971,13 @@ describe("background launch contract", () => {
     controller.abort()
     await settle(runId)
     // The run's own end-of-script cleanup aborts children as always; what must
-    // NOT happen is a signal-driven abort mid-run killing the agent's prompt.
-    const settledManifest = await readManifest(runId, undefined)
+    // NOT happen is a signal-driven abort mid-run killing the agent's prompt. The settle's
+    // manifest write lands right after its promise resolves — poll rather than race it.
+    let settledManifest = await readManifest(runId, undefined)
+    for (let i = 0; i < 100 && settledManifest?.status === "running"; i++) {
+      await new Promise((resolve) => {setTimeout(resolve, 20)})
+      settledManifest = await readManifest(runId, undefined)
+    }
     expect(settledManifest?.status).toBe("completed")
   })
 
@@ -1069,7 +1074,9 @@ describe("background launch contract", () => {
     await settle(runId)
     const status = statusToolOf(ultraopen({ client: stubClient }))
     if (!status) {throw new Error("status tool was not registered")}
-    const report = await status.execute({ runId }, { sessionID: "parent" })
+    // The settle's disk writes land just after its promise resolves (the atomic manifest write
+    // is the commit point; the artifacts follow) — the read must not race them: poll to terminal.
+    const report = await status.execute({ runId, wait: 5 }, { sessionID: "parent" })
     expect(report).toContain(`status="completed"`)
     expect(report).toContain("the-value")
     expect(report).toContain("agents total=1 running=0 done=1 failed=0")
