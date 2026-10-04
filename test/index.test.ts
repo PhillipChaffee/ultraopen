@@ -2146,16 +2146,10 @@ describe("stop path — the TUI control channel (#134)", () => {
     )
 
     // The watcher ticks every second; give the cancelled write its full window.
-    let settled: string | undefined
-    for (let i = 0; i < 600; i++) {
+    await waitFor(async () => {
       const manifest = await readManifest(runId)
-      if (manifest?.status !== "running") {
-        settled = manifest?.status
-        break
-      }
-      await new Promise((resolve) => {setTimeout(resolve, 10)})
-    }
-    expect(settled).toBe("cancelled")
+      return manifest?.status === "cancelled"
+    }, "the control stop to settle the run cancelled")
 
     // Unwind: the parked child finishes, the engine sees the aborted signal, the next
     // agent() call throws, and the detached task settles WITHOUT a notification — the

@@ -48,6 +48,15 @@ const runDirAbs = (): string => join(base, "opencode", "tool-output", "ultraopen
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => {setTimeout(resolve, ms)})
 
+/** Bounded waiting with a labelled timeout — the wait-instead-of-race idiom (PR #153). */
+const waitFor = async (until: () => boolean | Promise<boolean>, what: string): Promise<void> => {
+  for (let waited = 0; waited < 600; waited++) {
+    if (await until()) {return}
+    await sleep(10)
+  }
+  throw new Error(`timed out waiting for ${what}`)
+}
+
 let base: string,
  env: NodeJS.ProcessEnv
 
@@ -189,9 +198,7 @@ describe("the control-channel stop (#134)", () => {
       "utf8",
     )
 
-    for (let i = 0; i < 200 && dispatches.length < 2; i++) {
-      await sleep(10)
-    }
+    await waitFor(() => dispatches.length >= 2, "the watcher to dispatch both commands")
     expect(dispatches).toEqual(["pause", "stop-run"])
     // The hook is the stop surface's alone: pause/resume dispatch untouched.
     expect(fired).toEqual(["stop"])
@@ -209,11 +216,10 @@ describe("the control-channel stop (#134)", () => {
     // The trip is synchronous inside the hook; markCancelled's write follows.
     expect(controller.signal.aborted).toBe(true)
     expect(controller.signal.reason).toBe(CONTROL_STOP_ABORT_REASON)
-    let settled: Manifest | undefined
-    for (let i = 0; i < 200 && (settled = await readManifest(RUN_ID, env))?.status !== "cancelled"; i++) {
-      await sleep(10)
-    }
-    expect(settled?.status).toBe("cancelled")
+    await waitFor(async () => {
+      const settled = await readManifest(RUN_ID, env)
+      return settled?.status === "cancelled"
+    }, "the cancelled write")
   })
 
   test("without a stop surface, a control stop-run dispatches but never trips the engine signal", async () => {
@@ -228,9 +234,7 @@ describe("the control-channel stop (#134)", () => {
     wiring.executeContext.registerControl?.((command) => {dispatches.push(command)})
     await writeStopRun()
 
-    for (let i = 0; i < 200 && dispatches.length === 0; i++) {
-      await sleep(10)
-    }
+    await waitFor(() => dispatches.length > 0, "the watcher to dispatch the stop-run")
     expect(dispatches).toHaveLength(1)
     expect(controller.signal.aborted).toBe(false)
   })

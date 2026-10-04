@@ -296,6 +296,10 @@ describe("the stopped run's failure surface (#135)", () => {
     const empty = new AbortController()
     empty.abort("")
     expect(stopReasonOf(empty.signal)).toBeUndefined()
+    // A whitespace-only reason names nothing either.
+    const blank = new AbortController()
+    blank.abort("   ")
+    expect(stopReasonOf(blank.signal)).toBeUndefined()
   })
 
   test("renderStopFailure names the stop, quotes the reason's provenance, and keeps the resume pointer", () => {
