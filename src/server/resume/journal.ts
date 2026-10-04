@@ -39,6 +39,30 @@ export interface JournalEntry {
  */
 export const STOP_ABORT_REASON = "stopped by request"
 
+/**
+ * The run-control channel's abort reason: the canonical stop reason plus the provenance of
+ * the surface that requested it (#134). The suffix is what the journal records and what a
+ * stopped run's failure surface quotes, so the debugging direction survives the process
+ * that stopped it. `isStopAbortDetail` reads both through one recognizer.
+ */
+export const CONTROL_STOP_ABORT_REASON = `${STOP_ABORT_REASON} (run-control channel)`
+
+/**
+ * True when a journal entry's detail records a stop-path abort.
+ *
+ * The bare reason is the tool stop's (`workflow({ stop })`); the control channel's carries
+ * its provenance as a parenthesized suffix. Matching the exact bare string and that
+ * documented suffix shape keeps the two discriminators — the cancel write's re-claim and
+ * the never-auto-resume sweep — honest for both stops, while an arbitrary failure detail
+ * (server error strings reach the journal verbatim) can only collide by literally opening
+ * with the reason plus an opening parenthesis. The `typeof` guard is load-bearing:
+ * parseJournal tolerates hand-edited journals whose `detail` is any JSON, and a non-string
+ * must read as "not a stop", never throw through the recognizer.
+ */
+export function isStopAbortDetail(detail: string | undefined): boolean {
+  return detail === STOP_ABORT_REASON || (typeof detail === "string" && detail.startsWith(`${STOP_ABORT_REASON} (`))
+}
+
 export interface Manifest {
   runId: string
   bootId: string

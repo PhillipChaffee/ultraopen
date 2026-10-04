@@ -6,7 +6,7 @@ import { resumeInterruptedRuns } from "../src/server/resume/autoresume.js"
 import { appendJournal, artifactPaths, ensureRunDir, readManifest, writeManifest, writeScript } from "../src/server/resume/store.js"
 import { argsHash } from "../src/server/resume/key.js"
 import { resolveOptions } from "../src/server/options.js"
-import { STOP_ABORT_REASON, liveRunsForSession, resetForTests, settlePromiseOf } from "../src/server/tool/background.js"
+import { CONTROL_STOP_ABORT_REASON, STOP_ABORT_REASON, liveRunsForSession, resetForTests, settlePromiseOf } from "../src/server/tool/background.js"
 import { registry } from "../src/server/singleton.js"
 import type { execute, WorkflowArgs, WorkflowContext, WorkflowResult } from "../src/server/tool/workflow.js"
 import type { JournalEntry, Manifest } from "../src/server/resume/journal.js"
@@ -291,6 +291,20 @@ describe("resumeInterruptedRuns", () => {
     // The crash-mid-stop race: the user asked to stop, the process died before the cancelled
     // write landed. The journal's stop marker must keep that run off the resume path forever.
     const stoppedEntry: JournalEntry = { ...journalEntry(), status: "null", reason: "aborted", detail: STOP_ABORT_REASON },
+     entry = await seedCandidate({}, [stoppedEntry]),
+     { fn } = makeExecute()
+
+    const result = await resumeInterruptedRuns({ ...deps({ executeFn: fn }), candidates: [entry] })
+    expect(result).toEqual({ resumed: [], skipped: 1, failed: 0 })
+    expect(await statusOf(RUN_ID)).toBe("orphaned")
+    expect(await readMarker(RUN_ID)).toBe(RUN_ID)
+  })
+
+  test("skips a run whose children recorded the control channel's stop request", async () => {
+    // The TUI's stop-run aborts with the canonical reason plus its provenance; the
+    // never-auto-resume invariant reads the stop through the same recognizer, so a
+    // control-stopped run is as unresumable as a tool-stopped one.
+    const stoppedEntry: JournalEntry = { ...journalEntry(), status: "null", reason: "aborted", detail: CONTROL_STOP_ABORT_REASON },
      entry = await seedCandidate({}, [stoppedEntry]),
      { fn } = makeExecute()
 

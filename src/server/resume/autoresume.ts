@@ -2,7 +2,7 @@ import { readFile, rename, rm } from "node:fs/promises"
 import { join } from "node:path"
 import type { UltraopenOptions } from "../options.js"
 import type { OpencodeClient } from "../types.js"
-import { STOP_ABORT_REASON } from "./journal.js"
+import { isStopAbortDetail } from "./journal.js"
 import { nameRun, registerPending } from "../tool/background.js"
 import { startDetachedRun } from "../tool/settlement.js"
 import { prepare } from "../tool/workflow.js"
@@ -152,11 +152,12 @@ export async function resumeInterruptedRuns(deps: AutoResumeDeps): Promise<AutoR
       return "failed"
     }
 
-    // Stopped runs never resume: if any child recorded the stop path's abort reason, the user
+    // Stopped runs never resume: if any child recorded a stop path's abort reason, the user
     // asked for this work to end — the crash-mid-stop race (process died between the abort and
-    // the cancelled write) must not resurrect it.
+    // the cancelled write) must not resurrect it. The recognizer covers the tool stop's bare
+    // reason and the run-control channel's provenance-suffixed one (#134).
     const journal = await readJournal(runId, env)
-    if (journal.some((entry) => entry.detail === STOP_ABORT_REASON)) {
+    if (journal.some((entry) => isStopAbortDetail(entry.detail))) {
       await renameBack()
       return "skipped"
     }

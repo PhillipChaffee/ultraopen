@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { beginRun, endRun, loadResume, markCancelled, writeTerminalManifest } from "../src/server/resume/persist.js"
 import { artifactPaths, appendJournalEntry, ensureRunDir, readJournal, readManifest, writeManifest } from "../src/server/resume/store.js"
+import { CONTROL_STOP_ABORT_REASON, STOP_ABORT_REASON } from "../src/server/resume/journal.js"
 import type { JournalEntry } from "../src/server/resume/journal.js"
 
 let base: string,
@@ -189,6 +190,46 @@ describe("markCancelled — the stop path's terminal write", () => {
     await chmod(join(base, "opencode", "tool-output", "ultraopen", "wf_abc123"), 0o500)
 
     expect(await markCancelled(manifest, [], env)).toBeUndefined()
+  })
+
+  test("re-claims a settle that echoed the tool stop's abort, journal-discriminated", async () => {
+    // At CI speed the stop's abort can precede its manifest write: the unwind's failed
+    // settle lands first, and the journal's stop detail is the discriminator that lets
+    // the stop's cancellation re-claim what its own abort authored.
+    const manifest = await beginRun(record, env)
+    if (!manifest) {throw new Error("the run did not open")}
+    const stoppedEntry: JournalEntry = { ...entry, status: "null", reason: "aborted", detail: STOP_ABORT_REASON }
+    await appendJournalEntry("wf_abc123", stoppedEntry, env)
+    await endRun(manifest, { status: "failed", entries: [stoppedEntry], value: null, childSessionIDs: [] }, env)
+
+    const settled = await markCancelled(manifest, [], env)
+    expect(settled?.status).toBe("cancelled")
+  })
+
+  test("re-claims the control channel's abort echo — the provenance suffix counts as the stop", async () => {
+    // The run-control channel stops with its own reason string (the canonical stop
+    // reason plus its provenance). The recognizer must accept it, or a TUI stop that
+    // loses the first manifest race would leave the run recorded failed forever.
+    const manifest = await beginRun(record, env)
+    if (!manifest) {throw new Error("the run did not open")}
+    const stoppedEntry: JournalEntry = { ...entry, status: "null", reason: "aborted", detail: CONTROL_STOP_ABORT_REASON }
+    await appendJournalEntry("wf_abc123", stoppedEntry, env)
+    await endRun(manifest, { status: "failed", entries: [stoppedEntry], value: null, childSessionIDs: [] }, env)
+
+    const settled = await markCancelled(manifest, [], env)
+    expect(settled?.status).toBe("cancelled")
+  })
+
+  test("a genuine failure stands — a failed settle with no stop detail is never re-claimed", async () => {
+    // The discriminator exists to identify the stop's OWN abort echo; without it, a run
+    // that failed on its own a moment before the stop arrived keeps its honest record.
+    const manifest = await beginRun(record, env)
+    if (!manifest) {throw new Error("the run did not open")}
+    await appendJournalEntry("wf_abc123", entry, env)
+    await endRun(manifest, { status: "failed", entries: [entry], value: null, childSessionIDs: [] }, env)
+
+    const settled = await markCancelled(manifest, [], env)
+    expect(settled?.status).toBe("failed")
   })
 })
 

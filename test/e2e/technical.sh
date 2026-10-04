@@ -453,6 +453,121 @@ else
   bad "the stop probe produced no run dir" "see $OUT/t6b.out"
 fi
 
+section "T6c — control-channel stop: a stop-run command in the run directory records cancelled"
+# The TUI never calls the workflow tool to stop a run — it writes a stop-run command
+# into the run's control.jsonl and the run's own watcher dispatches it (#134). The
+# model launches a ten-agent run and holds its turn polling workflow_status; the SUITE
+# writes the command into the run directory mid-turn, exactly as the TUI would.
+# Proofs: the manifest settles cancelled (the tool stop's invariant, through the
+# control channel), the failure surface names the stop with the channel's provenance
+# instead of a script-authored garble (#135), no outcome notification contradicts the
+# cancelled record (neither workflow-failed nor workflow-stopped may hydrate), and the
+# journal went quiet — no child kept working after the stop.
+t6c_prompt() {
+  printf 'Call the workflow tool now. Pass no scriptPath and no args, background true. Use this script exactly, unchanged:\n\n%s\n\nThe tool returns a launch result with a run id, not the outcome. Then call workflow_status with that run id and wait=120 and reply with the status it reported. Never end your turn while the run is unsettled.' \
+    "$(cat "$E2E_DIR/fixtures/stop.js")"
+}
+runs_snapshot "$OUT/runs-before-t6c.txt"
+T6C_PROMPT="$(t6c_prompt)"
+opencode run --auto --format json "$T6C_PROMPT" >"$OUT/t6c.json" 2>&1 &
+T6C_PID=$!
+manifest_pid "$T6C_PID" "opencode run --auto --format json (t6c control-stop turn)"
+RUN6C=""
+for _ in $(seq 1 240); do
+  RUN6C="$(newest_run "$OUT/runs-before-t6c.txt")"
+  if [ -n "$RUN6C" ] && [ "$(manifest_status "$RUN6C")" = "running" ]; then
+    break
+  fi
+  sleep 1
+done
+if [ -z "$RUN6C" ]; then
+  bad "the control-stop probe produced no live run dir" "see $OUT/t6c.json"
+else
+  preserve_run "$RUN6C"
+  printf '{"seq":1,"action":"stop-run","run":"%s"}\n' "$RUN6C" >> "$RUN_ROOT/$RUN6C/control.jsonl"
+  # The turn ends when the status poll reports the settled status; bound the wait.
+  T6C_TURN=0
+  while kill -0 "$T6C_PID" 2>/dev/null && [ "$T6C_TURN" -lt 300 ]; do
+    sleep 2
+    T6C_TURN=$((T6C_TURN + 2))
+  done
+  kill "$T6C_PID" 2>/dev/null || true
+  for _ in $(seq 1 5); do kill -0 "$T6C_PID" 2>/dev/null || break; sleep 2; done
+  kill -9 "$T6C_PID" 2>/dev/null || true
+  T6C_SETTLED=0
+  for _ in $(seq 1 60); do
+    if [ "$(manifest_status "$RUN6C")" = "cancelled" ]; then
+      T6C_SETTLED=1
+      break
+    fi
+    sleep 1
+  done
+  if [ "$T6C_SETTLED" = "1" ]; then
+    ok "the control-channel stop recorded the run cancelled"
+  else
+    bad "the control-channel stop did not record cancelled" "manifest $(manifest_status "$RUN6C") — inspect $RUN_ROOT/$RUN6C and $OUT/t6c.json"
+  fi
+  t6c_notification() {
+    # BOTH notification shapes are forbidden for a control-stopped run: no
+    # workflow-failed (the run was stopped, it did not fail on its own) and no
+    # workflow-stopped (that confirmation is the tool stop's surface).
+    python3 - "$XDG_DATA_HOME/opencode/opencode.db" "$RUN6C" <<'PYEOF'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+row = db.execute(
+    "SELECT 1 FROM part WHERE data LIKE ? AND (data LIKE ? OR data LIKE ?) LIMIT 1",
+    ('%"synthetic":true%', f'%workflow-failed run=%{sys.argv[2]}%', f'%workflow-stopped run=%{sys.argv[2]}%'),
+).fetchone()
+sys.exit(0 if row is None else 1)
+PYEOF
+  }
+  if t6c_notification; then
+    ok "no outcome notification contradicts the cancelled record"
+  else
+    bad "a synthetic notification hydrated for the control-stopped run" "inspect $XDG_DATA_HOME/opencode/opencode.db"
+  fi
+  # failure.txt carries the stop, with the channel's provenance — never a script-authored
+  # garble. The settle's write trails the manifest's, so wait for it.
+  T6C_FAILURE=0
+  for _ in $(seq 1 60); do
+    if [ -f "$RUN_ROOT/$RUN6C/failure.txt" ]; then
+      T6C_FAILURE=1
+      break
+    fi
+    sleep 1
+  done
+  if [ "$T6C_FAILURE" = "1" ]; then
+    if grep -q "stopped by request (run-control channel)" "$RUN_ROOT/$RUN6C/failure.txt" &&
+       ! grep -q "wave 1 integration failed" "$RUN_ROOT/$RUN6C/failure.txt"; then
+      ok "failure.txt names the stop with the channel's provenance"
+    else
+      bad "failure.txt does not name the control-channel stop" "inspect $RUN_ROOT/$RUN6C/failure.txt"
+    fi
+  else
+    bad "failure.txt never landed for the control-stopped run" "inspect $RUN_ROOT/$RUN6C"
+  fi
+  # The stop's provenance in the journal is what makes the sweep refuse this run (#84);
+  # a stop landing before an agent could start journals nothing, so that half is weather.
+  if [ "$(journal_grep "$RUN6C" "stopped by request (run-control channel)")" -ge 1 ]; then
+    ok "the journal carries the control channel's stop provenance"
+  else
+    note "no control-channel reason in the journal — the stop landed before an agent could start; the cancelled manifest still decides"
+  fi
+  # No zombie child keeps working after the stop: the journal must go quiet.
+  T6C_QUIET=0
+  for _ in 1 2 3 4 5 6; do
+    T6C_Q1="$(journal_count "$RUN6C")"
+    sleep 5
+    T6C_Q2="$(journal_count "$RUN6C")"
+    if [ "$T6C_Q1" = "$T6C_Q2" ]; then T6C_QUIET=1; break; fi
+  done
+  if [ "$T6C_QUIET" = "1" ]; then
+    ok "the journal went quiet after the control stop — no child kept working"
+  else
+    bad "the journal kept growing after the control stop ($T6C_Q1 → $T6C_Q2 entries)" "a child survived the stop — inspect $RUN_ROOT/$RUN6C/journal.jsonl"
+  fi
+fi
+
 section "T7 — agentDeadlineMs option (tuple-form options reach the engine)"
 scratch_write_config '{"agentDeadlineMs": 1}'
 runs_snapshot "$OUT/runs-before-t7.txt"

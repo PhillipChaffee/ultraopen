@@ -8,7 +8,7 @@ import { Run } from "../src/server/runtime/run.js"
 import type { ProgressEvent, RunOptions } from "../src/server/runtime/run.js"
 import type { JournalEntry } from "../src/server/resume/journal.js"
 import { registry } from "../src/server/singleton.js"
-import { STOP_ABORT_REASON } from "../src/server/tool/background.js"
+import { CONTROL_STOP_ABORT_REASON, STOP_ABORT_REASON } from "../src/server/tool/background.js"
 import { LARGE_RUN_AGENTS, LARGE_RUN_PROJECTED_TOKENS, MAX_AGENTS_PER_RUN, MAX_AGENT_RESTARTS } from "../src/server/script/limits.js"
 import { chainKey } from "../src/server/resume/key.js"
 
@@ -625,6 +625,27 @@ describe("Run.agent — abort", () => {
     expect(stopped?.status).toBe("null")
     expect(stopped?.reason).toBe("aborted")
     expect(stopped?.detail).toBe(STOP_ABORT_REASON)
+  })
+
+  test("the control channel's abort reason stamps its provenance into the null journal entry", async () => {
+    // The run-control channel stops with the canonical reason plus its provenance, and the
+    // journal records the signal's reason verbatim — the durable discriminator the cancel
+    // re-claim and the never-auto-resume sweep both read, and the provenance failure.txt
+    // quotes. This pins that the suffix survives journaling exactly as written.
+    const controller = new AbortController(),
+     { client } = makeClient({
+      prompt: () => {
+        controller.abort(CONTROL_STOP_ABORT_REASON)
+        return Promise.resolve({ data: { info: baseInfo({ error: { name: "MessageAbortedError" } }), parts: [] } })
+      },
+    }),
+     run = makeRun(client, { signal: controller.signal })
+
+    await expect(run.agent("first")).resolves.toBeNull()
+    const stopped = run.journal.entries.at(-1)
+    expect(stopped?.status).toBe("null")
+    expect(stopped?.reason).toBe("aborted")
+    expect(stopped?.detail).toBe(CONTROL_STOP_ABORT_REASON)
   })
 
   test("an already-aborted run throws BEFORE creating a session or worktree", async () => {

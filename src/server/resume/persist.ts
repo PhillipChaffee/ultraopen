@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto"
 import { rename, unlink, writeFile } from "node:fs/promises"
 import { argsHash, sourceHash } from "./key.js"
-import { STOP_ABORT_REASON } from "./journal.js"
+import { isStopAbortDetail } from "./journal.js"
 import type { JournalEntry, Manifest } from "./journal.js"
 import {
   appendJournal,
@@ -209,7 +209,7 @@ export async function markCancelled(
     // torn-write and clobber scenarios the manifest does not.
     if (first.status !== "running") {
       const journal = await readJournal(manifest.runId, env)
-      if (!journal.some((entry) => entry.detail === STOP_ABORT_REASON)) {return first}
+      if (!journal.some((entry) => isStopAbortDetail(entry.detail))) {return first}
     }
     for (let attempt = 0; attempt < 3; attempt++) {
       const current = await readManifest(manifest.runId, env)

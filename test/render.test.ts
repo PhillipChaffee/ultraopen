@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test"
-import { renderCapRefusal, renderForeignSessionResumeRefusal, renderLaunch, renderRefusal, renderResult, renderSiblingAdvisory, renderStatus, renderStringifiedArgsRefusal, renderUnrecordedSessionResumeRefusal } from "../src/server/tool/render.js"
+import { renderCapRefusal, renderForeignSessionResumeRefusal, renderLaunch, renderRefusal, renderResult, renderSiblingAdvisory, renderStatus, renderStopFailure, renderStringifiedArgsRefusal, renderUnrecordedSessionResumeRefusal, stopReasonOf } from "../src/server/tool/render.js"
+import { CONTROL_STOP_ABORT_REASON, STOP_ABORT_REASON } from "../src/server/tool/background.js"
+import { runDir } from "../src/server/resume/store.js"
 import type { WorkflowResult } from "../src/server/tool/workflow.js"
 import type { StatusReport } from "../src/server/tool/status.js"
 
@@ -273,5 +275,40 @@ describe("renderResult", () => {
     expect(rendered).not.toContain("Sibling")
     const bare = renderResult(result())
     expect(rendered).toBe(bare)
+  })
+})
+
+describe("the stopped run's failure surface (#135)", () => {
+  test("stopReasonOf reads a signal that aborted with a named reason", () => {
+    const controller = new AbortController()
+    expect(stopReasonOf(controller.signal)).toBeUndefined()
+    controller.abort(STOP_ABORT_REASON)
+    expect(stopReasonOf(controller.signal)).toBe(STOP_ABORT_REASON)
+  })
+
+  test("a reasonless abort is never a stop — that is the parent-turn interrupt's shape", () => {
+    // The host aborts a tool call with a DOMException, not a string; an interrupt must
+    // keep the failure text it always had, and only a NAMED abort reads as a stop.
+    const controller = new AbortController()
+    controller.abort()
+    expect(stopReasonOf(controller.signal)).toBeUndefined()
+    expect(stopReasonOf(undefined)).toBeUndefined()
+    const empty = new AbortController()
+    empty.abort("")
+    expect(stopReasonOf(empty.signal)).toBeUndefined()
+    // A whitespace-only reason names nothing either.
+    const blank = new AbortController()
+    blank.abort("   ")
+    expect(stopReasonOf(blank.signal)).toBeUndefined()
+  })
+
+  test("renderStopFailure names the stop, quotes the reason's provenance, and keeps the resume pointer", () => {
+    const out = renderStopFailure(CONTROL_STOP_ABORT_REASON, "wf_stop001")
+    expect(out).toContain("The run was stopped")
+    expect(out).toContain("did not fail on its own")
+    expect(out).toContain(`Reason: ${CONTROL_STOP_ABORT_REASON}.`)
+    expect(out).toContain("Completed agents remain on disk for a later resume")
+    // The pointer is renderFailure's resume affordance; a stopped run's reader needs it too.
+    expect(out).toContain(`<run id="wf_stop001" dir="${runDir("wf_stop001")}" />`)
   })
 })

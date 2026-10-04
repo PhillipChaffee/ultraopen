@@ -7,6 +7,7 @@ import { executeStatus } from "../src/server/tool/status.js"
 import { mode } from "../src/server/ultracode/mode.js"
 import type { MutableConfig } from "../src/server/ultracode/config.js"
 import { ensureRunDir, artifactPaths, dataRoot, readJournal, readManifest, writeManifest, writeScript } from "../src/server/resume/store.js"
+import { controlPath } from "../src/server/runtime/control.js"
 import { argsHash } from "../src/server/resume/key.js"
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -630,9 +631,12 @@ describe("startup orphan sweep", () => {
     await writeFile(join(artifactPaths(runId).dir, "interrupted.txt"), runId, "utf8")
 
     ultraopen({ client: stubClient }, { autoResume: false })
-    await new Promise((resolve) => {
-      setTimeout(resolve, 20)
-    })
+    // The boot sweep is fire-and-forget: wait for the orphaning instead of racing it
+    // with a fixed sleep (the same class of CI-visible race PR #153 de-flaked twice).
+    await waitFor(async () => {
+      const swept = await readManifest(runId)
+      return swept?.status === "orphaned"
+    }, "the orphaning sweep")
 
     const orphaned = await readManifest(runId)
     expect(orphaned?.status).toBe("orphaned")
@@ -2096,6 +2100,154 @@ describe("stop path — workflow({ stop })", () => {
       expect(call.text).toContain("<workflow-stopped")
       expect(call.text).not.toContain("<workflow-failed")
     }
+  })
+})
+
+describe("stop path — the TUI control channel (#134)", () => {
+  /**
+   * The control channel is a file contract: the TUI writes control.jsonl into the run
+   * directory and the run's own watcher dispatches it. A stop-run command through that
+   * channel must settle the run exactly as `workflow({ stop })` does — cancelled, with
+   * no outcome notification contradicting the record.
+   */
+
+  test("a stop-run command settles the detached run cancelled and suppresses the outcome", async () => {
+    // A real detached launch against a parked child, driven through the REAL watcher:
+    // the engine parks mid-flight until the stop has landed and the test releases it.
+    let release!: () => void
+    const parked = new Promise<void>((resolve) => {release = resolve})
+    const parkClient = {
+      ...stubClient,
+      session: {
+        ...stubClient.session,
+        prompt: (): Promise<unknown> => parked.then(() => ({ data: { info: {}, parts: [] } })),
+      },
+    }
+    const tool = toolOf(ultraopen({ client: parkClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const launched = await tool.execute(
+      { script: `${META}await agent('a')\nawait agent('b')\nreturn 'NEVER-SEEN'\n`, background: true },
+      { sessionID: "parent" },
+    )
+    expect(launched).toContain("<workflow-launched")
+    const runId = runIdOf(launched)
+    expect(background.stopHandleOf(runId)).toBeDefined()
+
+    // The run is live; the stop command arrives the way the TUI writes it.
+    await waitFor(async () => {
+      const manifest = await readManifest(runId)
+      return manifest?.status === "running"
+    }, "the running manifest")
+    const dir = artifactPaths(runId).dir
+    await writeFile(
+      controlPath(dir),
+      `${JSON.stringify({ seq: 1, action: "stop-run", run: runId })}\n`,
+      "utf8",
+    )
+
+    // The watcher ticks every second; give the cancelled write its full window.
+    await waitFor(async () => {
+      const manifest = await readManifest(runId)
+      return manifest?.status === "cancelled"
+    }, "the control stop to settle the run cancelled")
+
+    // Unwind: the parked child finishes, the engine sees the aborted signal, the next
+    // agent() call throws, and the detached task settles WITHOUT a notification — the
+    // control stop carries no confirmation of its own, and no outcome may contradict
+    // the cancelled record.
+    release()
+    await background.settlePromiseOf(runId)
+
+    const manifest = await readManifest(runId)
+    expect(manifest?.status).toBe("cancelled")
+    expect(manifest?.childSessionIDs.length).toBeGreaterThan(0)
+    const deliveries = hydrationCalls.filter((call) => call.text.includes(`run="${runId}"`))
+    // Neither a workflow-failed (the run was stopped, it did not fail on its own) nor a
+    // workflow-stopped (that confirmation is the tool stop's surface) may have hydrated.
+    expect(deliveries).toEqual([])
+    // The stop handle went with the settle: a later tool stop reports not-live.
+    expect(background.stopHandleOf(runId)).toBeUndefined()
+  })
+})
+
+describe("the blocking failure render (#135)", () => {
+  /**
+   * The blocking contract renders the failure as the tool result. When the run was
+   * stopped — the signal carries a NAMED abort reason — the render must say so, the same
+   * composition the detached contract writes to failure.txt. A reasonless abort is the
+   * parent-turn interrupt's shape and keeps the text it always had.
+   */
+
+  /** A blocking run parked mid-flight, with the release for its parked child. */
+  const parkedBlocking = (): {
+    turn: Promise<string>
+    release: () => void
+    runId: () => Promise<string>
+    abort: (reason?: string) => void
+  } => {
+    let release!: () => void
+    const parked = new Promise<void>((resolve) => {release = resolve})
+    const parkClient = {
+      ...stubClient,
+      session: {
+        ...stubClient.session,
+        prompt: (): Promise<unknown> => parked.then(() => ({ data: { info: {}, parts: [] } })),
+      },
+    }
+    const controller = new AbortController(),
+      tool = toolOf(ultraopen({ client: parkClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const turn = tool.execute(
+      { script: `${META}await agent('a')\nawait agent('b')\nreturn 'NEVER'\n`, background: false },
+      { sessionID: "parent", abort: controller.signal },
+    )
+    return {
+      turn,
+      release,
+      runId: async () => {
+        await waitFor(async () => {
+          const live = background.liveRunsForSession("parent")
+          if (live.length === 0) {return false}
+          const manifest = await readManifest(live[0]?.runId ?? "")
+          return manifest?.status === "running"
+        }, "the running blocking run")
+        return background.liveRunsForSession("parent")[0]?.runId ?? ""
+      },
+      abort: (reason?: string) => {
+        if (reason === undefined) {controller.abort()}
+        else {controller.abort(reason)}
+      },
+    }
+  }
+
+  test("a named-abort blocking run's tool result names the stop, not the engine's error", async () => {
+    const run = parkedBlocking()
+    const runId = await run.runId()
+    run.abort(background.STOP_ABORT_REASON)
+    run.release()
+    const output = await run.turn
+    expect(output).toContain("The run was stopped")
+    expect(output).toContain(`Reason: ${background.STOP_ABORT_REASON}.`)
+    expect(output).toContain("Completed agents remain on disk for a later resume")
+    expect(output).not.toContain("aborted before this agent could start")
+    // The blocking contract has no cancel write — the settle stays its own; the RENDER
+    // is what names the stop.
+    const settled = await readManifest(runId)
+    expect(settled?.status).toBe("failed")
+  })
+
+  test("a parent-turn interrupt keeps the render it always had", async () => {
+    // No reason on the abort: the host's ESC/interrupt shape. The failure render names
+    // the engine's own abort error, never the stop text.
+    const run = parkedBlocking()
+    await run.runId()
+    run.abort()
+    run.release()
+    const output = await run.turn
+    // The engine's own abort error (pre-start or queued at the permit gate — either is
+    // the text this contract always rendered for an interrupt).
+    expect(output).toContain("The run was aborted")
+    expect(output).not.toContain("did not fail on its own")
   })
 })
 

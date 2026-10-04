@@ -469,3 +469,35 @@ export function statusArgsSchema(): Record<string, unknown> {
     wait: { type: "number", description: "Seconds to wait for the run to settle before returning (max 300). Prefer one long wait over many short polls." },
   }
 }
+
+/**
+ * The run-level stop reason on an aborted signal, when the abort named a requester.
+ *
+ * A stop aborts with a string reason — the tool stop's bare STOP_ABORT_REASON, the control
+ * channel's provenance-suffixed one (#134). A parent-turn interrupt aborts without one;
+ * that distinction is what keeps interrupts out of the stop's failure surface.
+ */
+export function stopReasonOf(signal: AbortSignal | undefined): string | undefined {
+  return signal?.aborted === true && typeof signal.reason === "string" && signal.reason.trim() !== ""
+    ? signal.reason
+    : undefined
+}
+
+/**
+ * The failure surface for a stopped run: the stop, named (#135).
+ *
+ * A stopped run's unwind usually carries the SCRIPT's own error text — the aborted agent's
+ * `null` interpolated into the script's template string, so the failure surface read like
+ * the script failed on its own and pointed the debugging direction away from the stop.
+ * When the signal carries a stop reason, the surface states the stop and quotes the reason
+ * verbatim, provenance included, and keeps the run-dir pointer renderFailure attaches —
+ * the resume affordance is the one thing a stopped run's reader still needs.
+ */
+export function renderStopFailure(reason: string, runId: string): string {
+  const body = [
+    "The run was stopped — it did not fail on its own.",
+    `Reason: ${reason}.`,
+    "Completed agents remain on disk for a later resume.",
+  ].join("\n")
+  return `${body}\n\n<run id="${runId}" dir="${runDir(runId)}" />`
+}

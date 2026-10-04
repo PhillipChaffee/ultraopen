@@ -7,9 +7,9 @@ import type { OpencodeClient } from "../types.js"
 import { renderResult } from "./render.js"
 import type { WorkflowResult } from "./workflow.js"
 
-// The constant lives in the journal module (the stop reason is journal-recorded state);
-// re-exported for the callers that read it off this module.
-export { STOP_ABORT_REASON } from "../resume/journal.js"
+// The constants live in the journal module (the stop reasons are journal-recorded state);
+// re-exported for the callers that read them off this module.
+export { STOP_ABORT_REASON, CONTROL_STOP_ABORT_REASON } from "../resume/journal.js"
 
 /**
  * Which launch contract the host process can honor, decided from the process shape.

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Journal, parseJournal } from "../src/server/resume/journal.js"
+import { CONTROL_STOP_ABORT_REASON, STOP_ABORT_REASON, Journal, isStopAbortDetail, parseJournal } from "../src/server/resume/journal.js"
 import type { JournalEntry } from "../src/server/resume/journal.js"
 
 const entry = (overrides: Partial<JournalEntry> = {}): JournalEntry => ({
@@ -141,5 +141,33 @@ describe("empty-state behaviour", () => {
     journal.record(entry())
     expect(journal.entries.length).toBe(1)
     expect(journal.entries[0]?.key).toBe("k1")
+  })
+})
+
+describe("isStopAbortDetail — the stop recognizer the discriminators share", () => {
+  test("matches the tool stop's bare reason and the control channel's provenance suffix", () => {
+    // Both abort reasons carry the canonical stop reason as their prefix: the bare
+    // constant is the tool stop's, the suffixed one names the run-control channel.
+    expect(isStopAbortDetail(STOP_ABORT_REASON)).toBe(true)
+    expect(isStopAbortDetail(CONTROL_STOP_ABORT_REASON)).toBe(true)
+    // The documented suffix shape is parenthesized provenance; another stop surface
+    // joins by following it.
+    expect(isStopAbortDetail(`${STOP_ABORT_REASON} (api)`)).toBe(true)
+  })
+
+  test("a genuine failure detail and an absent one are never a stop", () => {
+    expect(isStopAbortDetail("deadline hit")).toBe(false)
+    expect(isStopAbortDetail(undefined)).toBe(false)
+    expect(isStopAbortDetail("")).toBe(false)
+    // Prefix weather without the documented suffix shape is not a stop: server error
+    // strings reach the journal verbatim, and the re-claim writes cancelled over a
+    // failed manifest on this predicate.
+    expect(isStopAbortDetail(`${STOP_ABORT_REASON} and also the moon`)).toBe(false)
+  })
+
+  test("a corrupt journal's non-string detail reads as not-a-stop, never throws", () => {
+    // parseJournal tolerates hand-edited journals whose detail is any JSON value.
+    expect(isStopAbortDetail(42 as unknown as string)).toBe(false)
+    expect(isStopAbortDetail({ reason: STOP_ABORT_REASON } as unknown as string)).toBe(false)
   })
 })
