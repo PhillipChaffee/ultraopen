@@ -11,6 +11,7 @@ import { registry } from "../singleton.js"
 import type { OpencodeClient } from "../types.js"
 import { deliverOutcomeUnlessStopped, registerStopHandle, runDetached } from "./background.js"
 import { execute, renderFailure, WorkflowRunError } from "./workflow.js"
+import { renderStopFailure, stopReasonOf } from "./render.js"
 import type { PreparedWorkflow, WorkflowArgs } from "./workflow.js"
 
 /**
@@ -298,7 +299,14 @@ export function startDetachedRun(spec: DetachedRunSpec): void {
         })
       } catch (error) {
         const partial = error instanceof WorkflowRunError ? error.partial : undefined,
-          failureText = renderFailure(error instanceof WorkflowRunError ? error.cause : error, spec.args.script, spec.runId)
+          // A stopped run's failure surface names the stop (#135): the unwind's error is
+          // usually the script's own voice — the aborted agent's null interpolated into
+          // its template string — and that text points the debugging direction away from
+          // the stop. The signal's named reason is the honest arbiter of a stop.
+          stopReason = stopReasonOf(stopController.signal),
+          failureText = stopReason === undefined
+            ? renderFailure(error instanceof WorkflowRunError ? error.cause : error, spec.args.script, spec.runId)
+            : renderStopFailure(stopReason, spec.runId)
         await wiring.settle({
           status: "failed",
           entries: partial?.journal ?? [],

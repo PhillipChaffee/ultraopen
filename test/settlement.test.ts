@@ -2,12 +2,12 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { wireRun, controlStopRun } from "../src/server/tool/settlement.js"
+import { wireRun, startDetachedRun, controlStopRun } from "../src/server/tool/settlement.js"
 import { controlPath } from "../src/server/runtime/control.js"
-import { ensureRunDir, readManifest, writeManifest } from "../src/server/resume/store.js"
+import { artifactPaths, ensureRunDir, readManifest, writeManifest } from "../src/server/resume/store.js"
 import { resolveOptions } from "../src/server/options.js"
 import { registry } from "../src/server/singleton.js"
-import { CONTROL_STOP_ABORT_REASON, resetForTests } from "../src/server/tool/background.js"
+import { CONTROL_STOP_ABORT_REASON, STOP_ABORT_REASON, resetForTests, settlePromiseOf, stopHandleOf } from "../src/server/tool/background.js"
 import type { Manifest } from "../src/server/resume/journal.js"
 import type { OpencodeClient } from "../src/server/types.js"
 
@@ -233,5 +233,136 @@ describe("the control-channel stop (#134)", () => {
     }
     expect(dispatches).toHaveLength(1)
     expect(controller.signal.aborted).toBe(false)
+  })
+})
+
+describe("the settle protocol's failure surface (#135)", () => {
+  beforeEach(async () => {
+    base = await mkdtemp(join(tmpdir(), "ultraopen-wiring-"))
+    env = { XDG_DATA_HOME: base } as NodeJS.ProcessEnv
+    registry.resetForTests()
+    resetForTests()
+    await ensureRunDir(RUN_ID, env)
+  })
+
+  afterEach(async () => {
+    await rm(base, { recursive: true, force: true })
+  })
+
+  /** A client that records every promptAsync, so the hydration body is observable. */
+  const recordingClient = (): { recording: OpencodeClient; sent: { sessionID: string; text: string }[] } => {
+    const sent: { sessionID: string; text: string }[] = []
+    return {
+      sent,
+      recording: {
+        session: {
+          get: () => Promise.resolve({ data: { id: SESSION } }),
+          abort: () => Promise.resolve({}),
+          promptAsync: (options: { path: { id: string }; body: { parts: { text: string }[] } }) => {
+            sent.push({ sessionID: options.path.id, text: options.body.parts[0]?.text ?? "" })
+            return Promise.resolve({ data: undefined })
+          },
+        },
+      } as unknown as OpencodeClient,
+    }
+  }
+
+  const prepared = () => ({
+    source: SCRIPT,
+    meta: { name: "wired", description: "wiring" },
+    body: SCRIPT,
+    argsValue: undefined,
+    argsDereference: undefined,
+    argsHydrated: undefined,
+  })
+
+  /**
+   * Starts a detached run whose engine parks until the test releases it, then rejects with
+   * the corpus shape: the aborted agent's null interpolated into the script's own template
+   * string. `abortWith` stops the run through its registered handle before the release,
+   * exactly as the stop paths trip the engine.
+   */
+  const startGarbledRun = (
+    recording: OpencodeClient,
+    abortWith: ((controller: AbortController) => void) | undefined,
+  ): { release: () => void } => {
+    let release!: () => void
+    const parked = new Promise<void>((resolve) => {release = resolve})
+    startDetachedRun({
+      runId: RUN_ID,
+      client: recording,
+      sessionID: SESSION,
+      manifest: runningManifest(),
+      prepared: prepared(),
+      args: { script: SCRIPT },
+      options: resolveOptions({}),
+      env,
+      executeFn: async (_args, _ctx): Promise<never> => {
+        await parked
+        throw new Error("wave 1 integration failed: null")
+      },
+    })
+    return {
+      release: () => {
+        if (abortWith !== undefined) {
+          const handle = stopHandleOf(RUN_ID)
+          if (handle === undefined) {throw new Error("no stop handle was registered")}
+          abortWith(handle)
+        }
+        release()
+      },
+    }
+  }
+
+  test("a stopped run's failure.txt names the stop, not the script's garbled template", async () => {
+    // The corpus bug: the stop reason reached the journal but never the failure surface,
+    // so failure.txt read "wave 1 integration failed: null" for a run the user stopped.
+    const { recording, sent } = recordingClient()
+    const run = startGarbledRun(recording, (controller) => {controller.abort(CONTROL_STOP_ABORT_REASON)})
+
+    run.release()
+    await settlePromiseOf(RUN_ID)
+
+    const failure = await readFile(artifactPaths(RUN_ID, env).failurePath, "utf8")
+    expect(failure).toContain("did not fail on its own")
+    expect(failure).toContain(`Reason: ${CONTROL_STOP_ABORT_REASON}.`)
+    expect(failure).toContain("Completed agents remain on disk for a later resume")
+    expect(failure).toContain('<run id="wf_settle01"')
+    expect(failure).not.toContain("wave 1 integration failed")
+    // The same honesty on the hydration: the corner where a settle beats the cancel write
+    // still delivers the failure text — and that text names the stop, never the script.
+    expect(sent).toHaveLength(1)
+    expect(sent[0]?.text).toContain("did not fail on its own")
+    expect(sent[0]?.text).not.toContain("wave 1 integration failed")
+  })
+
+  test("a tool stop's failure text quotes the bare reason — no control-channel provenance", async () => {
+    const { recording, sent } = recordingClient()
+    const run = startGarbledRun(recording, (controller) => {controller.abort(STOP_ABORT_REASON)})
+
+    run.release()
+    await settlePromiseOf(RUN_ID)
+
+    const failure = await readFile(artifactPaths(RUN_ID, env).failurePath, "utf8")
+    expect(failure).toContain("Reason: stopped by request.")
+    expect(failure).not.toContain("run-control channel")
+    expect(failure).not.toContain("wave 1 integration failed")
+    expect(sent[0]?.text).toContain("Reason: stopped by request.")
+  })
+
+  test("a genuine failure's failure.txt renders exactly as before", async () => {
+    // No stop on the signal: the script's own error is the honest text, unchanged.
+    const { recording, sent } = recordingClient()
+    const run = startGarbledRun(recording, undefined)
+
+    run.release()
+    await settlePromiseOf(RUN_ID)
+
+    const failure = await readFile(artifactPaths(RUN_ID, env).failurePath, "utf8")
+    expect(failure).toContain("wave 1 integration failed: null")
+    expect(failure).toContain('<run id="wf_settle01"')
+    expect(failure).not.toContain("did not fail on its own")
+    expect(sent[0]?.text).toContain("wave 1 integration failed: null")
+    expect(sent[0]?.text).not.toContain("did not fail on its own")
   })
 })

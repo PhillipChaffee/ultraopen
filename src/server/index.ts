@@ -42,6 +42,8 @@ import {
   renderScriptPathDecorationRefusal,
   renderStringifiedArgsRefusal,
   renderStatus,
+  renderStopFailure,
+  stopReasonOf,
   workflowArgsSchema,
   statusArgsSchema,
   renderBothSourceRefusal,
@@ -559,7 +561,7 @@ async function launchWorkflow(
       // The blocking contract waits for the run and takes the tool call's abort signal: a
       // parent-turn interrupt unwinds the script it is waiting on.
       const wiring = wireRun({ ...shared, signal: context.abort })
-      const result = await runBlocking(args, { runId, manifest, resume, executeContext: wiring.executeContext, settleRun: wiring.settle, budgetTokens: options.budgetTokens })
+      const result = await runBlocking(args, { runId, manifest, resume, executeContext: wiring.executeContext, settleRun: wiring.settle, budgetTokens: options.budgetTokens, signal: context.abort })
       return [result, ...scanNoteLines].join("\n")
     }
 
@@ -590,6 +592,8 @@ interface BlockingRun {
   settleRun: SettleRun
   /** The plugin's per-run ceiling, for the blocking result's budget statement. */
   budgetTokens: number | null
+  /** The tool call's abort signal, read for the stop-naming failure render (#135). */
+  signal?: AbortSignal | undefined
 }
 
 /**
@@ -630,6 +634,11 @@ async function runBlocking(args: WorkflowArgs, run: BlockingRun): Promise<string
       // The blocking contract renders the failure as the tool result, the way
       // the pre-async tool did; failure.txt is the detached contract's channel.
     })
+    // A stopped run's result names the stop (#135), the same composition the detached
+    // contract writes to failure.txt. A reasonless abort is the parent-turn interrupt's
+    // shape and keeps the render it always had.
+    const stopReason = stopReasonOf(run.signal)
+    if (stopReason !== undefined) {return renderStopFailure(stopReason, runId)}
     return renderFailure(error instanceof WorkflowRunError ? error.cause : error, args.script, runId)
   } finally {
     // Settled, whatever the outcome. The drop waits for the settle protocol
