@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { renderCapRefusal, renderForeignSessionResumeRefusal, renderLaunch, renderRefusal, renderResult, renderSiblingAdvisory, renderStatus, renderStopFailure, renderStringifiedArgsRefusal, renderUnrecordedSessionResumeRefusal, stopReasonOf } from "../src/server/tool/render.js"
 import { CONTROL_STOP_ABORT_REASON, STOP_ABORT_REASON } from "../src/server/tool/background.js"
+import { runDir } from "../src/server/resume/store.js"
 import type { WorkflowResult } from "../src/server/tool/workflow.js"
 import type { StatusReport } from "../src/server/tool/status.js"
 
@@ -304,7 +305,6 @@ describe("the stopped run's failure surface (#135)", () => {
     expect(out).toContain(`Reason: ${CONTROL_STOP_ABORT_REASON}.`)
     expect(out).toContain("Completed agents remain on disk for a later resume")
     // The pointer is renderFailure's resume affordance; a stopped run's reader needs it too.
-    expect(out).toContain('<run id="wf_stop001"')
-    expect(out).toContain("dir=")
+    expect(out).toContain(`<run id="wf_stop001" dir="${runDir("wf_stop001")}" />`)
   })
 })

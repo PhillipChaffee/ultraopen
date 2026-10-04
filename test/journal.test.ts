@@ -150,18 +150,24 @@ describe("isStopAbortDetail — the stop recognizer the discriminators share", (
     // constant is the tool stop's, the suffixed one names the run-control channel.
     expect(isStopAbortDetail(STOP_ABORT_REASON)).toBe(true)
     expect(isStopAbortDetail(CONTROL_STOP_ABORT_REASON)).toBe(true)
+    // The documented suffix shape is parenthesized provenance; another stop surface
+    // joins by following it.
+    expect(isStopAbortDetail(`${STOP_ABORT_REASON} (api)`)).toBe(true)
   })
 
   test("a genuine failure detail and an absent one are never a stop", () => {
     expect(isStopAbortDetail("deadline hit")).toBe(false)
     expect(isStopAbortDetail(undefined)).toBe(false)
     expect(isStopAbortDetail("")).toBe(false)
+    // Prefix weather without the documented suffix shape is not a stop: server error
+    // strings reach the journal verbatim, and the re-claim writes cancelled over a
+    // failed manifest on this predicate.
+    expect(isStopAbortDetail(`${STOP_ABORT_REASON} and also the moon`)).toBe(false)
   })
 
-  test("the control reason carries the channel's provenance for the failure surface", () => {
-    // The suffix is durable provenance: failure.txt quotes the journal's own detail,
-    // so a stopped run's debugging direction survives the process that stopped it.
-    expect(CONTROL_STOP_ABORT_REASON).toContain(STOP_ABORT_REASON)
-    expect(CONTROL_STOP_ABORT_REASON).toContain("run-control channel")
+  test("a corrupt journal's non-string detail reads as not-a-stop, never throws", () => {
+    // parseJournal tolerates hand-edited journals whose detail is any JSON value.
+    expect(isStopAbortDetail(42 as unknown as string)).toBe(false)
+    expect(isStopAbortDetail({ reason: STOP_ABORT_REASON } as unknown as string)).toBe(false)
   })
 })
