@@ -1,7 +1,8 @@
 import { readFile } from "node:fs/promises"
 import type { UltraopenOptions } from "../options.js"
 import { ProgressWriter } from "../resume/progress.js"
-import { endRun } from "../resume/persist.js"
+import { endRun, markCancelled } from "../resume/persist.js"
+import { CONTROL_STOP_ABORT_REASON } from "../resume/journal.js"
 import type { JournalEntry, Manifest } from "../resume/journal.js"
 import { flushJournalEntry, readManifest, runDir, writeFailure, writeManifest } from "../resume/store.js"
 import { watchControl } from "../runtime/control.js"
@@ -65,6 +66,17 @@ export interface SettlementSpec {
   executeFn?: typeof execute | undefined
   /** Reported on the hydration notification; the launch path carries the resume's own shape. */
   resume?: { resumed: number; argsChanged: boolean } | undefined
+  /**
+   * Invoked for a control-channel stop-run command before it dispatches to the Run (#134).
+   *
+   * The detached contract supplies the hook: it owns the stop controller and the manifest,
+   * so it trips the engine signal with the control channel's own abort reason and records
+   * the manifest cancelled — exactly what `stopRun` does for the tool stop. The blocking
+   * contract omits the hook: its stop is aborting the conversation's turn (the tool stop
+   * refuses foreground runs), and tripping the tool call's own signal from a control
+   * command would fight the host.
+   */
+  onControlStopRun?: (() => void) | undefined
 }
 
 export interface RunWiring {
@@ -154,7 +166,17 @@ export function wireRun(spec: SettlementSpec): RunWiring {
       stopControl = watchControl({
         runId,
         runDir: runDir(runId, spec.env),
-        dispatch,
+        // A stop-run command with a stop surface first fires the surface's hook — the
+        // trip is synchronous inside it, so the engine signal lands BEFORE the command
+        // dispatch aborts the children, and the in-flight agents journal the stop's
+        // own reason (#134). Without a surface the command dispatches unchanged.
+        dispatch:
+          spec.onControlStopRun === undefined
+            ? dispatch
+            : (command: ControlCommand): void => {
+                if (command.action === "stop-run") {spec.onControlStopRun?.()}
+                dispatch(command)
+              },
         onNote: (note) => {
           progress.apply({ type: "log", message: note }, Date.now())
           // The control channel is the only writer that folds notes without an
@@ -204,6 +226,26 @@ export interface DetachedRunSpec extends Omit<SettlementSpec, "signal" | "cancel
 }
 
 /**
+ * The control-channel stop for a detached run: the TUI-side mirror of `stopRun` (#134).
+ *
+ * Snapshots the run's live children BEFORE anything unwinds (the cancelled manifest names
+ * what was alive at stop time, and the unwind forgets the sessions), trips the engine
+ * signal with the control channel's own abort reason — the in-flight agents journal it,
+ * which is what the cancel re-claim and the never-auto-resume sweep discriminate on —
+ * and records the manifest cancelled first-terminal-write-wins. A settle that raced ahead
+ * of the trip is re-claimed through the journal; one that settled genuinely keeps its
+ * status. Fire-and-forget: the watcher's dispatch cannot await, and `markCancelled` never
+ * rejects.
+ */
+export function controlStopRun(manifest: Manifest, stopController: AbortController, env?: NodeJS.ProcessEnv): void {
+  void (async (): Promise<void> => {
+    const sessions = registry.sessionsOf(manifest.runId)
+    stopController.abort(CONTROL_STOP_ABORT_REASON)
+    await markCancelled(manifest, sessions, env)
+  })()
+}
+
+/**
  * Starts a run under the detached contract and returns at once.
  *
  * The task fully captures its own outcome — flushes, manifest, failure text —
@@ -221,6 +263,11 @@ export function startDetachedRun(spec: DetachedRunSpec): void {
       ...spec,
       signal: stopController.signal,
       cancelGate: () => stopController.signal.aborted,
+      // The control-channel stop (a TUI-written stop-run command) mirrors the tool stop
+      // (#134) through controlStopRun above. The tool stop's confirmation hydration stays
+      // tool-path-only: the TUI's surfaces are the consumed-command note in the run log
+      // and the run's disappearance from the sidebar.
+      onControlStopRun: (): void => {controlStopRun(spec.manifest, stopController, spec.env)},
     })
 
   registerStopHandle(spec.runId, stopController)

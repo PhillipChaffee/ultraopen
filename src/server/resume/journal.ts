@@ -39,6 +39,26 @@ export interface JournalEntry {
  */
 export const STOP_ABORT_REASON = "stopped by request"
 
+/**
+ * The run-control channel's abort reason: the canonical stop reason plus the provenance of
+ * the surface that requested it (#134). The suffix is what the journal records and what a
+ * stopped run's failure surface quotes, so the debugging direction survives the process
+ * that stopped it. `isStopAbortDetail` reads both through one recognizer.
+ */
+export const CONTROL_STOP_ABORT_REASON = `${STOP_ABORT_REASON} (run-control channel)`
+
+/**
+ * True when a journal entry's detail records a stop-path abort.
+ *
+ * The bare reason is the tool stop's (`workflow({ stop })`); the control channel's carries
+ * its provenance as a suffix. Prefix matching lets both discriminators — the cancel write's
+ * re-claim and the never-auto-resume sweep — recognize either without a second constant,
+ * and any future stop surface that extends the same prefix joins for free.
+ */
+export function isStopAbortDetail(detail: string | undefined): boolean {
+  return detail !== undefined && detail.startsWith(STOP_ABORT_REASON)
+}
+
 export interface Manifest {
   runId: string
   bootId: string

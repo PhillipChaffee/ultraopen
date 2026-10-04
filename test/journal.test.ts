@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Journal, parseJournal } from "../src/server/resume/journal.js"
+import { CONTROL_STOP_ABORT_REASON, STOP_ABORT_REASON, Journal, isStopAbortDetail, parseJournal } from "../src/server/resume/journal.js"
 import type { JournalEntry } from "../src/server/resume/journal.js"
 
 const entry = (overrides: Partial<JournalEntry> = {}): JournalEntry => ({
@@ -141,5 +141,27 @@ describe("empty-state behaviour", () => {
     journal.record(entry())
     expect(journal.entries.length).toBe(1)
     expect(journal.entries[0]?.key).toBe("k1")
+  })
+})
+
+describe("isStopAbortDetail — the stop recognizer the discriminators share", () => {
+  test("matches the tool stop's bare reason and the control channel's provenance suffix", () => {
+    // Both abort reasons carry the canonical stop reason as their prefix: the bare
+    // constant is the tool stop's, the suffixed one names the run-control channel.
+    expect(isStopAbortDetail(STOP_ABORT_REASON)).toBe(true)
+    expect(isStopAbortDetail(CONTROL_STOP_ABORT_REASON)).toBe(true)
+  })
+
+  test("a genuine failure detail and an absent one are never a stop", () => {
+    expect(isStopAbortDetail("deadline hit")).toBe(false)
+    expect(isStopAbortDetail(undefined)).toBe(false)
+    expect(isStopAbortDetail("")).toBe(false)
+  })
+
+  test("the control reason carries the channel's provenance for the failure surface", () => {
+    // The suffix is durable provenance: failure.txt quotes the journal's own detail,
+    // so a stopped run's debugging direction survives the process that stopped it.
+    expect(CONTROL_STOP_ABORT_REASON).toContain(STOP_ABORT_REASON)
+    expect(CONTROL_STOP_ABORT_REASON).toContain("run-control channel")
   })
 })
