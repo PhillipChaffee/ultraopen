@@ -373,10 +373,15 @@ async function runPrepared(
 
   // dryRun exercises the whole engine — parse, sandbox, combinators, control flow — for zero
   // tokens, which is what makes iterating on a script cheap. It still counts the calls, so the
-  // result reports the fan-out the script WOULD have produced.
+  // result reports the fan-out the script WOULD have produced. The stub carries the live
+  // agent's argument guard: a script whose first agent() call would throw live must fail the
+  // dry run too, or a dry pass would vouch for a script that dies the moment it runs for real.
   let dryRunCount = 0
   const agent = args.dryRun
     ? (prompt: string, options: AgentOptions = {}): Promise<unknown> => {
+        if (typeof prompt !== "string" || prompt.trim() === "") {
+          throw new TypeError("agent() requires a non-empty prompt string as its first argument.")
+        }
         dryRunCount++
         run.log(`[dryRun] ${options.label ?? prompt.slice(0, 60)}`)
         return Promise.resolve(options.schema ? {} : `[dryRun] ${prompt.slice(0, 200)}`)

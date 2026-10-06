@@ -503,6 +503,30 @@ describe("nested workflow() — dry run inheritance", () => {
   })
 })
 
+describe("dry run — the agent contract holds under the stub", () => {
+  test("a dry run refuses a non-string agent prompt exactly as a live run does", async () => {
+    // The dry contract says it exercises the whole engine; the live agent throws on a
+    // non-string prompt, so the stub must too — or a dry pass would vouch for a script that
+    // dies at its first agent() call the moment it runs for real (unit C's review-panel
+    // launch failed live on exactly this shape after its dry checks were skipped).
+    await expect(execute({ script: `${META}await agent(['x'])\n`, dryRun: true }, base))
+      .rejects.toThrow(/requires a non-empty prompt string/u)
+  })
+
+  test("a dry run refuses an empty prompt exactly as a live run does", async () => {
+    await expect(execute({ script: `${META}await agent('  ')\n`, dryRun: true }, base))
+      .rejects.toThrow(/requires a non-empty prompt string/u)
+  })
+
+  test("a dry run still counts and narrates valid agent calls", async () => {
+    // The guard must not dampen the stub's own contract: valid prompts still count toward
+    // agentCount and narrate [dryRun] lines.
+    const result = await execute({ script: `${META}const a = await agent('one')\nreturn a\n`, dryRun: true }, base)
+    expect(result.agentCount).toBe(1)
+    expect(result.logs.some((line) => line.includes("[dryRun]"))).toBe(true)
+  })
+})
+
 describe("budget — end to end", () => {
   test("a run past the ceiling fails cleanly with the partial journal intact", async () => {
     // The budget is a HARD ceiling enforced at agent() entry: the first agent spends past it,
