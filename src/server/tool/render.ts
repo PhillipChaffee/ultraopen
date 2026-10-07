@@ -107,6 +107,11 @@ export function renderResult(
  * agents are scheduled, so it is the model's chance to double-check the script.
  * The per-run budget statement (when `budgetTokens` is set) rides beside it:
  * cost joins size as a pre-flight consideration.
+ *
+ * The launch's `title` metadata (#142), when the launch passed one, rides in
+ * the opening tag right after the workflow name it qualifies — the name stays
+ * primary, the title is additional. Absent on an untitled launch, whose tag is
+ * byte-identical to the pre-#142 shape.
  */
 export function renderLaunch(
   workflow: string,
@@ -115,6 +120,7 @@ export function renderLaunch(
   siblings: readonly RunSummary[] = [],
   projection?: { agents: number; threshold: number } | undefined,
   budgetTokens?: number | null | undefined,
+  title?: string | undefined,
 ): string {
   let projectionLine: string | undefined
   if (projection === undefined) {
@@ -127,8 +133,9 @@ export function renderLaunch(
     projectionLine = `~${projection.agents} agents projected at launch.`
   }
   const budgetLine = renderBudgetLine(budgetTokens)
+  const titleAttribute = title === undefined ? "" : ` title="${title}"`
   const lines = [
-    `<workflow-launched run="${runId}" workflow="${workflow}" dir="${runDir(runId)}">`,
+    `<workflow-launched run="${runId}" workflow="${workflow}"${titleAttribute} dir="${runDir(runId)}">`,
     // First body line, ahead of the contract sentence: size is what the model should
     // reconsider before the fan-out is scheduled.
     ...(projectionLine === undefined ? [] : [projectionLine]),

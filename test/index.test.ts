@@ -896,6 +896,29 @@ describe("background launch contract", () => {
     await settle(runId ?? "")
   })
 
+  test("a titled launch renders the title on the launch handle (#142)", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 1\n`, background: true, title: "Fix the login bug" },
+      { sessionID: "parent" },
+    )
+    expect(output).toContain('workflow="demo" title="Fix the login bug"')
+    await settle(output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? "")
+  })
+
+  test("an untitled launch's handle carries no title attribute (#142)", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 1\n`, background: true },
+      { sessionID: "parent" },
+    )
+    expect(output).toContain("<workflow-launched")
+    expect(output).not.toContain("title=")
+    await settle(output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? "")
+  })
+
   test("the manifest is on disk BEFORE the tool call returns", async () => {
     const tool = toolOf(ultraopen({ client: hangingClient }))
     if (!tool) {throw new Error("tool was not registered")}

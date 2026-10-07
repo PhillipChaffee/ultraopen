@@ -356,6 +356,10 @@ async function launchWorkflow(
   const background = args.dryRun !== true &&
     resolveLaunchContract(args.background, options) === "background",
    runId = `wf_${randomUUID().replaceAll("-", "").slice(0, 12)}`,
+   // The launch's title/description metadata (#142): absent together on an untitled
+   // launch, present verbatim otherwise. Read once, consumed by the manifest, the
+   // launch handle and the live-run reminder.
+   launchMetadata = launchMetadataOf(args),
    // The session's default model, so `effort` resolves against ITS variant set rather
    // than a guess. A failure here is non-fatal: effort simply goes unapplied, and the run
    // log says so.
@@ -567,7 +571,7 @@ async function launchWorkflow(
       // argsRawString preserves the raw string the caller sent.
       ...(prepared.argsHydrated === undefined ? {} : { argsRawString: prepared.argsHydrated.raw }),
       // The launch's title/description metadata (#142), absent together when the launch passed none.
-      ...launchMetadataOf(args),
+      ...launchMetadata,
     })
     if (!manifest) {
       dropPending(runId)
@@ -608,7 +612,8 @@ async function launchWorkflow(
     startDetachedRun(shared)
 
     const projection = projectedAgents === undefined ? undefined : { agents: projectedAgents, threshold: options.largeWorkflowAgents }
-    return [renderLaunch(prepared.meta.name, runId, longLived, siblingRunsForSession(context.sessionID, runId), projection, options.budgetTokens), ...scanNoteLines].join("\n")
+    // The title rides the handle beside the workflow name (#142); absent on an untitled launch.
+    return [renderLaunch(prepared.meta.name, runId, longLived, siblingRunsForSession(context.sessionID, runId), projection, options.budgetTokens, launchMetadata.title), ...scanNoteLines].join("\n")
   } catch (error) {
     // Reached only by the launch phase itself: a parse failure or a rejected
     // permission ask. The run never went live, so the pending entry is dropped.

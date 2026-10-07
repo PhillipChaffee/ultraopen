@@ -216,6 +216,18 @@ describe("renderLaunch", () => {
     const capped = renderLaunch("demo", "wf_budget03", false, siblings, undefined, 50_000)
     expect(capped).toContain("With 3 live runs in this session at 50000 output tokens each, combined ceiling 150000.")
   })
+
+  test("a titled launch names the title beside the workflow name in the opening tag (#142)", () => {
+    const launched = renderLaunch("demo", "wf_title01", false, [], undefined, undefined, "Fix the login bug")
+    expect(launched).toContain('<workflow-launched run="wf_title01" workflow="demo" title="Fix the login bug"')
+    // The name stays primary: the workflow attribute precedes the title it qualifies.
+    expect(launched.indexOf('workflow="demo"')).toBeLessThan(launched.indexOf('title="Fix the login bug"'))
+  })
+
+  test("an untitled launch renders exactly as before — no placeholder noise (#142)", () => {
+    expect(renderLaunch("demo", "wf_untitl1", false)).not.toContain("title=")
+    expect(renderLaunch("demo", "wf_untitl2", false)).toBe(renderLaunch("demo", "wf_untitl2", false, [], undefined, undefined, undefined))
+  })
 })
 
 describe("renderResult — budget statement", () => {
