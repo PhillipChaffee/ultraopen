@@ -133,7 +133,7 @@ export function renderLaunch(
     projectionLine = `~${projection.agents} agents projected at launch.`
   }
   const budgetLine = renderBudgetLine(budgetTokens)
-  const titleAttribute = title === undefined ? "" : ` title="${attributeValue(title)}"`
+  const titleAttribute = titleAttributeOf(title)
   const lines = [
     `<workflow-launched run="${runId}" workflow="${workflow}"${titleAttribute} dir="${runDir(runId)}">`,
     // First body line, ahead of the contract sentence: size is what the model should
@@ -190,6 +190,17 @@ export function renderBudgetLine(budgetTokens: number | null | undefined): strin
  */
 export function attributeValue(value: string): string {
   return value.replaceAll("&", "&amp;").replaceAll('"', "&quot;")
+}
+
+/**
+ * The ` title="..."` attribute for a render tag, empty when the title is absent.
+ *
+ * The manifests are JSON files a human can edit, so a non-string value read off disk
+ * degrades to untitled instead of throwing inside a render the settle protocol or the
+ * status tool already committed to.
+ */
+export function titleAttributeOf(title: string | undefined): string {
+  return typeof title === "string" ? ` title="${attributeValue(title)}"` : ""
 }
 
 /** The combined-spend math the sibling advisory appends when the per-run budget is set. */
@@ -424,7 +435,7 @@ export function renderStringifiedArgsRefusal(raw: string, reason: string): strin
 export function renderStatus(report: StatusReport): string {
   // The launch's title metadata (#142) rides the tag, appended after the existing
   // attributes so the untitled shape is byte-identical to the pre-#142 render.
-  const titleAttribute = report.title === undefined ? "" : ` title="${attributeValue(report.title)}"`
+  const titleAttribute = titleAttributeOf(report.title)
   const lines = [
     `<workflow-status run="${report.runId}" status="${report.status}" dir="${report.dir}"${titleAttribute}>`,
     `agents total=${report.agents.total} running=${report.agents.running} done=${report.agents.done} failed=${report.agents.failed}`,

@@ -160,6 +160,17 @@ export function formatElapsed(ms: number): string {
 }
 
 /**
+ * Flattens a free-text title onto one line for the reminder's per-run line (#142).
+ *
+ * The template's shape is constant header + one line per run + closer; a newline inside a
+ * title would inject lines into the system-reminder block and break the shape stability the
+ * decoration exists to keep. Display-only: the manifest records the title verbatim.
+ */
+function oneLine(title: string): string {
+  return title.replaceAll(/\s+/gu, " ").trim()
+}
+
+/**
  * Renders the live-run reminder for one turn.
  *
  * Header, one line per run, closer — nothing else, so the shape never varies with run count. The
@@ -173,7 +184,7 @@ export function renderRunsReminder(runs: readonly LiveRunLine[], now: number): s
     "and topics they are using; each run's outcome arrives as a <workflow-completed> or <workflow-failed>",
     "notification, and workflow_status reads its progress on demand.",
     ...runs.map((run) =>
-      `- ${run.runId} "${run.name}"${run.title === undefined ? "" : ` (${run.title})`} — ` +
+      `- ${run.runId} "${run.name}"${run.title === undefined ? "" : ` (${oneLine(run.title)})`} — ` +
       `${run.agents} agents spawned so far, ` +
       `${formatElapsed(Math.max(0, now - run.startedAt))} elapsed`,
     ),

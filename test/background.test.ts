@@ -394,6 +394,22 @@ describe("hydration — renderNotification", () => {
       .toContain('<workflow-completed run="wf_hyd0002" workflow="demo">')
     expect(renderNotification({ status: "completed", name: "demo", runId: "wf_hyd0002", body: "v" })).not.toContain("title=")
   })
+
+  test("a non-string title (a hand-edited manifest) renders as untitled instead of throwing (#142)", () => {
+    // The manifest is JSON a human can edit; a non-string must degrade to untitled,
+    // never break the hydration that the settle protocol already closed the run for.
+    const text = renderNotification({ status: "completed", name: "demo", runId: "wf_hyd0003", title: 42 as unknown as string, body: "v" })
+    expect(text).toContain('<workflow-completed run="wf_hyd0003" workflow="demo">')
+    expect(text).not.toContain("title=")
+  })
+
+  test("a title with an ampersand and a quote escapes in attribute order, and &-only stays readable (#142)", () => {
+    // & goes first so the escape sequence itself is not double-escaped.
+    const both = renderNotification({ status: "completed", name: "demo", runId: "wf_hyd0004", title: 'A & "B"', body: "v" })
+    expect(both).toContain('<workflow-completed run="wf_hyd0004" workflow="demo" title="A &amp; &quot;B&quot;">')
+    const ampersandOnly = renderNotification({ status: "completed", name: "demo", runId: "wf_hyd0005", title: "A&B", body: "v" })
+    expect(ampersandOnly).toContain('title="A&amp;B"')
+  })
 })
 
 describe("hydration — hydrateParent and deliverOutcome", () => {

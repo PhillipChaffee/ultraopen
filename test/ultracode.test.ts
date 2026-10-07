@@ -572,6 +572,14 @@ describe("runs reminder — fixed shape and elapsed format", () => {
     expect(line).toBe('- wf_shape004 "demo" (Fix the login bug) — 1 agents spawned so far, 1m elapsed')
   })
 
+  test("a title with a newline stays one line — the fixed-shape contract holds (#142)", () => {
+    // The reminder's shape is constant header + one line per run + closer; a newline
+    // inside a free-text title would inject lines into the system-reminder block.
+    const rendered = renderRunsReminder([{ ...run("wf_shape006", "demo", 1, 100), title: "Fix\nthe bug" }], 62_100)
+    expect(rendered.split("\n")).toHaveLength(6)
+    expect(rendered).toContain('- wf_shape006 "demo" (Fix the bug) —')
+  })
+
   test("an untitled run's line is unchanged — no placeholder noise (#142)", () => {
     expect(renderRunsReminder([run("wf_shape005", "demo", 1, 100)], 62_100).split("\n")[4])
       .toBe('- wf_shape005 "demo" — 1 agents spawned so far, 1m elapsed')

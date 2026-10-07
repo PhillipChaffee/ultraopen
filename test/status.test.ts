@@ -202,6 +202,14 @@ describe("executeStatus — derivations", () => {
     expect(report.title).toBeUndefined()
   })
 
+  test("a hand-edited manifest with a non-string title reports none instead of poisoning the render (#142)", async () => {
+    // The manifest is JSON on disk a human can edit; parseJournal-style inputs are
+    // guarded elsewhere (isStopAbortDetail's typeof guard) — the same honesty here.
+    const numeric = JSON.stringify({ ...MANIFEST_RUNNING, title: 42 })
+    const report = await executeStatus({ runId: RUN }, deps({ "manifest.json": numeric }))
+    expect(report.title).toBeUndefined()
+  })
+
   test("output tokens exclude replayed entries and sum the rest", async () => {
     const journal = [
       entry({ outputTokens: 100 }),

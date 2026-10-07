@@ -170,15 +170,28 @@ describe("plugin registration", () => {
 
   test("the title and description args' schemas teach the metadata contract (#142)", () => {
     // The fields stopped being ignored (#142); a stale "Ignored." description would teach the
-    // model a lie on a load-bearing surface.
+    // model a lie on a load-bearing surface. The prose itself is free to change — only the
+    // not-Ignored contract and the fields' existence are pinned here.
     const args = toolOf(ultraopen({ client: stubClient }))?.args ?? {}
-    const title = JSON.stringify(args["title"]) ?? "",
-      description = JSON.stringify(args["description"]) ?? ""
-    expect(title).not.toContain("Ignored")
-    expect(title).toContain("manifest")
-    expect(title).toContain("workflow name")
-    expect(description).not.toContain("Ignored")
-    expect(description).toContain("manifest")
+    expect(args["title"]).toBeDefined()
+    expect(args["description"]).toBeDefined()
+    expect(JSON.stringify(args["title"])).not.toContain("Ignored")
+    expect(JSON.stringify(args["description"])).not.toContain("Ignored")
+  })
+
+  test("the manifest records the title verbatim even when the render escapes it (#142)", async () => {
+    // Escape-on-display, verbatim-on-disk: the tag attribute is quoted for the model, the
+    // manifest keeps the exact string a resume or an operator reads back.
+    const tool = toolOf(ultraopen({ client: hangingClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 1\n`, background: true, title: 'Fix the "login" bug' },
+      { sessionID: "parent" },
+    )
+    expect(output).toContain("title=\"Fix the &quot;login&quot; bug\"")
+    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
+    const manifest = await readManifest(runId, undefined)
+    expect(manifest?.title).toBe('Fix the "login" bug')
   })
 
   test("applies the configured concurrency to the process-wide gate", () => {
@@ -971,9 +984,12 @@ describe("background launch contract", () => {
   test.each([
     ["empty string", ""],
     ["whitespace-only", "   "],
+    ["null decoration", "null"],
+    ["undefined decoration", "undefined"],
   ])("a %s title is absent everywhere — no placeholder noise (#142)", async (_label, blank) => {
-    // Models emit zero-value decorations; the presence rule treats blank as absent on
-    // every surface and on the manifest, exactly like an omitted field.
+    // Models emit zero-value decorations; the presence rule treats blank and the
+    // documented decoration strings as absent on every surface and on the manifest,
+    // exactly like an omitted field.
     const tool = toolOf(ultraopen({ client: hangingClient }))
     if (!tool) {throw new Error("tool was not registered")}
     const output = await tool.execute(
@@ -985,6 +1001,20 @@ describe("background launch contract", () => {
     const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
     const manifest = await readManifest(runId, undefined)
     expect(manifest).not.toHaveProperty("title")
+    expect(manifest).not.toHaveProperty("description")
+  })
+
+  test("mixed presence: a real title with a blank description records only the title (#142)", async () => {
+    const tool = toolOf(ultraopen({ client: hangingClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 1\n`, background: true, title: "Fix the login bug", description: "  " },
+      { sessionID: "parent" },
+    )
+    expect(output).toContain('title="Fix the login bug"')
+    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
+    const manifest = await readManifest(runId, undefined)
+    expect(manifest?.title).toBe("Fix the login bug")
     expect(manifest).not.toHaveProperty("description")
   })
 

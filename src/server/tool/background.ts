@@ -4,7 +4,7 @@ import { endRun, markCancelled } from "../resume/persist.js"
 import { artifactPaths, isSafeRunId, readManifest, runDir, writeFailure } from "../resume/store.js"
 import { registry } from "../singleton.js"
 import type { OpencodeClient } from "../types.js"
-import { attributeValue, renderResult } from "./render.js"
+import { renderResult, titleAttributeOf } from "./render.js"
 import type { WorkflowResult } from "./workflow.js"
 
 // The constants live in the journal module (the stop reasons are journal-recorded state);
@@ -446,9 +446,8 @@ export interface HydrationOutcome {
 export function renderNotification(outcome: HydrationOutcome): string {
   const tag = outcome.status === "completed" ? "workflow-completed" : "workflow-failed",
     // The title rides the subject line beside the workflow name (#142), escaped for the
-    // attribute; absent on untitled runs, whose subject line is byte-identical to the
-    // pre-#142 shape.
-    titleAttribute = outcome.title === undefined ? "" : ` title="${attributeValue(outcome.title)}"`,
+    // attribute; absent on untitled runs and on a hand-edited non-string value.
+    titleAttribute = titleAttributeOf(outcome.title),
     { resultPath, failurePath } = artifactPaths(outcome.runId),
     full = outcome.status === "completed" ? `full result: ${resultPath}` : `full failure: ${failurePath}`
   return [

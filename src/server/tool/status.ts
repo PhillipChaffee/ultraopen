@@ -227,8 +227,9 @@ async function buildSnapshot(input: {
     runId: args.runId,
     dir,
     status,
-    // The launch's title metadata (#142), verbatim off the manifest; absent on untitled runs.
-    ...(manifest?.title === undefined ? {} : { title: manifest.title }),
+    // The launch's title metadata (#142), verbatim off the manifest; a hand-edited
+    // non-string degrades to absent (the render's attribute builder would throw).
+    ...(typeof manifest?.title === "string" ? { title: manifest.title } : {}),
     phase: progress?.phase,
     phases,
     agents: countAgents(progress, entries),

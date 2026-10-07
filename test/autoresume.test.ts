@@ -213,6 +213,7 @@ describe("resumeInterruptedRuns", () => {
   test("the adopted run's reminder carries the manifest's title (#142)", async () => {
     const entry = await seedCandidate({ title: "Fix the login bug" }),
      { fn, calls } = makeExecute()
+    reminderTitleAtCall = undefined
 
     await resumeInterruptedRuns({ ...deps({ executeFn: fn }), candidates: [entry] })
     await settlePromiseOf(RUN_ID)

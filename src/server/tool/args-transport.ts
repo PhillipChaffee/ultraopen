@@ -60,20 +60,29 @@ export const stringifiedArgsSuggestion =
 /**
  * The launch metadata the boundary honors (#142), with its presence rule.
  *
- * A `title`/`description` field that is missing, empty, or whitespace-only is ABSENT everywhere:
- * the manifest omits it (untitled manifests stay byte-identical to the pre-#142 shape) and no
- * surface renders placeholder noise. A present string is recorded and shown verbatim — refusing
- * or dropping the fields is out of scope, and so is decorating an absent one into an empty title.
+ * A field that is missing, empty, whitespace-only, or one of the documented zero-value
+ * decorations (`"null"`, `"undefined"`) is ABSENT everywhere: the manifest omits it (untitled
+ * manifests stay byte-identical to the pre-#142 shape) and no surface renders placeholder
+ * noise. Models emit those strings for an absent optional field — the same weather the args
+ * boundary guards. A present string is recorded and shown verbatim — refusing or dropping the
+ * fields is out of scope, and so is decorating an absent one into an empty title.
  */
 export function launchMetadataOf(args: { title?: unknown; description?: unknown }): {
   title?: string
   description?: string
 } {
-  const title = typeof args.title === "string" && args.title.trim() !== "" ? args.title : undefined,
-    description =
-      typeof args.description === "string" && args.description.trim() !== "" ? args.description : undefined
+  const title = presentMetadata(args.title),
+    description = presentMetadata(args.description)
   return {
     ...(title === undefined ? {} : { title }),
     ...(description === undefined ? {} : { description }),
   }
+}
+
+/** One field's presence: a real non-blank string that is not a zero-value decoration. */
+function presentMetadata(value: unknown): string | undefined {
+  if (typeof value !== "string") {return undefined}
+  const trimmed = value.trim()
+  if (trimmed === "" || trimmed === "null" || trimmed === "undefined") {return undefined}
+  return value
 }
