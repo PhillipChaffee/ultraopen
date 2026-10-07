@@ -68,6 +68,12 @@ export interface SettlementSpec {
   /** Reported on the hydration notification; the launch path carries the resume's own shape. */
   resume?: { resumed: number; argsChanged: boolean } | undefined
   /**
+   * Injectable manifest read for tests: the child-list writer's cancel race (#156) needs
+   * the read gated mid-flight to drive the window deterministically. Defaults to the real
+   * read; scoped to writeChildren — the settle protocol's own reads stay on the real store.
+   */
+  readManifestFn?: typeof readManifest | undefined
+  /**
    * Invoked for a control-channel stop-run command before it dispatches to the Run (#134).
    *
    * The detached contract supplies the hook: it owns the stop controller and the manifest,
@@ -118,6 +124,7 @@ export function wireRun(spec: SettlementSpec): RunWiring {
   // Crash safety: the manifest's child list is updated as sessions appear, so a server killed
   // mid-run leaves the reaper a list of children to abort. The on-disk status guard keeps an
   // unwind-time progress event from resurrecting a cancelled record.
+  const readManifestOf = spec.readManifestFn ?? readManifest
   let persistedChildren = -1
   const writeChildren = async (): Promise<void> => {
     // The cancelled gate is the run-level stop signal: once a stop is in flight, child-list
@@ -127,7 +134,13 @@ export function wireRun(spec: SettlementSpec): RunWiring {
     if (sessions.length === persistedChildren) {return}
     persistedChildren = sessions.length
     try {
-      const current = await readManifest(runId, spec.env)
+      const current = await readManifestOf(runId, spec.env)
+      // The gate re-check after the await (#156): a call that passed the gate check before
+      // its read resolved must not write when the cancel landed mid-read — the stale
+      // `running` read would clobber the just-landed cancelled record back to running and
+      // re-open the door for the unwind's endRun to write `failed` over it. Re-checking
+      // after the await collapses the window to the same shape writeTerminalManifest uses.
+      if (spec.cancelGate?.() === true) {return}
       if (current !== undefined && current.status === "running") {
         await writeManifest(runId, { ...current, childSessionIDs: sessions }, spec.env)
       }

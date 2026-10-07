@@ -96,6 +96,46 @@ const flushSnapshot = async (): Promise<{ logs: string[]; agents: unknown[] } | 
   }
 }
 
+test("an in-flight child-list rewrite never resurrects running over a cancelled record (#156)", async () => {
+  // Found live by the e2e T6b probe: writeChildren checked the cancel gate, then awaited
+  // the manifest read; a cancel landing mid-read left the write firing from the stale
+  // `running` read — the cancelled record was clobbered back to running, the unwind's
+  // endRun then honestly wrote failed over it, and a run the user stopped settled failed.
+  // The gate is re-checked after the await.
+  base = await mkdtemp(join(tmpdir(), "ultraopen-wiring-"))
+  env = { XDG_DATA_HOME: base } as NodeJS.ProcessEnv
+  registry.resetForTests()
+  resetForTests()
+  await ensureRunDir(RUN_ID, env)
+  const manifest = runningManifest()
+  await writeManifest(RUN_ID, manifest, env)
+
+  let releaseRead!: () => void
+  const gatedRead = new Promise<void>((resolve) => {releaseRead = resolve})
+  let gateOpen = false
+  const wiring = wire({
+    cancelGate: () => gateOpen,
+    readManifestFn: async () => {
+      // The read is in flight while the cancel lands.
+      await gatedRead
+      return manifest
+    },
+  })
+
+  // A progress event starts writeChildren; its read is now gated mid-flight.
+  wiring.executeContext.onProgress?.({ type: "agent-start", index: 0, label: "a", phase: undefined })
+  // The stop's cancel lands while the read is outstanding — markCancelled's write won.
+  await writeManifest(RUN_ID, { ...manifest, status: "cancelled" }, env)
+  gateOpen = true
+  releaseRead()
+  await new Promise((resolve) => {setTimeout(resolve, 20)})
+
+  // The cancelled record stands: the stale-running read never wrote over it.
+  const standing = await readManifest(RUN_ID, env)
+  expect(standing?.status).toBe("cancelled")
+  await rm(base, { recursive: true, force: true })
+})
+
 describe("wireRun", () => {
   beforeEach(async () => {
     base = await mkdtemp(join(tmpdir(), "ultraopen-wiring-"))
