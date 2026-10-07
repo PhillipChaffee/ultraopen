@@ -136,6 +136,8 @@ export async function endRun(
     childSessionIDs: string[]
   },
   env?: NodeJS.ProcessEnv,
+  /** Test-only seam (#164): swap the terminal write to stage a concurrent writer. */
+  writeTerminalManifestFn: typeof writeTerminalManifest = writeTerminalManifest,
 ): Promise<void> {
   if (!manifest) {return}
   try {
@@ -147,7 +149,7 @@ export async function endRun(
     // race against a stop's cancellation must write NOTHING — the previous order published this
     // settle's journal rewrite and result.json beside a manifest it never won, and a cancelled
     // run then "invented" a result.json (caught live by the e2e stop-path assertion).
-    const won = await writeTerminalManifest(
+    const won = await writeTerminalManifestFn(
       manifest.runId,
       {
         ...manifest,
@@ -158,6 +160,12 @@ export async function endRun(
       env,
     )
     if (!won) {return}
+    // The rename landing is not ownership: a racing stop's cancelled rename can land inside
+    // the re-check→rename gap (#164) and stand over this record. The journal and result are
+    // the SETTLE's artifacts — a cancelled record never settles a result — so whatever stands
+    // is re-read before they are published, and a record that is not ours abandons them.
+    const standing = await readManifest(manifest.runId, env)
+    if (standing === undefined || standing.status !== outcome.status) {return}
     await appendJournal(manifest.runId, outcome.entries.map((entry) => JSON.stringify(entry)).join("\n"), env)
     await writeResult(manifest.runId, outcome.value, env)
   } catch {
@@ -208,6 +216,26 @@ export async function endRun(
   * stop won, the earlier terminal status when it lost the race, `undefined`
   * when the disk could not be read at all.
  */
+/**
+ * Whether a landed cancelled record still stands, polled over a bounded window (#164).
+ *
+ * A verified-then-returned cancelled write can still be renamed away by a racing settle
+ * whose rename lands after the stop's verification read — the probe then reads a run the
+ * user stopped as completed/failed. The poll re-reads for a short bounded window; a flip
+ * sends the caller back into its claim loop, and the settle-side verification (endRun's
+ * post-rename re-read) keeps the settle from publishing beside a record it lost to.
+ */
+const PERSISTENCE_POLLS = 8
+const PERSISTENCE_POLL_MS = 30
+async function cancelledPersists(runId: string, env?: NodeJS.ProcessEnv): Promise<boolean> {
+  for (let poll = 0; poll < PERSISTENCE_POLLS; poll++) {
+    const current = await readManifest(runId, env)
+    if (current === undefined || current.status !== "cancelled") {return false}
+    await new Promise((resolve) => {setTimeout(resolve, PERSISTENCE_POLL_MS)})
+  }
+  return true
+}
+
 export async function markCancelled(
   manifest: Manifest,
   childSessionIDs: string[],
@@ -241,7 +269,13 @@ export async function markCancelled(
         if (won) {
           const after = await readManifest(manifest.runId, env)
           if (after === undefined) {return after}
-          if (after.status === "cancelled") {return after}
+          if (after.status === "cancelled") {
+            // Verified is not persisted (#164): a racing rename inside the gap can still
+            // land over this record. The poll holds the record's persistence; a flip
+            // re-enters the claim.
+            if (await cancelledPersists(manifest.runId, env)) {return after}
+            continue
+          }
           if (after.status === "running") {continue}
           // A different terminal landed over the stop's own cancelled write: the racing
           // settle's rename passed its re-check before the cancel's rename and landed
@@ -263,7 +297,10 @@ export async function markCancelled(
         env,
       )
       const after = await readManifest(manifest.runId, env)
-      if (after !== undefined && after.status === "cancelled") {return after}
+      if (after !== undefined && after.status === "cancelled" && (await cancelledPersists(manifest.runId, env))) {
+        // Same persistence discipline as the rename path above (#164).
+        return after
+      }
     }
     return undefined
   } catch {

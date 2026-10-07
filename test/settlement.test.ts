@@ -5,6 +5,7 @@ import { join } from "node:path"
 import { wireRun, startDetachedRun, controlStopRun } from "../src/server/tool/settlement.js"
 import { controlPath } from "../src/server/runtime/control.js"
 import { artifactPaths, ensureRunDir, readManifest, writeManifest } from "../src/server/resume/store.js"
+import { writeTerminalManifest } from "../src/server/resume/persist.js"
 import { resolveOptions } from "../src/server/options.js"
 import { registry } from "../src/server/singleton.js"
 import { CONTROL_STOP_ABORT_REASON, STOP_ABORT_REASON, resetForTests, settlePromiseOf, stopHandleOf } from "../src/server/tool/background.js"
@@ -178,6 +179,39 @@ describe("the child-list rewrite's cancel gate (#156)", () => {
     // And the cancelled record stands at the bound.
     const standing = await readManifest(RUN_ID, env)
     expect(standing?.status).toBe("cancelled")
+  })
+
+  test("a child-list write carries the terminal-write discipline — a cancel that lands mid-flight is never resurrected (#164)", async () => {
+    // The wide window the #156 gate cannot close: the gate re-check passes, the stop's
+    // cancel lands, and the stale-running write lands after it. A plain rewrite would
+    // resurrect running over the cancelled record and legitimize the unwind's later
+    // terminal rename; the write's own re-read refuses a record that is no longer running.
+    const manifest = runningManifest()
+    await writeManifest(RUN_ID, manifest, env)
+
+    let releaseRead!: () => void
+    const gatedRead = new Promise<void>((resolve) => {releaseRead = resolve})
+    const wiring = wire({
+      // The gate NEVER opens: no stop-controller signal is in play, so only the write's
+      // own disk discipline can refuse the stale read.
+      cancelGate: () => false,
+      readManifestFn: async () => {
+        await gatedRead
+        // The stale `running` read — the cancel has already landed on disk.
+        return manifest
+      },
+    })
+
+    // A progress event starts writeChildren; its read is gated mid-flight.
+    wiring.executeContext.onProgress?.({ type: "agent-start", index: 0, label: "a", phase: undefined })
+    // The stop's cancel lands while the read is outstanding.
+    await writeTerminalManifest(RUN_ID, { ...manifest, status: "cancelled", childSessionIDs: [] }, env)
+    releaseRead()
+    await waitFor(() => readManifest(RUN_ID, env).then((m) => m?.status === "cancelled" && (m?.childSessionIDs.length ?? 0) === 0), "the cancelled record to stand un-resurrected")
+
+    const standing = await readManifest(RUN_ID, env)
+    expect(standing?.status).toBe("cancelled")
+    expect(standing?.childSessionIDs).toEqual([])
   })
 })
 

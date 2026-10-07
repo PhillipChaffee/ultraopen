@@ -1,10 +1,10 @@
 import { readFile } from "node:fs/promises"
 import type { UltraopenOptions } from "../options.js"
 import { ProgressWriter } from "../resume/progress.js"
-import { endRun, markCancelled } from "../resume/persist.js"
+import { endRun, markCancelled, writeTerminalManifest } from "../resume/persist.js"
 import { CONTROL_STOP_ABORT_REASON } from "../resume/journal.js"
 import type { JournalEntry, Manifest } from "../resume/journal.js"
-import { flushJournalEntry, readManifest, runDir, writeFailure, writeManifest } from "../resume/store.js"
+import { flushJournalEntry, readManifest, runDir, writeFailure } from "../resume/store.js"
 import { watchControl } from "../runtime/control.js"
 import type { ControlCommand } from "../runtime/control.js"
 import { registry } from "../singleton.js"
@@ -142,7 +142,12 @@ export function wireRun(spec: SettlementSpec): RunWiring {
       // after the await collapses the window to the same shape writeTerminalManifest uses.
       if (spec.cancelGate?.() === true) {return}
       if (current !== undefined && current.status === "running") {
-        await writeManifest(runId, { ...current, childSessionIDs: sessions }, spec.env)
+        // The child-list update carries the TERMINAL-WRITE discipline (#164): the stale
+        // running read can outlive a cancel that landed between the gate's re-check and
+        // this write, and a plain rewrite resurrects running over the cancelled record —
+        // which then legitimizes the unwind's later terminal rename. The rename's own
+        // re-check refuses any record that is no longer running.
+        await writeTerminalManifest(runId, { ...current, childSessionIDs: sessions }, spec.env)
       }
     } catch {
       // Crash safety is best-effort: a failed manifest rewrite must not stall the run.

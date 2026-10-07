@@ -5,7 +5,7 @@ import { dirname, join } from "node:path"
 import { beginRun, endRun, loadResume, markCancelled, writeTerminalManifest } from "../src/server/resume/persist.js"
 import { artifactPaths, appendJournalEntry, ensureRunDir, readJournal, readManifest, writeManifest } from "../src/server/resume/store.js"
 import { CONTROL_STOP_ABORT_REASON, STOP_ABORT_REASON } from "../src/server/resume/journal.js"
-import type { JournalEntry } from "../src/server/resume/journal.js"
+import type { JournalEntry, Manifest } from "../src/server/resume/journal.js"
 
 let base: string,
  env: NodeJS.ProcessEnv
@@ -96,6 +96,60 @@ describe("beginRun", () => {
     expect(settled?.status).toBe("completed")
     expect(settled?.title).toBe("Fix the login bug")
     expect(settled?.description).toBe("The auth flow")
+  })
+})
+
+describe("the terminal-write race (#164)", () => {
+  test("a settle whose rename was clobbered by a landed cancel abandons the journal and result", async () => {
+    // Round-5 shape: the settle's rename lands, the stop's cancelled rename lands after it,
+    // and endRun must NOT publish journal/result beside a cancelled record it no longer owns.
+    await beginRun(record, env)
+    let staged = false
+    const clobberingWrite = async (runId: string, manifest: Manifest, e?: NodeJS.ProcessEnv): Promise<boolean> => {
+      const won = await writeTerminalManifest(runId, manifest, e)
+      if (won && !staged) {
+        staged = true
+        // The stop's cancel rename landing inside the settle's re-check→rename gap.
+        await writeManifest(runId, { ...manifest, status: "cancelled", childSessionIDs: [] }, e)
+      }
+      return won
+    }
+    const manifest = await readManifest("wf_abc123", env)
+    if (!manifest) {throw new Error("the run was not opened")}
+    await endRun(manifest, { status: "completed", entries: [entry], value: { done: true }, childSessionIDs: ["c1"] }, env, clobberingWrite)
+    const standing = await readManifest("wf_abc123", env)
+    expect(standing?.status).toBe("cancelled")
+    const resultFile = Bun.file(artifactPaths("wf_abc123", env).resultPath)
+    expect(await resultFile.exists()).toBe(false)
+    expect(await readJournal("wf_abc123", env)).toEqual([])
+  })
+
+  test("the stop's cancelled write re-claims when a racing settle renames over it after verification", async () => {
+    // The stop's rename wins and verifies; the settle's rename lands during the persistence
+    // window; the poll detects the flip and re-claims — the cancelled record must stand.
+    await beginRun(record, env)
+    let clobbered = false
+    const racingWrite = async (runId: string, manifest: Manifest, e?: NodeJS.ProcessEnv): Promise<boolean> => {
+      const won = await writeTerminalManifest(runId, manifest, e)
+      if (won && !clobbered) {
+        clobbered = true
+        // The settle's rename lands just after the stop's verification read.
+        setTimeout(() => {
+          void writeManifest(runId, { ...manifest, status: "completed", childSessionIDs: ["c1"] }, e)
+        }, 10)
+      }
+      return won
+    }
+    const manifest = await readManifest("wf_abc123", env)
+    if (!manifest) {throw new Error("the run was not opened")}
+    const settled = await markCancelled(manifest, [], env, racingWrite)
+    expect(settled?.status).toBe("cancelled")
+    // The staged racing write is a floating timer; let it land before asserting — on the
+    // pre-fix code the clobber stands (the stop returned before noticing), and the fix's
+    // persistence poll must have re-claimed instead.
+    await new Promise((resolve) => {setTimeout(resolve, 100)})
+    const standing = await readManifest("wf_abc123", env)
+    expect(standing?.status).toBe("cancelled")
   })
 })
 
