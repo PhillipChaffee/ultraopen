@@ -109,19 +109,17 @@ interface ExecuteCall {
   context: WorkflowContext
   /** The manifest as the engine saw it — proving the re-stamp landed BEFORE execution. */
   manifestAtCall: Manifest | undefined
+  /** The live-run reminder's title view while the run is live (#142). */
+  reminderTitle: string | undefined
 }
 
 /** The live-run reminder's own view of the adopted run, captured while the run is live. */
-/** The live-run reminder's own view of the adopted run, captured while the run is live. */
-const reminderCapture: { title: string | undefined } = { title: undefined }
-
 /** A fake engine that records its inputs and completes the run. */
 const makeExecute = (): { fn: typeof execute; calls: ExecuteCall[] } => {
   const calls: ExecuteCall[] = []
   const fn = async (args: WorkflowArgs, context: WorkflowContext): Promise<WorkflowResult> => {
     const atCall = await readManifest(RUN_ID, env)
-    reminderCapture.title = liveRunsForSession(SESSION).at(0)?.title
-    calls.push({ args, context, manifestAtCall: atCall })
+    calls.push({ args, context, manifestAtCall: atCall, reminderTitle: liveRunsForSession(SESSION).at(0)?.title })
     return {
       runId: RUN_ID,
       meta: { name: "e2e-resume", description: "resume me" },
@@ -214,14 +212,13 @@ describe("resumeInterruptedRuns", () => {
   test("the adopted run's reminder carries the manifest's title (#142)", async () => {
     const entry = await seedCandidate({ title: "Fix the login bug" }),
      { fn, calls } = makeExecute()
-    reminderCapture.title = undefined
 
     await resumeInterruptedRuns({ ...deps({ executeFn: fn }), candidates: [entry] })
     await settlePromiseOf(RUN_ID)
 
     expect(calls).toHaveLength(1)
     // The title rides the registry while the run is live, so the per-turn reminder shows it.
-    expect(reminderCapture.title).toBe("Fix the login bug")
+    expect(calls[0]?.reminderTitle).toBe("Fix the login bug")
   })
 
   test("skips a run whose interruption is older than the TTL window", async () => {
