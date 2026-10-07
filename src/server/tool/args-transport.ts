@@ -56,3 +56,24 @@ export function stringifiedArgsMessage(raw: string, reason: string): string {
 /** The one fix both refusal surfaces suggest. */
 export const stringifiedArgsSuggestion =
   "Pass the value as real JSON — an object literal, not a quoted string: `args: {\"key\": \"value\"}`."
+
+/**
+ * The launch metadata the boundary honors (#142), with its presence rule.
+ *
+ * A `title`/`description` field that is missing, empty, or whitespace-only is ABSENT everywhere:
+ * the manifest omits it (untitled manifests stay byte-identical to the pre-#142 shape) and no
+ * surface renders placeholder noise. A present string is recorded and shown verbatim — refusing
+ * or dropping the fields is out of scope, and so is decorating an absent one into an empty title.
+ */
+export function launchMetadataOf(args: { title?: unknown; description?: unknown }): {
+  title?: string
+  description?: string
+} {
+  const title = typeof args.title === "string" && args.title.trim() !== "" ? args.title : undefined,
+    description =
+      typeof args.description === "string" && args.description.trim() !== "" ? args.description : undefined
+  return {
+    ...(title === undefined ? {} : { title }),
+    ...(description === undefined ? {} : { description }),
+  }
+}
