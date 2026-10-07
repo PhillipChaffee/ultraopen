@@ -131,15 +131,18 @@ describe("the terminal-write race (#164)", () => {
     await beginRun(record, env)
     await appendJournalEntry("wf_abc123", { type: "result", key: "k3", scopePath: "", ordinal: 3, label: "step4", status: "null", reason: "aborted", detail: STOP_ABORT_REASON, outputTokens: 0 }, env)
     let clobbered = false,
-      clobberLanded = false
+      clobberPromise: Promise<void> | undefined
     const racingWrite = async (runId: string, manifest: Manifest, e?: NodeJS.ProcessEnv): Promise<boolean> => {
       const won = await writeTerminalManifest(runId, manifest, e)
       if (won && !clobbered) {
         clobbered = true
-        // The settle's rename lands just after the stop's verification read.
-        setTimeout(() => {
-          void writeManifest(runId, { ...manifest, status: "completed", childSessionIDs: ["c1"] }, e).then(() => {clobberLanded = true})
-        }, 10)
+        // The settle's rename lands just after the stop's verification read; the test joins
+        // the staged write so no floating timer races the fixture cleanup.
+        clobberPromise = new Promise<void>((resolve) => {
+          setTimeout(() => {
+            writeManifest(runId, { ...manifest, status: "completed", childSessionIDs: ["c1"] }, e).then(() => resolve())
+          }, 10)
+        })
       }
       return won
     }
@@ -147,13 +150,9 @@ describe("the terminal-write race (#164)", () => {
     if (!manifest) {throw new Error("the run was not opened")}
     const settled = await markCancelled(manifest, [], env, racingWrite)
     expect(settled?.status).toBe("cancelled")
-    // Wait for the staged clobber to land (bounded, generous against the 10ms timer) — on
-    // the pre-fix code it stands and the stop never noticed; the persistence poll must have
-    // re-claimed instead.
-    for (let waited = 0; waited < 50 && !clobberLanded; waited++) {
-      await new Promise((resolve) => {setTimeout(resolve, 10)})
-    }
-    expect(clobberLanded).toBe(true)
+    // Join the staged clobber: on the pre-fix code it stands and the stop never noticed;
+    // the persistence poll must have re-claimed instead.
+    await clobberPromise
     const standing = await readManifest("wf_abc123", env)
     expect(standing?.status).toBe("cancelled")
   })
@@ -165,14 +164,16 @@ describe("the terminal-write race (#164)", () => {
     await beginRun(record, env)
     await appendJournalEntry("wf_abc123", { type: "result", key: "k0", scopePath: "", ordinal: 0, label: "a", status: "ok", outputTokens: 3 }, env)
     let clobbered = false,
-      clobberLanded = false
+      clobberPromise: Promise<void> | undefined
     const racingWrite = async (runId: string, manifest: Manifest, e?: NodeJS.ProcessEnv): Promise<boolean> => {
       const won = await writeTerminalManifest(runId, manifest, e)
       if (won && !clobbered) {
         clobbered = true
-        setTimeout(() => {
-          void writeManifest(runId, { ...manifest, status: "completed", childSessionIDs: ["c1"] }, e).then(() => {clobberLanded = true})
-        }, 10)
+        clobberPromise = new Promise<void>((resolve) => {
+          setTimeout(() => {
+            writeManifest(runId, { ...manifest, status: "completed", childSessionIDs: ["c1"] }, e).then(() => resolve())
+          }, 10)
+        })
       }
       return won
     }
@@ -180,10 +181,7 @@ describe("the terminal-write race (#164)", () => {
     if (!manifest) {throw new Error("the run was not opened")}
     const settled = await markCancelled(manifest, [], env, racingWrite)
     expect(settled?.status).toBe("completed")
-    for (let waited = 0; waited < 50 && !clobberLanded; waited++) {
-      await new Promise((resolve) => {setTimeout(resolve, 10)})
-    }
-    expect(clobberLanded).toBe(true)
+    await clobberPromise
     const settledStanding = await readManifest("wf_abc123", env)
     expect(settledStanding?.status).toBe("completed")
   })
