@@ -197,10 +197,17 @@ export function attributeValue(value: string): string {
  *
  * The manifests are JSON files a human can edit, so a non-string value read off disk
  * degrades to untitled instead of throwing inside a render the settle protocol or the
- * status tool already committed to.
+ * status tool already committed to. Line breaks are flattened for display — the same
+ * free-text shape rule the reminder's oneLine applies — so the tag stays one line; the
+ * manifest records the title verbatim.
  */
 export function titleAttributeOf(title: string | undefined): string {
-  return typeof title === "string" ? ` title="${attributeValue(title)}"` : ""
+  return typeof title === "string" ? ` title="${attributeValue(oneLineTitle(title))}"` : ""
+}
+
+/** Flattens a free-text title onto one line for a tag attribute (#142). */
+function oneLineTitle(title: string): string {
+  return title.replaceAll(/\s+/gu, " ").trim()
 }
 
 /** The combined-spend math the sibling advisory appends when the per-run budget is set. */
@@ -495,7 +502,7 @@ export function workflowArgsSchema(): Record<string, unknown> {
     title: {
       type: "string",
       description:
-        "Optional run title, recorded on the run's manifest and shown on the launch result, the live-run reminder, status reports, and settle notifications. The workflow name stays primary.",
+        "Optional run title, recorded on the run's manifest and shown on a background launch's result, the live-run reminder, status reports, and settle notifications. The workflow name stays primary.",
     },
     description: {
       type: "string",

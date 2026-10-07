@@ -458,8 +458,14 @@ describe("RunPoller", () => {
     // The one started interval was actually cleared.
     expect(timers.cleared.length).toBe(1)
     timers.tick()
-    // The negative direction, bounded: no update may land after the unsubscribe.
-    await Bun.sleep(30)
+    // The negative direction, bounded: no update may land after the unsubscribe. A fixed
+    // sleep could false-pass when a buggy refresh lands after it, so poll for the absence.
+    for (let waited = 0; waited < 20; waited++) {
+      if (mine.length !== mineAfter || other.length !== otherBefore + 1) {
+        throw new Error("an update landed after every surface unsubscribed")
+      }
+      await Bun.sleep(10)
+    }
     expect(mine.length).toBe(mineAfter)
     expect(other.length).toBe(otherBefore + 1)
 

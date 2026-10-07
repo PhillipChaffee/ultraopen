@@ -230,6 +230,14 @@ describe("renderLaunch", () => {
     expect(launched).toContain('<workflow-launched run="wf_quoted1" workflow="demo" title="Fix the &quot;login&quot; bug"')
   })
 
+  test("a title with a line break stays one line in the tag (#142)", () => {
+    // The same free-text class the reminder's oneLine guards: a multi-line title would
+    // split the opening tag across lines.
+    const launched = renderLaunch("demo", "wf_newlin1", false, [], undefined, undefined, "Fix\nthe bug")
+    expect(launched).toContain('<workflow-launched run="wf_newlin1" workflow="demo" title="Fix the bug" dir="')
+    expect(launched.split("\n").length).toBeGreaterThan(1)
+  })
+
   test("an untitled launch renders exactly as before — no placeholder noise (#142)", () => {
     // The full tag, exactly: an untitled launch's opening line is byte-identical to the
     // pre-#142 shape, not merely free of the title attribute.

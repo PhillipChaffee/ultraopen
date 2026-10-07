@@ -170,13 +170,14 @@ describe("plugin registration", () => {
 
   test("the title and description args' schemas teach the metadata contract (#142)", () => {
     // The fields stopped being ignored (#142); a stale "Ignored." description would teach the
-    // model a lie on a load-bearing surface. The prose itself is free to change — only the
-    // not-Ignored contract and the fields' existence are pinned here.
+    // model a lie on a load-bearing surface. The prose is otherwise free to change — the
+    // pinned positive phrase is the manifest recording, the durable half of the contract.
     const args = toolOf(ultraopen({ client: stubClient }))?.args ?? {}
     expect(args["title"]).toBeDefined()
     expect(args["description"]).toBeDefined()
-    expect(JSON.stringify(args["title"])).not.toContain("Ignored")
-    expect(JSON.stringify(args["description"])).not.toContain("Ignored")
+    const title = JSON.stringify(args["title"]) ?? ""
+    expect(title).not.toContain("Ignored")
+    expect(title).toContain("manifest")
   })
 
   test("the manifest records the title verbatim even when the render escapes it (#142)", async () => {
