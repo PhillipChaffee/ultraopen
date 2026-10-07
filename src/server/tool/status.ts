@@ -55,6 +55,11 @@ export interface StatusReport {
   status: "running" | "completed" | "failed" | "cancelled" | "orphaned" | "corrupt"
   phase?: string | undefined
   phases: string[]
+  /**
+   * The launch's `title` metadata (#142), from the manifest — the report renders it in the
+   * opening tag. Absent on untitled runs and on the corrupt state (no manifest to read).
+   */
+  title?: string | undefined
   agents: { total: number; running: number; done: number; failed: number }
   outputTokens: number
   /**
@@ -222,6 +227,8 @@ async function buildSnapshot(input: {
     runId: args.runId,
     dir,
     status,
+    // The launch's title metadata (#142), verbatim off the manifest; absent on untitled runs.
+    ...(manifest?.title === undefined ? {} : { title: manifest.title }),
     phase: progress?.phase,
     phases,
     agents: countAgents(progress, entries),

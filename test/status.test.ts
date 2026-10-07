@@ -190,6 +190,18 @@ describe("executeStatus — running, completed, failed", () => {
 })
 
 describe("executeStatus — derivations", () => {
+  test("the manifest's title rides the report when present (#142)", async () => {
+    // Description stays manifest-only — the brief surfaces the title alone here.
+    const titled = JSON.stringify({ ...MANIFEST_RUNNING, title: "Fix the login bug", description: "The auth flow" })
+    const report = await executeStatus({ runId: RUN }, deps({ "manifest.json": titled }))
+    expect(report.title).toBe("Fix the login bug")
+  })
+
+  test("a manifest without title metadata reports none (#142)", async () => {
+    const report = await executeStatus({ runId: RUN }, deps())
+    expect(report.title).toBeUndefined()
+  })
+
   test("output tokens exclude replayed entries and sum the rest", async () => {
     const journal = [
       entry({ outputTokens: 100 }),

@@ -273,6 +273,15 @@ describe("renderStatus", () => {
   test("an uncapped run stays silent — no budget line at all", () => {
     expect(renderStatus(statusReport())).not.toContain("budget")
   })
+
+  test("a titled run carries the title in the opening tag, appended after the existing attributes (#142)", () => {
+    const rendered = renderStatus(statusReport({ title: "Fix the login bug" }))
+    expect(rendered).toContain('<workflow-status run="wf_status01" status="running" dir="/fake/opencode/tool-output/ultraopen/wf_status01" title="Fix the login bug">')
+  })
+
+  test("an untitled run's tag is unchanged — no placeholder noise (#142)", () => {
+    expect(renderStatus(statusReport())).not.toContain("title=")
+  })
 })
 
 describe("renderResult", () => {

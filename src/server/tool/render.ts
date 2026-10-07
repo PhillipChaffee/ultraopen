@@ -410,8 +410,11 @@ export function renderStringifiedArgsRefusal(raw: string, reason: string): strin
 
 /** The status tool's report, for the model. Same uncapped stance as renderResult. */
 export function renderStatus(report: StatusReport): string {
+  // The launch's title metadata (#142) rides the tag, appended after the existing
+  // attributes so the untitled shape is byte-identical to the pre-#142 render.
+  const titleAttribute = report.title === undefined ? "" : ` title="${report.title}"`
   const lines = [
-    `<workflow-status run="${report.runId}" status="${report.status}" dir="${report.dir}">`,
+    `<workflow-status run="${report.runId}" status="${report.status}" dir="${report.dir}"${titleAttribute}>`,
     `agents total=${report.agents.total} running=${report.agents.running} done=${report.agents.done} failed=${report.agents.failed}`,
     `output_tokens=${report.outputTokens}`,
     // Capped runs surface the ceiling and the live spend against it; uncapped (total
