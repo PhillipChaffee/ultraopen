@@ -350,6 +350,33 @@ describe("tool execution", () => {
     expect(await run({ script, dryRun: true })).toContain('agents="3"')
   })
 
+  test("a dry run leaves no run-lifecycle artifacts in the data root (#138)", async () => {
+    // A dry run is documented as free and stubbed; a settled manifest the status
+    // tool resolves as a real run contradicts that. The script still persists
+    // before the ask (the user opens the real file while the prompt is on screen),
+    // but the manifest lifecycle — manifest, journal, progress, result — never
+    // touches the shared run space, and the value comes back as the tool call's
+    // value, nothing more.
+    const output = await run({ script: `${META}return { ok: 1 }\n`, dryRun: true })
+    expect(output).toContain(`<result workflow="demo"`)
+    expect(output).toContain("<usage")
+    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? "",
+      runDir = join(dataRoot(undefined), runId)
+    expect(runId).toMatch(/^wf_/u)
+    expect(await readdir(runDir)).toEqual(["script.js"])
+    // The persisted script is the real source, so scriptPath can re-run it.
+    expect(await readFile(join(runDir, "script.js"), "utf8")).toBe(`${META}return { ok: 1 }\n`)
+  })
+
+  test("a failed dry run renders bare — no manifest means nothing to resume (#138)", async () => {
+    // With no manifest lifecycle, a dry failure is not a resumable run either:
+    // the render carries the diagnostic alone, and status is never sent to a
+    // run id the data root cannot resolve.
+    const output = await run({ script: `${META}throw new Error('dry boom')\n`, dryRun: true })
+    expect(output).toContain("dry boom")
+    expect(output).not.toContain(`<run id="`)
+  })
+
   test("asks for permission using the workflow's real name, not the ignored title arg", async () => {
     // The script is parsed BEFORE asking so the prompt can name the workflow. Using the `title`
     // argument would be wrong twice over: it is documented as ignored, and models omit it — which
