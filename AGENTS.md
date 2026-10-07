@@ -18,7 +18,7 @@ Single-context: a root `CONTEXT.md` and `docs/adr/` are created lazily by `/doma
 
 A ticket is done only when **every suite is green locally and the PR's CI is green** — code review and commit are not the close-out.
 
-1. **Unit gate**: `bun run check` (lint + typecheck + full bun test with the 95% coverage gate + node sandbox parity). Criterion: zero failures. `bun` lives at `~/.bun/bin` and is absent from the default shell PATH — `export PATH="$HOME/.bun/bin:$PATH"` first.
+1. **Unit gate**: `bun run check` (lint + typecheck + full bun test with the 95% coverage gate + node sandbox parity). Criterion: zero failures. `bun` lives at `~/.bun/bin` and is absent from the default shell PATH — `export PATH="$HOME/.bun/bin:$PATH"` first. A fresh worktree ships without node_modules — `bun install` before any suite, or the run dies on `Cannot find package` errors naming the wrong culprit.
 2. **Real-harness e2e**: the bun suite never exercises live opencode; both suites below drive real opencode processes with real model calls (pennies) inside a scratch-isolated XDG home:
    - `bash test/e2e/technical.sh` — headless `opencode run` cases.
    - `bash test/e2e/visual.sh` — the real TUI in tmux (tmux required), the slower suite.

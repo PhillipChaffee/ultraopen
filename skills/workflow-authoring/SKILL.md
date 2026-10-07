@@ -87,8 +87,12 @@ wastes the fast ones' idle time.
 
 ## Debugging
 
-Pass `dryRun: true` to run the whole script with `agent()` stubbed out — it exercises parsing,
-control flow and fan-out shape for zero tokens.
+**Pre-flight every script.** Launch each authored script once with `dryRun: true` — the whole
+script runs with `agent()` stubbed out, exercising parsing, the meta rules, control flow,
+combinator shape, and `agent()` argument validity (the stub carries the live agent's prompt
+guard) for zero tokens. Launch live only once the dry run has completed. Honest scope: a dry
+pass vouches for the script's structure, not its outcomes — prompt quality, schema fit under
+real provider behavior, and budget behavior under real spend are only visible live.
 
 Every run writes a journal, manifest, result and script under
 `<data>/opencode/tool-output/ultraopen/<runId>/`. Read `journal.jsonl` before diagnosing an
