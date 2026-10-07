@@ -291,6 +291,15 @@ export async function markCancelled(
       // The disk moved under the stop (a checkpoint's running rewrite, or the abort's echoed
       // settle): the stop authored this cancellation, so it re-claims directly over whatever
       // stands. The manifest-only write keeps the journal/result the run already flushed.
+      // A SETTLE terminal without the echo is the honest loss, not a re-claim (#164): the
+      // poll-flip route can deliver a genuine settled record here, and clobbering it would
+      // stand a cancelled record beside a published result.json. The re-read is live — the
+      // stale `current` above can predate the settle's rename.
+      const standing = await readManifest(manifest.runId, env)
+      if (standing !== undefined && standing.status !== "running" && standing.status !== "cancelled") {
+        const journal = await readJournal(manifest.runId, env)
+        if (!journal.some((entry) => isStopAbortDetail(entry.detail))) {return standing}
+      }
       await writeManifest(
         manifest.runId,
         { ...manifest, status: "cancelled", childSessionIDs, endedAt: Date.now() },

@@ -221,6 +221,19 @@ describe("resumeInterruptedRuns", () => {
     expect(calls[0]?.reminderTitle).toBe("Fix the login bug")
   })
 
+  test("a hand-edited non-string title degrades to untitled at the registry (#142)", async () => {
+    // The manifest is JSON a human can edit; a non-string must never reach the reminder's
+    // renderer (oneLine would throw inside the host's messages transform).
+    const entry = await seedCandidate({ title: 42 as unknown as string }),
+     { fn, calls } = makeExecute()
+
+    await resumeInterruptedRuns({ ...deps({ executeFn: fn }), candidates: [entry] })
+    await settlePromiseOf(RUN_ID)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.reminderTitle).toBeUndefined()
+  })
+
   test("skips a run whose interruption is older than the TTL window", async () => {
     const entry = await seedCandidate({ endedAt: Date.now() - 72 * 60 * 60 * 1000 }),
      { fn } = makeExecute()

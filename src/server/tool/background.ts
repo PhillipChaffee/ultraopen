@@ -115,14 +115,16 @@ export function promote(runId: string): void {
  * `title` metadata when the launch passed one (#142).
  *
  * Called from the launch path between registration and the permission ask, so even a pending
- * entry carries the name the reminder should show. Unknown ids are ignored: a dropped launch
- * must not resurrect anything.
+ * entry carries the name the reminder should show. The title must be a real non-blank string:
+ * the auto-resume sweep passes the adopted manifest's title — JSON a human can edit — and a
+ * non-string or blank would reach the reminder's renderer, which interpolates it into a line
+ * whose shape must hold. Unknown ids are ignored: a dropped launch must not resurrect anything.
  */
 export function nameRun(runId: string, name: string, title?: string | undefined): void {
   const entry = detached.get(runId)
   if (entry) {
     entry.name = name
-    if (title !== undefined) {entry.title = title}
+    if (typeof title === "string" && title.trim() !== "") {entry.title = title}
   }
 }
 

@@ -930,6 +930,9 @@ describe("background launch contract", () => {
       { sessionID: "parent" },
     )
     expect(output).toContain('workflow="demo" title="Fix the login bug"')
+    // The title reaches the live-run registry the per-turn reminder reads, before the run
+    // settles and the entry drops — the reminder surface's launch-path pin.
+    expect(background.liveRunsForSession("parent").at(0)?.title).toBe("Fix the login bug")
     await settle(output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? "")
   })
 

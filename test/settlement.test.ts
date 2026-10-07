@@ -124,6 +124,20 @@ const flushSnapshot = async (): Promise<{ logs: string[]; agents: unknown[] } | 
   }
 }
 
+/** The negative-direction stability idiom: the absence of a resurrection IS the pass, so
+ * the assertion polls a bounded window and throws the moment the forbidden state appears.
+ * A bare waitFor cannot express "must never happen"; a fixed sleep can false-pass when the
+ * clobber lands after it (the PR-#153 wait-instead-of-race rule, negative form). */
+async function assertStays(probe: () => Promise<string | undefined>, forbidden: string, what: string): Promise<void> {
+  for (let waited = 0; waited < 75; waited++) {
+    const current = await probe()
+    if (current !== forbidden) {
+      throw new Error(`${what}: "${String(current)}" appeared where "${forbidden}" must stay`)
+    }
+    await sleep(20)
+  }
+}
+
 describe("the child-list rewrite's cancel gate (#156)", () => {
   beforeEach(async () => {
     base = await mkdtemp(join(tmpdir(), "ultraopen-wiring-"))
@@ -167,15 +181,12 @@ describe("the child-list rewrite's cancel gate (#156)", () => {
 
     // The negative direction, waited for instead of slept: a stale rewrite that
     // resurrects running must appear within this bound (a buggy write lands within
-    // microseconds of the read's release), and its absence is the pass. A fixed
-    // sleep could false-pass under CI load when the clobber lands after it.
-    for (let waited = 0; waited < 75; waited++) {
-      const standing = await readManifest(RUN_ID, env)
-      if (standing?.status !== "cancelled") {
-        throw new Error("a stale child-list rewrite resurrected running over the cancelled record")
-      }
-      await sleep(20)
-    }
+    // microseconds of the read's release), and its absence is the pass.
+    await assertStays(
+      () => readManifest(RUN_ID, env).then((m) => m?.status),
+      "cancelled",
+      "a stale child-list rewrite resurrected running over the cancelled record",
+    )
     // And the cancelled record stands at the bound.
     const standing = await readManifest(RUN_ID, env)
     expect(standing?.status).toBe("cancelled")

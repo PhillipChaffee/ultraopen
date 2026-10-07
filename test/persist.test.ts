@@ -127,15 +127,18 @@ describe("the terminal-write race (#164)", () => {
   test("the stop's cancelled write re-claims when a racing settle renames over it after verification", async () => {
     // The stop's rename wins and verifies; the settle's rename lands during the persistence
     // window; the poll detects the flip and re-claims — the cancelled record must stand.
+    // The echo is what makes the re-claim the stop's to make: a real stop's abort journals it.
     await beginRun(record, env)
-    let clobbered = false
+    await appendJournalEntry("wf_abc123", { type: "result", key: "k3", scopePath: "", ordinal: 3, label: "step4", status: "null", reason: "aborted", detail: STOP_ABORT_REASON, outputTokens: 0 }, env)
+    let clobbered = false,
+      clobberLanded = false
     const racingWrite = async (runId: string, manifest: Manifest, e?: NodeJS.ProcessEnv): Promise<boolean> => {
       const won = await writeTerminalManifest(runId, manifest, e)
       if (won && !clobbered) {
         clobbered = true
         // The settle's rename lands just after the stop's verification read.
         setTimeout(() => {
-          void writeManifest(runId, { ...manifest, status: "completed", childSessionIDs: ["c1"] }, e)
+          void writeManifest(runId, { ...manifest, status: "completed", childSessionIDs: ["c1"] }, e).then(() => {clobberLanded = true})
         }, 10)
       }
       return won
@@ -144,12 +147,45 @@ describe("the terminal-write race (#164)", () => {
     if (!manifest) {throw new Error("the run was not opened")}
     const settled = await markCancelled(manifest, [], env, racingWrite)
     expect(settled?.status).toBe("cancelled")
-    // The staged racing write is a floating timer; let it land before asserting — on the
-    // pre-fix code the clobber stands (the stop returned before noticing), and the fix's
-    // persistence poll must have re-claimed instead.
-    await new Promise((resolve) => {setTimeout(resolve, 100)})
+    // Wait for the staged clobber to land (bounded, generous against the 10ms timer) — on
+    // the pre-fix code it stands and the stop never noticed; the persistence poll must have
+    // re-claimed instead.
+    for (let waited = 0; waited < 50 && !clobberLanded; waited++) {
+      await new Promise((resolve) => {setTimeout(resolve, 10)})
+    }
+    expect(clobberLanded).toBe(true)
     const standing = await readManifest("wf_abc123", env)
     expect(standing?.status).toBe("cancelled")
+  })
+
+  test("a poll-flip to a settled record with no stop echo in the journal is the honest loss", async () => {
+    // The re-claim is the stop's to make only when the journal proves the abort authored the
+    // terminal (the echo). A settle that genuinely won — no echo — keeps its status; a
+    // discriminator-less fallback would clobber a completed run into cancelled.
+    await beginRun(record, env)
+    await appendJournalEntry("wf_abc123", { type: "result", key: "k0", scopePath: "", ordinal: 0, label: "a", status: "ok", outputTokens: 3 }, env)
+    let clobbered = false,
+      clobberLanded = false
+    const racingWrite = async (runId: string, manifest: Manifest, e?: NodeJS.ProcessEnv): Promise<boolean> => {
+      const won = await writeTerminalManifest(runId, manifest, e)
+      if (won && !clobbered) {
+        clobbered = true
+        setTimeout(() => {
+          void writeManifest(runId, { ...manifest, status: "completed", childSessionIDs: ["c1"] }, e).then(() => {clobberLanded = true})
+        }, 10)
+      }
+      return won
+    }
+    const manifest = await readManifest("wf_abc123", env)
+    if (!manifest) {throw new Error("the run was not opened")}
+    const settled = await markCancelled(manifest, [], env, racingWrite)
+    expect(settled?.status).toBe("completed")
+    for (let waited = 0; waited < 50 && !clobberLanded; waited++) {
+      await new Promise((resolve) => {setTimeout(resolve, 10)})
+    }
+    expect(clobberLanded).toBe(true)
+    const settledStanding = await readManifest("wf_abc123", env)
+    expect(settledStanding?.status).toBe("completed")
   })
 })
 
