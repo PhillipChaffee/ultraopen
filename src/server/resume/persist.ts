@@ -183,20 +183,29 @@ export async function endRun(
  * lands only over a still-`running` manifest, so a run that settled a moment
  * earlier keeps its own status and the stop reports the loss honestly.
  *
- * The write retries a bounded number of times: a live run's own progress
- * checkpoint can rewrite `running` in the instant between this read and this
- * write (both are plain file writes), and a single clobber must not flip the
- * run's settled status — the retry re-reads and re-claims until the cancelled
- * record stands or another terminal status has already won.
- *
- * Returns whatever stands on disk after the attempt — `cancelled` when the
- * stop won, the earlier terminal status when it lost the race, `undefined`
- * when the disk could not be read at all.
+* The write retries a bounded number of times: a live run's own progress
+  * checkpoint can rewrite `running` in the instant between this read and this
+  * write (both are plain file writes), and a single clobber must not flip the
+  * run's settled status — the retry re-reads and re-claims until the cancelled
+  * record stands or another terminal status has already won.
+  *
+  * A cancelled write that WON can still be clobbered: the racing settle's
+  * rename passes its own still-`running` re-check before the cancel's rename
+  * and lands after it (check-then-rename is two syscalls, not one). The
+  * post-write read catches this, and the journal is the discriminator as
+  * everywhere: an abort's echo re-claims what the stop authored; a genuine
+  * settle keeps its status.
+  *
+  * Returns whatever stands on disk after the attempt — `cancelled` when the
+  * stop won, the earlier terminal status when it lost the race, `undefined`
+  * when the disk could not be read at all.
  */
 export async function markCancelled(
   manifest: Manifest,
   childSessionIDs: string[],
   env?: NodeJS.ProcessEnv,
+  /** Test-only seam (#161's race): swap the terminal write to stage a concurrent writer. */
+  writeTerminalManifestFn: typeof writeTerminalManifest = writeTerminalManifest,
 ): Promise<Manifest | undefined> {
   try {
     const first = await readManifest(manifest.runId, env)
@@ -216,14 +225,24 @@ export async function markCancelled(
       if (current === undefined) {return current}
       if (current.status === "cancelled") {return current}
       if (current.status === "running") {
-        const won = await writeTerminalManifest(
+        const won = await writeTerminalManifestFn(
           manifest.runId,
           { ...manifest, status: "cancelled", childSessionIDs, endedAt: Date.now() },
           env,
         )
         if (won) {
           const after = await readManifest(manifest.runId, env)
-          if (after === undefined || after.status !== "running") {return after}
+          if (after === undefined) {return after}
+          if (after.status === "cancelled") {return after}
+          if (after.status === "running") {continue}
+          // A different terminal landed over the stop's own cancelled write: the racing
+          // settle's rename passed its re-check before the cancel's rename and landed
+          // after it — both re-checks saw `running`, because check-then-rename is two
+          // syscalls, not one. The journal is the discriminator, as everywhere: the
+          // abort's echo re-claims what the stop authored; a genuine settle keeps its
+          // status.
+          const journal = await readJournal(manifest.runId, env)
+          if (!journal.some((entry) => isStopAbortDetail(entry.detail))) {return after}
           continue
         }
       }
