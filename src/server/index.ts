@@ -577,7 +577,14 @@ async function launchWorkflow(
     // Reached only by the launch phase itself: a parse failure or a rejected
     // permission ask. The run never went live, so the pending entry is dropped.
     dropPending(runId)
-    return renderFailure(error, args.script, runId)
+    // The run id/dir footer renders only when the run went live (#133): a
+    // prepare-phase failure or a rejected ask has no manifest, and advertising
+    // the id sent the status tool to "No run found" — which the model read as
+    // its own fault. The disk is the arbiter, not a flag: a settle-phase throw
+    // after beginRun (the only post-launch error this catch can see) keeps its
+    // footer, because the manifest on disk proves the run is real and resumable.
+    const wentLive = (await readManifest(runId)) !== undefined
+    return renderFailure(error, args.script, wentLive ? runId : undefined)
   }
 }
 
