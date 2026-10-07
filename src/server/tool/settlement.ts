@@ -300,12 +300,14 @@ export function startDetachedRun(spec: DetachedRunSpec): void {
           childSessionIDs: result.childSessionIDs,
         })
         // Hydration fires AFTER the settle protocol — the manifest is closed, so a model reacting
-        // to the notification finds workflow_status settled, not "running".
+        // to the notification finds workflow_status settled, not "running". The subject line
+        // carries the launch's title metadata (#142) off the manifest; absent when untitled.
         await deliverOutcomeUnlessStopped({
           client: spec.client,
           sessionID: spec.manifest.sessionID,
           runId: spec.runId,
           workflow: spec.prepared.meta.name,
+          ...(spec.manifest.title === undefined ? {} : { title: spec.manifest.title }),
           result,
           ...(spec.resume === undefined ? {} : { resume: spec.resume }),
           ...(explain === undefined ? {} : { prefix: explain(replayedCount(result.journal)) }),
@@ -332,6 +334,7 @@ export function startDetachedRun(spec: DetachedRunSpec): void {
           sessionID: spec.manifest.sessionID,
           runId: spec.runId,
           workflow: spec.prepared.meta.name,
+          ...(spec.manifest.title === undefined ? {} : { title: spec.manifest.title }),
           failureText: explain === undefined ? failureText : `${explain(replayedCount(partial?.journal))}\n${failureText}`,
         })
       }

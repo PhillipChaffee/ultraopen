@@ -378,6 +378,22 @@ describe("hydration — renderNotification", () => {
     expect(text.length).toBeLessThan(HYDRATION_CAP + 200)
     expect(text.endsWith(artifactPaths("wf_hyd0001").resultPath)).toBe(true)
   })
+
+  test("a titled completion's subject line carries the title beside the workflow name (#142)", () => {
+    const text = renderNotification({ status: "completed", name: "demo", runId: "wf_hyd0001", title: "Fix the login bug", body: "the value" })
+    expect(text).toContain('<workflow-completed run="wf_hyd0001" workflow="demo" title="Fix the login bug">')
+  })
+
+  test("a titled failure's subject line carries the title (#142)", () => {
+    const text = renderNotification({ status: "failed", name: "demo", runId: "wf_hyd0001", title: "Fix the login bug", body: "it broke" })
+    expect(text).toContain('<workflow-failed run="wf_hyd0001" workflow="demo" title="Fix the login bug">')
+  })
+
+  test("an untitled notification's subject line is unchanged — no placeholder noise (#142)", () => {
+    expect(renderNotification({ status: "completed", name: "demo", runId: "wf_hyd0002", body: "v" }))
+      .toContain('<workflow-completed run="wf_hyd0002" workflow="demo">')
+    expect(renderNotification({ status: "completed", name: "demo", runId: "wf_hyd0002", body: "v" })).not.toContain("title=")
+  })
 })
 
 describe("hydration — hydrateParent and deliverOutcome", () => {
@@ -436,6 +452,21 @@ describe("hydration — hydrateParent and deliverOutcome", () => {
     expect(sent).toHaveLength(1)
     expect(sent[0]?.text).toContain('<workflow-failed run="wf_hyd0001" workflow="demo">')
     expect(sent[0]?.text).toContain("it exploded")
+  })
+
+  test("deliverOutcome's title rides the notification's subject line, completed or failed (#142)", async () => {
+    const { client, sent } = fakeClient({})
+    await deliverOutcome({
+      client,
+      sessionID: "parent",
+      runId: "wf_hyd0001",
+      workflow: "demo",
+      title: "Fix the login bug",
+      result: { runId: "wf_hyd0001", meta: { name: "demo", description: "d" }, value: "OUTCOME", agentCount: 1, nulls: [], logs: [], outputTokens: 0, journal: [], childSessionIDs: [] },
+    })
+    expect(sent[0]?.text).toContain('<workflow-completed run="wf_hyd0001" workflow="demo" title="Fix the login bug">')
+    await deliverOutcome({ client, sessionID: "parent", runId: "wf_hyd0002", workflow: "demo", title: "Fix the login bug", failureText: "it exploded" })
+    expect(sent[1]?.text).toContain('<workflow-failed run="wf_hyd0002" workflow="demo" title="Fix the login bug">')
   })
 })
 

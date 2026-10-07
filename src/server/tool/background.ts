@@ -426,6 +426,11 @@ export interface HydrationOutcome {
   status: "completed" | "failed"
   name: string
   runId: string
+  /**
+   * The launch's `title` metadata (#142), shown in the subject line beside the workflow name.
+   * Absent on untitled runs, whose subject line is byte-identical to the pre-#142 shape.
+   */
+  title?: string
   /** The rendered result (completed) or failure text (failed) to wrap and cap. */
   body: string
 }
@@ -440,10 +445,12 @@ export interface HydrationOutcome {
  */
 export function renderNotification(outcome: HydrationOutcome): string {
   const tag = outcome.status === "completed" ? "workflow-completed" : "workflow-failed",
+    // The title rides the subject line beside the workflow name (#142); absent on untitled runs.
+    titleAttribute = outcome.title === undefined ? "" : ` title="${outcome.title}"`,
     { resultPath, failurePath } = artifactPaths(outcome.runId),
     full = outcome.status === "completed" ? `full result: ${resultPath}` : `full failure: ${failurePath}`
   return [
-    `<${tag} run="${outcome.runId}" workflow="${outcome.name}">`,
+    `<${tag} run="${outcome.runId}" workflow="${outcome.name}"${titleAttribute}>`,
     capAtLineBoundary(outcome.body),
     `</${tag}>`,
     full,
@@ -503,6 +510,8 @@ export function deliverOutcome(options: {
   sessionID: string
   runId: string
   workflow: string
+  /** The launch's `title` metadata (#142), shown in the subject line; absent when untitled. */
+  title?: string | undefined
   /** The completed run's result; its presence picks the completed shape. */
   result?: WorkflowResult
   resume?: { resumed: number; argsChanged: boolean }
@@ -511,7 +520,8 @@ export function deliverOutcome(options: {
   /** Prepended to the notification body, before the result render. */
   prefix?: string
 }): Promise<void> {
-  const prefixLine = options.prefix === undefined ? "" : `${options.prefix}\n`
+  const prefixLine = options.prefix === undefined ? "" : `${options.prefix}\n`,
+    title = options.title === undefined ? {} : { title: options.title }
   if (options.result !== undefined) {
     return hydrateParent({
       client: options.client,
@@ -520,6 +530,7 @@ export function deliverOutcome(options: {
         status: "completed",
         name: options.workflow,
         runId: options.runId,
+        ...title,
         body: `${prefixLine}${renderResult(options.result, options.resume, siblingRunsForSession(options.sessionID, options.runId))}`,
       },
     })
@@ -527,7 +538,7 @@ export function deliverOutcome(options: {
   return hydrateParent({
     client: options.client,
     sessionID: options.sessionID,
-    outcome: { status: "failed", name: options.workflow, runId: options.runId, body: `${prefixLine}${options.failureText ?? ""}` },
+    outcome: { status: "failed", name: options.workflow, runId: options.runId, ...title, body: `${prefixLine}${options.failureText ?? ""}` },
   })
 }
 
@@ -544,6 +555,8 @@ export async function deliverOutcomeUnlessStopped(options: {
   sessionID: string
   runId: string
   workflow: string
+  /** The launch's `title` metadata (#142), shown in the subject line; absent when untitled. */
+  title?: string | undefined
   result?: WorkflowResult
   resume?: { resumed: number; argsChanged: boolean }
   failureText?: string

@@ -48,6 +48,33 @@ const runDirAbs = (): string => join(base, "opencode", "tool-output", "ultraopen
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => {setTimeout(resolve, ms)})
 
+/** A client that records every promptAsync, so the hydration body is observable. */
+const recordingClient = (): { recording: OpencodeClient; sent: { sessionID: string; text: string }[] } => {
+  const sent: { sessionID: string; text: string }[] = []
+  return {
+    sent,
+    recording: {
+      session: {
+        get: () => Promise.resolve({ data: { id: SESSION } }),
+        abort: () => Promise.resolve({}),
+        promptAsync: (options: { path: { id: string }; body: { parts: { text: string }[] } }) => {
+          sent.push({ sessionID: options.path.id, text: options.body.parts[0]?.text ?? "" })
+          return Promise.resolve({ data: undefined })
+        },
+      },
+    } as unknown as OpencodeClient,
+  }
+}
+
+const preparedFixture = () => ({
+  source: SCRIPT,
+  meta: { name: "wired", description: "wiring" },
+  body: SCRIPT,
+  argsValue: undefined,
+  argsDereference: undefined,
+  argsHydrated: undefined,
+})
+
 /** Bounded waiting with a labelled timeout — the wait-instead-of-race idiom (PR #153). */
 const waitFor = async (until: () => boolean | Promise<boolean>, what: string): Promise<void> => {
   for (let waited = 0; waited < 600; waited++) {
@@ -293,33 +320,6 @@ describe("the settle protocol's failure surface (#135)", () => {
     await rm(base, { recursive: true, force: true })
   })
 
-  /** A client that records every promptAsync, so the hydration body is observable. */
-  const recordingClient = (): { recording: OpencodeClient; sent: { sessionID: string; text: string }[] } => {
-    const sent: { sessionID: string; text: string }[] = []
-    return {
-      sent,
-      recording: {
-        session: {
-          get: () => Promise.resolve({ data: { id: SESSION } }),
-          abort: () => Promise.resolve({}),
-          promptAsync: (options: { path: { id: string }; body: { parts: { text: string }[] } }) => {
-            sent.push({ sessionID: options.path.id, text: options.body.parts[0]?.text ?? "" })
-            return Promise.resolve({ data: undefined })
-          },
-        },
-      } as unknown as OpencodeClient,
-    }
-  }
-
-  const prepared = () => ({
-    source: SCRIPT,
-    meta: { name: "wired", description: "wiring" },
-    body: SCRIPT,
-    argsValue: undefined,
-    argsDereference: undefined,
-    argsHydrated: undefined,
-  })
-
   /**
    * Starts a detached run whose engine parks until the test releases it, then rejects with
    * the corpus shape: the aborted agent's null interpolated into the script's own template
@@ -337,7 +337,7 @@ describe("the settle protocol's failure surface (#135)", () => {
       client: recording,
       sessionID: SESSION,
       manifest: runningManifest(),
-      prepared: prepared(),
+      prepared: preparedFixture(),
       args: { script: SCRIPT },
       options: resolveOptions({}),
       env,
@@ -408,5 +408,73 @@ describe("the settle protocol's failure surface (#135)", () => {
     expect(failure).not.toContain("did not fail on its own")
     expect(sent[0]?.text).toContain("wave 1 integration failed: null")
     expect(sent[0]?.text).not.toContain("did not fail on its own")
+  })
+})
+
+describe("the settle notification's subject line (#142)", () => {
+  beforeEach(async () => {
+    base = await mkdtemp(join(tmpdir(), "ultraopen-wiring-"))
+    env = { XDG_DATA_HOME: base } as NodeJS.ProcessEnv
+    registry.resetForTests()
+    resetForTests()
+    await ensureRunDir(RUN_ID, env)
+  })
+
+  afterEach(async () => {
+    await rm(base, { recursive: true, force: true })
+  })
+
+  test("a titled run's completion subject line carries the title beside the workflow name", async () => {
+    const { recording, sent } = recordingClient()
+    const manifest = { ...runningManifest(), title: "Fix the login bug", description: "The auth flow" }
+    let release!: () => void
+    const parked = new Promise<void>((resolve) => {release = resolve})
+    startDetachedRun({
+      runId: RUN_ID,
+      client: recording,
+      sessionID: SESSION,
+      manifest,
+      prepared: preparedFixture(),
+      args: { script: SCRIPT },
+      options: resolveOptions({}),
+      env,
+      executeFn: async () => {
+        await parked
+        return { runId: RUN_ID, meta: { name: "wired", description: "wiring" }, value: "the value", agentCount: 1, nulls: [], logs: [], outputTokens: 0, journal: [], childSessionIDs: [] }
+      },
+    })
+    release()
+    await settlePromiseOf(RUN_ID)
+
+    expect(sent).toHaveLength(1)
+    expect(sent[0]?.text).toContain('<workflow-completed run="wf_settle01" workflow="wired" title="Fix the login bug">')
+    // The description is manifest-only: no render surface shows it.
+    expect(sent[0]?.text).not.toContain("The auth flow")
+  })
+
+  test("an untitled run's completion subject line is unchanged", async () => {
+    const { recording, sent } = recordingClient()
+    let release!: () => void
+    const parked = new Promise<void>((resolve) => {release = resolve})
+    startDetachedRun({
+      runId: RUN_ID,
+      client: recording,
+      sessionID: SESSION,
+      manifest: runningManifest(),
+      prepared: preparedFixture(),
+      args: { script: SCRIPT },
+      options: resolveOptions({}),
+      env,
+      executeFn: async () => {
+        await parked
+        return { runId: RUN_ID, meta: { name: "wired", description: "wiring" }, value: "the value", agentCount: 1, nulls: [], logs: [], outputTokens: 0, journal: [], childSessionIDs: [] }
+      },
+    })
+    release()
+    await settlePromiseOf(RUN_ID)
+
+    expect(sent).toHaveLength(1)
+    expect(sent[0]?.text).toContain('<workflow-completed run="wf_settle01" workflow="wired">')
+    expect(sent[0]?.text).not.toContain("title=")
   })
 })
