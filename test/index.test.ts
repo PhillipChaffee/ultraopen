@@ -390,10 +390,10 @@ describe("tool execution", () => {
     expect(output).not.toContain(`<run id="`)
   })
 
-  test("asks for permission using the workflow's real name, not the ignored title arg", async () => {
-    // The script is parsed BEFORE asking so the prompt can name the workflow. Using the `title`
-    // argument would be wrong twice over: it is documented as ignored, and models omit it — which
-    // showed up live as a permission prompt reading "null".
+  test("asks for permission using the workflow's real name, not the title arg", async () => {
+    // The script is parsed BEFORE asking so the prompt can name the workflow. The launch's
+    // `title` is run metadata (#142) — it surfaces on the run's own renders, never in the
+    // prompt — and models omit it, which showed up live as a permission prompt reading "null".
     const asked: Record<string, unknown>[] = []
     await run(
       { script: `${META}return 1\n`, dryRun: true, title: "ignored-title" },
@@ -966,6 +966,26 @@ describe("background launch contract", () => {
     const manifest = await readManifest(runId, undefined)
     expect(manifest?.title).toBeUndefined()
     expect(manifest?.description).toBeUndefined()
+  })
+
+  test.each([
+    ["empty string", ""],
+    ["whitespace-only", "   "],
+  ])("a %s title is absent everywhere — no placeholder noise (#142)", async (_label, blank) => {
+    // Models emit zero-value decorations; the presence rule treats blank as absent on
+    // every surface and on the manifest, exactly like an omitted field.
+    const tool = toolOf(ultraopen({ client: hangingClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 1\n`, background: true, title: blank, description: blank },
+      { sessionID: "parent" },
+    )
+    expect(output).toContain("<workflow-launched")
+    expect(output).not.toContain("title=")
+    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
+    const manifest = await readManifest(runId, undefined)
+    expect(manifest).not.toHaveProperty("title")
+    expect(manifest).not.toHaveProperty("description")
   })
 
   test("a second launch from the same session is refused while one is live", async () => {

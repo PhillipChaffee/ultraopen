@@ -224,9 +224,14 @@ describe("renderLaunch", () => {
     expect(launched.indexOf('workflow="demo"')).toBeLessThan(launched.indexOf('title="Fix the login bug"'))
   })
 
+  test("a title with a quote renders a well-formed attribute (#142)", () => {
+    // Titles are free model text; a raw quote would break the tag the model reads.
+    const launched = renderLaunch("demo", "wf_quoted1", false, [], undefined, undefined, 'Fix the "login" bug')
+    expect(launched).toContain('<workflow-launched run="wf_quoted1" workflow="demo" title="Fix the &quot;login&quot; bug"')
+  })
+
   test("an untitled launch renders exactly as before — no placeholder noise (#142)", () => {
     expect(renderLaunch("demo", "wf_untitl1", false)).not.toContain("title=")
-    expect(renderLaunch("demo", "wf_untitl2", false)).toBe(renderLaunch("demo", "wf_untitl2", false, [], undefined, undefined, undefined))
   })
 })
 

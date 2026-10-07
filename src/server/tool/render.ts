@@ -133,7 +133,7 @@ export function renderLaunch(
     projectionLine = `~${projection.agents} agents projected at launch.`
   }
   const budgetLine = renderBudgetLine(budgetTokens)
-  const titleAttribute = title === undefined ? "" : ` title="${title}"`
+  const titleAttribute = title === undefined ? "" : ` title="${attributeValue(title)}"`
   const lines = [
     `<workflow-launched run="${runId}" workflow="${workflow}"${titleAttribute} dir="${runDir(runId)}">`,
     // First body line, ahead of the contract sentence: size is what the model should
@@ -178,6 +178,18 @@ export interface RunSummary {
 /** The per-run ceiling statement; null (uncapped) stays silent — the surface is unchanged. */
 export function renderBudgetLine(budgetTokens: number | null | undefined): string | undefined {
   return typeof budgetTokens === "number" ? `Output-token budget: ${budgetTokens} per run.` : undefined
+}
+
+/**
+ * Renders one string as a double-quoted tag attribute value.
+ *
+ * Titles are free model text (#142); a raw quote inside the value would end the
+ * attribute early and malform the tag the model reads. The value is escaped for
+ * DISPLAY only — the manifest records the string verbatim. `&` goes first so the
+ * escape sequence itself is not double-escaped.
+ */
+export function attributeValue(value: string): string {
+  return value.replaceAll("&", "&amp;").replaceAll('"', "&quot;")
 }
 
 /** The combined-spend math the sibling advisory appends when the per-run budget is set. */
@@ -412,7 +424,7 @@ export function renderStringifiedArgsRefusal(raw: string, reason: string): strin
 export function renderStatus(report: StatusReport): string {
   // The launch's title metadata (#142) rides the tag, appended after the existing
   // attributes so the untitled shape is byte-identical to the pre-#142 render.
-  const titleAttribute = report.title === undefined ? "" : ` title="${report.title}"`
+  const titleAttribute = report.title === undefined ? "" : ` title="${attributeValue(report.title)}"`
   const lines = [
     `<workflow-status run="${report.runId}" status="${report.status}" dir="${report.dir}"${titleAttribute}>`,
     `agents total=${report.agents.total} running=${report.agents.running} done=${report.agents.done} failed=${report.agents.failed}`,
@@ -472,7 +484,7 @@ export function workflowArgsSchema(): Record<string, unknown> {
     title: {
       type: "string",
       description:
-        "Optional run title, recorded on the run's manifest and shown beside the workflow name on the launch result, the live-run reminder, status reports, and settle notifications. The workflow name stays primary.",
+        "Optional run title, recorded on the run's manifest and shown on the launch result, the live-run reminder, status reports, and settle notifications. The workflow name stays primary.",
     },
     description: {
       type: "string",

@@ -477,4 +477,31 @@ describe("the settle notification's subject line (#142)", () => {
     expect(sent[0]?.text).toContain('<workflow-completed run="wf_settle01" workflow="wired">')
     expect(sent[0]?.text).not.toContain("title=")
   })
+
+  test("a titled run's failure subject line carries the title through the real settle path", async () => {
+    // The catch path's deliverOutcomeUnlessStopped reads the title off the same manifest.
+    const { recording, sent } = recordingClient()
+    const manifest = { ...runningManifest(), title: "Fix the login bug" }
+    let release!: () => void
+    const parked = new Promise<void>((resolve) => {release = resolve})
+    startDetachedRun({
+      runId: RUN_ID,
+      client: recording,
+      sessionID: SESSION,
+      manifest,
+      prepared: preparedFixture(),
+      args: { script: SCRIPT },
+      options: resolveOptions({}),
+      env,
+      executeFn: async (): Promise<never> => {
+        await parked
+        throw new Error("the script blew up")
+      },
+    })
+    release()
+    await settlePromiseOf(RUN_ID)
+
+    expect(sent).toHaveLength(1)
+    expect(sent[0]?.text).toContain('<workflow-failed run="wf_settle01" workflow="wired" title="Fix the login bug">')
+  })
 })
