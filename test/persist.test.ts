@@ -254,7 +254,8 @@ describe("markCancelled — the stop path's terminal write", () => {
 
     expect(settled?.status).toBe("cancelled")
     expect(settled?.childSessionIDs).toEqual(["child-1"])
-    expect((await readManifest("wf_abc123", env))?.status).toBe("cancelled")
+    const reread = await readManifest("wf_abc123", env)
+    expect(reread?.status).toBe("cancelled")
   })
 
   test("a clobbering settle with no stop detail keeps its genuine record", async () => {
@@ -272,7 +273,8 @@ describe("markCancelled — the stop path's terminal write", () => {
     })
 
     expect(settled?.status).toBe("failed")
-    expect((await readManifest("wf_abc123", env))?.status).toBe("failed")
+    const reread = await readManifest("wf_abc123", env)
+    expect(reread?.status).toBe("failed")
   })
 })
 
