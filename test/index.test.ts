@@ -168,6 +168,19 @@ describe("plugin registration", () => {
     expect(JSON.stringify(args["stop"])).toContain("clear error")
   })
 
+  test("the title and description args' schemas teach the metadata contract (#142)", () => {
+    // The fields stopped being ignored (#142); a stale "Ignored." description would teach the
+    // model a lie on a load-bearing surface.
+    const args = toolOf(ultraopen({ client: stubClient }))?.args ?? {}
+    const title = JSON.stringify(args["title"]) ?? "",
+      description = JSON.stringify(args["description"]) ?? ""
+    expect(title).not.toContain("Ignored")
+    expect(title).toContain("manifest")
+    expect(title).toContain("workflow name")
+    expect(description).not.toContain("Ignored")
+    expect(description).toContain("manifest")
+  })
+
   test("applies the configured concurrency to the process-wide gate", () => {
     ultraopen({ client: stubClient }, { concurrency: 3 })
     expect(registry.semaphore.limit).toBe(3)

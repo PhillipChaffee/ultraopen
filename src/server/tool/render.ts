@@ -439,9 +439,10 @@ export function renderStatus(report: StatusReport): string {
 /**
  * The tools' argument schemas, as plain JSON-Schema-ish records.
  *
- * `title` and `description` are accepted and IGNORED, exactly as the spec specifies — a model
- * trained on Claude Code passes them, and rejecting them would surface as a validation error
- * instead of the documented silent ignore.
+ * `title` and `description` are honored as run metadata (#142) — a model trained on Claude Code
+ * passes them on most launches (89% of the sampled corpus), and the fields are recorded and
+ * surfaced rather than fought. The fields stay ACCEPTED either way: rejecting them would surface
+ * as a schema validation error instead of the honored metadata.
  */
 export function workflowArgsSchema(): Record<string, unknown> {
   return {
@@ -468,8 +469,15 @@ export function workflowArgsSchema(): Record<string, unknown> {
       description:
         "Stop the live workflow run with this id: its subagents are aborted and the run is marked cancelled. Unknown or already-finished run ids return a clear error.",
     },
-    title: { type: "string", description: "Ignored." },
-    description: { type: "string", description: "Ignored." },
+    title: {
+      type: "string",
+      description:
+        "Optional run title, recorded on the run's manifest and shown beside the workflow name on the launch result, the live-run reminder, status reports, and settle notifications. The workflow name stays primary.",
+    },
+    description: {
+      type: "string",
+      description: "Optional run description, recorded on the run's manifest.",
+    },
   }
 }
 
