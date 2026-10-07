@@ -909,6 +909,29 @@ describe("background launch contract", () => {
     expect(manifest?.bootId).toBeDefined()
   })
 
+  test("a titled launch round-trips title and description onto the manifest (#142)", async () => {
+    const tool = toolOf(ultraopen({ client: hangingClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 1\n`, background: true, title: "Fix the login bug", description: "The auth flow" },
+      { sessionID: "parent" },
+    )
+    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
+    const manifest = await readManifest(runId, undefined)
+    expect(manifest?.title).toBe("Fix the login bug")
+    expect(manifest?.description).toBe("The auth flow")
+  })
+
+  test("an untitled launch records no title on the manifest (#142)", async () => {
+    const tool = toolOf(ultraopen({ client: hangingClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute({ script: `${META}await agent('a')\nreturn 1\n`, background: true }, { sessionID: "parent" })
+    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
+    const manifest = await readManifest(runId, undefined)
+    expect(manifest?.title).toBeUndefined()
+    expect(manifest?.description).toBeUndefined()
+  })
+
   test("a second launch from the same session is refused while one is live", async () => {
     const tool = toolOf(ultraopen({ client: hangingClient }))
     if (!tool) {throw new Error("tool was not registered")}

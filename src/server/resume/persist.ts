@@ -33,6 +33,10 @@ export interface RunRecord {
    * JSON payload (#78) — the manifest then records both what arrived and what the script sees.
    */
   argsRawString?: string | undefined
+  /** The launch's `title` argument (#142), absent when the launch passed none. */
+  title?: string | undefined
+  /** The launch's `description` argument (#142), absent when the launch passed none. */
+  description?: string | undefined
 }
 
 /** Opens a run: creates its directory, persists the script, and marks it running. */
@@ -55,6 +59,10 @@ export async function beginRun(record: RunRecord, env?: NodeJS.ProcessEnv): Prom
       // When the boundary hydrated a stringified args (#78), the manifest records BOTH what
       // arrived and what the script will see — the transport repair stays diagnosable on disk.
       ...(record.argsRawString === undefined ? {} : { argsRawString: record.argsRawString }),
+      // The launch's title/description metadata (#142), recorded verbatim when present; an
+      // absent field is omitted so untitled manifests stay byte-identical to the pre-#142 shape.
+      ...(record.title === undefined ? {} : { title: record.title }),
+      ...(record.description === undefined ? {} : { description: record.description }),
       status: "running",
       childSessionIDs: [],
       // Wall-clock, stamped by the host rather than the script — scripts cannot read the clock at

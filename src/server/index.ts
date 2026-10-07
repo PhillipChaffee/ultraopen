@@ -6,7 +6,7 @@ import type { UltraopenOptions } from "./options.js"
 import { registry } from "./singleton.js"
 import { installConfig } from "./ultracode/config.js"
 import type { MutableConfig } from "./ultracode/config.js"
-import { execute, prepare, projectLaunchSize, renderFailure, WorkflowRunError } from "./tool/workflow.js"
+import { execute, launchMetadataOf, prepare, projectLaunchSize, renderFailure, WorkflowRunError } from "./tool/workflow.js"
 import { inspectArgsTransport } from "./tool/args-transport.js"
 import type { WorkflowArgs } from "./tool/workflow.js"
 import { WORKFLOW_TOOL, STATUS_TOOL } from "./bridge/permission.js"
@@ -566,6 +566,8 @@ async function launchWorkflow(
       // A hydrated launch records what actually arrived (#78): args holds the hydrated value,
       // argsRawString preserves the raw string the caller sent.
       ...(prepared.argsHydrated === undefined ? {} : { argsRawString: prepared.argsHydrated.raw }),
+      // The launch's title/description metadata (#142), absent together when the launch passed none.
+      ...launchMetadataOf(args),
     })
     if (!manifest) {
       dropPending(runId)

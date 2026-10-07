@@ -68,6 +68,35 @@ describe("beginRun", () => {
     const plain = await beginRun({ ...record }, env)
     expect(plain?.argsRawString).toBeUndefined()
   })
+
+  test("records the launch's title and description on the manifest (#142)", async () => {
+    const manifest = await beginRun({ ...record, title: "Fix the login bug", description: "The auth flow" }, env)
+    expect(manifest?.title).toBe("Fix the login bug")
+    expect(manifest?.description).toBe("The auth flow")
+    // Round-trip: what beginRun wrote is what a later read returns.
+    const onDisk = await readManifest("wf_abc123", env)
+    expect(onDisk?.title).toBe("Fix the login bug")
+    expect(onDisk?.description).toBe("The auth flow")
+  })
+
+  test("an untitled launch records neither field — the manifest shape is unchanged", async () => {
+    const manifest = await beginRun(record, env)
+    expect(manifest?.title).toBeUndefined()
+    expect(manifest?.description).toBeUndefined()
+    const onDisk = await readManifest("wf_abc123", env)
+    expect(onDisk).not.toHaveProperty("title")
+    expect(onDisk).not.toHaveProperty("description")
+  })
+
+  test("the terminal rewrite preserves the recorded title and description (#142)", async () => {
+    // endRun rewrites the manifest whole; the launch metadata is not the settle's to drop.
+    const manifest = await beginRun({ ...record, title: "Fix the login bug", description: "The auth flow" }, env)
+    await endRun(manifest, { status: "completed", entries: [entry], value: { done: true }, childSessionIDs: ["c1"] }, env)
+    const settled = await readManifest("wf_abc123", env)
+    expect(settled?.status).toBe("completed")
+    expect(settled?.title).toBe("Fix the login bug")
+    expect(settled?.description).toBe("The auth flow")
+  })
 })
 
 describe("endRun", () => {

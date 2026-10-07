@@ -39,12 +39,35 @@ export interface WorkflowArgs {
    */
   stop?: string
   /**
-   * Accepted and ignored, exactly as the spec specifies. A model trained on Claude Code passes
-   * these; rejecting them would surface as a schema validation error instead of the documented
-   * silent ignore.
+   * Honored as run metadata (#142). A model trained on Claude Code passes these on most
+   * launches (89% of the sampled corpus); the title surfaces where the run is already named
+   * (launch render, live-run reminder, status report, settle notifications) and both are
+   * recorded on the manifest. The workflow name stays primary on every surface.
    */
   title?: string
+  /** Honored as run metadata (#142); manifest-only — no render surface shows it. */
   description?: string
+}
+
+/**
+ * The launch metadata the boundary honors (#142), with its presence rule.
+ *
+ * A field that is missing, empty, or whitespace-only is ABSENT everywhere: the manifest omits
+ * it (untitled manifests stay byte-identical to the pre-#142 shape) and no surface renders
+ * placeholder noise. A present string is recorded and shown verbatim — refusing or dropping
+ * the fields is out of scope, and so is decorating an absent one into an empty title.
+ */
+export function launchMetadataOf(args: Pick<WorkflowArgs, "title" | "description">): {
+  title?: string
+  description?: string
+} {
+  const title = typeof args.title === "string" && args.title.trim() !== "" ? args.title : undefined,
+    description =
+      typeof args.description === "string" && args.description.trim() !== "" ? args.description : undefined
+  return {
+    ...(title === undefined ? {} : { title }),
+    ...(description === undefined ? {} : { description }),
+  }
 }
 
 export interface WorkflowContext {
