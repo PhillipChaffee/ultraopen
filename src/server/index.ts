@@ -638,12 +638,12 @@ interface BlockingRun {
 }
 
 /**
-* The blocking contract: wait for the run, then return one consolidated result.
-  *
-  * Kept behaviorally identical to the pre-async tool — it is the documented kill
-  * switch (`runMode: "blocking"` / `ULTRAOPEN_WORKFLOW_SYNC=1`). Dry runs no
-  * longer pass through here: they run the engine alone and leave no artifacts
-  * (#138). Its launch registered at the session gate like every other launch; the
+ * The blocking contract: wait for the run, then return one consolidated result.
+ *
+ * Kept behaviorally identical to the pre-async tool — it is the documented kill
+ * switch (`runMode: "blocking"` / `ULTRAOPEN_WORKFLOW_SYNC=1`). Dry runs no
+ * longer pass through here: they run the engine alone and leave no artifacts
+ * (#138). Its launch registered at the session gate like every other launch; the
  * finally drops that entry only after the settle protocol completed, so the
  * resume gate stays closed while the settle is writing and the next launch
  * finds no residue once it is done.
