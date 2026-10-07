@@ -35,8 +35,20 @@ ARTIFACTS_ROOT="$REPO_ROOT/test/e2e/artifacts"
 
 # Config knobs ----------------------------------------------------------------
 E2E_MODEL="${E2E_MODEL:-togetherai/zai-org/GLM-5.3-Flash}"
-E2E_PORT="${E2E_PORT:-18888}"
-E2E_TMUX_SOCKET="${E2E_TMUX_SOCKET:-ultraopen-e2e}"
+# Isolation is DERIVED from the branch this suite runs from, so two units can
+# never share a socket or a port by construction — there is nothing to record
+# and nothing to disagree about (the hand-assigned per-unit triples lived in
+# ephemeral handoffs and drifted). E2E_* overrides still win for manual control.
+# A rare hash collision (two branch ids mapping to one port) fails fast and loud
+# at the suites' own startup port checks instead of colliding mid-suite; a stale
+# listener on a derived port is almost certainly this branch's own leftover,
+# which makes the startup sweep's reclaim safe.
+E2E_UNIT_ID="${E2E_UNIT_ID:-$(git -C "$REPO_ROOT" branch --show-current)}"
+E2E_UNIT_ID="${E2E_UNIT_ID:-unknown}"
+E2E_UNIT_ID="${E2E_UNIT_ID//[^a-zA-Z0-9_-]/-}"   # tmux sockets reject '/'
+E2E_TMUX_SOCKET="${E2E_TMUX_SOCKET:-ultraopen-e2e-${E2E_UNIT_ID}}"
+E2E_PORT="${E2E_PORT:-$((18880 + $(printf '%s' "$E2E_UNIT_ID" | cksum | cut -d' ' -f1) % 19))}"
+E2E_RESUME_PORT="${E2E_RESUME_PORT:-$((E2E_PORT + 1))}"
 E2E_WAIT_TIMEOUT="${E2E_WAIT_TIMEOUT:-120}"   # seconds, default for wait_for
 E2E_POLL_INTERVAL="${E2E_POLL_INTERVAL:-1}"   # seconds between polls
 # seconds, hard max-time on every harness curl probe (#89): a wedged server
