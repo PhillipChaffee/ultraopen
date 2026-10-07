@@ -350,6 +350,33 @@ describe("tool execution", () => {
     expect(await run({ script, dryRun: true })).toContain('agents="3"')
   })
 
+  test("a dry run leaves no run-lifecycle artifacts in the data root (#138)", async () => {
+    // A dry run is documented as free and stubbed; a settled manifest the status
+    // tool resolves as a real run contradicts that. The script still persists
+    // before the ask (the user opens the real file while the prompt is on screen),
+    // but the manifest lifecycle — manifest, journal, progress, result — never
+    // touches the shared run space, and the value comes back as the tool call's
+    // value, nothing more.
+    const output = await run({ script: `${META}return { ok: 1 }\n`, dryRun: true })
+    expect(output).toContain(`<result workflow="demo"`)
+    expect(output).toContain("<usage")
+    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? "",
+      runDir = join(dataRoot(undefined), runId)
+    expect(runId).toMatch(/^wf_/u)
+    expect(await readdir(runDir)).toEqual(["script.js"])
+    // The persisted script is the real source, so scriptPath can re-run it.
+    expect(await readFile(join(runDir, "script.js"), "utf8")).toBe(`${META}return { ok: 1 }\n`)
+  })
+
+  test("a failed dry run renders bare — no manifest means nothing to resume (#138)", async () => {
+    // With no manifest lifecycle, a dry failure is not a resumable run either:
+    // the render carries the diagnostic alone, and status is never sent to a
+    // run id the data root cannot resolve.
+    const output = await run({ script: `${META}throw new Error('dry boom')\n`, dryRun: true })
+    expect(output).toContain("dry boom")
+    expect(output).not.toContain(`<run id="`)
+  })
+
   test("asks for permission using the workflow's real name, not the ignored title arg", async () => {
     // The script is parsed BEFORE asking so the prompt can name the workflow. Using the `title`
     // argument would be wrong twice over: it is documented as ignored, and models omit it — which
@@ -397,6 +424,48 @@ describe("tool execution", () => {
     expect(output).toContain("not TypeScript")
     // The caret line proves the source was threaded through to the renderer.
     expect(output).toContain("^")
+  })
+
+  test("a prepare-phase failure renders bare — no run id or dir footer (#133)", async () => {
+    // The failure footer's resume pointer names a run only when the run went live.
+    // A parse failure dies in prepare — before the run directory exists — and the
+    // footer it used to advertise sent the status tool to "No run found", which the
+    // model read as its own fault. 40/40 sampled failure-render ids were absent.
+    const before = await listRoot(),
+      output = await run({ script: `${META}const x: string[] = []\n` })
+    expect(output).toContain("ParseError")
+    expect(output).not.toContain(`<run id="`)
+    expect(output).not.toContain(`dir="`)
+    // Nothing was created to resume: the data root gains no run directory.
+    expect(await listRoot()).toEqual(before)
+  })
+
+  test("a rejected permission ask renders bare — no run id or dir footer (#133)", async () => {
+    // The ask gates the launch, so a rejection means the run never went live:
+    // nothing to resume, nothing to advertise, nothing for status to miss. The
+    // script-persisting run directory still exists (it is written before the ask
+    // on purpose) — but the render must not point at it.
+    const output = await run(
+      { script: `${META}return 1\n` },
+      { ask: () => Promise.reject(new Error("user said no")) },
+    )
+    expect(output).toContain("user said no")
+    expect(output).not.toContain(`<run id="`)
+  })
+
+  test("a live-run failure keeps the run id/dir footer (#133)", async () => {
+    // The footer's purpose is resume recoverability: a run that went live has a
+    // journal to replay, so its failure render keeps naming it. Pinned so the
+    // prepare-phase bareness above cannot bleed into real runs.
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}await agent('a')\nthrow new Error('boom mid-run')\n`, background: false },
+      { sessionID: "parent" },
+    )
+    expect(output).toContain("boom mid-run")
+    expect(output).toContain(`<run id="`)
+    expect(output).toMatch(/dir="[^"]+"/u)
   })
 
   test("a missing script is reported clearly", async () => {

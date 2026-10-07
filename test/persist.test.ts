@@ -231,6 +231,51 @@ describe("markCancelled — the stop path's terminal write", () => {
     const settled = await markCancelled(manifest, [], env)
     expect(settled?.status).toBe("failed")
   })
+
+  test("re-claims the abort's echo when the racing settle clobbers the cancel's own write", async () => {
+    // The live shape the technical e2e's stop probe hit: the stop's cancelled rename and
+    // the unwind's failed rename both passed their re-checks (each saw `running`), and the
+    // settle's rename landed second — clobbering the cancel that was already on disk.
+    // The won branch's post-write read then sees `failed`. The journal is the
+    // discriminator, as everywhere: the abort's echo re-claims what the stop authored.
+    const manifest = await beginRun(record, env)
+    if (!manifest) {throw new Error("the run did not open")}
+    const stoppedEntry: JournalEntry = { ...entry, status: "null", reason: "aborted", detail: STOP_ABORT_REASON }
+    await appendJournalEntry("wf_abc123", stoppedEntry, env)
+
+    // Deterministic clobber: the real terminal write lands cancelled, and the racing
+    // settle's rename — which passed its own re-check a beat earlier — lands over it
+    // before markCancelled's post-write read.
+    const settled = await markCancelled(manifest, ["child-1"], env, async (runId, cancelled, writeEnv) => {
+      const won = await writeTerminalManifest(runId, cancelled, writeEnv)
+      await writeManifest(runId, { ...cancelled, status: "failed", endedAt: 1 }, writeEnv)
+      return won
+    })
+
+    expect(settled?.status).toBe("cancelled")
+    expect(settled?.childSessionIDs).toEqual(["child-1"])
+    const reread = await readManifest("wf_abc123", env)
+    expect(reread?.status).toBe("cancelled")
+  })
+
+  test("a clobbering settle with no stop detail keeps its genuine record", async () => {
+    // Same race shape, but the journal carries no stop detail: the settle was genuine
+    // (the run failed on its own while the stop's write was in flight), so the stop's
+    // cancellation must NOT re-claim it.
+    const manifest = await beginRun(record, env)
+    if (!manifest) {throw new Error("the run did not open")}
+    await appendJournalEntry("wf_abc123", entry, env)
+
+    const settled = await markCancelled(manifest, [], env, async (runId, cancelled, writeEnv) => {
+      const won = await writeTerminalManifest(runId, cancelled, writeEnv)
+      await writeManifest(runId, { ...cancelled, status: "failed", endedAt: 1 }, writeEnv)
+      return won
+    })
+
+    expect(settled?.status).toBe("failed")
+    const reread = await readManifest("wf_abc123", env)
+    expect(reread?.status).toBe("failed")
+  })
 })
 
 describe("loadResume", () => {

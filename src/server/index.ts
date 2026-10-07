@@ -517,6 +517,40 @@ async function launchWorkflow(
       ? await loadResume(args.resumeFromRunId, prepared.argsValue, context.sessionID)
       : undefined
 
+    // A dry run keeps the pre-ask script persistence above but runs NO manifest
+    // lifecycle (#138): no manifest, no journal, no progress, no result.json in
+    // the shared run space — a settled manifest that workflow_status resolves as
+    // a real run contradicts what a dry run is documented to be. The value comes
+    // back as the tool call's value, nothing more; the context below is the live
+    // blocking one minus every artifact writer, so the engine's log lines and
+    // any replayed entries stay in memory. A dry failure lands in the catch
+    // below, whose manifest check renders it bare (nothing to resume).
+    if (args.dryRun === true) {
+      const dryContext: Parameters<typeof execute>[1] = {
+        client,
+        sessionID: context.sessionID,
+        runId,
+        deadlineMs: options.agentDeadlineMs,
+        idleMs: options.agentIdleMs,
+        readScript: (path: string) => readFile(path, "utf8"),
+        ...(defaultModel === undefined ? {} : { defaultModel }),
+        ...(options.budgetTokens === null ? {} : { budgetTotal: options.budgetTokens }),
+        signal: context.abort,
+        ...(Object.keys(named).length > 0 ? { named } : {}),
+        ...(resume !== undefined && resume.entries.length > 0
+          ? {
+              previousEntries: resume.entries,
+              ...(args.resumeFromRunId === undefined ? {} : { resumedFrom: args.resumeFromRunId }),
+            }
+          : {}),
+      }
+      const result = await execute(args, dryContext)
+      return [renderResult(result, {
+        resumed: resume?.entries.length ?? 0,
+        argsChanged: resume?.argsChanged === true,
+      }, siblingRunsForSession(context.sessionID, runId), options.budgetTokens), ...scanNoteLines].join("\n")
+    }
+
     // The manifest MUST be on disk before this call returns: the launch result
     // names a run id that `workflow_status` has to resolve, and a run without a
     // manifest is invisible to the status tool and to the reaper. A beginRun
@@ -577,7 +611,14 @@ async function launchWorkflow(
     // Reached only by the launch phase itself: a parse failure or a rejected
     // permission ask. The run never went live, so the pending entry is dropped.
     dropPending(runId)
-    return renderFailure(error, args.script, runId)
+    // The run id/dir footer renders only when the run went live (#133): a
+    // prepare-phase failure or a rejected ask has no manifest, and advertising
+    // the id sent the status tool to "No run found" — which the model read as
+    // its own fault. The disk is the arbiter, not a flag: a settle-phase throw
+    // after beginRun (the only post-launch error this catch can see) keeps its
+    // footer, because the manifest on disk proves the run is real and resumable.
+    const wentLive = (await readManifest(runId)) !== undefined
+    return renderFailure(error, args.script, wentLive ? runId : undefined)
   }
 }
 
@@ -600,8 +641,9 @@ interface BlockingRun {
  * The blocking contract: wait for the run, then return one consolidated result.
  *
  * Kept behaviorally identical to the pre-async tool — it is the documented kill
- * switch (`runMode: "blocking"` / `ULTRAOPEN_WORKFLOW_SYNC=1`) and the dry-run
- * path. Its launch registered at the session gate like every other launch; the
+ * switch (`runMode: "blocking"` / `ULTRAOPEN_WORKFLOW_SYNC=1`). Dry runs no
+ * longer pass through here: they run the engine alone and leave no artifacts
+ * (#138). Its launch registered at the session gate like every other launch; the
  * finally drops that entry only after the settle protocol completed, so the
  * resume gate stays closed while the settle is writing and the next launch
  * finds no residue once it is done.
