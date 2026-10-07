@@ -75,6 +75,11 @@ export interface DetachedRun {
    * live-run reminder falls back to the run id for that window.
    */
   name?: string
+  /**
+   * The launch's `title` metadata (#142), recorded alongside the name once the launch path has
+   * read it; the reminder shows it as a parenthetical beside the name. Absent on untitled runs.
+   */
+  title?: string
 }
 
 const detached = new Map<string, DetachedRun>()
@@ -106,15 +111,19 @@ export function promote(runId: string): void {
 }
 
 /**
- * Records a launch's workflow name once prepare() has parsed the script.
+ * Records a launch's workflow name once prepare() has parsed the script, with the launch's
+ * `title` metadata when the launch passed one (#142).
  *
  * Called from the launch path between registration and the permission ask, so even a pending
  * entry carries the name the reminder should show. Unknown ids are ignored: a dropped launch
  * must not resurrect anything.
  */
-export function nameRun(runId: string, name: string): void {
+export function nameRun(runId: string, name: string, title?: string | undefined): void {
   const entry = detached.get(runId)
-  if (entry) {entry.name = name}
+  if (entry) {
+    entry.name = name
+    if (title !== undefined) {entry.title = title}
+  }
 }
 
 /** Drops a pending entry — the launch failed before the run went live. */

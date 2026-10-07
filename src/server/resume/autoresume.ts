@@ -224,7 +224,9 @@ export async function resumeInterruptedRuns(deps: AutoResumeDeps): Promise<AutoR
     deps.onNote?.(`ultraopen: resuming ${runId} — interrupted when opencode exited`)
 
     registerPending(runId, candidate.sessionID)
-    nameRun(runId, prepared.meta.name)
+    // The adopted manifest carries the original launch's title metadata (#142); the reminder
+    // shows it beside the name, exactly as the original session's live reminder did.
+    nameRun(runId, prepared.meta.name, candidate.title)
     startDetachedRun({
       runId,
       client,

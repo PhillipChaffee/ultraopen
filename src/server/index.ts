@@ -472,8 +472,9 @@ async function launchWorkflow(
     })
 
     // The per-turn live-run reminder names the workflow, and prepare() is where the name is
-    // first known — recorded before the ask so even a pending entry carries it.
-    nameRun(runId, prepared.meta.name)
+    // first known — recorded before the ask so even a pending entry carries it. The launch's
+    // title metadata rides along (#142); the reminder shows it beside the name.
+    nameRun(runId, prepared.meta.name, launchMetadata.title)
 
     // Persist the script BEFORE the ask, so the user can open the real file
     // while the prompt is on screen. beginRun writes it again (same bytes) when
