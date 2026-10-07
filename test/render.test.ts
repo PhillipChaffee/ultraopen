@@ -231,6 +231,9 @@ describe("renderLaunch", () => {
   })
 
   test("an untitled launch renders exactly as before — no placeholder noise (#142)", () => {
+    // The full tag, exactly: an untitled launch's opening line is byte-identical to the
+    // pre-#142 shape, not merely free of the title attribute.
+    expect(renderLaunch("demo", "wf_untitl1", false)).toContain('<workflow-launched run="wf_untitl1" workflow="demo" dir="')
     expect(renderLaunch("demo", "wf_untitl1", false)).not.toContain("title=")
   })
 })
@@ -286,6 +289,8 @@ describe("renderStatus", () => {
 
   test("an untitled run's tag is unchanged — no placeholder noise (#142)", () => {
     expect(renderStatus(statusReport())).not.toContain("title=")
+    // The full tag, exactly: byte-identical to the pre-#142 shape.
+    expect(renderStatus(statusReport())).toContain('<workflow-status run="wf_status01" status="running" dir="/fake/opencode/tool-output/ultraopen/wf_status01">')
   })
 })
 

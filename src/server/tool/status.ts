@@ -4,6 +4,7 @@ import { artifactPaths, isSafeRunId, runDir } from "../resume/store.js"
 import type { ManifestRead } from "../resume/store.js"
 import type { ProgressSnapshot } from "../resume/progress.js"
 import { isProcessAlive } from "./background.js"
+import { manifestTitleOf } from "./args-transport.js"
 
 /**
  * The `workflow_status` tool: a disk-only read of a run's state.
@@ -223,13 +224,15 @@ async function buildSnapshot(input: {
   )
   if (typeof progress?.phase === "string" && !phases.includes(progress.phase)) {phases.push(progress.phase)}
 
+  // The launch's title metadata (#142), under the same presence rule every manifest reader
+  // applies (a hand-edited blank/decoration/non-string degrades to absent).
+  const launchTitle = manifestTitleOf(manifest?.title)
+
   const report: StatusReport = {
     runId: args.runId,
     dir,
     status,
-    // The launch's title metadata (#142), verbatim off the manifest; a hand-edited
-    // non-string degrades to absent (the render's attribute builder would throw).
-    ...(typeof manifest?.title === "string" ? { title: manifest.title } : {}),
+    ...(launchTitle === undefined ? {} : { title: launchTitle }),
     phase: progress?.phase,
     phases,
     agents: countAgents(progress, entries),

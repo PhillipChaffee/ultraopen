@@ -234,6 +234,20 @@ describe("resumeInterruptedRuns", () => {
     expect(calls[0]?.reminderTitle).toBeUndefined()
   })
 
+  test.each([
+    ["whitespace-only", "   "],
+    ["null decoration", "null"],
+  ])("a hand-edited %s title is absent at the registry — the same presence rule as the launch (#142)", async (_label, blank) => {
+    const entry = await seedCandidate({ title: blank }),
+     { fn, calls } = makeExecute()
+
+    await resumeInterruptedRuns({ ...deps({ executeFn: fn }), candidates: [entry] })
+    await settlePromiseOf(RUN_ID)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.reminderTitle).toBeUndefined()
+  })
+
   test("skips a run whose interruption is older than the TTL window", async () => {
     const entry = await seedCandidate({ endedAt: Date.now() - 72 * 60 * 60 * 1000 }),
      { fn } = makeExecute()

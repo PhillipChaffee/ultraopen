@@ -11,6 +11,7 @@ import { registry } from "../singleton.js"
 import type { OpencodeClient } from "../types.js"
 import { deliverOutcomeUnlessStopped, registerStopHandle, runDetached } from "./background.js"
 import { execute, renderFailure, WorkflowRunError } from "./workflow.js"
+import { manifestTitleOf } from "./args-transport.js"
 import { renderStopFailure, stopReasonOf } from "./render.js"
 import type { PreparedWorkflow, WorkflowArgs } from "./workflow.js"
 
@@ -294,6 +295,8 @@ export function startDetachedRun(spec: DetachedRunSpec): void {
     runId: spec.runId,
     manifest: spec.manifest,
     task: async (): Promise<void> => {
+      // The subject line's title (#142), under the presence rule every manifest reader applies.
+      const launchTitle = manifestTitleOf(spec.manifest.title)
       try {
         const result = await executeFn(spec.args, wiring.executeContext)
         await wiring.settle({
@@ -312,7 +315,7 @@ export function startDetachedRun(spec: DetachedRunSpec): void {
           sessionID: spec.manifest.sessionID,
           runId: spec.runId,
           workflow: spec.prepared.meta.name,
-          ...(spec.manifest.title === undefined ? {} : { title: spec.manifest.title }),
+          ...(launchTitle === undefined ? {} : { title: launchTitle }),
           result,
           ...(spec.resume === undefined ? {} : { resume: spec.resume }),
           ...(explain === undefined ? {} : { prefix: explain(replayedCount(result.journal)) }),
@@ -339,7 +342,7 @@ export function startDetachedRun(spec: DetachedRunSpec): void {
           sessionID: spec.manifest.sessionID,
           runId: spec.runId,
           workflow: spec.prepared.meta.name,
-          ...(spec.manifest.title === undefined ? {} : { title: spec.manifest.title }),
+          ...(launchTitle === undefined ? {} : { title: launchTitle }),
           failureText: explain === undefined ? failureText : `${explain(replayedCount(partial?.journal))}\n${failureText}`,
         })
       }

@@ -217,6 +217,15 @@ describe("executeStatus — derivations", () => {
     expect(report.title).toBeUndefined()
   })
 
+  test.each([
+    ["whitespace-only", "   "],
+    ["null decoration", "null"],
+  ])("a hand-edited %s title rides the status report as absent — the same presence rule as the launch (#142)", async (_label, blank) => {
+    const blanked = JSON.stringify({ ...MANIFEST_RUNNING, title: blank })
+    const report = await executeStatus({ runId: RUN }, deps({ "manifest.json": blanked }))
+    expect(report.title).toBeUndefined()
+  })
+
   test("output tokens exclude replayed entries and sum the rest", async () => {
     const journal = [
       entry({ outputTokens: 100 }),

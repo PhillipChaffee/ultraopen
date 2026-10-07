@@ -86,3 +86,14 @@ function presentMetadata(value: unknown): string | undefined {
   if (trimmed === "" || trimmed === "null" || trimmed === "undefined") {return undefined}
   return value
 }
+
+/**
+ * The presence rule applied to a title read back OFF a manifest (#142).
+ *
+ * The manifest is JSON a human can edit, so every reader — the launch registry, the status
+ * report, the settle notifications — applies the same rule the launch boundary does, instead
+ * of each growing its own guard.
+ */
+export function manifestTitleOf(title: unknown): string | undefined {
+  return presentMetadata(title)
+}

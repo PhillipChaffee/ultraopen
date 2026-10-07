@@ -4,6 +4,7 @@ import { endRun, markCancelled } from "../resume/persist.js"
 import { artifactPaths, isSafeRunId, readManifest, runDir, writeFailure } from "../resume/store.js"
 import { registry } from "../singleton.js"
 import type { OpencodeClient } from "../types.js"
+import { manifestTitleOf } from "./args-transport.js"
 import { renderResult, titleAttributeOf } from "./render.js"
 import type { WorkflowResult } from "./workflow.js"
 
@@ -124,7 +125,8 @@ export function nameRun(runId: string, name: string, title?: string | undefined)
   const entry = detached.get(runId)
   if (entry) {
     entry.name = name
-    if (typeof title === "string" && title.trim() !== "") {entry.title = title}
+    const present = manifestTitleOf(title)
+    if (present !== undefined) {entry.title = present}
   }
 }
 
