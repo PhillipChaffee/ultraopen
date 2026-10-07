@@ -216,6 +216,34 @@ describe("renderLaunch", () => {
     const capped = renderLaunch("demo", "wf_budget03", false, siblings, undefined, 50_000)
     expect(capped).toContain("With 3 live runs in this session at 50000 output tokens each, combined ceiling 150000.")
   })
+
+  test("a titled launch names the title beside the workflow name in the opening tag (#142)", () => {
+    const launched = renderLaunch("demo", "wf_title01", false, [], undefined, undefined, "Fix the login bug")
+    expect(launched).toContain('<workflow-launched run="wf_title01" workflow="demo" title="Fix the login bug"')
+    // The name stays primary: the workflow attribute precedes the title it qualifies.
+    expect(launched.indexOf('workflow="demo"')).toBeLessThan(launched.indexOf('title="Fix the login bug"'))
+  })
+
+  test("a title with a quote renders a well-formed attribute (#142)", () => {
+    // Titles are free model text; a raw quote would break the tag the model reads.
+    const launched = renderLaunch("demo", "wf_quoted1", false, [], undefined, undefined, 'Fix the "login" bug')
+    expect(launched).toContain('<workflow-launched run="wf_quoted1" workflow="demo" title="Fix the &quot;login&quot; bug"')
+  })
+
+  test("a title with a line break stays one line in the tag (#142)", () => {
+    // The same free-text class the reminder's oneLine guards: a multi-line title would
+    // split the opening tag across lines.
+    const launched = renderLaunch("demo", "wf_newlin1", false, [], undefined, undefined, "Fix\nthe bug")
+    expect(launched).toContain('<workflow-launched run="wf_newlin1" workflow="demo" title="Fix the bug" dir="')
+    expect(launched.split("\n").length).toBeGreaterThan(1)
+  })
+
+  test("an untitled launch renders exactly as before — no placeholder noise (#142)", () => {
+    // The full tag, exactly: an untitled launch's opening line is byte-identical to the
+    // pre-#142 shape, not merely free of the title attribute.
+    expect(renderLaunch("demo", "wf_untitl1", false)).toContain('<workflow-launched run="wf_untitl1" workflow="demo" dir="')
+    expect(renderLaunch("demo", "wf_untitl1", false)).not.toContain("title=")
+  })
 })
 
 describe("renderResult — budget statement", () => {
@@ -260,6 +288,17 @@ describe("renderStatus", () => {
 
   test("an uncapped run stays silent — no budget line at all", () => {
     expect(renderStatus(statusReport())).not.toContain("budget")
+  })
+
+  test("a titled run carries the title in the opening tag, appended after the existing attributes (#142)", () => {
+    const rendered = renderStatus(statusReport({ title: "Fix the login bug" }))
+    expect(rendered).toContain('<workflow-status run="wf_status01" status="running" dir="/fake/opencode/tool-output/ultraopen/wf_status01" title="Fix the login bug">')
+  })
+
+  test("an untitled run's tag is unchanged — no placeholder noise (#142)", () => {
+    expect(renderStatus(statusReport())).not.toContain("title=")
+    // The full tag, exactly: byte-identical to the pre-#142 shape.
+    expect(renderStatus(statusReport())).toContain('<workflow-status run="wf_status01" status="running" dir="/fake/opencode/tool-output/ultraopen/wf_status01">')
   })
 })
 

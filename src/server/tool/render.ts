@@ -107,6 +107,11 @@ export function renderResult(
  * agents are scheduled, so it is the model's chance to double-check the script.
  * The per-run budget statement (when `budgetTokens` is set) rides beside it:
  * cost joins size as a pre-flight consideration.
+ *
+ * The launch's `title` metadata (#142), when the launch passed one, rides in
+ * the opening tag right after the workflow name it qualifies — the name stays
+ * primary, the title is additional. Absent on an untitled launch, whose tag is
+ * byte-identical to the pre-#142 shape.
  */
 export function renderLaunch(
   workflow: string,
@@ -115,6 +120,7 @@ export function renderLaunch(
   siblings: readonly RunSummary[] = [],
   projection?: { agents: number; threshold: number } | undefined,
   budgetTokens?: number | null | undefined,
+  title?: string | undefined,
 ): string {
   let projectionLine: string | undefined
   if (projection === undefined) {
@@ -127,8 +133,9 @@ export function renderLaunch(
     projectionLine = `~${projection.agents} agents projected at launch.`
   }
   const budgetLine = renderBudgetLine(budgetTokens)
+  const titleAttribute = titleAttributeOf(title)
   const lines = [
-    `<workflow-launched run="${runId}" workflow="${workflow}" dir="${runDir(runId)}">`,
+    `<workflow-launched run="${runId}" workflow="${workflow}"${titleAttribute} dir="${runDir(runId)}">`,
     // First body line, ahead of the contract sentence: size is what the model should
     // reconsider before the fan-out is scheduled.
     ...(projectionLine === undefined ? [] : [projectionLine]),
@@ -171,6 +178,36 @@ export interface RunSummary {
 /** The per-run ceiling statement; null (uncapped) stays silent — the surface is unchanged. */
 export function renderBudgetLine(budgetTokens: number | null | undefined): string | undefined {
   return typeof budgetTokens === "number" ? `Output-token budget: ${budgetTokens} per run.` : undefined
+}
+
+/**
+ * Renders one string as a double-quoted tag attribute value.
+ *
+ * Titles are free model text (#142); a raw quote inside the value would end the
+ * attribute early and malform the tag the model reads. The value is escaped for
+ * DISPLAY only — the manifest records the string verbatim. `&` goes first so the
+ * escape sequence itself is not double-escaped.
+ */
+export function attributeValue(value: string): string {
+  return value.replaceAll("&", "&amp;").replaceAll('"', "&quot;")
+}
+
+/**
+ * The ` title="..."` attribute for a render tag, empty when the title is absent.
+ *
+ * The manifests are JSON files a human can edit, so a non-string value read off disk
+ * degrades to untitled instead of throwing inside a render the settle protocol or the
+ * status tool already committed to. Line breaks are flattened for display — the same
+ * free-text shape rule the reminder's oneLine applies — so the tag stays one line; the
+ * manifest records the title verbatim.
+ */
+export function titleAttributeOf(title: string | undefined): string {
+  return typeof title === "string" ? ` title="${attributeValue(oneLineTitle(title))}"` : ""
+}
+
+/** Flattens a free-text title onto one line for a tag attribute (#142). */
+function oneLineTitle(title: string): string {
+  return title.replaceAll(/\s+/gu, " ").trim()
 }
 
 /** The combined-spend math the sibling advisory appends when the per-run budget is set. */
@@ -403,8 +440,11 @@ export function renderStringifiedArgsRefusal(raw: string, reason: string): strin
 
 /** The status tool's report, for the model. Same uncapped stance as renderResult. */
 export function renderStatus(report: StatusReport): string {
+  // The launch's title metadata (#142) rides the tag, appended after the existing
+  // attributes so the untitled shape is byte-identical to the pre-#142 render.
+  const titleAttribute = titleAttributeOf(report.title)
   const lines = [
-    `<workflow-status run="${report.runId}" status="${report.status}" dir="${report.dir}">`,
+    `<workflow-status run="${report.runId}" status="${report.status}" dir="${report.dir}"${titleAttribute}>`,
     `agents total=${report.agents.total} running=${report.agents.running} done=${report.agents.done} failed=${report.agents.failed}`,
     `output_tokens=${report.outputTokens}`,
     // Capped runs surface the ceiling and the live spend against it; uncapped (total
@@ -429,9 +469,10 @@ export function renderStatus(report: StatusReport): string {
 /**
  * The tools' argument schemas, as plain JSON-Schema-ish records.
  *
- * `title` and `description` are accepted and IGNORED, exactly as the spec specifies — a model
- * trained on Claude Code passes them, and rejecting them would surface as a validation error
- * instead of the documented silent ignore.
+ * `title` and `description` are honored as run metadata (#142) — a model trained on Claude Code
+ * passes them on most launches (89% of the sampled corpus), and the fields are recorded and
+ * surfaced rather than fought. The fields stay ACCEPTED either way: rejecting them would surface
+ * as a schema validation error instead of the honored metadata.
  */
 export function workflowArgsSchema(): Record<string, unknown> {
   return {
@@ -458,8 +499,15 @@ export function workflowArgsSchema(): Record<string, unknown> {
       description:
         "Stop the live workflow run with this id: its subagents are aborted and the run is marked cancelled. Unknown or already-finished run ids return a clear error.",
     },
-    title: { type: "string", description: "Ignored." },
-    description: { type: "string", description: "Ignored." },
+    title: {
+      type: "string",
+      description:
+        "Optional run title, recorded on the run's manifest and shown on a background launch's result, the live-run reminder, status reports, and settle notifications. The workflow name stays primary.",
+    },
+    description: {
+      type: "string",
+      description: "Optional run description, recorded on the run's manifest.",
+    },
   }
 }
 

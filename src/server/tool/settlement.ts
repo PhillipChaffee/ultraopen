@@ -1,16 +1,17 @@
 import { readFile } from "node:fs/promises"
 import type { UltraopenOptions } from "../options.js"
 import { ProgressWriter } from "../resume/progress.js"
-import { endRun, markCancelled } from "../resume/persist.js"
+import { endRun, markCancelled, writeTerminalManifest } from "../resume/persist.js"
 import { CONTROL_STOP_ABORT_REASON } from "../resume/journal.js"
 import type { JournalEntry, Manifest } from "../resume/journal.js"
-import { flushJournalEntry, readManifest, runDir, writeFailure, writeManifest } from "../resume/store.js"
+import { flushJournalEntry, readManifest, runDir, writeFailure } from "../resume/store.js"
 import { watchControl } from "../runtime/control.js"
 import type { ControlCommand } from "../runtime/control.js"
 import { registry } from "../singleton.js"
 import type { OpencodeClient } from "../types.js"
 import { deliverOutcomeUnlessStopped, registerStopHandle, runDetached } from "./background.js"
 import { execute, renderFailure, WorkflowRunError } from "./workflow.js"
+import { manifestTitleOf } from "./args-transport.js"
 import { renderStopFailure, stopReasonOf } from "./render.js"
 import type { PreparedWorkflow, WorkflowArgs } from "./workflow.js"
 
@@ -142,7 +143,12 @@ export function wireRun(spec: SettlementSpec): RunWiring {
       // after the await collapses the window to the same shape writeTerminalManifest uses.
       if (spec.cancelGate?.() === true) {return}
       if (current !== undefined && current.status === "running") {
-        await writeManifest(runId, { ...current, childSessionIDs: sessions }, spec.env)
+        // The child-list update carries the TERMINAL-WRITE discipline (#164): the stale
+        // running read can outlive a cancel that landed between the gate's re-check and
+        // this write, and a plain rewrite resurrects running over the cancelled record —
+        // which then legitimizes the unwind's later terminal rename. The rename's own
+        // re-check refuses any record that is no longer running.
+        await writeTerminalManifest(runId, { ...current, childSessionIDs: sessions }, spec.env)
       }
     } catch {
       // Crash safety is best-effort: a failed manifest rewrite must not stall the run.
@@ -289,6 +295,8 @@ export function startDetachedRun(spec: DetachedRunSpec): void {
     runId: spec.runId,
     manifest: spec.manifest,
     task: async (): Promise<void> => {
+      // The subject line's title (#142), under the presence rule every manifest reader applies.
+      const launchTitle = manifestTitleOf(spec.manifest.title)
       try {
         const result = await executeFn(spec.args, wiring.executeContext)
         await wiring.settle({
@@ -300,12 +308,14 @@ export function startDetachedRun(spec: DetachedRunSpec): void {
           childSessionIDs: result.childSessionIDs,
         })
         // Hydration fires AFTER the settle protocol — the manifest is closed, so a model reacting
-        // to the notification finds workflow_status settled, not "running".
+        // to the notification finds workflow_status settled, not "running". The subject line
+        // carries the launch's title metadata (#142) off the manifest; absent when untitled.
         await deliverOutcomeUnlessStopped({
           client: spec.client,
           sessionID: spec.manifest.sessionID,
           runId: spec.runId,
           workflow: spec.prepared.meta.name,
+          ...(launchTitle === undefined ? {} : { title: launchTitle }),
           result,
           ...(spec.resume === undefined ? {} : { resume: spec.resume }),
           ...(explain === undefined ? {} : { prefix: explain(replayedCount(result.journal)) }),
@@ -332,6 +342,7 @@ export function startDetachedRun(spec: DetachedRunSpec): void {
           sessionID: spec.manifest.sessionID,
           runId: spec.runId,
           workflow: spec.prepared.meta.name,
+          ...(launchTitle === undefined ? {} : { title: launchTitle }),
           failureText: explain === undefined ? failureText : `${explain(replayedCount(partial?.journal))}\n${failureText}`,
         })
       }

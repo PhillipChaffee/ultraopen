@@ -4,7 +4,8 @@ import { endRun, markCancelled } from "../resume/persist.js"
 import { artifactPaths, isSafeRunId, readManifest, runDir, writeFailure } from "../resume/store.js"
 import { registry } from "../singleton.js"
 import type { OpencodeClient } from "../types.js"
-import { renderResult } from "./render.js"
+import { manifestTitleOf } from "./args-transport.js"
+import { renderResult, titleAttributeOf } from "./render.js"
 import type { WorkflowResult } from "./workflow.js"
 
 // The constants live in the journal module (the stop reasons are journal-recorded state);
@@ -75,6 +76,11 @@ export interface DetachedRun {
    * live-run reminder falls back to the run id for that window.
    */
   name?: string
+  /**
+   * The launch's `title` metadata (#142), recorded alongside the name once the launch path has
+   * read it; the reminder shows it as a parenthetical beside the name. Absent on untitled runs.
+   */
+  title?: string
 }
 
 const detached = new Map<string, DetachedRun>()
@@ -106,15 +112,22 @@ export function promote(runId: string): void {
 }
 
 /**
- * Records a launch's workflow name once prepare() has parsed the script.
+ * Records a launch's workflow name once prepare() has parsed the script, with the launch's
+ * `title` metadata when the launch passed one (#142).
  *
  * Called from the launch path between registration and the permission ask, so even a pending
- * entry carries the name the reminder should show. Unknown ids are ignored: a dropped launch
- * must not resurrect anything.
+ * entry carries the name the reminder should show. The title must be a real non-blank string:
+ * the auto-resume sweep passes the adopted manifest's title — JSON a human can edit — and a
+ * non-string or blank would reach the reminder's renderer, which interpolates it into a line
+ * whose shape must hold. Unknown ids are ignored: a dropped launch must not resurrect anything.
  */
-export function nameRun(runId: string, name: string): void {
+export function nameRun(runId: string, name: string, title?: string | undefined): void {
   const entry = detached.get(runId)
-  if (entry) {entry.name = name}
+  if (entry) {
+    entry.name = name
+    const present = manifestTitleOf(title)
+    if (present !== undefined) {entry.title = present}
+  }
 }
 
 /** Drops a pending entry — the launch failed before the run went live. */
@@ -417,6 +430,11 @@ export interface HydrationOutcome {
   status: "completed" | "failed"
   name: string
   runId: string
+  /**
+   * The launch's `title` metadata (#142), shown in the subject line beside the workflow name.
+   * Absent on untitled runs, whose subject line is byte-identical to the pre-#142 shape.
+   */
+  title?: string
   /** The rendered result (completed) or failure text (failed) to wrap and cap. */
   body: string
 }
@@ -431,10 +449,13 @@ export interface HydrationOutcome {
  */
 export function renderNotification(outcome: HydrationOutcome): string {
   const tag = outcome.status === "completed" ? "workflow-completed" : "workflow-failed",
+    // The title rides the subject line beside the workflow name (#142), escaped for the
+    // attribute; absent on untitled runs and on a hand-edited non-string value.
+    titleAttribute = titleAttributeOf(outcome.title),
     { resultPath, failurePath } = artifactPaths(outcome.runId),
     full = outcome.status === "completed" ? `full result: ${resultPath}` : `full failure: ${failurePath}`
   return [
-    `<${tag} run="${outcome.runId}" workflow="${outcome.name}">`,
+    `<${tag} run="${outcome.runId}" workflow="${outcome.name}"${titleAttribute}>`,
     capAtLineBoundary(outcome.body),
     `</${tag}>`,
     full,
@@ -494,6 +515,8 @@ export function deliverOutcome(options: {
   sessionID: string
   runId: string
   workflow: string
+  /** The launch's `title` metadata (#142), shown in the subject line; absent when untitled. */
+  title?: string | undefined
   /** The completed run's result; its presence picks the completed shape. */
   result?: WorkflowResult
   resume?: { resumed: number; argsChanged: boolean }
@@ -502,7 +525,8 @@ export function deliverOutcome(options: {
   /** Prepended to the notification body, before the result render. */
   prefix?: string
 }): Promise<void> {
-  const prefixLine = options.prefix === undefined ? "" : `${options.prefix}\n`
+  const prefixLine = options.prefix === undefined ? "" : `${options.prefix}\n`,
+    title = options.title === undefined ? {} : { title: options.title }
   if (options.result !== undefined) {
     return hydrateParent({
       client: options.client,
@@ -511,6 +535,7 @@ export function deliverOutcome(options: {
         status: "completed",
         name: options.workflow,
         runId: options.runId,
+        ...title,
         body: `${prefixLine}${renderResult(options.result, options.resume, siblingRunsForSession(options.sessionID, options.runId))}`,
       },
     })
@@ -518,7 +543,7 @@ export function deliverOutcome(options: {
   return hydrateParent({
     client: options.client,
     sessionID: options.sessionID,
-    outcome: { status: "failed", name: options.workflow, runId: options.runId, body: `${prefixLine}${options.failureText ?? ""}` },
+    outcome: { status: "failed", name: options.workflow, runId: options.runId, ...title, body: `${prefixLine}${options.failureText ?? ""}` },
   })
 }
 
@@ -535,6 +560,8 @@ export async function deliverOutcomeUnlessStopped(options: {
   sessionID: string
   runId: string
   workflow: string
+  /** The launch's `title` metadata (#142), shown in the subject line; absent when untitled. */
+  title?: string | undefined
   result?: WorkflowResult
   resume?: { resumed: number; argsChanged: boolean }
   failureText?: string

@@ -4,6 +4,7 @@ import { artifactPaths, isSafeRunId, runDir } from "../resume/store.js"
 import type { ManifestRead } from "../resume/store.js"
 import type { ProgressSnapshot } from "../resume/progress.js"
 import { isProcessAlive } from "./background.js"
+import { manifestTitleOf } from "./args-transport.js"
 
 /**
  * The `workflow_status` tool: a disk-only read of a run's state.
@@ -55,6 +56,11 @@ export interface StatusReport {
   status: "running" | "completed" | "failed" | "cancelled" | "orphaned" | "corrupt"
   phase?: string | undefined
   phases: string[]
+  /**
+   * The launch's `title` metadata (#142), from the manifest — the report renders it in the
+   * opening tag. Absent on untitled runs and on the corrupt state (no manifest to read).
+   */
+  title?: string | undefined
   agents: { total: number; running: number; done: number; failed: number }
   outputTokens: number
   /**
@@ -218,10 +224,15 @@ async function buildSnapshot(input: {
   )
   if (typeof progress?.phase === "string" && !phases.includes(progress.phase)) {phases.push(progress.phase)}
 
+  // The launch's title metadata (#142), under the same presence rule every manifest reader
+  // applies (a hand-edited blank/decoration/non-string degrades to absent).
+  const launchTitle = manifestTitleOf(manifest?.title)
+
   const report: StatusReport = {
     runId: args.runId,
     dir,
     status,
+    ...(launchTitle === undefined ? {} : { title: launchTitle }),
     phase: progress?.phase,
     phases,
     agents: countAgents(progress, entries),

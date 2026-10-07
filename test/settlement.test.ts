@@ -5,6 +5,7 @@ import { join } from "node:path"
 import { wireRun, startDetachedRun, controlStopRun } from "../src/server/tool/settlement.js"
 import { controlPath } from "../src/server/runtime/control.js"
 import { artifactPaths, ensureRunDir, readManifest, writeManifest } from "../src/server/resume/store.js"
+import { writeTerminalManifest } from "../src/server/resume/persist.js"
 import { resolveOptions } from "../src/server/options.js"
 import { registry } from "../src/server/singleton.js"
 import { CONTROL_STOP_ABORT_REASON, STOP_ABORT_REASON, resetForTests, settlePromiseOf, stopHandleOf } from "../src/server/tool/background.js"
@@ -47,6 +48,33 @@ const runningManifest = (): Manifest => ({
 const runDirAbs = (): string => join(base, "opencode", "tool-output", "ultraopen", RUN_ID)
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => {setTimeout(resolve, ms)})
+
+/** A client that records every promptAsync, so the hydration body is observable. */
+const recordingClient = (): { recording: OpencodeClient; sent: { sessionID: string; text: string }[] } => {
+  const sent: { sessionID: string; text: string }[] = []
+  return {
+    sent,
+    recording: {
+      session: {
+        get: () => Promise.resolve({ data: { id: SESSION } }),
+        abort: () => Promise.resolve({}),
+        promptAsync: (options: { path: { id: string }; body: { parts: { text: string }[] } }) => {
+          sent.push({ sessionID: options.path.id, text: options.body.parts[0]?.text ?? "" })
+          return Promise.resolve({ data: undefined })
+        },
+      },
+    } as unknown as OpencodeClient,
+  }
+}
+
+const preparedFixture = () => ({
+  source: SCRIPT,
+  meta: { name: "wired", description: "wiring" },
+  body: SCRIPT,
+  argsValue: undefined,
+  argsDereference: undefined,
+  argsHydrated: undefined,
+})
 
 /** Bounded waiting with a labelled timeout — the wait-instead-of-race idiom (PR #153). */
 const waitFor = async (until: () => boolean | Promise<boolean>, what: string): Promise<void> => {
@@ -96,44 +124,106 @@ const flushSnapshot = async (): Promise<{ logs: string[]; agents: unknown[] } | 
   }
 }
 
-test("an in-flight child-list rewrite never resurrects running over a cancelled record (#156)", async () => {
-  // Found live by the e2e T6b probe: writeChildren checked the cancel gate, then awaited
-  // the manifest read; a cancel landing mid-read left the write firing from the stale
-  // `running` read — the cancelled record was clobbered back to running, the unwind's
-  // endRun then honestly wrote failed over it, and a run the user stopped settled failed.
-  // The gate is re-checked after the await.
-  base = await mkdtemp(join(tmpdir(), "ultraopen-wiring-"))
-  env = { XDG_DATA_HOME: base } as NodeJS.ProcessEnv
-  registry.resetForTests()
-  resetForTests()
-  await ensureRunDir(RUN_ID, env)
-  const manifest = runningManifest()
-  await writeManifest(RUN_ID, manifest, env)
+/** The negative-direction stability idiom: the absence of a resurrection IS the pass, so
+ * the assertion polls a bounded window and throws the moment the forbidden state appears.
+ * A bare waitFor cannot express "must never happen"; a fixed sleep can false-pass when the
+ * clobber lands after it (the PR-#153 wait-instead-of-race rule, negative form). */
+async function assertStays(probe: () => Promise<string | undefined>, forbidden: string, what: string): Promise<void> {
+  for (let waited = 0; waited < 75; waited++) {
+    const current = await probe()
+    if (current !== forbidden) {
+      throw new Error(`${what}: "${String(current)}" appeared where "${forbidden}" must stay`)
+    }
+    await sleep(20)
+  }
+}
 
-  let releaseRead!: () => void
-  const gatedRead = new Promise<void>((resolve) => {releaseRead = resolve})
-  let gateOpen = false
-  const wiring = wire({
-    cancelGate: () => gateOpen,
-    readManifestFn: async () => {
-      // The read is in flight while the cancel lands.
-      await gatedRead
-      return manifest
-    },
+describe("the child-list rewrite's cancel gate (#156)", () => {
+  beforeEach(async () => {
+    base = await mkdtemp(join(tmpdir(), "ultraopen-wiring-"))
+    env = { XDG_DATA_HOME: base } as NodeJS.ProcessEnv
+    registry.resetForTests()
+    resetForTests()
+    await ensureRunDir(RUN_ID, env)
   })
 
-  // A progress event starts writeChildren; its read is now gated mid-flight.
-  wiring.executeContext.onProgress?.({ type: "agent-start", index: 0, label: "a", phase: undefined })
-  // The stop's cancel lands while the read is outstanding — markCancelled's write won.
-  await writeManifest(RUN_ID, { ...manifest, status: "cancelled" }, env)
-  gateOpen = true
-  releaseRead()
-  await new Promise((resolve) => {setTimeout(resolve, 20)})
+  afterEach(async () => {
+    await rm(base, { recursive: true, force: true })
+  })
 
-  // The cancelled record stands: the stale-running read never wrote over it.
-  const standing = await readManifest(RUN_ID, env)
-  expect(standing?.status).toBe("cancelled")
-  await rm(base, { recursive: true, force: true })
+  test("an in-flight child-list rewrite never resurrects running over a cancelled record (#156)", async () => {
+    // Found live by the e2e T6b probe: writeChildren checked the cancel gate, then awaited
+    // the manifest read; a cancel landing mid-read left the write firing from the stale
+    // `running` read — the cancelled record was clobbered back to running, the unwind's
+    // endRun then honestly wrote failed over it, and a run the user stopped settled failed.
+    // The gate is re-checked after the await.
+    const manifest = runningManifest()
+    await writeManifest(RUN_ID, manifest, env)
+
+    let releaseRead!: () => void
+    const gatedRead = new Promise<void>((resolve) => {releaseRead = resolve})
+    let gateOpen = false
+    const wiring = wire({
+      cancelGate: () => gateOpen,
+      readManifestFn: async () => {
+        // The read is in flight while the cancel lands.
+        await gatedRead
+        return manifest
+      },
+    })
+
+    // A progress event starts writeChildren; its read is now gated mid-flight.
+    wiring.executeContext.onProgress?.({ type: "agent-start", index: 0, label: "a", phase: undefined })
+    // The stop's cancel lands while the read is outstanding — markCancelled's write won.
+    await writeManifest(RUN_ID, { ...manifest, status: "cancelled" }, env)
+    gateOpen = true
+    releaseRead()
+
+    // The negative direction, waited for instead of slept: a stale rewrite that
+    // resurrects running must appear within this bound (a buggy write lands within
+    // microseconds of the read's release), and its absence is the pass.
+    await assertStays(
+      () => readManifest(RUN_ID, env).then((m) => m?.status),
+      "cancelled",
+      "a stale child-list rewrite resurrected running over the cancelled record",
+    )
+    // And the cancelled record stands at the bound.
+    const standing = await readManifest(RUN_ID, env)
+    expect(standing?.status).toBe("cancelled")
+  })
+
+  test("a child-list write carries the terminal-write discipline — a cancel that lands mid-flight is never resurrected (#164)", async () => {
+    // The wide window the #156 gate cannot close: the gate re-check passes, the stop's
+    // cancel lands, and the stale-running write lands after it. A plain rewrite would
+    // resurrect running over the cancelled record and legitimize the unwind's later
+    // terminal rename; the write's own re-read refuses a record that is no longer running.
+    const manifest = runningManifest()
+    await writeManifest(RUN_ID, manifest, env)
+
+    let releaseRead!: () => void
+    const gatedRead = new Promise<void>((resolve) => {releaseRead = resolve})
+    const wiring = wire({
+      // The gate NEVER opens: no stop-controller signal is in play, so only the write's
+      // own disk discipline can refuse the stale read.
+      cancelGate: () => false,
+      readManifestFn: async () => {
+        await gatedRead
+        // The stale `running` read — the cancel has already landed on disk.
+        return manifest
+      },
+    })
+
+    // A progress event starts writeChildren; its read is gated mid-flight.
+    wiring.executeContext.onProgress?.({ type: "agent-start", index: 0, label: "a", phase: undefined })
+    // The stop's cancel lands while the read is outstanding.
+    await writeTerminalManifest(RUN_ID, { ...manifest, status: "cancelled", childSessionIDs: [] }, env)
+    releaseRead()
+    await waitFor(() => readManifest(RUN_ID, env).then((m) => m?.status === "cancelled" && (m?.childSessionIDs.length ?? 0) === 0), "the cancelled record to stand un-resurrected")
+
+    const standing = await readManifest(RUN_ID, env)
+    expect(standing?.status).toBe("cancelled")
+    expect(standing?.childSessionIDs).toEqual([])
+  })
 })
 
 describe("wireRun", () => {
@@ -293,33 +383,6 @@ describe("the settle protocol's failure surface (#135)", () => {
     await rm(base, { recursive: true, force: true })
   })
 
-  /** A client that records every promptAsync, so the hydration body is observable. */
-  const recordingClient = (): { recording: OpencodeClient; sent: { sessionID: string; text: string }[] } => {
-    const sent: { sessionID: string; text: string }[] = []
-    return {
-      sent,
-      recording: {
-        session: {
-          get: () => Promise.resolve({ data: { id: SESSION } }),
-          abort: () => Promise.resolve({}),
-          promptAsync: (options: { path: { id: string }; body: { parts: { text: string }[] } }) => {
-            sent.push({ sessionID: options.path.id, text: options.body.parts[0]?.text ?? "" })
-            return Promise.resolve({ data: undefined })
-          },
-        },
-      } as unknown as OpencodeClient,
-    }
-  }
-
-  const prepared = () => ({
-    source: SCRIPT,
-    meta: { name: "wired", description: "wiring" },
-    body: SCRIPT,
-    argsValue: undefined,
-    argsDereference: undefined,
-    argsHydrated: undefined,
-  })
-
   /**
    * Starts a detached run whose engine parks until the test releases it, then rejects with
    * the corpus shape: the aborted agent's null interpolated into the script's own template
@@ -337,7 +400,7 @@ describe("the settle protocol's failure surface (#135)", () => {
       client: recording,
       sessionID: SESSION,
       manifest: runningManifest(),
-      prepared: prepared(),
+      prepared: preparedFixture(),
       args: { script: SCRIPT },
       options: resolveOptions({}),
       env,
@@ -408,5 +471,129 @@ describe("the settle protocol's failure surface (#135)", () => {
     expect(failure).not.toContain("did not fail on its own")
     expect(sent[0]?.text).toContain("wave 1 integration failed: null")
     expect(sent[0]?.text).not.toContain("did not fail on its own")
+  })
+})
+
+describe("the settle notification's subject line (#142)", () => {
+  beforeEach(async () => {
+    base = await mkdtemp(join(tmpdir(), "ultraopen-wiring-"))
+    env = { XDG_DATA_HOME: base } as NodeJS.ProcessEnv
+    registry.resetForTests()
+    resetForTests()
+    await ensureRunDir(RUN_ID, env)
+  })
+
+  afterEach(async () => {
+    await rm(base, { recursive: true, force: true })
+  })
+
+  test("a titled run's completion subject line carries the title beside the workflow name", async () => {
+    const { recording, sent } = recordingClient()
+    const manifest = { ...runningManifest(), title: "Fix the login bug", description: "The auth flow" }
+    let release!: () => void
+    const parked = new Promise<void>((resolve) => {release = resolve})
+    startDetachedRun({
+      runId: RUN_ID,
+      client: recording,
+      sessionID: SESSION,
+      manifest,
+      prepared: preparedFixture(),
+      args: { script: SCRIPT },
+      options: resolveOptions({}),
+      env,
+      executeFn: async () => {
+        await parked
+        return { runId: RUN_ID, meta: { name: "wired", description: "wiring" }, value: "the value", agentCount: 1, nulls: [], logs: [], outputTokens: 0, journal: [], childSessionIDs: [] }
+      },
+    })
+    release()
+    await settlePromiseOf(RUN_ID)
+
+    expect(sent).toHaveLength(1)
+    expect(sent[0]?.text).toContain('<workflow-completed run="wf_settle01" workflow="wired" title="Fix the login bug">')
+    // The description is manifest-only: no render surface shows it.
+    expect(sent[0]?.text).not.toContain("The auth flow")
+  })
+
+  test("an untitled run's completion subject line is unchanged", async () => {
+    const { recording, sent } = recordingClient()
+    let release!: () => void
+    const parked = new Promise<void>((resolve) => {release = resolve})
+    startDetachedRun({
+      runId: RUN_ID,
+      client: recording,
+      sessionID: SESSION,
+      manifest: runningManifest(),
+      prepared: preparedFixture(),
+      args: { script: SCRIPT },
+      options: resolveOptions({}),
+      env,
+      executeFn: async () => {
+        await parked
+        return { runId: RUN_ID, meta: { name: "wired", description: "wiring" }, value: "the value", agentCount: 1, nulls: [], logs: [], outputTokens: 0, journal: [], childSessionIDs: [] }
+      },
+    })
+    release()
+    await settlePromiseOf(RUN_ID)
+
+    expect(sent).toHaveLength(1)
+    expect(sent[0]?.text).toContain('<workflow-completed run="wf_settle01" workflow="wired">')
+    expect(sent[0]?.text).not.toContain("title=")
+  })
+
+  test("a titled run's failure subject line carries the title through the real settle path", async () => {
+    // The catch path's deliverOutcomeUnlessStopped reads the title off the same manifest.
+    const { recording, sent } = recordingClient()
+    const manifest = { ...runningManifest(), title: "Fix the login bug" }
+    let release!: () => void
+    const parked = new Promise<void>((resolve) => {release = resolve})
+    startDetachedRun({
+      runId: RUN_ID,
+      client: recording,
+      sessionID: SESSION,
+      manifest,
+      prepared: preparedFixture(),
+      args: { script: SCRIPT },
+      options: resolveOptions({}),
+      env,
+      executeFn: async (): Promise<never> => {
+        await parked
+        throw new Error("the script blew up")
+      },
+    })
+    release()
+    await settlePromiseOf(RUN_ID)
+
+    expect(sent).toHaveLength(1)
+    expect(sent[0]?.text).toContain('<workflow-failed run="wf_settle01" workflow="wired" title="Fix the login bug">')
+  })
+
+  test("a hand-edited non-string title degrades to untitled — the notification still hydrates (#142)", async () => {
+    // hydrateParent swallows render errors, so a throwing render would SILENTLY drop
+    // the settle notification; the title must be guarded at the read boundary.
+    const { recording, sent } = recordingClient()
+    const manifest = { ...runningManifest(), title: 42 as unknown as string }
+    let release!: () => void
+    const parked = new Promise<void>((resolve) => {release = resolve})
+    startDetachedRun({
+      runId: RUN_ID,
+      client: recording,
+      sessionID: SESSION,
+      manifest,
+      prepared: preparedFixture(),
+      args: { script: SCRIPT },
+      options: resolveOptions({}),
+      env,
+      executeFn: async () => {
+        await parked
+        return { runId: RUN_ID, meta: { name: "wired", description: "wiring" }, value: "the value", agentCount: 1, nulls: [], logs: [], outputTokens: 0, journal: [], childSessionIDs: [] }
+      },
+    })
+    release()
+    await settlePromiseOf(RUN_ID)
+
+    expect(sent).toHaveLength(1)
+    expect(sent[0]?.text).toContain('<workflow-completed run="wf_settle01" workflow="wired">')
+    expect(sent[0]?.text).not.toContain("title=")
   })
 })

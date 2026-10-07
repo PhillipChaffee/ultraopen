@@ -56,3 +56,44 @@ export function stringifiedArgsMessage(raw: string, reason: string): string {
 /** The one fix both refusal surfaces suggest. */
 export const stringifiedArgsSuggestion =
   "Pass the value as real JSON — an object literal, not a quoted string: `args: {\"key\": \"value\"}`."
+
+/**
+ * The launch metadata the boundary honors (#142), with its presence rule.
+ *
+ * A field that is missing, empty, whitespace-only, or one of the documented zero-value
+ * decorations (`"null"`, `"undefined"`) is ABSENT everywhere: the manifest omits it (untitled
+ * manifests stay byte-identical to the pre-#142 shape) and no surface renders placeholder
+ * noise. Models emit those strings for an absent optional field — the same weather the args
+ * boundary guards. A present string is recorded and shown verbatim — refusing or dropping the
+ * fields is out of scope, and so is decorating an absent one into an empty title.
+ */
+export function launchMetadataOf(args: { title?: unknown; description?: unknown }): {
+  title?: string
+  description?: string
+} {
+  const title = presentMetadata(args.title),
+    description = presentMetadata(args.description)
+  return {
+    ...(title === undefined ? {} : { title }),
+    ...(description === undefined ? {} : { description }),
+  }
+}
+
+/** One field's presence: a real non-blank string that is not a zero-value decoration. */
+function presentMetadata(value: unknown): string | undefined {
+  if (typeof value !== "string") {return undefined}
+  const trimmed = value.trim()
+  if (trimmed === "" || trimmed === "null" || trimmed === "undefined") {return undefined}
+  return value
+}
+
+/**
+ * The presence rule applied to a title read back OFF a manifest (#142).
+ *
+ * The manifest is JSON a human can edit, so every reader — the launch registry, the status
+ * report, the settle notifications — applies the same rule the launch boundary does, instead
+ * of each growing its own guard.
+ */
+export function manifestTitleOf(title: unknown): string | undefined {
+  return presentMetadata(title)
+}

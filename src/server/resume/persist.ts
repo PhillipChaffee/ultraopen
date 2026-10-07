@@ -33,6 +33,10 @@ export interface RunRecord {
    * JSON payload (#78) — the manifest then records both what arrived and what the script sees.
    */
   argsRawString?: string | undefined
+  /** The launch's `title` argument (#142), absent when the launch passed none. */
+  title?: string | undefined
+  /** The launch's `description` argument (#142), absent when the launch passed none. */
+  description?: string | undefined
 }
 
 /** Opens a run: creates its directory, persists the script, and marks it running. */
@@ -55,6 +59,10 @@ export async function beginRun(record: RunRecord, env?: NodeJS.ProcessEnv): Prom
       // When the boundary hydrated a stringified args (#78), the manifest records BOTH what
       // arrived and what the script will see — the transport repair stays diagnosable on disk.
       ...(record.argsRawString === undefined ? {} : { argsRawString: record.argsRawString }),
+      // The launch's title/description metadata (#142), recorded verbatim when present; an
+      // absent field is omitted so untitled manifests stay byte-identical to the pre-#142 shape.
+      ...(record.title === undefined ? {} : { title: record.title }),
+      ...(record.description === undefined ? {} : { description: record.description }),
       status: "running",
       childSessionIDs: [],
       // Wall-clock, stamped by the host rather than the script — scripts cannot read the clock at
@@ -128,6 +136,8 @@ export async function endRun(
     childSessionIDs: string[]
   },
   env?: NodeJS.ProcessEnv,
+  /** Test-only seam (#164): swap the terminal write to stage a concurrent writer. */
+  writeTerminalManifestFn: typeof writeTerminalManifest = writeTerminalManifest,
 ): Promise<void> {
   if (!manifest) {return}
   try {
@@ -139,7 +149,7 @@ export async function endRun(
     // race against a stop's cancellation must write NOTHING — the previous order published this
     // settle's journal rewrite and result.json beside a manifest it never won, and a cancelled
     // run then "invented" a result.json (caught live by the e2e stop-path assertion).
-    const won = await writeTerminalManifest(
+    const won = await writeTerminalManifestFn(
       manifest.runId,
       {
         ...manifest,
@@ -150,6 +160,12 @@ export async function endRun(
       env,
     )
     if (!won) {return}
+    // The rename landing is not ownership: a racing stop's cancelled rename can land inside
+    // the re-check→rename gap (#164) and stand over this record. The journal and result are
+    // the SETTLE's artifacts — a cancelled record never settles a result — so whatever stands
+    // is re-read before they are published, and a record that is not ours abandons them.
+    const standing = await readManifest(manifest.runId, env)
+    if (standing === undefined || standing.status !== outcome.status) {return}
     await appendJournal(manifest.runId, outcome.entries.map((entry) => JSON.stringify(entry)).join("\n"), env)
     await writeResult(manifest.runId, outcome.value, env)
   } catch {
@@ -200,6 +216,26 @@ export async function endRun(
   * stop won, the earlier terminal status when it lost the race, `undefined`
   * when the disk could not be read at all.
  */
+/**
+ * Whether a landed cancelled record still stands, polled over a bounded window (#164).
+ *
+ * A verified-then-returned cancelled write can still be renamed away by a racing settle
+ * whose rename lands after the stop's verification read — the probe then reads a run the
+ * user stopped as completed/failed. The poll re-reads for a short bounded window; a flip
+ * sends the caller back into its claim loop, and the settle-side verification (endRun's
+ * post-rename re-read) keeps the settle from publishing beside a record it lost to.
+ */
+const PERSISTENCE_POLLS = 8
+const PERSISTENCE_POLL_MS = 30
+async function cancelledPersists(runId: string, env?: NodeJS.ProcessEnv): Promise<boolean> {
+  for (let poll = 0; poll < PERSISTENCE_POLLS; poll++) {
+    const current = await readManifest(runId, env)
+    if (current === undefined || current.status !== "cancelled") {return false}
+    await new Promise((resolve) => {setTimeout(resolve, PERSISTENCE_POLL_MS)})
+  }
+  return true
+}
+
 export async function markCancelled(
   manifest: Manifest,
   childSessionIDs: string[],
@@ -233,7 +269,13 @@ export async function markCancelled(
         if (won) {
           const after = await readManifest(manifest.runId, env)
           if (after === undefined) {return after}
-          if (after.status === "cancelled") {return after}
+          if (after.status === "cancelled") {
+            // Verified is not persisted (#164): a racing rename inside the gap can still
+            // land over this record. The poll holds the record's persistence; a flip
+            // re-enters the claim.
+            if (await cancelledPersists(manifest.runId, env)) {return after}
+            continue
+          }
           if (after.status === "running") {continue}
           // A different terminal landed over the stop's own cancelled write: the racing
           // settle's rename passed its re-check before the cancel's rename and landed
@@ -249,13 +291,25 @@ export async function markCancelled(
       // The disk moved under the stop (a checkpoint's running rewrite, or the abort's echoed
       // settle): the stop authored this cancellation, so it re-claims directly over whatever
       // stands. The manifest-only write keeps the journal/result the run already flushed.
+      // A SETTLE terminal without the echo is the honest loss, not a re-claim (#164): the
+      // poll-flip route can deliver a genuine settled record here, and clobbering it would
+      // stand a cancelled record beside a published result.json. The re-read is live — the
+      // stale `current` above can predate the settle's rename.
+      const standing = await readManifest(manifest.runId, env)
+      if (standing !== undefined && standing.status !== "running" && standing.status !== "cancelled") {
+        const journal = await readJournal(manifest.runId, env)
+        if (!journal.some((entry) => isStopAbortDetail(entry.detail))) {return standing}
+      }
       await writeManifest(
         manifest.runId,
         { ...manifest, status: "cancelled", childSessionIDs, endedAt: Date.now() },
         env,
       )
       const after = await readManifest(manifest.runId, env)
-      if (after !== undefined && after.status === "cancelled") {return after}
+      if (after !== undefined && after.status === "cancelled" && (await cancelledPersists(manifest.runId, env))) {
+        // Same persistence discipline as the rename path above (#164).
+        return after
+      }
     }
     return undefined
   } catch {

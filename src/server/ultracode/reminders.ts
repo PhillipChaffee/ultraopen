@@ -139,6 +139,11 @@ export interface LiveRunLine {
   runId: string
   /** The workflow's meta name, or the run id when the launch had not parsed it yet. */
   name: string
+  /**
+   * The launch's `title` metadata (#142), when the launch passed one; the line shows it as a
+   * parenthetical beside the quoted name — the name stays primary. Absent on untitled runs.
+   */
+  title?: string
   /** Agents the run has spawned so far — live children registered under the run. */
   agents: number
   /** Epoch ms the run was registered at; elapsed is computed against `now`. */
@@ -155,6 +160,17 @@ export function formatElapsed(ms: number): string {
 }
 
 /**
+ * Flattens a free-text title onto one line for the reminder's per-run line (#142).
+ *
+ * The template's shape is constant header + one line per run + closer; a newline inside a
+ * title would inject lines into the system-reminder block and break the shape stability the
+ * decoration exists to keep. Display-only: the manifest records the title verbatim.
+ */
+function oneLine(title: string): string {
+  return title.replaceAll(/\s+/gu, " ").trim()
+}
+
+/**
  * Renders the live-run reminder for one turn.
  *
  * Header, one line per run, closer — nothing else, so the shape never varies with run count. The
@@ -168,7 +184,8 @@ export function renderRunsReminder(runs: readonly LiveRunLine[], now: number): s
     "and topics they are using; each run's outcome arrives as a <workflow-completed> or <workflow-failed>",
     "notification, and workflow_status reads its progress on demand.",
     ...runs.map((run) =>
-      `- ${run.runId} "${run.name}" — ${run.agents} agents spawned so far, ` +
+      `- ${run.runId} "${run.name}"${run.title === undefined ? "" : ` (${oneLine(run.title)})`} — ` +
+      `${run.agents} agents spawned so far, ` +
       `${formatElapsed(Math.max(0, now - run.startedAt))} elapsed`,
     ),
     "</system-reminder>",

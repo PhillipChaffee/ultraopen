@@ -11,6 +11,15 @@ import { join } from "node:path"
 const nullEntry = (label: string, reason: string): string =>
   JSON.stringify({ type: "result", key: `k-${label}`, label, status: "null", reason, outputTokens: 0 })
 
+/** Bounded waiting for a subscriber's async refresh — the wait-instead-of-race idiom. */
+const waitFor = async (until: () => boolean): Promise<void> => {
+  for (let waited = 0; waited < 200; waited++) {
+    if (until()) {return}
+    await Bun.sleep(5)
+  }
+  throw new Error("timed out waiting for the poller's refresh")
+}
+
 const writer = (writes: { path: string; body: string }[]) =>
   new ProgressWriter({
     runId: "wf_abc123",
@@ -425,10 +434,11 @@ describe("RunPoller", () => {
      mine: RunView[][] = [],
      other: RunView[][] = [],
      unsub1 = poller.subscribe(() => "s1", (runs) => mine.push(runs))
-    // The immediate refresh fires at subscribe time.
-    await Bun.sleep(5)
+    // The immediate refresh fires at subscribe time — waited for, not slept for: under load
+    // a fixed sleep can cut the refresh off and race the counts below.
+    await waitFor(() => mine.length > 0)
     const unsub2 = poller.subscribe(() => "s2", (runs) => other.push(runs))
-    await Bun.sleep(5)
+    await waitFor(() => other.length > 0)
 
     expect(mine.at(-1)?.map((run) => run.runId)).toEqual(["wf_a"])
     expect(other.at(-1)?.map((run) => run.runId)).toEqual(["wf_b"])
@@ -437,7 +447,7 @@ describe("RunPoller", () => {
     const mineBefore = mine.length,
      otherBefore = other.length
     timers.tick()
-    await Bun.sleep(5)
+    await waitFor(() => mine.length >= mineBefore + 1 && other.length >= otherBefore + 1)
     expect(mine.length).toBe(mineBefore + 1)
     expect(other.length).toBe(otherBefore + 1)
 
@@ -448,7 +458,14 @@ describe("RunPoller", () => {
     // The one started interval was actually cleared.
     expect(timers.cleared.length).toBe(1)
     timers.tick()
-    await Bun.sleep(5)
+    // The negative direction, bounded: no update may land after the unsubscribe. A fixed
+    // sleep could false-pass when a buggy refresh lands after it, so poll for the absence.
+    for (let waited = 0; waited < 20; waited++) {
+      if (mine.length !== mineAfter || other.length !== otherBefore + 1) {
+        throw new Error("an update landed after every surface unsubscribed")
+      }
+      await Bun.sleep(10)
+    }
     expect(mine.length).toBe(mineAfter)
     expect(other.length).toBe(otherBefore + 1)
 

@@ -5,7 +5,7 @@ import { dirname, join } from "node:path"
 import { beginRun, endRun, loadResume, markCancelled, writeTerminalManifest } from "../src/server/resume/persist.js"
 import { artifactPaths, appendJournalEntry, ensureRunDir, readJournal, readManifest, writeManifest } from "../src/server/resume/store.js"
 import { CONTROL_STOP_ABORT_REASON, STOP_ABORT_REASON } from "../src/server/resume/journal.js"
-import type { JournalEntry } from "../src/server/resume/journal.js"
+import type { JournalEntry, Manifest } from "../src/server/resume/journal.js"
 
 let base: string,
  env: NodeJS.ProcessEnv
@@ -67,6 +67,123 @@ describe("beginRun", () => {
     // A non-hydrated launch carries no raw-string field, so manifests stay byte-shape stable.
     const plain = await beginRun({ ...record }, env)
     expect(plain?.argsRawString).toBeUndefined()
+  })
+
+  test("records the launch's title and description on the manifest (#142)", async () => {
+    const manifest = await beginRun({ ...record, title: "Fix the login bug", description: "The auth flow" }, env)
+    expect(manifest?.title).toBe("Fix the login bug")
+    expect(manifest?.description).toBe("The auth flow")
+    // Round-trip: what beginRun wrote is what a later read returns.
+    const onDisk = await readManifest("wf_abc123", env)
+    expect(onDisk?.title).toBe("Fix the login bug")
+    expect(onDisk?.description).toBe("The auth flow")
+  })
+
+  test("an untitled launch records neither field — the manifest shape is unchanged", async () => {
+    const manifest = await beginRun(record, env)
+    expect(manifest?.title).toBeUndefined()
+    expect(manifest?.description).toBeUndefined()
+    const onDisk = await readManifest("wf_abc123", env)
+    expect(onDisk).not.toHaveProperty("title")
+    expect(onDisk).not.toHaveProperty("description")
+  })
+
+  test("the terminal rewrite preserves the recorded title and description (#142)", async () => {
+    // endRun rewrites the manifest whole; the launch metadata is not the settle's to drop.
+    const manifest = await beginRun({ ...record, title: "Fix the login bug", description: "The auth flow" }, env)
+    await endRun(manifest, { status: "completed", entries: [entry], value: { done: true }, childSessionIDs: ["c1"] }, env)
+    const settled = await readManifest("wf_abc123", env)
+    expect(settled?.status).toBe("completed")
+    expect(settled?.title).toBe("Fix the login bug")
+    expect(settled?.description).toBe("The auth flow")
+  })
+})
+
+describe("the terminal-write race (#164)", () => {
+  test("a settle whose rename was clobbered by a landed cancel abandons the journal and result", async () => {
+    // Round-5 shape: the settle's rename lands, the stop's cancelled rename lands after it,
+    // and endRun must NOT publish journal/result beside a cancelled record it no longer owns.
+    await beginRun(record, env)
+    let staged = false
+    const clobberingWrite = async (runId: string, manifest: Manifest, e?: NodeJS.ProcessEnv): Promise<boolean> => {
+      const won = await writeTerminalManifest(runId, manifest, e)
+      if (won && !staged) {
+        staged = true
+        // The stop's cancel rename landing inside the settle's re-check→rename gap.
+        await writeManifest(runId, { ...manifest, status: "cancelled", childSessionIDs: [] }, e)
+      }
+      return won
+    }
+    const manifest = await readManifest("wf_abc123", env)
+    if (!manifest) {throw new Error("the run was not opened")}
+    await endRun(manifest, { status: "completed", entries: [entry], value: { done: true }, childSessionIDs: ["c1"] }, env, clobberingWrite)
+    const standing = await readManifest("wf_abc123", env)
+    expect(standing?.status).toBe("cancelled")
+    const resultFile = Bun.file(artifactPaths("wf_abc123", env).resultPath)
+    expect(await resultFile.exists()).toBe(false)
+    expect(await readJournal("wf_abc123", env)).toEqual([])
+  })
+
+  test("the stop's cancelled write re-claims when a racing settle renames over it after verification", async () => {
+    // The stop's rename wins and verifies; the settle's rename lands during the persistence
+    // window; the poll detects the flip and re-claims — the cancelled record must stand.
+    // The echo is what makes the re-claim the stop's to make: a real stop's abort journals it.
+    await beginRun(record, env)
+    await appendJournalEntry("wf_abc123", { type: "result", key: "k3", scopePath: "", ordinal: 3, label: "step4", status: "null", reason: "aborted", detail: STOP_ABORT_REASON, outputTokens: 0 }, env)
+    let clobbered = false,
+      clobberPromise: Promise<void> | undefined
+    const racingWrite = async (runId: string, manifest: Manifest, e?: NodeJS.ProcessEnv): Promise<boolean> => {
+      const won = await writeTerminalManifest(runId, manifest, e)
+      if (won && !clobbered) {
+        clobbered = true
+        // The settle's rename lands just after the stop's verification read; the test joins
+        // the staged write so no floating timer races the fixture cleanup.
+        clobberPromise = new Promise<void>((resolve) => {
+          setTimeout(() => {
+            writeManifest(runId, { ...manifest, status: "completed", childSessionIDs: ["c1"] }, e).then(() => resolve())
+          }, 10)
+        })
+      }
+      return won
+    }
+    const manifest = await readManifest("wf_abc123", env)
+    if (!manifest) {throw new Error("the run was not opened")}
+    const settled = await markCancelled(manifest, [], env, racingWrite)
+    expect(settled?.status).toBe("cancelled")
+    // Join the staged clobber: on the pre-fix code it stands and the stop never noticed;
+    // the persistence poll must have re-claimed instead.
+    await clobberPromise
+    const standing = await readManifest("wf_abc123", env)
+    expect(standing?.status).toBe("cancelled")
+  })
+
+  test("a poll-flip to a settled record with no stop echo in the journal is the honest loss", async () => {
+    // The re-claim is the stop's to make only when the journal proves the abort authored the
+    // terminal (the echo). A settle that genuinely won — no echo — keeps its status; a
+    // discriminator-less fallback would clobber a completed run into cancelled.
+    await beginRun(record, env)
+    await appendJournalEntry("wf_abc123", { type: "result", key: "k0", scopePath: "", ordinal: 0, label: "a", status: "ok", outputTokens: 3 }, env)
+    let clobbered = false,
+      clobberPromise: Promise<void> | undefined
+    const racingWrite = async (runId: string, manifest: Manifest, e?: NodeJS.ProcessEnv): Promise<boolean> => {
+      const won = await writeTerminalManifest(runId, manifest, e)
+      if (won && !clobbered) {
+        clobbered = true
+        clobberPromise = new Promise<void>((resolve) => {
+          setTimeout(() => {
+            writeManifest(runId, { ...manifest, status: "completed", childSessionIDs: ["c1"] }, e).then(() => resolve())
+          }, 10)
+        })
+      }
+      return won
+    }
+    const manifest = await readManifest("wf_abc123", env)
+    if (!manifest) {throw new Error("the run was not opened")}
+    const settled = await markCancelled(manifest, [], env, racingWrite)
+    expect(settled?.status).toBe("completed")
+    await clobberPromise
+    const settledStanding = await readManifest("wf_abc123", env)
+    expect(settledStanding?.status).toBe("completed")
   })
 })
 

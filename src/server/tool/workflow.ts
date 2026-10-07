@@ -39,11 +39,13 @@ export interface WorkflowArgs {
    */
   stop?: string
   /**
-   * Accepted and ignored, exactly as the spec specifies. A model trained on Claude Code passes
-   * these; rejecting them would surface as a schema validation error instead of the documented
-   * silent ignore.
+   * Honored as run metadata (#142). A model trained on Claude Code passes these on most
+   * launches (89% of the sampled corpus); the title surfaces where the run is already named
+   * (launch render, live-run reminder, status report, settle notifications) and both are
+   * recorded on the manifest. The workflow name stays primary on every surface.
    */
   title?: string
+  /** Honored as run metadata (#142); manifest-only — no render surface shows it. */
   description?: string
 }
 

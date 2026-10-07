@@ -92,6 +92,19 @@ export interface Manifest {
    * manifest alone. Absent on non-hydrated launches.
    */
   argsRawString?: string
+  /**
+   * The launch's `title` argument, honored as run metadata (#142): recorded verbatim when the
+   * launch passed a non-blank string, absent otherwise — JSON.stringify drops an undefined
+   * field, so untitled manifests stay byte-identical to the pre-#142 shape. Surfaced where the
+   * run is already named (launch render, live-run reminder, status report, settle
+   * notifications); the workflow name stays primary on every surface.
+   */
+  title?: string
+  /**
+   * The launch's `description` argument (#142), recorded verbatim under the same presence rule
+   * as `title`. Manifest-only — no render surface shows it.
+   */
+  description?: string
   /** `cancelled` is written by the stop path: the run was stopped by request, not by failure. */
   status: "running" | "completed" | "failed" | "cancelled" | "orphaned"
   childSessionIDs: string[]

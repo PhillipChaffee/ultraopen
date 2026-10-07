@@ -168,6 +168,33 @@ describe("plugin registration", () => {
     expect(JSON.stringify(args["stop"])).toContain("clear error")
   })
 
+  test("the title and description args' schemas teach the metadata contract (#142)", () => {
+    // The fields stopped being ignored (#142); a stale "Ignored." description would teach the
+    // model a lie on a load-bearing surface. The prose is otherwise free to change — the
+    // pinned positive phrase is the manifest recording, the durable half of the contract.
+    const args = toolOf(ultraopen({ client: stubClient }))?.args ?? {}
+    expect(args["title"]).toBeDefined()
+    expect(args["description"]).toBeDefined()
+    const title = JSON.stringify(args["title"]) ?? ""
+    expect(title).not.toContain("Ignored")
+    expect(title).toContain("manifest")
+  })
+
+  test("the manifest records the title verbatim even when the render escapes it (#142)", async () => {
+    // Escape-on-display, verbatim-on-disk: the tag attribute is quoted for the model, the
+    // manifest keeps the exact string a resume or an operator reads back.
+    const tool = toolOf(ultraopen({ client: hangingClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 1\n`, background: true, title: 'Fix the "login" bug' },
+      { sessionID: "parent" },
+    )
+    expect(output).toContain("title=\"Fix the &quot;login&quot; bug\"")
+    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
+    const manifest = await readManifest(runId, undefined)
+    expect(manifest?.title).toBe('Fix the "login" bug')
+  })
+
   test("applies the configured concurrency to the process-wide gate", () => {
     ultraopen({ client: stubClient }, { concurrency: 3 })
     expect(registry.semaphore.limit).toBe(3)
@@ -377,10 +404,10 @@ describe("tool execution", () => {
     expect(output).not.toContain(`<run id="`)
   })
 
-  test("asks for permission using the workflow's real name, not the ignored title arg", async () => {
-    // The script is parsed BEFORE asking so the prompt can name the workflow. Using the `title`
-    // argument would be wrong twice over: it is documented as ignored, and models omit it — which
-    // showed up live as a permission prompt reading "null".
+  test("asks for permission using the workflow's real name, not the title arg", async () => {
+    // The script is parsed BEFORE asking so the prompt can name the workflow. The launch's
+    // `title` is run metadata (#142) — it surfaces on the run's own renders, never in the
+    // prompt — and models omit it, which showed up live as a permission prompt reading "null".
     const asked: Record<string, unknown>[] = []
     await run(
       { script: `${META}return 1\n`, dryRun: true, title: "ignored-title" },
@@ -896,6 +923,32 @@ describe("background launch contract", () => {
     await settle(runId ?? "")
   })
 
+  test("a titled launch renders the title on the launch handle (#142)", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 1\n`, background: true, title: "Fix the login bug" },
+      { sessionID: "parent" },
+    )
+    expect(output).toContain('workflow="demo" title="Fix the login bug"')
+    // The title reaches the live-run registry the per-turn reminder reads, before the run
+    // settles and the entry drops — the reminder surface's launch-path pin.
+    expect(background.liveRunsForSession("parent").at(0)?.title).toBe("Fix the login bug")
+    await settle(output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? "")
+  })
+
+  test("an untitled launch's handle carries no title attribute (#142)", async () => {
+    const tool = toolOf(ultraopen({ client: stubClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 1\n`, background: true },
+      { sessionID: "parent" },
+    )
+    expect(output).toContain("<workflow-launched")
+    expect(output).not.toContain("title=")
+    await settle(output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? "")
+  })
+
   test("the manifest is on disk BEFORE the tool call returns", async () => {
     const tool = toolOf(ultraopen({ client: hangingClient }))
     if (!tool) {throw new Error("tool was not registered")}
@@ -907,6 +960,66 @@ describe("background launch contract", () => {
     expect(manifest?.status).toBe("running")
     expect(manifest?.sessionID).toBe("parent")
     expect(manifest?.bootId).toBeDefined()
+  })
+
+  test("a titled launch round-trips title and description onto the manifest (#142)", async () => {
+    const tool = toolOf(ultraopen({ client: hangingClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 1\n`, background: true, title: "Fix the login bug", description: "The auth flow" },
+      { sessionID: "parent" },
+    )
+    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
+    const manifest = await readManifest(runId, undefined)
+    expect(manifest?.title).toBe("Fix the login bug")
+    expect(manifest?.description).toBe("The auth flow")
+  })
+
+  test("an untitled launch records no title on the manifest (#142)", async () => {
+    const tool = toolOf(ultraopen({ client: hangingClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute({ script: `${META}await agent('a')\nreturn 1\n`, background: true }, { sessionID: "parent" })
+    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
+    const manifest = await readManifest(runId, undefined)
+    expect(manifest?.title).toBeUndefined()
+    expect(manifest?.description).toBeUndefined()
+  })
+
+  test.each([
+    ["empty string", ""],
+    ["whitespace-only", "   "],
+    ["null decoration", "null"],
+    ["undefined decoration", "undefined"],
+  ])("a %s title is absent everywhere — no placeholder noise (#142)", async (_label, blank) => {
+    // Models emit zero-value decorations; the presence rule treats blank and the
+    // documented decoration strings as absent on every surface and on the manifest,
+    // exactly like an omitted field.
+    const tool = toolOf(ultraopen({ client: hangingClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 1\n`, background: true, title: blank, description: blank },
+      { sessionID: "parent" },
+    )
+    expect(output).toContain("<workflow-launched")
+    expect(output).not.toContain("title=")
+    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
+    const manifest = await readManifest(runId, undefined)
+    expect(manifest).not.toHaveProperty("title")
+    expect(manifest).not.toHaveProperty("description")
+  })
+
+  test("mixed presence: a real title with a blank description records only the title (#142)", async () => {
+    const tool = toolOf(ultraopen({ client: hangingClient }))
+    if (!tool) {throw new Error("tool was not registered")}
+    const output = await tool.execute(
+      { script: `${META}await agent('a')\nreturn 1\n`, background: true, title: "Fix the login bug", description: "  " },
+      { sessionID: "parent" },
+    )
+    expect(output).toContain('title="Fix the login bug"')
+    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
+    const manifest = await readManifest(runId, undefined)
+    expect(manifest?.title).toBe("Fix the login bug")
+    expect(manifest).not.toHaveProperty("description")
   })
 
   test("a second launch from the same session is refused while one is live", async () => {

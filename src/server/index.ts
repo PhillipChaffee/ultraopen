@@ -7,7 +7,7 @@ import { registry } from "./singleton.js"
 import { installConfig } from "./ultracode/config.js"
 import type { MutableConfig } from "./ultracode/config.js"
 import { execute, prepare, projectLaunchSize, renderFailure, WorkflowRunError } from "./tool/workflow.js"
-import { inspectArgsTransport } from "./tool/args-transport.js"
+import { inspectArgsTransport, launchMetadataOf } from "./tool/args-transport.js"
 import type { WorkflowArgs } from "./tool/workflow.js"
 import { WORKFLOW_TOOL, STATUS_TOOL } from "./bridge/permission.js"
 import { asClient } from "./types.js"
@@ -356,6 +356,10 @@ async function launchWorkflow(
   const background = args.dryRun !== true &&
     resolveLaunchContract(args.background, options) === "background",
    runId = `wf_${randomUUID().replaceAll("-", "").slice(0, 12)}`,
+   // The launch's title/description metadata (#142): absent together on an untitled
+   // launch, present verbatim otherwise. Read once, consumed by the manifest, the
+   // launch handle and the live-run reminder.
+   launchMetadata = launchMetadataOf(args),
    // The session's default model, so `effort` resolves against ITS variant set rather
    // than a guess. A failure here is non-fatal: effort simply goes unapplied, and the run
    // log says so.
@@ -468,8 +472,9 @@ async function launchWorkflow(
     })
 
     // The per-turn live-run reminder names the workflow, and prepare() is where the name is
-    // first known — recorded before the ask so even a pending entry carries it.
-    nameRun(runId, prepared.meta.name)
+    // first known — recorded before the ask so even a pending entry carries it. The launch's
+    // title metadata rides along (#142); the reminder shows it beside the name.
+    nameRun(runId, prepared.meta.name, launchMetadata.title)
 
     // Persist the script BEFORE the ask, so the user can open the real file
     // while the prompt is on screen. beginRun writes it again (same bytes) when
@@ -566,6 +571,8 @@ async function launchWorkflow(
       // A hydrated launch records what actually arrived (#78): args holds the hydrated value,
       // argsRawString preserves the raw string the caller sent.
       ...(prepared.argsHydrated === undefined ? {} : { argsRawString: prepared.argsHydrated.raw }),
+      // The launch's title/description metadata (#142), absent together when the launch passed none.
+      ...launchMetadata,
     })
     if (!manifest) {
       dropPending(runId)
@@ -606,7 +613,8 @@ async function launchWorkflow(
     startDetachedRun(shared)
 
     const projection = projectedAgents === undefined ? undefined : { agents: projectedAgents, threshold: options.largeWorkflowAgents }
-    return [renderLaunch(prepared.meta.name, runId, longLived, siblingRunsForSession(context.sessionID, runId), projection, options.budgetTokens), ...scanNoteLines].join("\n")
+    // The title rides the handle beside the workflow name (#142); absent on an untitled launch.
+    return [renderLaunch(prepared.meta.name, runId, longLived, siblingRunsForSession(context.sessionID, runId), projection, options.budgetTokens, launchMetadata.title), ...scanNoteLines].join("\n")
   } catch (error) {
     // Reached only by the launch phase itself: a parse failure or a rejected
     // permission ask. The run never went live, so the pending entry is dropped.

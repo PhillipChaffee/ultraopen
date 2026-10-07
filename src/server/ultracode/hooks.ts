@@ -3,7 +3,7 @@ import { liveRunsForSession } from "../tool/background.js"
 import type { DetachedRun } from "../tool/background.js"
 import { mentionsKeyword, mode, requestsNoFanOut } from "./mode.js"
 import { decorate, decorateLatest, renderRunsReminder, ULTRACODE_DEMOTED, ULTRACODE_ON } from "./reminders.js"
-import type { MessageLike } from "./reminders.js"
+import type { LiveRunLine, MessageLike } from "./reminders.js"
 
 /**
  * The hooks that turn ultracode on and keep it visible to the model.
@@ -117,12 +117,16 @@ export function onMessagesTransform(
     runsDecorated = decorateLatest(
       messages,
       renderRunsReminder(
-        live.map((entry) => ({
-          runId: entry.runId,
-          name: entry.name ?? entry.runId,
-          agents: registry.sessionsOf(entry.runId).length,
-          startedAt: entry.startedAt,
-        })),
+        live.map((entry) => {
+          const line: LiveRunLine = {
+            runId: entry.runId,
+            name: entry.name ?? entry.runId,
+            agents: registry.sessionsOf(entry.runId).length,
+            startedAt: entry.startedAt,
+          }
+          if (entry.title !== undefined) {line.title = entry.title}
+          return line
+        }),
         options.now?.() ?? Date.now(),
       ),
     )

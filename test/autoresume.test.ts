@@ -109,14 +109,17 @@ interface ExecuteCall {
   context: WorkflowContext
   /** The manifest as the engine saw it — proving the re-stamp landed BEFORE execution. */
   manifestAtCall: Manifest | undefined
+  /** The live-run reminder's title view while the run is live (#142). */
+  reminderTitle: string | undefined
 }
 
+/** The live-run reminder's own view of the adopted run, captured while the run is live. */
 /** A fake engine that records its inputs and completes the run. */
 const makeExecute = (): { fn: typeof execute; calls: ExecuteCall[] } => {
   const calls: ExecuteCall[] = []
   const fn = async (args: WorkflowArgs, context: WorkflowContext): Promise<WorkflowResult> => {
     const atCall = await readManifest(RUN_ID, env)
-    calls.push({ args, context, manifestAtCall: atCall })
+    calls.push({ args, context, manifestAtCall: atCall, reminderTitle: liveRunsForSession(SESSION).at(0)?.title })
     return {
       runId: RUN_ID,
       meta: { name: "e2e-resume", description: "resume me" },
@@ -204,6 +207,45 @@ describe("resumeInterruptedRuns", () => {
 
     // The launch-gating registry holds no residue once the run settled.
     expect(liveRunsForSession(SESSION)).toEqual([])
+  })
+
+  test("the adopted run's reminder carries the manifest's title (#142)", async () => {
+    const entry = await seedCandidate({ title: "Fix the login bug" }),
+     { fn, calls } = makeExecute()
+
+    await resumeInterruptedRuns({ ...deps({ executeFn: fn }), candidates: [entry] })
+    await settlePromiseOf(RUN_ID)
+
+    expect(calls).toHaveLength(1)
+    // The title rides the registry while the run is live, so the per-turn reminder shows it.
+    expect(calls[0]?.reminderTitle).toBe("Fix the login bug")
+  })
+
+  test("a hand-edited non-string title degrades to untitled at the registry (#142)", async () => {
+    // The manifest is JSON a human can edit; a non-string must never reach the reminder's
+    // renderer (oneLine would throw inside the host's messages transform).
+    const entry = await seedCandidate({ title: 42 as unknown as string }),
+     { fn, calls } = makeExecute()
+
+    await resumeInterruptedRuns({ ...deps({ executeFn: fn }), candidates: [entry] })
+    await settlePromiseOf(RUN_ID)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.reminderTitle).toBeUndefined()
+  })
+
+  test.each([
+    ["whitespace-only", "   "],
+    ["null decoration", "null"],
+  ])("a hand-edited %s title is absent at the registry — the same presence rule as the launch (#142)", async (_label, blank) => {
+    const entry = await seedCandidate({ title: blank }),
+     { fn, calls } = makeExecute()
+
+    await resumeInterruptedRuns({ ...deps({ executeFn: fn }), candidates: [entry] })
+    await settlePromiseOf(RUN_ID)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.reminderTitle).toBeUndefined()
   })
 
   test("skips a run whose interruption is older than the TTL window", async () => {
