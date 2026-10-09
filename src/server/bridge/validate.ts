@@ -20,6 +20,100 @@ export function validate(value: unknown, schema: Record<string, unknown>): Valid
   return errors.length === 0 ? { valid: true } : { valid: false, errors }
 }
 
+/**
+ * Finds provable self-contradictions — schema shapes NO value can ever satisfy — so a caller can
+ * reject them before a subagent is ever spawned on them. A never-satisfiable schema cannot be
+ * repaired by retrying: the ladder would burn real tokens to prove a theorem and record a null
+ * that reads as the agent's failure, when the schema is the bug.
+ *
+ * Deliberately conservative. General satisfiability is undecidable, so only airtight shapes are
+ * flagged, and any keyword this walk does not model (`$ref`, `patternProperties`,
+ * `unevaluatedProperties`) silences the checks it could invalidate — a validator that rejects
+ * satisfiable schemas would be worse than one that misses a contradiction. A shape is provable
+ * only when every admissible instance is forced into the constrained type: a pinned `type`, or
+ * an `enum` whose members all share it — a schema a string can escape is not provably
+ * unsatisfiable. Descent follows only subschemas that MUST hold: a required property's
+ * subschema, and `items` when `minItems` forces at least one member.
+ */
+export function findContradictions(schema: Record<string, unknown>): string[] {
+  const contradictions: string[] = []
+  walkSchema(schema, "", new WeakSet(), contradictions)
+  return contradictions
+}
+
+function walkSchema(
+  schema: Record<string, unknown>,
+  path: string,
+  visited: WeakSet<object>,
+  contradictions: string[],
+): void {
+  // A reused subschema object (or a self-referencing one) must not be walked twice.
+  if (visited.has(schema)) {return}
+  visited.add(schema)
+
+  // Keywords outside the modelled subset could change what the node's keywords apply to;
+  // silence rather than risk rejecting a satisfiable schema.
+  if (schema["$ref"] !== undefined || schema["patternProperties"] !== undefined || schema["unevaluatedProperties"] !== undefined) {return}
+
+  const {type} = schema,
+   {enum: enumValues} = schema,
+   // A keyword only constrains instances of its own type, so a contradiction is provable only
+   // when EVERY admissible instance has that type: a pinned `type`, or an `enum` all of whose
+   // members have it. A schema a string can escape is not provably unsatisfiable.
+   forced = (jsonType: string): boolean =>
+     (typeof type === "string" && type === jsonType) ||
+     (Array.isArray(type) && type.length > 0 && type.every((entry) => entry === jsonType)) ||
+     (Array.isArray(enumValues) && enumValues.length > 0 && enumValues.every((member) => matchesType(member, jsonType))),
+   at = path === "" ? "" : `at ${path}: `
+
+  if (forced("object") && schema["additionalProperties"] === false) {
+    const {required} = schema
+    if (Array.isArray(required)) {
+      const {properties} = schema,
+       allowed = isPlainObject(properties) ? properties : {}
+      for (const key of required) {
+        if (typeof key === "string" && !(key in allowed)) {
+          contradictions.push(`${at}required property "${key}" is ruled out by additionalProperties: false`)
+        }
+      }
+    }
+  }
+
+  if (forced("number") || forced("integer")) {
+    const {minimum} = schema,
+     {maximum} = schema
+    if (typeof minimum === "number" && typeof maximum === "number" && minimum > maximum) {
+      contradictions.push(`${at}minimum ${minimum} is above maximum ${maximum} — no number can satisfy both`)
+    }
+  }
+
+  // Descend only where the subschema MUST hold: a required property applies to every object
+  // instance, and items applies to every member of a non-empty array. A contradiction an
+  // instance shape can dodge (an optional property, items of a possibly-empty array) must not
+  // be flagged — rejecting a satisfiable schema is the worse error.
+  if (forced("object")) {
+    const {required} = schema,
+     {properties} = schema
+    if (Array.isArray(required) && isPlainObject(properties)) {
+      for (const key of required) {
+        if (typeof key !== "string") {continue}
+        const sub = properties[key]
+        if (isPlainObject(sub)) {
+          walkSchema(sub, path === "" ? `properties.${key}` : `${path}.properties.${key}`, visited, contradictions)
+        }
+      }
+    }
+  }
+
+  const {minItems} = schema
+  if (forced("array") && typeof minItems === "number" && minItems >= 1) {
+    const {items} = schema
+    if (isPlainObject(items)) {
+      walkSchema(items, path === "" ? "items" : `${path}.items`, visited, contradictions)
+    }
+  }
+}
+
 function check(value: unknown, schema: Record<string, unknown>, path: string, errors: string[]): void {
   const where = path === "" ? "value" : path,
 

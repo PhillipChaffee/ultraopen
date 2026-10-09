@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { validate } from "../src/server/bridge/validate.js"
+import { findContradictions, validate } from "../src/server/bridge/validate.js"
 
 const ok = (value: unknown, schema: Record<string, unknown>) => validate(value, schema).valid,
  errorsOf = (value: unknown, schema: Record<string, unknown>): string[] => {
@@ -172,5 +172,129 @@ describe("realistic agent output", () => {
     // This is the failure the validator exists for — a stripped `format` returns plain text with
     // no error at all, so nothing upstream would have caught it.
     expect(ok("I found three issues...", findings)).toBe(false)
+  })
+})
+
+describe("schema pre-validation — provable self-contradictions", () => {
+  test("a required key ruled out by additionalProperties: false is flagged, naming the key", () => {
+    const contradictions = findContradictions({
+      type: "object",
+      additionalProperties: false,
+      required: ["name", "extra"],
+      properties: { name: { type: "string" } },
+    })
+    expect(contradictions).toHaveLength(1)
+    expect(contradictions[0]).toContain('"extra"')
+    expect(contradictions[0]).toContain("additionalProperties")
+  })
+
+  test("a required key is still ruled out when properties is absent entirely", () => {
+    expect(findContradictions({ type: "object", additionalProperties: false, required: ["id"] })).toHaveLength(1)
+  })
+
+  test("minimum above maximum is flagged", () => {
+    const contradictions = findContradictions({ type: "number", minimum: 10, maximum: 5 })
+    expect(contradictions).toHaveLength(1)
+    expect(contradictions[0]).toContain("minimum 10")
+    expect(contradictions[0]).toContain("maximum 5")
+  })
+
+  test("an integer-pinned bound pair is flagged too", () => {
+    expect(findContradictions({ type: "integer", minimum: 2, maximum: 1 })).toHaveLength(1)
+  })
+
+  test("a type array or a numeric enum that forces the type is honored", () => {
+    expect(findContradictions({ type: ["number"], minimum: 10, maximum: 5 })).toHaveLength(1)
+    expect(findContradictions({ enum: [1, 2], minimum: 10, maximum: 5 })).toHaveLength(1)
+  })
+
+  test("equal bounds are satisfiable (minimum === maximum)", () => {
+    expect(findContradictions({ type: "number", minimum: 5, maximum: 5 })).toHaveLength(0)
+  })
+
+  test("a contradiction nested in a required property is flagged with its path", () => {
+    const contradictions = findContradictions({
+      type: "object",
+      required: ["count"],
+      properties: { count: { type: "number", minimum: 10, maximum: 5 } },
+    })
+    expect(contradictions).toHaveLength(1)
+    expect(contradictions[0]).toContain("properties.count")
+  })
+
+  test("a contradiction nested in a required property's own required/additionalProperties pair is flagged", () => {
+    const contradictions = findContradictions({
+      type: "object",
+      required: ["meta"],
+      properties: { meta: { type: "object", additionalProperties: false, required: ["id"], properties: {} } },
+    })
+    expect(contradictions).toHaveLength(1)
+    expect(contradictions[0]).toContain("properties.meta")
+    expect(contradictions[0]).toContain('"id"')
+  })
+
+  test("a contradiction inside items is flagged when minItems forces a member", () => {
+    const contradictions = findContradictions({
+      type: "array",
+      minItems: 1,
+      items: { type: "number", minimum: 10, maximum: 5 },
+    })
+    expect(contradictions).toHaveLength(1)
+    expect(contradictions[0]).toContain("items")
+  })
+
+  test("a contradiction under items of a required property carries the full path", () => {
+    const contradictions = findContradictions({
+      type: "object",
+      required: ["tags"],
+      properties: { tags: { type: "array", minItems: 1, items: { type: "number", minimum: 10, maximum: 5 } } },
+    })
+    expect(contradictions).toHaveLength(1)
+    expect(contradictions[0]).toContain("properties.tags.items")
+  })
+
+  test("both contradiction shapes on one schema are reported together", () => {
+    const contradictions = findContradictions({
+      type: "object",
+      additionalProperties: false,
+      required: ["ghost", "count"],
+      properties: { count: { type: "number", minimum: 10, maximum: 5 } },
+    })
+    expect(contradictions).toHaveLength(2)
+  })
+
+  test("satisfiable near-misses are never flagged", () => {
+    const nearMisses: Record<string, unknown>[] = [
+      { type: "object", additionalProperties: false, required: ["name"], properties: { name: { type: "string" } } },
+      { type: "object", required: ["extra"], properties: { name: { type: "string" } } },
+      { type: "object", properties: { opt: { type: "number", minimum: 10, maximum: 5 } } },
+      { type: "array", items: { type: "number", minimum: 10, maximum: 5 } },
+      { type: "array", minItems: 0, items: { type: "number", minimum: 10, maximum: 5 } },
+      { type: "string", minimum: 10, maximum: 5 },
+      { minimum: 10, maximum: 5 },
+      { type: ["object", "string"], additionalProperties: false, required: ["x"] },
+      { enum: ["a"], additionalProperties: false, required: ["x"] },
+      { type: "object", additionalProperties: false, required: ["x"], patternProperties: { "^x": {} } },
+      { type: "object", additionalProperties: false, required: ["x"], $ref: "#/$defs/thing" },
+      { type: "object", additionalProperties: false, required: ["x"], unevaluatedProperties: false },
+      { type: "object", additionalProperties: true, required: ["x"] },
+      { type: "object", additionalProperties: false, required: "x" },
+      { type: "object", additionalProperties: false, required: [1], properties: {} },
+      { type: "object", additionalProperties: false, required: [1], properties: { 1: { type: "number", minimum: 10, maximum: 5 } } },
+      { minItems: 1, items: { type: "number", minimum: 10, maximum: 5 } },
+    ]
+    for (const schema of nearMisses) {
+      expect(findContradictions(schema)).toEqual([])
+    }
+  })
+
+  test("an enum that forces the object type still proves the contradiction", () => {
+    expect(findContradictions({ enum: [{}], additionalProperties: false, required: ["x"] })).toHaveLength(1)
+  })
+
+  test("a cyclic schema does not hang the walk", () => {
+    const node: Record<string, unknown> = { type: "object", required: ["self"], properties: {} }
+    node["properties"] = { self: node }
+    expect(findContradictions(node)).toHaveLength(0)
   })
 })
