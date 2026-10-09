@@ -3,7 +3,7 @@ import { parse } from "../script/parse.js"
 import { run as runSandbox } from "../script/sandbox.js"
 import type { ArgsDereference } from "../script/lint.js"
 import { parallel, pipeline } from "../runtime/combinators.js"
-import { Run } from "../runtime/run.js"
+import { Run, assertSchemaSatisfiable } from "../runtime/run.js"
 import type { ControlCommand } from "../runtime/control.js"
 import type { AgentOptions, ProgressEvent } from "../runtime/run.js"
 import { subagentContract } from "../bridge/contract.js"
@@ -384,6 +384,7 @@ async function runPrepared(
         if (typeof prompt !== "string" || prompt.trim() === "") {
           throw new TypeError("agent() requires a non-empty prompt string as its first argument.")
         }
+        assertSchemaSatisfiable(options.schema)
         dryRunCount++
         run.log(`[dryRun] ${options.label ?? prompt.slice(0, 60)}`)
         return Promise.resolve(options.schema ? {} : `[dryRun] ${prompt.slice(0, 200)}`)

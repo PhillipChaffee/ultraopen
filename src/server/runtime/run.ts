@@ -4,6 +4,7 @@ import { registry } from "../singleton.js"
 import type { ControlAction, ControlCommand } from "./control.js"
 import type { NullReason } from "../bridge/spawn.js"
 import { spawnStructured } from "../bridge/structured.js"
+import { findContradictions } from "../bridge/validate.js"
 import { Journal } from "../resume/journal.js"
 import type { JournalEntry } from "../resume/journal.js"
 import { toJournalEntry, toReplayedEntry, tryReplay } from "../resume/replay.js"
@@ -26,6 +27,23 @@ export interface AgentOptions {
   agentType?: string
   isolation?: "worktree"
   disallowedTools?: readonly string[]
+}
+
+/**
+ * The schema argument guard every `agent()` call site shares — the live engine and the dry-run
+ * stub — so their message contract cannot drift apart. A schema that can never be satisfied is
+ * the script's bug, not the agent's failure: the call throws before any session is created,
+ * because the retry ladder would otherwise burn real tokens to prove a theorem and record a
+ * null that reads as the agent's fault.
+ */
+export function assertSchemaSatisfiable(schema: Record<string, unknown> | undefined): void {
+  if (schema === undefined) {return}
+  const contradictions = findContradictions(schema)
+  if (contradictions.length > 0) {
+    throw new TypeError(
+      `agent() received a schema that can never be satisfied, so no session was created: ${contradictions.join("; ")}`,
+    )
+  }
 }
 
 /** One agent's outcome, recorded so partial coverage can never read as full coverage. */
@@ -264,6 +282,11 @@ export class Run {
     if (typeof prompt !== "string" || prompt.trim() === "") {
       throw new TypeError("agent() requires a non-empty prompt string as its first argument.")
     }
+
+    // A schema that can never be satisfied is the script's bug, not the agent's failure — reject
+    // the call here, before any session is created: the retry ladder would otherwise burn real
+    // tokens to prove a theorem and record a null that reads as the agent's fault.
+    assertSchemaSatisfiable(options.schema)
 
     // Checked before the counter moves, so a rejected call does not inflate the count that the
     // result envelope reports.

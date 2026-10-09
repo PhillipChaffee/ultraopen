@@ -446,6 +446,53 @@ describe("Run.agent — validation and caps", () => {
     await expect(run.agent("   \n\t  ")).rejects.toThrow(TypeError)
   })
 
+  test("a provably contradictory schema rejects at call time before any session is created", async () => {
+    const { client, createCalls, promptCalls } = makeClient(),
+     run = makeRun(client),
+     rejected = run.agent("work", { schema: { type: "object", additionalProperties: false, required: ["id"], properties: {} } })
+
+    await expect(rejected).rejects.toThrow(TypeError)
+    await expect(rejected).rejects.toThrow(/"id"/u)
+    await expect(
+      run.agent("work", { schema: { type: "number", minimum: 10, maximum: 5 } }),
+    ).rejects.toThrow(/minimum 10 is above maximum 5/u)
+
+    // Zero tokens: no session, no prompt, and the rejected calls never inflate the agent count.
+    expect(createCalls).toHaveLength(0)
+    expect(promptCalls).toHaveLength(0)
+    expect(run.agentCount).toBe(0)
+  })
+
+  test("a satisfiable schema still spawns and returns its structured result", async () => {
+    const { client, createCalls } = makeClient({
+      prompt: () =>
+        Promise.resolve({ data: { info: baseInfo({ structured: { ok: true } }), parts: [textPart("done")] } }),
+    }),
+     run = makeRun(client),
+     value = await run.agent("work", {
+       schema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } },
+     })
+
+    expect(value).toEqual({ ok: true })
+    expect(createCalls).toHaveLength(1)
+  })
+
+  test("a satisfiable schema whose output misses still ladders through Run.agent", async () => {
+    // AC-4's run-level pin: the pre-check gates the door, it does not shorten the ladder — a
+    // schema that passes it but keeps missing gets all three attempts in the same session.
+    const { client, promptCalls, createCalls } = makeClient({
+      prompt: () => Promise.resolve({ data: { info: baseInfo(), parts: [textPart("done")] } }),
+    }),
+     run = makeRun(client),
+     value = await run.agent("work", { schema: { type: "object" } })
+
+    expect(value).toBeNull()
+    expect(createCalls).toHaveLength(1)
+    expect(promptCalls).toHaveLength(3)
+    // The ladder retries in the SAME session — a fresh session per attempt would lose the child's research.
+    expect(new Set(promptCalls.map((call) => call.path.id)).size).toBe(1)
+  })
+
   test("the lifetime cap rejects the call past MAX_AGENTS_PER_RUN without inflating agentCount", async () => {
     // MAX_AGENTS_PER_RUN (1000) is a runaway-loop backstop, not a tuning knob — this drives the cap
     // itself rather than spawning 1000 real agents end to end. `#spawned` is checked and incremented
