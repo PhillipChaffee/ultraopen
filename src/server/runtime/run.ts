@@ -29,6 +29,23 @@ export interface AgentOptions {
   disallowedTools?: readonly string[]
 }
 
+/**
+ * The schema argument guard every `agent()` call site shares — the live engine and the dry-run
+ * stub — so their message contract cannot drift apart. A schema that can never be satisfied is
+ * the script's bug, not the agent's failure: the call throws before any session is created,
+ * because the retry ladder would otherwise burn real tokens to prove a theorem and record a
+ * null that reads as the agent's fault.
+ */
+export function assertSchemaSatisfiable(schema: Record<string, unknown> | undefined): void {
+  if (schema === undefined) {return}
+  const contradictions = findContradictions(schema)
+  if (contradictions.length > 0) {
+    throw new TypeError(
+      `agent() received a schema that can never be satisfied, so no session was created: ${contradictions.join("; ")}`,
+    )
+  }
+}
+
 /** One agent's outcome, recorded so partial coverage can never read as full coverage. */
 export interface AgentRecord {
   index: number
@@ -269,14 +286,7 @@ export class Run {
     // A schema that can never be satisfied is the script's bug, not the agent's failure — reject
     // the call here, before any session is created: the retry ladder would otherwise burn real
     // tokens to prove a theorem and record a null that reads as the agent's fault.
-    if (options.schema !== undefined) {
-      const contradictions = findContradictions(options.schema)
-      if (contradictions.length > 0) {
-        throw new TypeError(
-          `agent() received a schema that can never be satisfied, so no session was created: ${contradictions.join("; ")}`,
-        )
-      }
-    }
+    assertSchemaSatisfiable(options.schema)
 
     // Checked before the counter moves, so a rejected call does not inflate the count that the
     // result envelope reports.

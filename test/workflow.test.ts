@@ -518,6 +518,23 @@ describe("dry run — the agent contract holds under the stub", () => {
       .rejects.toThrow(/requires a non-empty prompt string/u)
   })
 
+  test("a dry run refuses a provably contradictory schema exactly as a live run does", async () => {
+    // The stub carries the live agent's whole argument guard: a dry pass may not vouch for a
+    // script whose first agent() call would die live on the contradictory-schema TypeError.
+    await expect(
+      execute(
+        { script: `${META}await agent('x', { schema: { type: 'object', additionalProperties: false, required: ['id'], properties: {} } })\n`, dryRun: true },
+        base,
+      ),
+    ).rejects.toThrow(/"id"/u)
+    await expect(
+      execute(
+        { script: `${META}await agent('x', { schema: { type: 'number', minimum: 10, maximum: 5 } })\n`, dryRun: true },
+        base,
+      ),
+    ).rejects.toThrow(/minimum 10 is above maximum 5/u)
+  })
+
   test("a dry run still counts and narrates valid agent calls", async () => {
     // The guard must not dampen the stub's own contract: valid prompts still count toward
     // agentCount and narrate [dryRun] lines.

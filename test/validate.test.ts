@@ -263,29 +263,45 @@ describe("schema pre-validation — provable self-contradictions", () => {
     expect(contradictions).toHaveLength(2)
   })
 
-  test("satisfiable near-misses are never flagged", () => {
-    const nearMisses: Record<string, unknown>[] = [
-      { type: "object", additionalProperties: false, required: ["name"], properties: { name: { type: "string" } } },
-      { type: "object", required: ["extra"], properties: { name: { type: "string" } } },
-      { type: "object", properties: { opt: { type: "number", minimum: 10, maximum: 5 } } },
-      { type: "array", items: { type: "number", minimum: 10, maximum: 5 } },
-      { type: "array", minItems: 0, items: { type: "number", minimum: 10, maximum: 5 } },
-      { type: "string", minimum: 10, maximum: 5 },
-      { minimum: 10, maximum: 5 },
-      { type: ["object", "string"], additionalProperties: false, required: ["x"] },
-      { enum: ["a"], additionalProperties: false, required: ["x"] },
-      { type: "object", additionalProperties: false, required: ["x"], patternProperties: { "^x": {} } },
-      { type: "object", additionalProperties: false, required: ["x"], $ref: "#/$defs/thing" },
-      { type: "object", additionalProperties: false, required: ["x"], unevaluatedProperties: false },
-      { type: "object", additionalProperties: true, required: ["x"] },
-      { type: "object", additionalProperties: false, required: "x" },
-      { type: "object", additionalProperties: false, required: [1], properties: {} },
-      { type: "object", additionalProperties: false, required: [1], properties: { 1: { type: "number", minimum: 10, maximum: 5 } } },
-      { minItems: 1, items: { type: "number", minimum: 10, maximum: 5 } },
-    ]
-    for (const schema of nearMisses) {
-      expect(findContradictions(schema)).toEqual([])
-    }
+  test.each([
+    ["every required key is in properties", { type: "object", additionalProperties: false, required: ["name"], properties: { name: { type: "string" } } }],
+    ["no additionalProperties: false to rule a key out", { type: "object", required: ["extra"], properties: { name: { type: "string" } } }],
+    ["the contradictory property is optional", { type: "object", properties: { opt: { type: "number", minimum: 10, maximum: 5 } } }],
+    ["items can be dodged by an empty array", { type: "array", items: { type: "number", minimum: 10, maximum: 5 } }],
+    ["minItems: 0 permits the empty array", { type: "array", minItems: 0, items: { type: "number", minimum: 10, maximum: 5 } }],
+    ["bounds are vacuous on a string", { type: "string", minimum: 10, maximum: 5 }],
+    ["bounds without a type are escaped by any non-number", { minimum: 10, maximum: 5 }],
+    ["the type union lets a string escape", { type: ["object", "string"], additionalProperties: false, required: ["x"] }],
+    ["the enum lets a non-object member escape", { enum: ["a"], additionalProperties: false, required: ["x"] }],
+    ["patternProperties may admit the required key", { type: "object", additionalProperties: false, required: ["x"], patternProperties: { "^x": {} } }],
+    ["$ref changes sibling semantics", { type: "object", additionalProperties: false, required: ["x"], $ref: "#/$defs/thing" }],
+    ["unevaluatedProperties changes sibling semantics", { type: "object", additionalProperties: false, required: ["x"], unevaluatedProperties: false }],
+    ["additionalProperties: true admits the key", { type: "object", additionalProperties: true, required: ["x"] }],
+    ["a non-array required is ignored", { type: "object", additionalProperties: false, required: "x" }],
+    ["a non-string required key is ignored", { type: "object", additionalProperties: false, required: [1], properties: {} }],
+    ["a non-string required key is never descended into", { type: "object", additionalProperties: false, required: [1], properties: { 1: { type: "number", minimum: 10, maximum: 5 } } }],
+    ["items without a pinned array type is escaped by any non-array", { minItems: 1, items: { type: "number", minimum: 10, maximum: 5 } }],
+    ["enum forcing is silenced by an unmodelled applicator", { enum: [{}], oneOf: [{ type: "string" }], additionalProperties: false, required: ["id"] }],
+  ])("satisfiable near-miss: %s", (_name, schema) => {
+    expect(findContradictions(schema as Record<string, unknown>)).toEqual([])
+  })
+
+  test("pinned-type forcing holds even alongside an unmodelled applicator", () => {
+    // The applicator can only restrict further — every instance still has the pinned type.
+    expect(
+      findContradictions({ type: "object", additionalProperties: false, required: ["id"], properties: {}, oneOf: [{ type: "object" }, { type: "string" }] }),
+    ).toHaveLength(1)
+  })
+
+  test("a required key matching an inherited prototype name is still flagged", () => {
+    // `"toString" in {}` is true via Object.prototype; the walk must ask the schema's own keys.
+    expect(findContradictions({ type: "object", additionalProperties: false, required: ["toString"], properties: {} })[0]).toContain('"toString"')
+  })
+
+  test("a malformed schema is silenced rather than crashed on", () => {
+    expect(findContradictions(null as unknown as Record<string, unknown>)).toEqual([])
+    expect(findContradictions(undefined as unknown as Record<string, unknown>)).toEqual([])
+    expect(findContradictions([] as unknown as Record<string, unknown>)).toEqual([])
   })
 
   test("an enum that forces the object type still proves the contradiction", () => {

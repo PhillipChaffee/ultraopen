@@ -28,18 +28,46 @@ export function validate(value: unknown, schema: Record<string, unknown>): Valid
  *
  * Deliberately conservative. General satisfiability is undecidable, so only airtight shapes are
  * flagged, and any keyword this walk does not model (`$ref`, `patternProperties`,
- * `unevaluatedProperties`) silences the checks it could invalidate — a validator that rejects
- * satisfiable schemas would be worse than one that misses a contradiction. A shape is provable
- * only when every admissible instance is forced into the constrained type: a pinned `type`, or
- * an `enum` whose members all share it — a schema a string can escape is not provably
- * unsatisfiable. Descent follows only subschemas that MUST hold: a required property's
- * subschema, and `items` when `minItems` forces at least one member.
+ * `unevaluatedProperties`, the applicators and name constraints in UNMODELLED_APPLICATORS)
+ * silences the checks it could invalidate — a validator that rejects satisfiable schemas would
+ * be worse than one that misses a contradiction. A shape is provable only when every
+ * admissible instance is forced into the constrained type: a pinned `type`, or — on fully
+ * modelled nodes only — an `enum` whose members all share it; a schema a string can escape is
+ * not provably unsatisfiable. Descent follows only subschemas that MUST hold: a required
+ * property's subschema, and `items` when `minItems` forces at least one member.
  */
 export function findContradictions(schema: Record<string, unknown>): string[] {
   const contradictions: string[] = []
-  walkSchema(schema, "", new WeakSet(), contradictions)
+  // A malformed schema (a sandbox script can pass anything) is not a provable contradiction;
+  // the validator's doctrine is to treat what it does not understand as satisfied, and the
+  // spawn layer already treats a falsy schema as absent.
+  if (isPlainObject(schema)) {
+    walkSchema(schema, "", new WeakSet(), contradictions)
+  }
   return contradictions
 }
+
+/**
+ * Keywords that apply other schemas, or constrain names, in ways this walk does not model.
+ * A node carrying any of them keeps its PINNED-type checks (every instance still has the
+ * pinned type — the other keywords can only restrict further), but loses its weaker
+ * enum-derived checks and its descent, so nothing outside the model can turn a flag into a
+ * false rejection.
+ */
+const UNMODELLED_APPLICATORS = [
+  "oneOf",
+  "anyOf",
+  "allOf",
+  "not",
+  "if",
+  "then",
+  "else",
+  "const",
+  "propertyNames",
+  "dependentRequired",
+  "dependentSchemas",
+  "dependencies",
+]
 
 function walkSchema(
   schema: Record<string, unknown>,
@@ -58,12 +86,16 @@ function walkSchema(
   const {type} = schema,
    {enum: enumValues} = schema,
    // A keyword only constrains instances of its own type, so a contradiction is provable only
-   // when EVERY admissible instance has that type: a pinned `type`, or an `enum` all of whose
-   // members have it. A schema a string can escape is not provably unsatisfiable.
-   forced = (jsonType: string): boolean =>
+   // when EVERY admissible instance has that type. A pinned `type` proves it on its own — the
+   // remaining keywords can only restrict further. An `enum` proves it only while it is the
+   // whole candidate set, so it is honored solely on nodes the walk fully models.
+   pinned = (jsonType: string): boolean =>
      (typeof type === "string" && type === jsonType) ||
-     (Array.isArray(type) && type.length > 0 && type.every((entry) => entry === jsonType)) ||
-     (Array.isArray(enumValues) && enumValues.length > 0 && enumValues.every((member) => matchesType(member, jsonType))),
+     (Array.isArray(type) && type.length > 0 && type.every((entry) => entry === jsonType)),
+   enumForced = (jsonType: string): boolean =>
+     !UNMODELLED_APPLICATORS.some((keyword) => schema[keyword] !== undefined) &&
+     Array.isArray(enumValues) && enumValues.length > 0 && enumValues.every((member) => matchesType(member, jsonType)),
+   forced = (jsonType: string): boolean => pinned(jsonType) || enumForced(jsonType),
    at = path === "" ? "" : `at ${path}: `
 
   if (forced("object") && schema["additionalProperties"] === false) {
@@ -72,7 +104,7 @@ function walkSchema(
       const {properties} = schema,
        allowed = isPlainObject(properties) ? properties : {}
       for (const key of required) {
-        if (typeof key === "string" && !(key in allowed)) {
+        if (typeof key === "string" && !Object.hasOwn(allowed, key)) {
           contradictions.push(`${at}required property "${key}" is ruled out by additionalProperties: false`)
         }
       }
