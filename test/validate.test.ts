@@ -282,6 +282,7 @@ describe("schema pre-validation — provable self-contradictions", () => {
     ["a non-string required key is never descended into", { type: "object", additionalProperties: false, required: [1], properties: { 1: { type: "number", minimum: 10, maximum: 5 } } }],
     ["items without a pinned array type is escaped by any non-array", { minItems: 1, items: { type: "number", minimum: 10, maximum: 5 } }],
     ["enum forcing is silenced by an unmodelled applicator", { enum: [{}], oneOf: [{ type: "string" }], additionalProperties: false, required: ["id"] }],
+    ["a malformed properties silences the node", { type: "object", additionalProperties: false, required: ["x"], properties: [] }],
   ])("satisfiable near-miss: %s", (_name, schema) => {
     expect(findContradictions(schema as Record<string, unknown>)).toEqual([])
   })
@@ -312,5 +313,12 @@ describe("schema pre-validation — provable self-contradictions", () => {
     const node: Record<string, unknown> = { type: "object", required: ["self"], properties: {} }
     node["properties"] = { self: node }
     expect(findContradictions(node)).toHaveLength(0)
+  })
+
+  test("a cyclic schema containing a contradiction flags it exactly once", () => {
+    // The visited-set short-circuits the second arrival, so the cycle must not double-count.
+    const node: Record<string, unknown> = { type: "number", minimum: 10, maximum: 5 }
+    node["properties"] = { self: node }
+    expect(findContradictions(node)).toHaveLength(1)
   })
 })

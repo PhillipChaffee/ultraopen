@@ -49,10 +49,10 @@ export function findContradictions(schema: Record<string, unknown>): string[] {
 
 /**
  * Keywords that apply other schemas, or constrain names, in ways this walk does not model.
- * A node carrying any of them keeps its PINNED-type checks (every instance still has the
- * pinned type — the other keywords can only restrict further), but loses its weaker
- * enum-derived checks and its descent, so nothing outside the model can turn a flag into a
- * false rejection.
+ * A node carrying any of them keeps its PINNED-type checks and its descent (sound: every
+ * instance still has the pinned type, and applicators can only restrict further), but loses
+ * its weaker enum-derived checks, so nothing outside the model can turn a flag into a false
+ * rejection.
  */
 const UNMODELLED_APPLICATORS = [
   "oneOf",
@@ -99,10 +99,13 @@ function walkSchema(
    at = path === "" ? "" : `at ${path}: `
 
   if (forced("object") && schema["additionalProperties"] === false) {
-    const {required} = schema
-    if (Array.isArray(required)) {
-      const {properties} = schema,
-       allowed = isPlainObject(properties) ? properties : {}
+    const {required} = schema,
+     {properties} = schema
+    // A `properties` that is present but not an object is malformed, and the file's doctrine is
+    // to silence malformed shapes; a properties that is ABSENT rules every key out, which is a
+    // true contradiction.
+    if (Array.isArray(required) && (properties === undefined || isPlainObject(properties))) {
+      const allowed = isPlainObject(properties) ? properties : {}
       for (const key of required) {
         if (typeof key === "string" && !Object.hasOwn(allowed, key)) {
           contradictions.push(`${at}required property "${key}" is ruled out by additionalProperties: false`)
@@ -122,7 +125,9 @@ function walkSchema(
   // Descend only where the subschema MUST hold: a required property applies to every object
   // instance, and items applies to every member of a non-empty array. A contradiction an
   // instance shape can dodge (an optional property, items of a possibly-empty array) must not
-  // be flagged — rejecting a satisfiable schema is the worse error.
+  // be flagged — rejecting a satisfiable schema is the worse error. The items dialect note:
+  // this walk treats `items` as applying to every member, matching the local validator's own
+  // checkArray and the ladder's local re-validation, not 2020-12's prefixItems-aware split.
   if (forced("object")) {
     const {required} = schema,
      {properties} = schema

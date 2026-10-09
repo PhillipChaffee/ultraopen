@@ -489,6 +489,8 @@ describe("Run.agent — validation and caps", () => {
     expect(value).toBeNull()
     expect(createCalls).toHaveLength(1)
     expect(promptCalls).toHaveLength(3)
+    // The ladder retries in the SAME session — a fresh session per attempt would lose the child's research.
+    expect(new Set(promptCalls.map((call) => call.path.id)).size).toBe(1)
   })
 
   test("the lifetime cap rejects the call past MAX_AGENTS_PER_RUN without inflating agentCount", async () => {
