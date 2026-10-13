@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto"
-import { appendFile, mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises"
+import { appendFile, mkdir, readFile, readdir, rename, rm, unlink, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { parseJournal } from "./journal.js"
@@ -74,6 +74,29 @@ export async function ensureRunDir(runId: string, env?: NodeJS.ProcessEnv): Prom
   const paths = artifactPaths(runId, env)
   await mkdir(paths.dir, { recursive: true })
   return paths
+}
+
+/**
+ * Deletes a run directory entirely, when a launch is proven never to have gone live (#161).
+ *
+ * The launch manufactures the directory before the permission ask — deliberately, so the user
+ * can open the real script while the prompt is on screen — and that pre-ask dir has no manifest
+ * when the launch never went live (rejected ask, dry run). No sweep touches it: pruning keys on
+ * a manifest, so the dir is a phantom the shared run-data root accumulates one per preview. The
+ * launch catch and the dry branch call THIS when the manifest read they already make for the
+ * #133 gate proves the run never went live — the same read gates both.
+ *
+ * Never rejects, like the module's persistence style: the caller reports the launch's outcome
+ * in its render, not from the dir's removal. An unsafe id removes nothing — the launch always
+ * supplies a minted safe id, so the refusal is the cheap symmetry with ensureRunDir's throw.
+ */
+export async function removeRunDir(runId: string, env?: NodeJS.ProcessEnv): Promise<void> {
+  if (!isSafeRunId(runId)) {return}
+  try {
+    await rm(runDir(runId, env), { recursive: true, force: true })
+  } catch {
+    // Best-effort like the writes it rolls back: the dir was never a real run's record.
+  }
 }
 
 /**

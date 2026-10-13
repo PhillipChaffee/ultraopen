@@ -52,7 +52,7 @@ import { listSavedWorkflows, scanNamedWorkflows } from "./tool/named.js"
 import { wireRun, startDetachedRun } from "./tool/settlement.js"
 import type { SettleOutcome } from "./tool/settlement.js"
 import { beginRun, loadResume } from "./resume/persist.js"
-import { ensureRunDir, isSafeRunId, readManifest, writeScript } from "./resume/store.js"
+import { ensureRunDir, isSafeRunId, readManifest, removeRunDir, writeScript } from "./resume/store.js"
 import type { JournalEntry, Manifest } from "./resume/journal.js"
 import { onChatMessage, onChatParams, onMessagesTransform } from "./ultracode/hooks.js"
 import { mode } from "./ultracode/mode.js"
@@ -529,7 +529,11 @@ async function launchWorkflow(
     // back as the tool call's value, nothing more; the context below is the live
     // blocking one minus every artifact writer, so the engine's log lines and
     // any replayed entries stay in memory. A dry failure lands in the catch
-    // below, whose manifest check renders it bare (nothing to resume).
+    // below, whose manifest check renders it bare (nothing to resume) — and
+    // (#161) deletes the pre-ask dir by the same gate. The success path here
+    // removes the dir itself: the pre-ask persistence exists only for the
+    // prompt's lifetime, so once the preview is done the data root gains
+    // nothing (#161; one dir per authoring pass was the accumulating shape).
     if (args.dryRun === true) {
       const dryContext: Parameters<typeof execute>[1] = {
         client,
@@ -550,10 +554,14 @@ async function launchWorkflow(
           : {}),
       }
       const result = await execute(args, dryContext)
+      // Best-effort and never rejecting — the module's persistence style; the
+      // render below still carries the id/dir refs for debug continuity,
+      // annotated (next call) as not queryable.
+      await removeRunDir(runId)
       return [renderResult(result, {
         resumed: resume?.entries.length ?? 0,
         argsChanged: resume?.argsChanged === true,
-      }, siblingRunsForSession(context.sessionID, runId), options.budgetTokens), ...scanNoteLines].join("\n")
+      }, siblingRunsForSession(context.sessionID, runId), options.budgetTokens, { dry: true }), ...scanNoteLines].join("\n")
     }
 
     // The manifest MUST be on disk before this call returns: the launch result
@@ -626,6 +634,13 @@ async function launchWorkflow(
     // after beginRun (the only post-launch error this catch can see) keeps its
     // footer, because the manifest on disk proves the run is real and resumable.
     const wentLive = (await readManifest(runId)) !== undefined
+    // (#161) The pre-ask dir is removed when this same read proves the run
+    // never went live — a launch that manufactured the dir for the prompt but
+    // died before any manifest must leave no phantom behind (no sweep ever
+    // skips past a manifest-less directory). wentLive keeps everything: the
+    // dir IS the failed live run's record. Never rejecting, like the
+    // persistence it rolls back.
+    if (!wentLive) {await removeRunDir(runId)}
     return renderFailure(error, args.script, wentLive ? runId : undefined)
   }
 }

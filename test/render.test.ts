@@ -315,6 +315,25 @@ describe("renderResult", () => {
     const bare = renderResult(result())
     expect(rendered).toBe(bare)
   })
+
+  test("a successful dry-run render annotates the id as not queryable (#161)", () => {
+    // Decision 2 (#161): the id and dir refs stay for debug continuity, and the
+    // annotation states outright that the id is not a queryable handle —
+    // workflow_status on it would answer "No run found".
+    const dry = renderResult(result(), undefined, [], undefined, { dry: true })
+    expect(dry).toContain(
+      '<dry-run note="dry run — nothing was persisted to the run-data root; the run id above is not queryable" />',
+    )
+    expect(dry).toContain('<result workflow="demo" run="wf_render01"')
+    expect(dry).toContain("run_dir=")
+  })
+
+  test("a real render is unchanged by the dry-run annotation (#161)", () => {
+    // Decision 2's second half: no real (non-dry) render changes by one byte —
+    // the annotation param is never supplied there.
+    expect(renderResult(result())).not.toContain("<dry-run")
+    expect(renderResult(result(), undefined, siblings, 50_000)).not.toContain("<dry-run")
+  })
 })
 
 describe("the stopped run's failure surface (#135)", () => {
