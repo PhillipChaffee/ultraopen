@@ -85,6 +85,41 @@ const waitFor = async (until: () => boolean | Promise<boolean>, what: string): P
   throw new Error(`timed out waiting for ${what}`)
 }
 
+/**
+ * Wall-clock deadline wait — the stretched-runner form of the PR-#153 wait-instead-of-race
+ * idiom. Instead of a fixed spin count (which prices every poll nominally at 10 ms no matter
+ * how a starved runner actually stretches it), the budget is real elapsed milliseconds
+ * (#118): a poll landing past the bound still passes when the predicate holds, so the
+ * deadline only reports exhaustion — loudly, through `describeObservations`, never a silent
+ * pass.
+ */
+const waitUntil = async (
+  until: () => boolean | Promise<boolean>,
+  what: string,
+  budgetMs: number,
+  describeObservations: () => string,
+): Promise<void> => {
+  const started = Date.now()
+  for (;;) {
+    if (await until()) {return}
+    if (Date.now() - started >= budgetMs) {
+      throw new Error(`timed out after ${Date.now() - started}ms waiting for ${what}: ${describeObservations()}`)
+    }
+    await sleep(10)
+  }
+}
+
+/**
+ * The wireRun control-channel test's wait budgets, sized against the #118 macos flake:
+ * the dispatch depends on the watcher's default 1 s tick and the flush note rides a
+ * coalesced timer, and a starved macos runner stretches real timers disproportionately —
+ * so the budgets cover a multi-second event-loop stall while a healthy runner exits within
+ * about a tick. Together they keep the test inside bun test's 15 s limit even when both
+ * exhaust.
+ */
+const DISPATCH_BUDGET_MS = 8000,
+ FLUSH_NOTE_BUDGET_MS = 4000
+
 let base: string,
  env: NodeJS.ProcessEnv
 
@@ -264,20 +299,33 @@ describe("wireRun", () => {
       "utf8",
     )
 
-    // The watcher's first tick runs at registration; give the async tick a beat.
-    for (let i = 0; i < 200 && dispatches.length === 0; i++) {
-      await new Promise((resolve) => {setTimeout(resolve, 10)})
-    }
+    // The dispatch lands on the watcher's next DEFAULT 1 s tick: the registration tick
+    // fires before this file exists, so a file written after wiring gets no
+    // registration-tick coverage (#118), and a starved runner stretches that remaining
+    // interval tick disproportionately. The wait is therefore a WALL-CLOCK deadline, not
+    // the 200×10ms spin it replaces — a multi-second event-loop stall must not exhaust it.
+    await waitUntil(
+      () => dispatches.length > 0,
+      "the control-file dispatch",
+      DISPATCH_BUDGET_MS,
+      () => `observed ${dispatches.length} dispatches`,
+    )
     expect(dispatches).toHaveLength(1)
     // The note reaches the snapshot through the coalesced flush — a timer, not the dispatch —
     // so the assertion must WAIT for it instead of racing the coalescer (the dispatch is
-    // event-driven and can land long before the flush timer fires).
+    // event-driven and can land long before the flush timer fires). That coalescer timer
+    // rides the same stretched real timers, so the note wait is the same wall-clock deadline,
+    // failing loudly with the observed dispatches and the last flush snapshot.
     let snapshot: Awaited<ReturnType<typeof flushSnapshot>>
-    for (let i = 0; i < 200; i++) {
-      snapshot = await flushSnapshot()
-      if (snapshot?.logs.some((line) => line.includes("run-control: stop-run"))) {break}
-      await new Promise((resolve) => {setTimeout(resolve, 10)})
-    }
+    await waitUntil(
+      async () => {
+        snapshot = await flushSnapshot()
+        return snapshot?.logs.some((line) => line.includes("run-control: stop-run")) ?? false
+      },
+      "the run-control note in the flush snapshot",
+      FLUSH_NOTE_BUDGET_MS,
+      () => `observed ${dispatches.length} dispatches; last flush snapshot: ${JSON.stringify(snapshot)}`,
+    )
     expect(snapshot?.logs.some((line) => line.includes("run-control: stop-run"))).toBe(true)
 
     // Settling clears the watcher: the settled rewrite must never race a late control read.
