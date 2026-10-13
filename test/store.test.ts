@@ -15,6 +15,7 @@ import {
   atomicWriteFile,
   readManifest,
   readManifestState,
+  removeRunDir,
   runDir,
   writeManifest,
   writeResult,
@@ -98,6 +99,32 @@ describe("run id safety", () => {
   test("ensureRunDir refuses an unsafe id rather than sanitising it", async () => {
     // Rejecting outright keeps a caller-supplied id from ever reaching a path join.
     await expect(ensureRunDir("wf_../escape", env)).rejects.toThrow(/unsafe run id/u)
+  })
+})
+
+describe("removeRunDir — the launch's rollback of its own pre-ask dir (#161)", () => {
+  test("deletes a run directory with everything in it", async () => {
+    await ensureRunDir("wf_abc123", env)
+    await writeManifest("wf_abc123", manifest(), env)
+    await writeScript("wf_abc123", "export default 1\n", env)
+    await removeRunDir("wf_abc123", env)
+    await expect(readdir(runDir("wf_abc123", env))).rejects.toThrow()
+  })
+
+  test("a directory that is not there is a no-op", async () => {
+    await expect(removeRunDir("wf_abc123", env)).resolves.toBeUndefined()
+  })
+
+  test("an unsafe id removes nothing", async () => {
+    await expect(removeRunDir("wf_../../escape", env)).resolves.toBeUndefined()
+  })
+
+  test("never rejects: a removal the filesystem refuses is swallowed", async () => {
+    // `force` swallows ENOENT but not ENOTDIR: with a regular file sitting where
+    // the walk needs a directory, rm throws — and the catch does the swallowing,
+    // because a rollback must never reject the launch that already rendered.
+    await writeFile(join(base, "opencode"), "a regular file, not a directory", "utf8")
+    await expect(removeRunDir("wf_abc123", env)).resolves.toBeUndefined()
   })
 })
 

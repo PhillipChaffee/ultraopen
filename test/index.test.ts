@@ -384,24 +384,52 @@ describe("tool execution", () => {
     // but the manifest lifecycle — manifest, journal, progress, result — never
     // touches the shared run space, and the value comes back as the tool call's
     // value, nothing more.
-    const output = await run({ script: `${META}return { ok: 1 }\n`, dryRun: true })
+    // Re-pinned deliberately (#161): the pre-ask persistence is scoped to the
+    // prompt's lifetime. While the ask is on screen the dir is exact —
+    // script.js alone, the #162 seam — and the script on it is the real source;
+    // once the preview is done the data root gains no directory.
+    const before = await listRoot(),
+      atAsk: { dir?: string[]; source?: string } = {}
+    const output = await run(
+      { script: `${META}return { ok: 1 }\n`, dryRun: true },
+      { ask: async (request: Record<string, unknown>) => {
+          const askRunId = ((request["metadata"] ?? {}) as { runId?: string }).runId ?? "",
+            dir = join(dataRoot(undefined), askRunId)
+          atAsk.dir = await readdir(dir)
+          atAsk.source = await readFile(join(dir, "script.js"), "utf8")
+        } },
+    )
     expect(output).toContain(`<result workflow="demo"`)
     expect(output).toContain("<usage")
-    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? "",
-      runDir = join(dataRoot(undefined), runId)
+    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
     expect(runId).toMatch(/^wf_/u)
-    expect(await readdir(runDir)).toEqual(["script.js"])
-    // The persisted script is the real source, so scriptPath can re-run it.
-    expect(await readFile(join(runDir, "script.js"), "utf8")).toBe(`${META}return { ok: 1 }\n`)
+    // At the prompt: the dir exists exactly per the #162 seam, holding the real
+    // source, so the persisted script stays usable for a later scriptPath run.
+    expect(atAsk.dir).toEqual(["script.js"])
+    expect(atAsk.source).toBe(`${META}return { ok: 1 }\n`)
+    // (#161, decision 2) The successful dry render keeps the id/dir refs but
+    // states outright that the id is not queryable and nothing was persisted.
+    expect(output).toContain(
+      '<dry-run note="dry run — nothing was persisted to the run-data root; the run id above is not queryable" />',
+    )
+    expect(output).toContain(`run_dir="`)
+    // And the tool call leaves the data root exactly as it found it.
+    expect(await listRoot()).toEqual(before)
   })
 
   test("a failed dry run renders bare — no manifest means nothing to resume (#138)", async () => {
     // With no manifest lifecycle, a dry failure is not a resumable run either:
     // the render carries the diagnostic alone, and status is never sent to a
-    // run id the data root cannot resolve.
-    const output = await run({ script: `${META}throw new Error('dry boom')\n`, dryRun: true })
+    // run id the data root cannot resolve. Added (#161): the dry failure lands
+    // in the launch catch, whose pre-live gate deletes the pre-ask dir — no
+    // phantom either way a dry run ends — and the render stays bare without
+    // the success-only annotation.
+    const before = await listRoot(),
+      output = await run({ script: `${META}throw new Error('dry boom')\n`, dryRun: true })
     expect(output).toContain("dry boom")
     expect(output).not.toContain(`<run id="`)
+    expect(output).not.toContain("not queryable")
+    expect(await listRoot()).toEqual(before)
   })
 
   test("asks for permission using the workflow's real name, not the title arg", async () => {
@@ -470,14 +498,18 @@ describe("tool execution", () => {
   test("a rejected permission ask renders bare — no run id or dir footer (#133)", async () => {
     // The ask gates the launch, so a rejection means the run never went live:
     // nothing to resume, nothing to advertise, nothing for status to miss. The
-    // script-persisting run directory still exists (it is written before the ask
-    // on purpose) — but the render must not point at it.
-    const output = await run(
-      { script: `${META}return 1\n` },
-      { ask: () => Promise.reject(new Error("user said no")) },
-    )
+    // render must not point at the pre-ask dir — and (#161) that dir does not
+    // outlive the call: the launch catch deletes it once the manifest read
+    // proves the run never went live, best-effort, while `wentLive` keeps a
+    // post-beginRun dir complete.
+    const before = await listRoot(),
+      output = await run(
+        { script: `${META}return 1\n` },
+        { ask: () => Promise.reject(new Error("user said no")) },
+      )
     expect(output).toContain("user said no")
     expect(output).not.toContain(`<run id="`)
+    expect(await listRoot()).toEqual(before)
   })
 
   test("a live-run failure keeps the run id/dir footer (#133)", async () => {
@@ -493,6 +525,10 @@ describe("tool execution", () => {
     expect(output).toContain("boom mid-run")
     expect(output).toContain(`<run id="`)
     expect(output).toMatch(/dir="[^"]+"/u)
+    // Added (#161): the launch catch's delete gate is the same manifest read
+    // that justifies the footer — wentLive keeps the dir, record intact.
+    const failedRunId = output.match(/<run id="(?<runId>[^"]+)"/u)?.[1] ?? ""
+    expect(await readManifest(failedRunId, undefined)).toBeDefined()
   })
 
   test("a missing script is reported clearly", async () => {

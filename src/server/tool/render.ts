@@ -33,18 +33,33 @@ import type { StatusReport } from "./status.js"
  * The per-run budget (when `budgetTokens` is set) is stated beside the spend it caps, and the
  * advisory carries the combined math — the cure for silent multi-run overspend is visibility,
  * not prevention (#32). Uncapped stays silent: no budget line when the option is unset.
+ *
+ * The `opts.dry` annotation (#161): ONLY a successful dry run's render passes `{ dry: true }`.
+ * The run id rides the id/dir refs as before, for debug continuity — a dry run persists nothing
+ * to the run-data root, so `workflow_status` on that id answers "No run found" (the failure mode
+ * #133 documented as reading as the model's own fault) — the annotation states that outright
+ * instead of letting the refs promise what the disk contradicts. A dry FAILURE stays bare
+ * (#133: nothing to resume), and every real render is byte-identical: the param is undefined
+ * there, so the extra line is never emitted.
  */
 export function renderResult(
   result: WorkflowResult,
   resume?: { resumed: number; argsChanged: boolean },
   siblings: readonly RunSummary[] = [],
   budgetTokens?: number | null | undefined,
+  opts?: { dry?: boolean | undefined } | undefined,
 ): string {
   const lines = [
     `<result workflow="${result.meta.name}" run="${result.runId}" agents="${result.agentCount}">`,
     typeof result.value === "string" ? result.value : JSON.stringify(result.value, null, 2),
     "</result>",
   ]
+  // (#161) A successful dry run only: the id is not a queryable handle and
+  // nothing was persisted under it. Success-only because a dry failure keeps
+  // the #133 bareness — no footer, no handle, nothing to qualify.
+  if (opts?.dry === true) {
+    lines.push('<dry-run note="dry run — nothing was persisted to the run-data root; the run id above is not queryable" />')
+  }
 
   // Never let partial coverage read as full coverage.
   if (result.nulls.length > 0) {
