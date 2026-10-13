@@ -46,6 +46,36 @@ export interface RunArtifacts {
   failurePath: string
 }
 
+/**
+ * The per-agent recording's filename base, deterministic from the agent call's index and
+ * label (#150 / ADR-0004).
+ *
+ * Labels are free script text — a prompt fragment when the script passed none — so they are
+ * not path-safe as given: every character outside the safe set collapses to `-`, the segment
+ * caps at 48 characters, and a label that sanitizes to nothing falls back to `agent` so the
+ * name is never empty. The zero-padded index keeps a directory listing in call order; the
+ * label suffix keeps it readable by eye. This function and `recordingPath` below are the ONLY
+ * path source for recordings — readers never string-build the shape.
+ */
+export function recordingFileBase(index: number, label: string): string {
+  const safe =
+    label
+      .replaceAll(/[^A-Za-z0-9._-]+/gu, "-")
+      .replaceAll(/^-+|-+$/gu, "")
+      .slice(0, 48) || "agent"
+  return `${String(index).padStart(4, "0")}-${safe}`
+}
+
+/** The run directory's recordings subdirectory — one JSONL file per agent. */
+export function recordingsDir(runId: string, env?: NodeJS.ProcessEnv): string {
+  return join(runDir(runId, env), "recordings")
+}
+
+/** The deterministic path of one agent's recording file. */
+export function recordingPath(runId: string, index: number, label: string, env?: NodeJS.ProcessEnv): string {
+  return join(recordingsDir(runId, env), `${recordingFileBase(index, label)}.jsonl`)
+}
+
 export function artifactPaths(runId: string, env?: NodeJS.ProcessEnv): RunArtifacts {
   const dir = runDir(runId, env)
   return {

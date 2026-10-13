@@ -20,10 +20,20 @@ const engineSessions = new Set<string>(),
 /** Child session id -> the run that owns it, so aborts and budget roll up correctly. */
  sessionToRun = new Map<string, string>(),
 
+/** Child session id -> which agent call of its run spawned it (index + label), for recordings (#150). */
+ sessionAgents = new Map<string, { index: number; label: string }>(),
+
 /** Child session id -> epoch ms of its last observed activity, for the idle deadline. */
  lastActivityAt = new Map<string, number>()
 
 let semaphore = new Semaphore(DEFAULT_CONCURRENCY)
+
+/** The per-agent identity a child session carries, once its run's engine spawned it. */
+export interface AgentOwner {
+  runId: string
+  index: number
+  label: string
+}
 
 export const registry = {
   /** The single global admission gate for agent spawns. */
@@ -43,14 +53,22 @@ export const registry = {
     semaphore.resize(clamped)
   },
 
-  register(sessionID: string, runId: string): void {
+  /**
+   * Registers a child session this engine created, with the agent call's identity when the
+   * caller knows it (the run's live engine passes index + label; older or test callers may
+   * omit it). The session→agent map is what scopes agent recordings (#150): the event hook
+   * resolves the emitting session to `runId + index + label` and records under that name.
+   */
+  register(sessionID: string, runId: string, agent?: { index: number; label: string } | undefined): void {
     engineSessions.add(sessionID)
     sessionToRun.set(sessionID, runId)
+    if (agent !== undefined) {sessionAgents.set(sessionID, agent)}
   },
 
   forget(sessionID: string): void {
     engineSessions.delete(sessionID)
     sessionToRun.delete(sessionID)
+    sessionAgents.delete(sessionID)
     lastActivityAt.delete(sessionID)
   },
 
@@ -80,6 +98,20 @@ export const registry = {
     return sessionToRun.get(sessionID)
   },
 
+  /**
+   * The full owner of an engine-created child session — run id plus the agent call's index
+   * and label (#150). The combination is the agent recording's filename contract: the event
+   * hook records under exactly this triple. undefined for a session this process did not
+   * create (foreign sessions never record), and also for one registered without an agent
+   * identity — which reads, honestly, as no recording.
+   */
+  agentOf(sessionID: string): AgentOwner | undefined {
+    const agent = sessionAgents.get(sessionID)
+    const runId = sessionToRun.get(sessionID)
+    if (agent === undefined || runId === undefined) {return undefined}
+    return { runId, ...agent }
+  },
+
   /** Live child sessions belonging to a run, for abort fan-out. */
   sessionsOf(runId: string): string[] {
     const out: string[] = []
@@ -104,6 +136,7 @@ export const registry = {
   resetForTests(): void {
     engineSessions.clear()
     sessionToRun.clear()
+    sessionAgents.clear()
     lastActivityAt.clear()
     semaphore = new Semaphore(DEFAULT_CONCURRENCY)
   },

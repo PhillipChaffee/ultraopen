@@ -650,7 +650,10 @@ dir_, run_id, session_id, workflow, phase, now = sys.argv[1:7]
 rest = sys.argv[7:]
 agents = []
 for i in range(0, len(rest), 2):
-    agents.append({"index": i // 2, "label": rest[i], "phase": phase, "status": rest[i + 1]})
+    # A child session id per agent (#150), synthetic like everything here: the surfaces'
+    # id-bearing rows are exercised the same way their labels are, without a model call.
+    agents.append({"index": i // 2, "label": rest[i], "phase": phase, "status": rest[i + 1],
+                   "sessionID": f"ses_synth{i // 2}"})
 manifest = {"runId": run_id, "bootId": "synthetic", "pid": 0, "sessionID": session_id,
             "sourceHash": "synthetic", "argsHash": "synthetic", "status": "running",
             "childSessionIDs": [], "startedAt": int(now)}

@@ -178,7 +178,10 @@ export function wireRun(spec: SettlementSpec): RunWiring {
       // Persist on agent-start AND on log lines: a stall restart spawns a NEW child
       // session without an agent-start, and a killed server must leave the reaper a
       // list that includes it. writeChildren no-ops when the list is unchanged, so
-      // narration-heavy runs cost no extra writes.
+      // narration-heavy runs cost no extra writes. The child-created event (#150)
+      // deliberately does NOT trigger: the log the restart writes already carries the
+      // re survived child, and a checkpoint this close to the settle widens the
+      // #164 terminal-write window for no fresh information.
       if (event.type === "agent-start" || event.type === "log") {void writeChildren()}
     },
     onJournal: flush,

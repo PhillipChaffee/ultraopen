@@ -188,25 +188,40 @@ export async function endRun(
     // race against a stop's cancellation must write NOTHING — the previous order published this
     // settle's journal rewrite and result.json beside a manifest it never won, and a cancelled
     // run then "invented" a result.json (caught live by the e2e stop-path assertion).
-    const won = await writeTerminalManifestFn(
-      manifest.runId,
-      {
-        ...manifest,
-        status: outcome.status,
-        childSessionIDs: outcome.childSessionIDs,
-        endedAt: Date.now(),
-      },
-      env,
-    )
-    if (!won) {return}
-    // The rename landing is not ownership: a racing stop's cancelled rename can land inside
-    // the re-check→rename gap (#164) and stand over this record. The journal and result are
-    // the SETTLE's artifacts — a cancelled record never settles a result — so whatever stands
-    // is re-read before they are published, and a record that is not ours abandons them.
-    const standing = await readManifest(manifest.runId, env)
-    if (standing === undefined || standing.status !== outcome.status) {return}
-    await appendJournal(manifest.runId, outcome.entries.map((entry) => JSON.stringify(entry)).join("\n"), env)
-    await writeResult(manifest.runId, outcome.value, env)
+    //
+    // The rename landing is not ownership: a racing still-running checkpoint — the child-list
+    // rewrite of writeChildren, whose stage/re-check ran before this settle's rename — can
+    // rename its own RUNNING record in the post-rename instant and stand over this record
+    // (check-then-rename is two syscalls, not one). Its verification read then abandons the
+    // publish and the record stays `running` forever — PR #162's stuck-settle shape, hit again
+    // on 2026-10-13 at CI speed on #150's branch. So the re-claim is bounded like the cancel
+    // path's: a standing `running` record is re-claimed with another terminal write; a
+    // standing DIFFERENT terminal is the honest loss (first-terminal-write-wins).
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const won = await writeTerminalManifestFn(
+        manifest.runId,
+        {
+          ...manifest,
+          status: outcome.status,
+          childSessionIDs: outcome.childSessionIDs,
+          endedAt: Date.now(),
+        },
+        env,
+      )
+      if (!won) {return}
+      // The journal and result are the SETTLE's artifacts — a cancelled record never
+      // settles a result — so whatever stands is re-read before they are published, and a
+      // record that is not ours either re-claims (a resurrected `running`) or abandons
+      // (a different terminal that genuinely landed first).
+      const standing = await readManifest(manifest.runId, env)
+      if (standing === undefined || standing.status !== outcome.status) {
+        if (standing === undefined || standing.status !== "running") {return}
+        continue
+      }
+      await appendJournal(manifest.runId, outcome.entries.map((entry) => JSON.stringify(entry)).join("\n"), env)
+      await writeResult(manifest.runId, outcome.value, env)
+      return
+    }
   } catch {
     // See the note above: a persistence failure must not lose a completed run.
   }

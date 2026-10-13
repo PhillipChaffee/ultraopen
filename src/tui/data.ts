@@ -22,6 +22,8 @@ export interface AgentRow {
   reason?: string | undefined
   /** The agent's output-token spend, from the progress snapshot. */
   outputTokens?: number | undefined
+  /** The agent's child session id, once the spawn created one (#150). */
+  sessionID?: string | undefined
 }
 
 export interface RunView {
@@ -274,8 +276,33 @@ export async function consumeInterruptedMarker(root: string, runId: string): Pro
 
 export function agentRowText(agent: AgentRow): string {
   const reason = agent.status === "failed" && agent.reason ? ` — ${agent.reason}` : "",
-   tokens = typeof agent.outputTokens === "number" && agent.outputTokens > 0 ? ` · ${formatTokens(agent.outputTokens)}` : ""
-  return `${glyph(agent.status)} ${agent.label}${reason}${tokens}`
+    tokens = typeof agent.outputTokens === "number" && agent.outputTokens > 0 ? ` · ${formatTokens(agent.outputTokens)}` : "",
+    // The child session id where one exists (#150): the human path locates a child by its id
+    // or its title in the picker, never by sibling position — so the row states the id itself.
+    child = typeof agent.sessionID === "string" && agent.sessionID !== "" ? ` · ${agent.sessionID}` : ""
+  return `${glyph(agent.status)} ${agent.label}${reason}${tokens}${child}`
+}
+
+/**
+ * The strip's compact agent row: glyph, label, child id — nothing else.
+ *
+ * The strip clips at the input box's right edge, so length is cosmetic, not correctness; the
+ * failure reason and token spend stay sidebar-only there because the strip is the
+ * always-visible surface and its job is identification, not explanation (#150).
+ */
+export function stripAgentText(agent: AgentRow): string {
+  const child = typeof agent.sessionID === "string" && agent.sessionID !== "" ? ` · ${agent.sessionID}` : ""
+  return `${glyph(agent.status)} ${agent.label}${child}`
+}
+
+/**
+ * The transcript affordances for agent children (#150): the hint row's shared sentence, the
+ * TUI-side twin of the launch result's. Locate by title (`ultraopen · <label>`) or session id,
+ * never by position — two different upstream sorts exist for one child list, so neither order
+ * is claimable.
+ */
+export function transcriptHint(): string {
+  return "transcripts: /sessions lists children by title (ultraopen · <label>); on a transcript line, leader+down in, right/left cycle, up back"
 }
 
 /** Compact token count: `1.2k`, `345`, `1.1m`. */

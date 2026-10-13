@@ -26,6 +26,12 @@ export interface SpawnOptions {
   parentSessionID: string
   /** Subagent type. Validated against the agent list before spawning — a bad name is an opaque 500. */
   agentType?: string | undefined
+  /**
+   * The agent call's position in its run's schedule, passed by the live engine (#150). The
+   * child's recording filename keys on `index + label`, and both live in this options bag —
+   * the caller that knows the identity is the caller that spawns.
+   */
+  agentIndex?: number | undefined
   model?: { providerID: string; modelID: string } | undefined
   /** Resolved against the model's real variant map by the caller; never a hardcoded "xhigh". */
   variant?: string | undefined
@@ -41,6 +47,12 @@ export interface SpawnOptions {
   signal?: AbortSignal | undefined
   /** Working directory for an isolated agent. Routes the child session at its own worktree. */
   directory?: string | undefined
+  /**
+   * Fired the moment the child session exists and its deferred work is registered (#150).
+   * The engine uses it to publish the session id to the progress snapshot — a run's status
+   * row carries the child id while the agent is still working, not only after it settles.
+   */
+  onChildCreated?: ((sessionID: string) => void) | undefined
 }
 
 /**
@@ -91,7 +103,12 @@ export async function createChild(client: OpencodeClient, options: SpawnOptions)
   // why, and this is the first place a misconfigured agent name or a rejected body surfaces.
   if (!sessionID) {return { ok: false, detail: describe(created.error) }}
 
-  registry.register(sessionID, options.runId)
+  // The registry entry lands with the agent's identity (index + label) when the spawn carries
+  // it, so the event hook can scope agent recordings to this session (#150). The callback
+  // fires AFTER the registration: progress must never advertise a child the engine is not
+  // wired to yet — order is identity first, announcement second.
+  registry.register(sessionID, options.runId, options.agentIndex === undefined ? undefined : { index: options.agentIndex, label: options.label })
+  options.onChildCreated?.(sessionID)
   return { ok: true, sessionID }
 }
 

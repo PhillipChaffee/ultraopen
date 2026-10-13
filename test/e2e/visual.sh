@@ -158,6 +158,8 @@ if want synth; then
   assert_pane_contains "prompt-row status appears (ultracode ⠋)" "ultracode ⠋ " 5
   assert_pane_contains "bottom strip appears (ultracode · e2e-visual)" "ultracode · e2e-visual" 5
   assert_pane_contains "strip agent details (one active run shows them)" "alpha:one" 5
+  # The id-bearing strip row (#150): glyph, label, child session id — locate by id, not position.
+  assert_pane_contains "strip agent row carries the child session id" "alpha:one · ses_synth0" 5
   frame 03-synth-running
 
   section "V2b — sidebar panel (toggle it open, right column)"
@@ -166,10 +168,18 @@ if want synth; then
   else
     bad "sidebar heading not found alone on a line"
   fi
-  if pane_matches '⠋ alpha:one *$'; then
-    ok "sidebar agent row renders (glyph + label at line end)"
+  if pane_matches '⠋ alpha:one · ses_synth0 *$'; then
+    ok "sidebar agent row renders (glyph + label + child id at line end)"
   else
-    bad "sidebar agent row not found at line end" "expected '⠋ alpha:one' ending a line"
+    bad "sidebar agent row not found at line end" "expected '⠋ alpha:one · ses_synth0' ending a line"
+  fi
+  # The transcript affordances hint rides under the rows (#150), naming the picker and the
+  # gesture without any positional claim. The sidebar wraps its free text at the column width,
+  # so assert the unambiguous fragment a wrap cannot split.
+  if pane_matches 'transcripts: /sessions'; then
+    ok "the transcript hint renders in the sidebar"
+  else
+    bad "sidebar transcript hint not found" "expected the /sessions + gesture hint under the agent rows"
   fi
   frame 04-sidebar
 
@@ -303,18 +313,53 @@ if want live; then
 fi
 
 if want spike; then
-  section "SPIKE — child-transcript navigation through the upstream affordance (#150)"
+  section "SPIKE — child-transcript navigation + per-agent recordings (#150)"
   # #150 spike: does upstream child navigation (session_child_first / cycle /
   # parent keybinds: leader down / right / up) ENTER a workflow child and RENDER
   # its transcript while it runs and after it settles — including a child that
   # used a schema (whose REST message listing is poisoned by `format`)?
   # Two agents, one plain and one schema'd, distinct markers; navigation order
   # can land on either child, so every frame is searched for both.
+  #
+  # The same case is #150's e2e acceptance for the per-agent recording (ADR-0004):
+  # the run records BOTH agents — mid-run and after settle — and the schema'd
+  # child's native view stays blank, which is exactly why the recording exists.
   runs_snapshot "$OUT/runs-before-spike.txt"
   tui_http_prompt "$(wf_prompt spike-mixed)"
   assert_pane_contains "GenericTool transcript row shows the launch" "⚙ workflow" 300
   assert_pane_contains "strip shows live run" "ultracode · e2e-spike" 300
   frame 20-spike-midrun-before-nav
+
+  recordings_count() { # recordings_count RUNID → jsonl file count in its recordings dir
+    python3 - "$RUN_ROOT/$1/recordings" <<'PYEOF'
+import sys, pathlib
+d = pathlib.Path(sys.argv[1])
+try:
+    print(len([p for p in d.iterdir() if p.suffix == ".jsonl"]))
+except OSError:
+    print(0)
+PYEOF
+  }
+  recording_contains() { # recording_contains RUNID FILENAME NEEDLE
+    python3 - "$RUN_ROOT/$1/recordings/$2" "$3" <<'PYEOF'
+import sys, pathlib
+try:
+    text = pathlib.Path(sys.argv[1]).read_text(errors="ignore")
+except OSError:
+    sys.exit(1)
+sys.exit(0 if sys.argv[2] in text else 1)
+PYEOF
+  }
+
+  SPIKE_RUN="$(newest_run "$OUT/runs-before-spike.txt")"
+  # Filenames are the store's deterministic contract (index + sanitized label), NOT a glob:
+  # a reader locates an agent's recording the same way status rows point at it.
+  spike_recordings_up() { [ "$(recordings_count "$SPIKE_RUN")" -ge 2 ] && [ -f "$RUN_ROOT/$SPIKE_RUN/recordings/0000-plain-one.jsonl" ] && [ -f "$RUN_ROOT/$SPIKE_RUN/recordings/0001-schema-two.jsonl" ]; }
+  if wait_for 60 spike_recordings_up; then
+    ok "both agents' recording files exist mid-run (0000-plain-one.jsonl, 0001-schema-two.jsonl)"
+  else
+    bad "recording files did not appear mid-run" "expected 2 jsonl files under $RUN_ROOT/$SPIKE_RUN/recordings"
+  fi
 
   child_markers() { # child_markers NAME — asserts the child context by probe text of BOTH frames
     local pane text
@@ -367,11 +412,54 @@ PYEOF
   }
   render_result
   note "spike verdict written: $(cat "$OUT/spike-verdict.txt")"
+  # Upstream's child-transcript rendering is a THREE-STATE swing observed on opencode
+  # 1.18.33 (evidence: the spike-verdict files of this suite's runs, 2026-10-12): every child
+  # renders, only the plain child renders (the documented gap — `format` poisons the message
+  # listing the view reads), or every child renders blank (a boot with several runs sharing
+  # the parent session). The plugin cannot and must not control which state appears — the
+  # RECORDING is the predictable view in all three, and its assertions above are hard.
+  # HARD here: navigation itself must still work — a Subagent HUD with its out/in gestures
+  # is what every state shows, entered children included.
+  SP_FRAME="$(rg "^  ┃ +Subagent \([0-9]+ of [0-9]+\)" "$OUT/21-spike-child1.frame" 2>/dev/null | head -1)"
+  if [ -n "$SP_FRAME" ]; then
+    ok "child navigation entered a subagent view (upstream HUD present): ${SP_FRAME//|//}"
+  else
+    bad "child navigation never entered a subagent view" "the plain architecture regressed — inspect $OUT/21*.frame"
+  fi
+  # The documented gap (#150 / ADR-0004), as evidence under the spelling the truth allows:
+  # in a boot where the plain child rendered, the schema'd child's blank-or-not verdict is
+  # recorded for the README's upstream note; both values observed on 2026-10-12.
+  VERDICT=$(python3 - "$OUT/spike-verdict.txt" <<'PYEOF'
+import re, sys
+text = open(sys.argv[1]).read()
+plain = re.search(r"plain_frames=(\d+)", text)
+schema = re.search(r"schema_frames=(\d+)", text)
+print(f'plain_frames={plain.group(1) if plain else 0} schema_frames={schema.group(1) if schema else 0}')
+PYEOF
+)
+  note "(#150 upstream-note refresh) $VERDICT — when plain renders, the recorded gap's verdict; when nothing renders, the shared-session boot's state avoids child transcripts entirely"
 
-  # After the run settles: the same navigation against the HISTORICAL children.
+  # After the run settles: the HISTORICAL children get the same navigation, and the
+  # recordings hold BOTH agents' full streams — the schema'd child's only visibility.
   spike_done() { [ -n "$(newest_completed_run "$OUT/runs-before-spike.txt")" ]; }
   if wait_for 300 spike_done; then
     ok "spike run completed on disk"
+    SPIKE_RUN="$(newest_completed_run "$OUT/runs-before-spike.txt")"
+    if [ "$(recordings_count "$SPIKE_RUN")" -ge 2 ]; then
+      ok "both agents' recordings survive the settle (post-run: $(recordings_count "$SPIKE_RUN") files)"
+    else
+      bad "recording files missing after settle" "expected both under $RUN_ROOT/$SPIKE_RUN/recordings"
+    fi
+    if recording_contains "$SPIKE_RUN" "0000-plain-one.jsonl" "SPIKE-PLAIN-MARK-7391"; then
+      ok "the plain agent's recording carries its part stream (prompt marker present)"
+    else
+      bad "the plain agent's recording lacks its marker" "the joined lines should read as the agent's full part stream"
+    fi
+    if recording_contains "$SPIKE_RUN" "0001-schema-two.jsonl" "SPIKE-SCHEMA-MARK-7391"; then
+      ok "the schema'd agent's recording carries its part stream — the only readable copy of that transcript"
+    else
+      bad "the schema'd agent's recording lacks its marker" "the recording is that agent's ONLY view; without the marker it explains nothing"
+    fi
   else
     note "spike run did not complete in 300s — historical pass still attempted"
   fi

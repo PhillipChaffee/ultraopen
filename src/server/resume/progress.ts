@@ -18,6 +18,12 @@ export interface AgentProgress {
   status: "running" | "done" | "failed"
   /** The agent's output-token spend, once its call has settled. */
   outputTokens?: number | undefined
+  /**
+   * The child session id, once one exists (#150): set the moment the spawn creates the child
+   * and carried through agent-end. Absent for a replayed agent — no session is spawned, so
+   * there is none to name — and for a row whose child failed at spawn itself.
+   */
+  sessionID?: string | undefined
 }
 
 export interface ProgressSnapshot {
@@ -118,14 +124,27 @@ export class ProgressWriter {
         })
         break
       }
+      case "agent-session": {
+        // The spawn just created the child: the row agent-start announced gains its id. The
+        // event is never a row creator by itself — agent-start (or a replayed agent-end)
+        // always lands first, and a row-less fold here would manufacture an agent the
+        // schedule never started; ignored when absent.
+        const agent = this.snapshot.agents.find((entry) => entry.index === event.index)
+        if (agent) {agent.sessionID = event.sessionID}
+        break
+      }
       case "agent-end": {
         const tokens = typeof (event as { outputTokens?: unknown }).outputTokens === "number"
           ? (event as { outputTokens: number }).outputTokens
+          : undefined
+        const sessionID = typeof (event as { sessionID?: unknown }).sessionID === "string"
+          ? (event as { sessionID: string }).sessionID
           : undefined
         const agent = this.snapshot.agents.find((entry) => entry.index === event.index)
         if (agent) {
           agent.status = event.ok ? "done" : "failed"
           if (tokens !== undefined) {agent.outputTokens = tokens}
+          if (sessionID !== undefined) {agent.sessionID = sessionID}
         }
         // A replayed call never emits agent-start, so record it here rather than losing it.
         else {
@@ -135,6 +154,7 @@ export class ProgressWriter {
             phase: event.phase,
             status: event.ok ? "done" : "failed",
             ...(tokens === undefined ? {} : { outputTokens: tokens }),
+            ...(sessionID === undefined ? {} : { sessionID }),
           })
         }
         // The run-scoped spend accumulator: every settled call's outputTokens feeds it, the

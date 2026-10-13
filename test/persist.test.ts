@@ -254,6 +254,64 @@ describe("endRun", () => {
       endRun(manifest, { status: "completed", entries: [entry], value: 1, childSessionIDs: [] }, env),
     ).resolves.toBeUndefined()
   })
+
+  test("a checkpoint rename that resurrects `running` over the terminal record is re-claimed, not abandoned forever", async () => {
+    // The #162 shape, deterministic: writeChildren's child-list checkpoint stages before our
+    // terminal rename passes its own re-check, then renames its `running` record AFTER our
+    // rename lands — two syscalls, not one. The old endRun abandoned on the standing
+    // disagreement and the run stayed `running` forever (CI's stuck settle). The re-claim
+    // loop takes the record back and publishes the settle's own artifacts.
+    const manifest = await beginRun(record, env)
+    if (!manifest) {throw new Error("the run did not open")}
+    // The inject: the settle's terminal rename succeeds, and a concurrent checkpoint's
+    // rename lands a RUNNING record over it between the rename and endRun's standing read —
+    // ONE resurrection (a real checkpoint fires once per event, not at every attempt).
+    let resurrection = 0
+    const resurrectingWrite = (async (runId: string, next: Manifest): Promise<boolean> => {
+      const won = await writeTerminalManifest(runId, next, env)
+      if (!won) {return false}
+      if (resurrection++ === 0) {await writeManifest(runId, { ...next, status: "running" }, env)}
+      return true
+    })
+    await endRun(
+      manifest,
+      { status: "completed", entries: [entry], value: { done: true }, childSessionIDs: ["c1"] },
+      env,
+      resurrectingWrite,
+    )
+    const reread = await readManifest("wf_abc123", env)
+    expect(reread?.status).toBe("completed")
+    expect(reread?.childSessionIDs).toEqual(["c1"])
+    // The settle's own artifacts land beside the re-claimed record.
+    const entries = await readJournal("wf_abc123", env)
+    expect(entries.length).toBe(1)
+    const result = await Bun.file(artifactPaths("wf_abc123", env).resultPath).json()
+    expect(result).toEqual({ done: true })
+  })
+
+  test("a checkpoint resurrection is bounded: a permanently-running record loses, honestly", async () => {
+    // A checkpoint that resurrects at EVERY attempt: three bounded re-claims, then the
+    // standing `running` record is the honest outcome — endRun never publishes beside a
+    // record it does not own, and never loops forever.
+    const manifest = await beginRun(record, env)
+    if (!manifest) {throw new Error("the run did not open")}
+    const alwaysResurrecting = (async (runId: string, next: Manifest): Promise<boolean> => {
+      const won = await writeTerminalManifest(runId, next, env)
+      if (!won) {return false}
+      await writeManifest(runId, { ...next, status: "running" }, env)
+      return true
+    })
+    await endRun(
+      manifest,
+      { status: "completed", entries: [entry], value: 1, childSessionIDs: [] },
+      env,
+      alwaysResurrecting,
+    )
+    const reread = await readManifest("wf_abc123", env)
+    expect(reread?.status).toBe("running")
+    // Nothing was published: the settle never owned the record.
+    expect(await readJournal("wf_abc123", env)).toEqual([])
+  })
 })
 
 describe("markCancelled — the stop path's terminal write", () => {

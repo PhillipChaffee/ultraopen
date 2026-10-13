@@ -116,6 +116,35 @@ describe("registry.semaphore", () => {
   })
 })
 
+describe("registry.agentOf — the per-agent identity map (#150)", () => {
+  test("a session registered WITH an agent identity resolves run + index + label", () => {
+    registry.register("s1", "run-a", { index: 2, label: "verify:thing" })
+    expect(registry.agentOf("s1")).toEqual({ runId: "run-a", index: 2, label: "verify:thing" })
+  })
+
+  test("a session registered without an identity resolves undefined — no recording can be named", () => {
+    registry.register("s1", "run-a")
+    expect(registry.agentOf("s1")).toBeUndefined()
+  })
+
+  test("a foreign session resolves undefined", () => {
+    expect(registry.agentOf("never-registered")).toBeUndefined()
+  })
+
+  test("forget drops the identity with the session", () => {
+    registry.register("s1", "run-a", { index: 0, label: "a" })
+    registry.forget("s1")
+    expect(registry.agentOf("s1")).toBeUndefined()
+  })
+
+  test("an agent identity belongs to exactly its own session — siblings are independent", () => {
+    registry.register("s1", "run-a", { index: 0, label: "a" })
+    registry.register("s2", "run-a", { index: 1, label: "b" })
+    expect(registry.agentOf("s1")?.label).toBe("a")
+    expect(registry.agentOf("s2")?.label).toBe("b")
+  })
+})
+
 describe("registry.touchActivity / lastActivity", () => {
   test("a registered session records and reads back its last activity", () => {
     registry.register("s1", "run-a")

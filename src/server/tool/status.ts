@@ -1,6 +1,6 @@
 import { parseJournal } from "../resume/journal.js"
 import type { Manifest } from "../resume/journal.js"
-import { artifactPaths, isSafeRunId, runDir } from "../resume/store.js"
+import { artifactPaths, isSafeRunId, recordingPath, runDir } from "../resume/store.js"
 import type { ManifestRead } from "../resume/store.js"
 import type { ProgressSnapshot } from "../resume/progress.js"
 import { isProcessAlive } from "./background.js"
@@ -46,6 +46,29 @@ export interface StatusDeps {
   signal?: AbortSignal | undefined
 }
 
+/**
+ * One agent of one run, as `workflow_status` reports it (#150).
+ *
+ * `index` and `sessionID` exist only when the progress snapshot supplied them: the journal —
+ * the fallback when a snapshot is missing or torn — records neither, and a degraded row is an
+ * honest row rather than an invented one. `recordingPath` is derived through the store's
+ * per-agent path contract the same way only when the row carries both an index and a spawned
+ * child session id — a replayed agent spawns nothing and records nothing, so its row points
+ * nowhere rather than at a file that can only be read as missing.
+ */
+export interface StatusAgentRow {
+  index?: number | undefined
+  label: string
+  status: "running" | "done" | "failed"
+  phase?: string | undefined
+  /** The latest journal-recorded failure reason, when the row failed. */
+  reason?: string | undefined
+  outputTokens?: number | undefined
+  sessionID?: string | undefined
+  /** The recording's canonical path, present when the row has an index and a child session. */
+  recordingPath?: string | undefined
+}
+
 export interface StatusReport {
   runId: string
   dir: string
@@ -62,6 +85,13 @@ export interface StatusReport {
    */
   title?: string | undefined
   agents: { total: number; running: number; done: number; failed: number }
+  /**
+   * One row per agent, in call order (#150). The progress snapshot supplies labels, phases,
+   * statuses, spends and child session ids while it is readable; on a missing or torn
+   * snapshot the journal stands in (the same fallback the aggregate counts use), honestly
+   * narrower — the journal records no index and no child ids, so those fields stay absent.
+   */
+  agentRows: StatusAgentRow[]
   outputTokens: number
   /**
    * The run's output-token budget and live spend, from the progress snapshot.
@@ -132,6 +162,7 @@ export async function executeStatus(args: StatusArgs, deps: StatusDeps = {}): Pr
         status: "corrupt",
         phases: [],
         agents: { total: 0, running: 0, done: 0, failed: 0 },
+        agentRows: [],
         outputTokens: 0,
         budget: { total: null, spent: 0 },
         failure: {
@@ -176,8 +207,10 @@ export async function executeStatus(args: StatusArgs, deps: StatusDeps = {}): Pr
 
 interface JournalLine {
   key: string
+  label: string
   status?: string | undefined
   phase?: string | undefined
+  reason?: string | undefined
   outputTokens?: number | undefined
   replayed?: boolean | undefined
 }
@@ -236,6 +269,7 @@ async function buildSnapshot(input: {
     phase: progress?.phase,
     phases,
     agents: countAgents(progress, entries),
+    agentRows: agentRowsOf(progress, entries, args.runId, deps.env),
     outputTokens,
     // The snapshot's own budget record, verbatim — the same field the sidebar
     // reads. Guarded per-member: a snapshot predating the budget field (or a
@@ -298,6 +332,77 @@ function uniqueInOrder(values: string[]): string[] {
   return [...new Set(values)]
 }
 
+/**
+ * The per-agent rows (#150), degrading the way the counts do.
+ *
+ * Snapshot rows carry everything: call order (by index), phase, status, settled spend, the
+ * child session id once spawned, and the recording path the store's contract derives — the
+ * path appears on a row only when a child session exists, because that is exactly the set of
+ * agents a recording can belong to (replayed agents spawn nothing, record nothing). When no
+ * snapshot is readable the journal takes over, honestly narrower: the journal holds labels,
+ * statuses, phases, spends and failure reasons but no indices and no child ids, so those
+ * fields stay absent instead of being invented. Failure reasons arrive from the journal in
+ * BOTH cases — the snapshot never carries one.
+ */
+function agentRowsOf(
+  progress: ProgressSnapshot | undefined,
+  entries: JournalLine[],
+  runId: string,
+  env?: NodeJS.ProcessEnv,
+): StatusAgentRow[] {
+  const reasons = latestFailureReasons(entries),
+    rowOf = (index: number | undefined, label: string, tail: { status: StatusAgentRow["status"]; phase?: string | undefined; outputTokens?: number | undefined; sessionID?: string | undefined }): StatusAgentRow => {
+      const row: StatusAgentRow = {
+        ...(index === undefined ? {} : { index }),
+        label,
+        status: tail.status,
+        ...(tail.phase === undefined ? {} : { phase: tail.phase }),
+        ...(reasons.get(label) === undefined ? {} : { reason: reasons.get(label) }),
+        ...(tail.outputTokens === undefined ? {} : { outputTokens: tail.outputTokens }),
+        ...(tail.sessionID === undefined ? {} : { sessionID: tail.sessionID }),
+        ...(tail.sessionID === undefined || index === undefined ? {} : { recordingPath: recordingPath(runId, index, label, env) }),
+      }
+      return row
+    }
+
+  if (progress?.agents !== undefined && Array.isArray(progress.agents)) {
+    return progress.agents.map((agent) =>
+      rowOf(
+        agent.index,
+        agent.label,
+        {
+          status: agent.status,
+          phase: agent.phase,
+          outputTokens: agent.outputTokens,
+          sessionID: agent.sessionID,
+        },
+      ),
+    )
+  }
+  // Journal fallback: the latest entry per key decides each row's settled state, exactly the
+  // map the aggregate counts build. Rows keep their journal order; `running` is never honest
+  // from a journal alone, so every row reads done or failed.
+  const latest = new Map<string, JournalLine>()
+  for (const entry of entries) {latest.set(entry.key, entry)}
+  return [...latest.values()].map((entry) =>
+    rowOf(undefined, entry.label, {
+      status: entry.status === "ok" ? "done" : "failed",
+      phase: entry.phase,
+      outputTokens: entry.outputTokens,
+    }),
+  )
+}
+
+/** Each failed label's latest journal-recorded reason — one sweep, no per-row re-read. */
+function latestFailureReasons(entries: JournalLine[]): Map<string, string> {
+  const reasons = new Map<string, string>()
+  for (const entry of entries) {
+    if (entry.status === "ok" || entry.reason === undefined) {continue}
+    reasons.set(entry.label, entry.reason)
+  }
+  return reasons
+}
+
 function unknownRunMessage(runId: string, env?: NodeJS.ProcessEnv): string {
   return `No run found for id "${runId}". Checked ${runDir(runId, env)}. ` +
     "Pass the run id exactly as the workflow launch result reported it."
@@ -305,8 +410,9 @@ function unknownRunMessage(runId: string, env?: NodeJS.ProcessEnv): string {
 
 function parseJournalSafe(text: string): JournalLine[] {
   return parseJournal(text).map((entry): JournalLine => {
-    const line: JournalLine = { key: entry.key, status: entry.status, outputTokens: entry.outputTokens }
+    const line: JournalLine = { key: entry.key, label: entry.label, status: entry.status, outputTokens: entry.outputTokens }
     if (entry.phase !== undefined) {line.phase = entry.phase}
+    if (entry.reason !== undefined) {line.reason = entry.reason}
     if (entry.replayed !== undefined) {line.replayed = entry.replayed}
     return line
   })

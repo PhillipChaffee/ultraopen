@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import { ProgressWriter } from "../src/server/resume/progress.js"
 import { LARGE_RUN_AGENTS } from "../src/server/script/limits.js"
-import { RunPoller, activeRuns, agentRowText, dataRoot, formatElapsed, glyph, hintLine, loadAllRuns, loadFailedReasons, loadInterruptedRuns, summarize, toView } from "../src/tui/data.js"
+import { RunPoller, activeRuns, agentRowText, dataRoot, formatElapsed, glyph, hintLine, loadAllRuns, loadFailedReasons, loadInterruptedRuns, stripAgentText, summarize, toView, transcriptHint } from "../src/tui/data.js"
 import type { RunView } from "../src/tui/data.js"
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -106,6 +106,46 @@ describe("ProgressWriter", () => {
     const progress = writer([])
     progress.apply({ type: "agent-end", index: 3, label: "replayed", phase: "Verify", ok: true }, 5)
     expect(progress.snapshot.agents).toEqual([{ index: 3, label: "replayed", phase: "Verify", status: "done" }])
+  })
+
+  test("agent-session stamps the running row with its child's session id (#150)", () => {
+    const progress = writer([])
+    progress.apply({ type: "agent-start", index: 0, label: "a", phase: "Verify" }, 1)
+    progress.apply({ type: "agent-session", index: 0, sessionID: "ses_child_0" }, 2)
+    expect(progress.snapshot.agents).toEqual([
+      { index: 0, label: "a", phase: "Verify", status: "running", sessionID: "ses_child_0" },
+    ])
+  })
+
+  test("an idle deadline's stall restart re-stamps the row with the new child's id", () => {
+    // The restart re-fires agent-session for the same index; the row carries the CURRENT
+    // child, and both sessions belong to the same agent recording.
+    const progress = writer([])
+    progress.apply({ type: "agent-start", index: 0, label: "a", phase: "Verify" }, 1)
+    progress.apply({ type: "agent-session", index: 0, sessionID: "ses_child_old" }, 2)
+    progress.apply({ type: "agent-session", index: 0, sessionID: "ses_child_new" }, 3)
+    expect(progress.snapshot.agents).toEqual([
+      { index: 0, label: "a", phase: "Verify", status: "running", sessionID: "ses_child_new" },
+    ])
+  })
+
+  test("agent-session before any agent-start folds nothing — the row does not become invented", () => {
+    // A session without a schedule row is not an agent the run started; the fold waits for
+    // agent-start (or an end event) to name the agent properly.
+    const progress = writer([])
+    progress.apply({ type: "agent-session", index: 9, sessionID: "ses_orphan" }, 1)
+    expect(progress.snapshot.agents).toEqual([])
+  })
+
+  test("agent-end carries the session id through to a settled row, and a replayed one carries none", () => {
+    const progress = writer([])
+    progress.apply({ type: "agent-start", index: 0, label: "a", phase: undefined }, 1)
+    progress.apply({ type: "agent-end", index: 0, label: "a", phase: undefined, ok: true, outputTokens: 5, sessionID: "ses_child_0" }, 2)
+    progress.apply({ type: "agent-end", index: 1, label: "replayed", phase: undefined, ok: true }, 3)
+    expect(progress.snapshot.agents).toEqual([
+      { index: 0, label: "a", phase: undefined, status: "done", outputTokens: 5, sessionID: "ses_child_0" },
+      { index: 1, label: "replayed", phase: undefined, status: "done" },
+    ])
   })
 
   test("tracks phase and log narration", () => {
@@ -281,6 +321,43 @@ describe("TUI view shaping", () => {
     const base = { runId: "r", workflow: "audit", sessionID: "s", agents: [], logs: [], elapsedSeconds: 252 }
     expect(summarize({ ...base, phase: "Verify", done: 6, failed: 0, total: 8 })).toBe("audit · Verify 6/8 · 4m12s")
     expect(summarize({ ...base, done: 6, failed: 2, total: 8 })).toBe("audit · 6/8 · 4m12s · 2 failed")
+  })
+
+  test("agent rows state the child session id where the snapshot carries one (#150)", () => {
+    expect(agentRowText({ index: 0, label: "a", status: "running", sessionID: "ses_child_0" })).toBe("⠋ a · ses_child_0")
+    // A settled row keeps both its spend and its child id.
+    expect(agentRowText({ index: 0, label: "a", status: "done", outputTokens: 1500, sessionID: "ses_child_0" })).toBe("✓ a · 1.5k · ses_child_0")
+    // A replayed agent has no child to name — nothing is invented.
+    expect(agentRowText({ index: 0, label: "a", status: "done" })).toBe("✓ a")
+  })
+
+  test("the strip's compact rows carry the id and nothing else — identification, not explanation", () => {
+    expect(stripAgentText({ index: 0, label: "a", status: "failed", reason: "api-error", outputTokens: 999, sessionID: "ses_child_0" })).toBe("✗ a · ses_child_0")
+    expect(stripAgentText({ index: 0, label: "a", status: "running" })).toBe("⠋ a")
+  })
+
+  test("the transcript hint names the picker and the gesture without positional claims (#150)", () => {
+    const hint = transcriptHint()
+    expect(hint).toContain("/sessions")
+    expect(hint).toContain("ultraopen · <label>")
+    expect(hint).toContain("leader+down")
+    expect(hint).toContain("right/left")
+    expect(hint).toContain("up")
+    expect(hint).not.toMatch(/row \d/u)
+    expect(hint).not.toContain("child 2")
+  })
+
+  test("a snapshot's agent session ids reach the view shape unharmed", () => {
+    const view = toView(
+      {
+        runId: "wf_a",
+        workflow: "demo",
+        startedAt: 0,
+        agents: [{ index: 0, label: "a", status: "running", sessionID: "ses_child_0" }],
+      },
+      0,
+    )
+    expect(view.agents[0]?.sessionID).toBe("ses_child_0")
   })
 })
 
