@@ -19,6 +19,18 @@ exactly one session.
 A run that is still pending or running in the launch-gating registry — not yet settled. The gate,
 the resume refusal and the TUI surfaces all key off liveness, not disk status alone.
 
+**agent transcript**
+The child session stream: the full conversation an `agent()` call produces — prompt, tool calls,
+every part — owned by opencode's message storage, not by the plugin. The native viewer is
+upstream child-session navigation, which renders nothing for schema'd children (decided in #150,
+probe on branch `150-transcript-spike`). The plugin-side representation on disk is the recording.
+
+**agent recording**
+The per-agent capture of that stream's part events, written append-only to the run directory
+while the child works — always on, for every agent of every run (decided in ADR-0004). The
+recording is the transcript's representation on disk, not a second artifact pretending to be the
+session: schema'd children whose native view renders blank are readable only here.
+
 **launch**
 A call to the `workflow` tool that starts (or is refused at) the gate. A launch registers a pending
 entry synchronously before its first await, so the check-then-act race cannot admit two.
@@ -149,4 +161,5 @@ automatically (decided in #103).
 - `docs/adr/` — accepted decisions, one file each. ADR-0001 records the launch concurrency policy
   (one-live-run refusal, ultracode live-run cap, demotion neutrality, launch-contract neutrality).
   ADR-0003 records the npm publishing mechanism (trusted publisher OIDC, no token; v0.1.0's
-  provenance-less exception).
+  provenance-less exception). ADR-0004 records the per-agent agent-recording decision (always-on
+  disk capture; the plugin renders no transcript bytes; the native view's schema'd blank).
