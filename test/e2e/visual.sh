@@ -42,7 +42,7 @@ for arg in "$@"; do
   if [ "$arg" = "--keep" ]; then KEEP=1; else ARGS+=("$arg"); fi
 done
 
-RUN_CASES="rest synth live hydration permission hint"
+RUN_CASES="rest synth live hydration permission hint spike"
 if [ "${1:-}" = "--fast" ]; then
   RUN_CASES="rest synth hint"
   shift
@@ -129,7 +129,7 @@ sidebar_open() { pane_matches '^ *ultracode *$'; }
 sidebar_keys() { tui_keys C-x; sleep 0.5; tui_keys b; }
 toggle_sidebar() { probe_verify_retry sidebar_keys sidebar_open 3 3; }
 
-if want rest || want synth || want live || want hydration; then
+if want rest || want synth || want live || want hydration || want spike; then
   section "V0 — boot the real TUI"
   boot_tui
 fi
@@ -144,7 +144,7 @@ if want rest; then
   frame 01-rest
 fi
 
-if want synth || want live; then
+if want synth || want live || want spike; then
   section "V2 — create a session (routes the TUI to the session view)"
   ensure_session
 fi
@@ -300,6 +300,89 @@ if want live; then
   assert_pane_lacks "strip clears after the run completes" "ultracode · e2e-$LIVE_FIXTURE" 300
   assert_pane_lacks "prompt status clears after completion" "ultracode ⠋ " 5
   frame 10-live-done
+fi
+
+if want spike; then
+  section "SPIKE — child-transcript navigation through the upstream affordance (#150)"
+  # #150 spike: does upstream child navigation (session_child_first / cycle /
+  # parent keybinds: leader down / right / up) ENTER a workflow child and RENDER
+  # its transcript while it runs and after it settles — including a child that
+  # used a schema (whose REST message listing is poisoned by `format`)?
+  # Two agents, one plain and one schema'd, distinct markers; navigation order
+  # can land on either child, so every frame is searched for both.
+  runs_snapshot "$OUT/runs-before-spike.txt"
+  tui_http_prompt "$(wf_prompt spike-mixed)"
+  assert_pane_contains "GenericTool transcript row shows the launch" "⚙ workflow" 300
+  assert_pane_contains "strip shows live run" "ultracode · e2e-spike" 300
+  frame 20-spike-midrun-before-nav
+
+  child_markers() { # child_markers NAME — asserts the child context by probe text of BOTH frames
+    local pane text
+    pane="$(tui_capture)"
+    for text in "SPIKE-PLAIN-MARK-7391" "SPIKE-SCHEMA-MARK-7391"; do
+      if printf '%s' "$pane" | grep -qF -- "$text"; then
+        note "$1: rendered '$text'"
+      else
+        note "$1: did NOT render '$text'"
+      fi
+    done
+  }
+
+  # Enter the first child; name the SIDES via the strip/side labels so frames
+  # carry what the pane showed. The cycling gesture visits every child, so the
+  # pair order does not matter — both children get their frames either way.
+  tui_keys C-x; sleep 1; tui_keys Down; sleep 3
+  frame 21-spike-child1
+  child_markers "child1(down)"
+
+  tui_keys Right; sleep 3
+  frame 22-spike-child2-cycle
+  child_markers "child2(right)"
+
+  # One more cycle in case three (wrap) children exist, then return to parent.
+  tui_keys Right; sleep 3
+  frame 23-spike-child3-wrap
+  child_markers "child3(right)"
+
+  tui_keys Up; sleep 3
+  frame 24-spike-parent
+  child_markers "parent(up)"
+
+  render_result() {
+    python3 - "$OUT" <<'PYEOF'
+import sys, pathlib
+out = pathlib.Path(sys.argv[1])
+plain, schema = 0, 0
+for path in ["21-spike-child1.frame", "22-spike-child2-cycle.frame", "23-spike-child3-wrap.frame"]:
+    p = out / path
+    if not p.exists():
+        continue
+    text = p.read_text()
+    if "SPIKE-PLAIN-MARK-7391" in text:
+        plain += 1
+    if "SPIKE-SCHEMA-MARK-7391" in text:
+        schema += 1
+(out / "spike-verdict.txt").write_text(f"plain_frames={plain} schema_frames={schema}\n")
+PYEOF
+  }
+  render_result
+  note "spike verdict written: $(cat "$OUT/spike-verdict.txt")"
+
+  # After the run settles: the same navigation against the HISTORICAL children.
+  spike_done() { [ -n "$(newest_completed_run "$OUT/runs-before-spike.txt")" ]; }
+  if wait_for 300 spike_done; then
+    ok "spike run completed on disk"
+  else
+    note "spike run did not complete in 300s — historical pass still attempted"
+  fi
+  sleep 3
+  tui_keys C-x; sleep 1; tui_keys Down; sleep 3
+  frame 25-spike-historical-child1
+  child_markers "historical-child1"
+  tui_keys Right; sleep 3
+  frame 26-spike-historical-child2
+  child_markers "historical-child2"
+  tui_keys Up; sleep 2
 fi
 
 if want hydration; then
@@ -465,11 +548,11 @@ if want hint; then
   frame 14-hint-once
 fi
 
-if ! want rest && ! want synth && ! want live && ! want hydration && ! want permission && ! want hint; then
-  bad "no known case selected" "known cases: rest synth live hydration permission hint; --fast for the short pass"
+if ! want rest && ! want synth && ! want live && ! want hydration && ! want permission && ! want hint && ! want spike; then
+  bad "no known case selected" "known cases: rest synth live hydration permission hint spike; --fast for the short pass"
 fi
 
-if want rest || want synth || want live || want permission || want hint; then
+if want rest || want synth || want live || want permission || want hint || want spike; then
   # Teardown before the summary so port-freeness is asserted on the real end
   # state (the EXIT trap's shared teardown then finds nothing left). The port
   # probe is an assertion, never a kill input.
