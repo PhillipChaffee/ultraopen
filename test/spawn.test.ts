@@ -216,6 +216,40 @@ describe("spawn", () => {
     expect(registry.owns(result.sessionID)).toBe(true)
   })
 
+  test("the spawn's agent identity lands in the registry, and the child-created callback fires AFTER it (#150)", async () => {
+    const { client } = makeClient()
+    const announced: string[] = []
+    const result = await spawn(client, {
+      prompt: "p",
+      runId: "run-1",
+      parentSessionID: "parent-1",
+      label: "worker",
+      agentIndex: 3,
+      onChildCreated: (sessionID: string): void => {announced.push(sessionID)},
+    })
+    if (!result.ok) {throw new Error("expected success")}
+    // By the time the engine could announce the session to progress, the recording identity
+    // must already be resolvable — order is identity first, announcement second.
+    expect(registry.agentOf(result.sessionID)).toEqual({ runId: "run-1", index: 3, label: "worker" })
+    expect(announced).toEqual([result.sessionID])
+  })
+
+  test("a failed create fires no child-created callback and records no identity", async () => {
+    const { client } = makeClient({ create: () => Promise.resolve({ error: new Error("boom") }) })
+    const announced: string[] = []
+    const result = await spawn(client, {
+      prompt: "p",
+      runId: "run-1",
+      parentSessionID: "parent-1",
+      label: "worker",
+      agentIndex: 0,
+      onChildCreated: (sessionID: string): void => {announced.push(sessionID)},
+    })
+    if (result.ok) {throw new Error("expected failure")}
+    expect(announced).toEqual([])
+    expect(registry.size).toBe(0)
+  })
+
   test("create returns no data -> reason:spawn-failed and nothing is registered", async () => {
     const { client } = makeClient({ create: () => Promise.resolve({ error: new Error("boom") }) }),
      result = await spawn(client, { prompt: "p", runId: "run-1", parentSessionID: "parent-1", label: "worker" })

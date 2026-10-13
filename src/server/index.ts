@@ -23,7 +23,6 @@ import {
   dropPending,
   dropSettled,
   stopRun,
-  onSessionIdle,
 } from "./tool/background.js"
 
 import { executeStatus } from "./tool/status.js"
@@ -53,12 +52,12 @@ import { wireRun, startDetachedRun } from "./tool/settlement.js"
 import type { SettleOutcome } from "./tool/settlement.js"
 import { beginRun, loadResume } from "./resume/persist.js"
 import { ensureRunDir, isSafeRunId, readManifest, removeRunDir, writeScript } from "./resume/store.js"
+import { onBusEvent } from "./runtime/events.js"
 import type { JournalEntry, Manifest } from "./resume/journal.js"
 import { onChatMessage, onChatParams, onMessagesTransform } from "./ultracode/hooks.js"
 import { mode } from "./ultracode/mode.js"
 import { resolveEffort } from "./bridge/effort.js"
-import { newBootId, pruneRuns, reapOrphans } from "./resume/reaper.js"
-import { resumeInterruptedRuns } from "./resume/autoresume.js"
+import { bootSweep, newBootId } from "./resume/boot.js"
 
 /**
  * The ultraopen server plugin.
@@ -201,28 +200,11 @@ export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<stri
     },
 
     /**
-     * Feeds the idle deadline's activity map, and drives the hydration idle nudge.
-     *
-     * Every live message update touches the emitting child's last-activity stamp. Bus events are
-     * the only progress signal that covers schema'd children: `format` poisons the REST message
-     * listing, but part events are emitted live regardless. Touching is scoped to engine-owned
-     * sessions, so the user's own sessions never inflate the map.
-     *
-     * `session.idle` (captured v1.18.31: `{ type: "session.idle", properties: { sessionID } }`,
-     * deprecated upstream but still published) arms the missed-wake nudge for a session whose
-     * last word is an unanswered hydration notification. Fire-and-forget: the hook is synchronous
-     * by contract and must never reject.
+     * Feeds the idle deadline's activity map, records the per-agent recording (#150) and
+     * drives the hydration idle nudge — one seam, extracted to src/server/runtime/events.ts.
      */
-    event: (hookInput: { event?: { type?: string; properties?: { part?: { sessionID?: string }; info?: { sessionID?: string }; sessionID?: string } } }): void => {
-      const event = hookInput?.event
-      if (event?.type === "session.idle") {
-        const sessionID = event.properties?.sessionID
-        if (sessionID !== undefined) {void onSessionIdle(client, sessionID)}
-        return
-      }
-      if (event?.type !== "message.part.updated" && event?.type !== "message.updated") {return}
-      const sessionID = event.properties?.part?.sessionID ?? event.properties?.info?.sessionID
-      if (sessionID !== undefined) {registry.touchActivity(sessionID)}
+    event: (hookInput: Parameters<typeof onBusEvent>[0]): void => {
+      onBusEvent(hookInput, client)
     },
   }
 
@@ -711,37 +693,6 @@ async function runBlocking(args: WorkflowArgs, run: BlockingRun): Promise<string
     // unconditionally: a status-guarded drop could strand the gate.
     dropSettled(runId)
   }
-}
-
-/**
- * The boot-time durability sweep, in dependency order.
- *
- * 1. The reaper aborts the children a dead process left behind and harvests the
- *    freshly-interrupted manifests — that abort is also what makes a run resumable, since it
- *    stops the billing while the journal keeps the completed agents.
- * 2. Prune deletes run directories past retention, but never a just-orphaned one: the resume
- *    window guard keeps runs inside the pending-decision TTL, whatever `autoResume` says.
- * 3. The auto-resume sweep re-executes the candidates it can, from their own journals, and
- *    hydrates their original sessions with the outcome.
- *
- * Fire-and-forget like every boot-time persistence: no stage rejects, so plugin init never waits
- * on a slow or unreachable server and no caller needs a catch.
- */
-async function bootSweep(
-  client: OpencodeClient,
-  bootId: string,
-  options: UltraopenOptions,
-  directory: string | undefined,
-): Promise<void> {
-  const reaped = await reapOrphans(client, bootId, {})
-  void pruneRuns({ autoResumeTtlHours: options.autoResumeTtlHours })
-  await resumeInterruptedRuns({
-    client,
-    bootId,
-    candidates: reaped.orphaned,
-    options,
-    directory,
-  })
 }
 
 const plugin = { id: "ultraopen", server: ultraopen }

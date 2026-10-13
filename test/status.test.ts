@@ -324,6 +324,68 @@ describe("executeStatus — budget", () => {
   })
 })
 
+describe("executeStatus — per-agent rows (#150)", () => {
+  test("snapshot rows carry every detail: index, phase, spend, the child id and its recording path", async () => {
+    const snapshot = {
+      runId: RUN,
+      workflow: "demo",
+      sessionID: "parent",
+      phase: "Verify",
+      agents: [
+        { index: 0, label: "a", status: "done", outputTokens: 10, sessionID: "ses_child_0" },
+        { index: 1, label: "b", status: "running" },
+        { index: 2, label: "c", status: "failed" },
+      ],
+      logs: [],
+      startedAt: 1,
+      updatedAt: 2,
+    }
+    const journal = [entry(), entry({ key: "k2", label: "c", status: "null", reason: "api-error" })].join("\n")
+    const report = await executeStatus({ runId: RUN }, deps({ "progress.json": JSON.stringify(snapshot), "journal.jsonl": journal }))
+    expect(report.agentRows).toHaveLength(3)
+    const [first, second, third] = report.agentRows
+    expect(first).toEqual({ index: 0, label: "a", status: "done", outputTokens: 10, sessionID: "ses_child_0", recordingPath: "/fake/opencode/tool-output/ultraopen/wf_status01/recordings/0000-a.jsonl" })
+    // A row whose child has not spawned yet: no id, so no recording pointer either.
+    expect(second).toEqual({ index: 1, label: "b", status: "running" })
+    // Failure reasons come from the journal, which carries them (the snapshot never does).
+    expect(third).toEqual({ index: 2, label: "c", status: "failed", reason: "api-error" })
+  })
+
+  test("a row's recording pointer is built through the store's path contract, never string-built here", async () => {
+    // Same contract from the path side: a label with path-unsafe characters lands sanitized
+    // inside the run dir's recordings directory — the exact shape recordingPath produces.
+    const snapshot = {
+      runId: RUN, workflow: "demo", sessionID: "parent",
+      agents: [{ index: 1, label: "repair:the thing!!", status: "done", sessionID: "ses_child_1" }],
+      logs: [], startedAt: 1, updatedAt: 2,
+    }
+    const report = await executeStatus({ runId: RUN }, deps({ "progress.json": JSON.stringify(snapshot) }))
+    const [row] = report.agentRows
+    expect(row?.recordingPath).toBe("/fake/opencode/tool-output/ultraopen/wf_status01/recordings/0001-repair-the-thing.jsonl")
+  })
+
+  test("without a snapshot, the journal stands in — labels and failures, no invented ids", async () => {
+    const journal = [entry(), entry({ key: "k1", label: "b", outputTokens: 5, status: "null", reason: "dead-end" })].join("\n")
+    const report = await executeStatus({ runId: RUN }, deps({
+      "journal.jsonl": journal,
+      "progress.json": "not json",
+    }))
+    expect(report.agents).toEqual({ total: 2, running: 0, done: 1, failed: 1 })
+    expect(report.agentRows).toEqual([
+      { label: "a", status: "done", outputTokens: 10 },
+      { label: "b", status: "failed", reason: "dead-end", outputTokens: 5 },
+    ])
+  })
+
+  test("a snapshot with no agents array degrades to the journal fallback and no crash", async () => {
+    const report = await executeStatus({ runId: RUN }, deps({
+      "progress.json": JSON.stringify({ runId: RUN, workflow: "demo", sessionID: "parent", logs: [], startedAt: 1, updatedAt: 2 }),
+    }))
+    expect(report.agentRows).toHaveLength(2)
+    expect(report.agentRows[0]?.label).toBe("a")
+  })
+})
+
 describe("executeStatus — wait loop", () => {
   const sleeps: number[] = []
 

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { renderCapRefusal, renderForeignSessionResumeRefusal, renderLaunch, renderRefusal, renderResult, renderSiblingAdvisory, renderStatus, renderStopFailure, renderStringifiedArgsRefusal, renderUnrecordedSessionResumeRefusal, stopReasonOf } from "../src/server/tool/render.js"
+import { renderCapRefusal, renderForeignSessionResumeRefusal, renderLaunch, renderRefusal, renderResult, renderSiblingAdvisory, renderStatus, renderStopFailure, renderStringifiedArgsRefusal, renderUnrecordedSessionResumeRefusal, stopReasonOf, transcriptHint } from "../src/server/tool/render.js"
 import { CONTROL_STOP_ABORT_REASON, STOP_ABORT_REASON } from "../src/server/tool/background.js"
 import { runDir } from "../src/server/resume/store.js"
 import type { WorkflowResult } from "../src/server/tool/workflow.js"
@@ -238,6 +238,26 @@ describe("renderLaunch", () => {
     expect(launched.split("\n").length).toBeGreaterThan(1)
   })
 
+  test("the launch result carries the transcript hint (#150)", () => {
+    const launched = renderLaunch("demo", "wf_hint0001", false)
+    expect(launched).toContain("Agent transcripts: open `/sessions`")
+    // The gesture is named, the picker named; positional claims are named NOT.
+    expect(launched).toContain("leader+down")
+    expect(launched).toContain("ultraopen · <label>")
+    expect(launched).not.toContain("row ")
+    // The hint is the tag's closing neighbor — the discoverability pointer trails the
+    // poll/stop contract sentences.
+    expect(launched.lastIndexOf("Agent transcripts")).toBeLessThan(launched.lastIndexOf("</workflow-launched>"))
+  })
+
+  test("the hint is the model-facing sentence, and the TUI renders its own compact twin", () => {
+    // Different readers, same affordances: the launch result speaks to the model at full
+    // length; the TUI (src/tui/data.ts, tested over there) renders the compact shape near the
+    // rows. The two never drift in CONTENT — the picker, the gesture, and the no-positional
+    // rule are the same in both — but each keeps its reader's length.
+    expect(transcriptHint()).toContain("bare right/left cycles children")
+  })
+
   test("an untitled launch renders exactly as before — no placeholder noise (#142)", () => {
     // The full tag, exactly: an untitled launch's opening line is byte-identical to the
     // pre-#142 shape, not merely free of the title attribute.
@@ -272,6 +292,7 @@ const statusReport = (over: Partial<StatusReport> = {}): StatusReport => ({
     status: "running",
     phases: [],
     agents: { total: 1, running: 1, done: 0, failed: 0 },
+    agentRows: [],
     outputTokens: 120,
     budget: { total: null, spent: 0 },
     logs: [],
@@ -299,6 +320,37 @@ describe("renderStatus", () => {
     expect(renderStatus(statusReport())).not.toContain("title=")
     // The full tag, exactly: byte-identical to the pre-#142 shape.
     expect(renderStatus(statusReport())).toContain('<workflow-status run="wf_status01" status="running" dir="/fake/opencode/tool-output/ultraopen/wf_status01">')
+  })
+
+  test("per-agent rows render additively below the aggregate counts (#150)", () => {
+    const rendered = renderStatus(statusReport({
+      agents: { total: 2, running: 1, done: 1, failed: 0 },
+      agentRows: [
+        { index: 0, label: "alpha:one", status: "done", phase: "Verify", outputTokens: 421, sessionID: "ses_child_a", recordingPath: "/r/wf/recordings/0000-alpha-one.jsonl" },
+        { index: 1, label: "beta:two", status: "running" },
+      ],
+    }))
+    // The counts line survives byte-identical; the rows append beneath it in an agents block.
+    expect(rendered).toContain("agents total=2 running=1 done=1 failed=0")
+    expect(rendered).toContain('<agent i="0" label="alpha:one" status="done" phase="Verify" tokens="421" child="ses_child_a" recording="/r/wf/recordings/0000-alpha-one.jsonl" />')
+    // A running row has nothing settled to state — absent fields are absent attributes.
+    expect(rendered).toContain('<agent i="1" label="beta:two" status="running" />')
+    expect(rendered.indexOf("agents total=")).toBeLessThan(rendered.indexOf("<agents>"))
+  })
+
+  test("a failed row names its reason, and nothing is invented for a degraded row", () => {
+    const rendered = renderStatus(statusReport({
+      agents: { total: 1, running: 0, done: 0, failed: 1 },
+      agentRows: [{ index: 3, label: "gamma:three", status: "failed", reason: "api-error", sessionID: "ses_child_c", recordingPath: "/r/wf/recordings/0003-gamma-three.jsonl" }],
+    }))
+    expect(rendered).toContain('<agent i="3" label="gamma:three" status="failed" reason="api-error" child="ses_child_c" recording="/r/wf/recordings/0003-gamma-three.jsonl" />')
+    // Degraded rows (journal fallback) carry no index, no child, no recording — honestly absent.
+    const degraded = renderStatus(statusReport({ agentRows: [{ label: "fallback:row", status: "done", outputTokens: 9 }] }))
+    expect(degraded).toContain('<agent label="fallback:row" status="done" tokens="9" />')
+  })
+
+  test("a row with no agents renders no block (an append that adds no empty structure)", () => {
+    expect(renderStatus(statusReport())).not.toContain("<agents>")
   })
 })
 

@@ -1,7 +1,7 @@
 import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { createEffect, createSignal, onCleanup } from "solid-js"
 import { homedir } from "node:os"
-import { RunPoller, agentRowText, consumeInterruptedMarker, dataRoot, formatElapsed, glyph, hintLine, loadInterruptedRuns, stopHint, summarize } from "./data.js"
+import { RunPoller, agentRowText, consumeInterruptedMarker, dataRoot, formatElapsed, hintLine, loadInterruptedRuns, stopHint, stripAgentText, summarize, transcriptHint } from "./data.js"
 import type { InterruptedHint, RunView } from "./data.js"
 
 /**
@@ -88,6 +88,9 @@ function sidebarLines(rs: RunView[]): string {
     lines.push(summarize(run))
     for (const agent of run.agents) {lines.push(agentRowText(agent))}
   }
+  // The transcript affordances ride under the rows they apply to (#150): read the row's
+  // session id, open the picker or press the gesture. The hint never claims ordering.
+  if (rs.length > 0) {lines.push(transcriptHint())}
   const stop = stopHint(rs)
   if (stop !== undefined) {lines.push(stop)}
   return lines.join("\n")
@@ -146,9 +149,12 @@ function BottomStrip(props: { api: TuiPluginApi }) {
     let content = ""
     if (rs.length === 1) {
       const run = rs[0],
+       // The strip's rows are the compact identification row (glyph, label, child id) — the
+       // failure reason and token spend stay in the sidebar; the strip clips at the input
+       // box's edge either way (#150).
        agents =
         run.agents.length > 0
-          ? `  ${run.agents.map((agent) => `${glyph(agent.status)} ${agent.label}`).join("   ")}`
+          ? `  ${run.agents.map((agent) => stripAgentText(agent)).join("   ")}`
           : ""
       content = `ultracode · ${summarize(run)}${agents}`
     } else if (rs.length > 1) {

@@ -62,6 +62,12 @@ export interface AgentRecord {
 
 export type ProgressEvent =
   | { type: "agent-start"; index: number; label: string; phase: string | undefined; sessionID?: string }
+  | {
+      /** The child session now exists (#150): the row already announced by agent-start gains its id. */
+      type: "agent-session"
+      index: number
+      sessionID: string
+    }
   | { type: "agent-end"; index: number; label: string; phase: string | undefined; ok: boolean; outputTokens?: number; sessionID?: string }
   | { type: "phase"; title: string }
   | { type: "log"; message: string }
@@ -359,6 +365,7 @@ export class Run {
         runId: this.runId,
         parentSessionID: this.#options.parentSessionID,
         label,
+        agentIndex: index,
         ...pick("agentType", options.agentType),
         ...pick("schema", options.schema),
         ...pick("disallowedTools", options.disallowedTools),
@@ -370,6 +377,14 @@ export class Run {
         ...pick("idleMs", this.#options.idleMs ?? DEFAULT_AGENT_IDLE_MS),
         ...pick("signal", agentSignal(this.#options.signal, this.#agentControllers, index)),
         ...pick("directory", worktree?.directory),
+        ...pick(
+          "onChildCreated",
+          this.#options.onProgress === undefined
+            ? undefined
+            : (sessionID: string): void => {
+                this.#options.onProgress?.({ type: "agent-session", index, sessionID })
+              },
+        ),
       }
       let outcome = await spawnStructured(this.#options.client, spawnOptions)
 

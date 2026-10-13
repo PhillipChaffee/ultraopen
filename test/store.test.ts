@@ -15,6 +15,8 @@ import {
   atomicWriteFile,
   readManifest,
   readManifestState,
+  recordingFileBase,
+  recordingPath,
   removeRunDir,
   runDir,
   writeManifest,
@@ -79,6 +81,32 @@ describe("paths", () => {
     expect(paths.scriptPath).toBe(join(paths.dir, "script.js"))
   })
 })
+
+describe("recording paths (#150)", () => {
+  test("one JSONL per agent under recordings/, deterministic from index + label", () => {
+    expect(recordingPath("wf_rec0001", 0, "alpha:one", env)).toBe(
+      join(runDir("wf_rec0001", env), "recordings", "0000-alpha-one.jsonl"),
+    )
+    expect(recordingPath("wf_rec0001", 12, "verify the thing", env)).toBe(
+      join(runDir("wf_rec0001", env), "recordings", "0012-verify-the-thing.jsonl"),
+    )
+    // The zero-padded index keeps a plain listing in call order.
+    expect(usingIndex(recordingFileBase(3, "x"))).toBeGreaterThan(usingIndex(recordingFileBase(2, "x")))
+  })
+
+  test("labels are free script text, so the name segment is path-safe", () => {
+    // Colons, spaces, slashes, control chars, unicode — every unsafe byte collapses to `-`,
+    // then leading/trailing dashes trim.
+    expect(recordingFileBase(0, "a/b:c d??é")).toBe("0000-a-b-c-d")
+    expect(recordingFileBase(0, "  ")).toBe("0000-agent")
+    expect(recordingFileBase(0, ":")).toBe("0000-agent")
+    // A 200-character label caps; a name never makes a run dir's listing unreadable.
+    expect(recordingFileBase(1, "y".repeat(200)).length).toBe(5 + 48)
+  })
+})
+
+/** Numeric key of a recording filename's index prefix, as a directory listing sees it. */
+const usingIndex = (name: string): number => Number(name.split("-", 1)[0])
 
 describe("run id safety", () => {
   test.each(["wf_abc123", "wf_0123456789ab"])("accepts %s", (id) => {

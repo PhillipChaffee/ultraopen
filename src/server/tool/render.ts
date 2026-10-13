@@ -2,7 +2,7 @@ import { runDir } from "../resume/store.js"
 import { LARGE_RUN_AGENTS } from "../script/limits.js"
 import { stringifiedArgsMessage, stringifiedArgsSuggestion } from "./args-transport.js"
 import type { WorkflowResult } from "./workflow.js"
-import type { StatusReport } from "./status.js"
+import type { StatusAgentRow, StatusReport } from "./status.js"
 
 /**
  * Everything the two tools SAY to the model: the blocking result, the launch
@@ -180,8 +180,28 @@ export function renderLaunch(
   }
   // The run just launched and is live, so the combined math counts it: siblings + this one.
   appendAdvisory(lines, siblings, budgetMath(budgetTokens, siblings.length + 1))
-  lines.push("</workflow-launched>")
+  // The human path to an agent's transcript is a discoverability hint, never a pane (#150 /
+  // ADR-0004): navigation rides upstream — the /sessions picker lists children under their
+  // `ultraopen · <label>` titles, and the child-navigation gesture works on the current
+  // transcript line. Deliberately NO positional claims: upstream sorts siblings by session id
+  // in one place and by creation time in another, so each agent's child id is located through
+  // the per-agent rows of workflow_status, never through an ordering.
+  lines.push(transcriptHint(), "</workflow-launched>")
   return lines.join("\n")
+}
+
+/**
+ * The transcript hint: how a human opens an agent's child transcript (#150).
+ *
+ * One compact sentence pair reused by the launch result (and echoed by the TUI's agent rows,
+ * which render the same affordances near the data). Two facts and no invention: children
+ * appear in the picker under their titles, and the gesture keys are the upstream keybinds' —
+ * leader+down to enter, bare right/left to cycle, bare up to return, all on the current
+ * transcript line.
+ */
+export function transcriptHint(): string {
+  return "Agent transcripts: open `/sessions` and find each child under its `ultraopen · <label>` title; " +
+    "on a transcript line, leader+down enters the first child, bare right/left cycles children, bare up returns."
 }
 
 /** A run as the model-facing renders name it: its id and status. */
@@ -468,6 +488,17 @@ export function renderStatus(report: StatusReport): string {
     `phases: ${report.phases.length > 0 ? report.phases.join(", ") : "(none)"}`,
   ]
   if (report.phase !== undefined) {lines.push(`current phase: ${report.phase}`)}
+  // Per-agent rows (#150): additive below the aggregate counts — the counts stay exactly
+  // where they were, one row line follows per agent, each naming what the row verifies
+  // (label, status, phase, failure reason, settled spend, child session id, recording path)
+  // and omitting what it cannot verify (a degraded row's absent fields are absent attributes,
+  // not guessed ones). Uncapped like the report itself: a large run's fans-out are already
+  // advised at launch, and truncating here would hide stuck agents — the rows' whole point.
+  if (report.agentRows.length > 0) {
+    lines.push("<agents>")
+    for (const row of report.agentRows) {lines.push(`  ${agentRowTag(row)}`)}
+    lines.push("</agents>")
+  }
   if (report.status === "completed") {
     lines.push("", typeof report.value === "string" ? report.value : JSON.stringify(report.value, null, 2))
   }
@@ -479,6 +510,21 @@ export function renderStatus(report: StatusReport): string {
   }
   lines.push("</workflow-status>")
   return lines.join("\n")
+}
+
+/** One agent row as a self-closing tag; every absent detail is an absent attribute. */
+function agentRowTag(row: StatusAgentRow): string {
+  const attrs = [
+    ...(row.index === undefined ? [] : [`i="${row.index}"`]),
+    `label="${attributeValue(row.label)}"`,
+    `status="${row.status}"`,
+    ...(row.phase === undefined ? [] : [`phase="${attributeValue(oneLineTitle(row.phase))}"`]),
+    ...(row.reason === undefined ? [] : [`reason="${attributeValue(oneLineTitle(row.reason))}"`]),
+    ...(row.outputTokens === undefined ? [] : [`tokens="${row.outputTokens}"`]),
+    ...(row.sessionID === undefined ? [] : [`child="${attributeValue(row.sessionID)}"`]),
+    ...(row.recordingPath === undefined ? [] : [`recording="${attributeValue(row.recordingPath)}"`]),
+  ]
+  return `<agent ${attrs.join(" ")} />`
 }
 
 /**
