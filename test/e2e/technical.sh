@@ -792,6 +792,75 @@ if [ "$T10_VALUES" = "2" ]; then
 else
   bad "a concurrent run's journal lacks its result entry" "inspect $T10_A and $T10_B"
 fi
+# Per-agent rows in the real status poll (#150) — the agent-facing transcript
+# surface, headless this time. The rows the model actually reads name each agent
+# with its child session id and the recording file's path, and the path must
+# resolve: a pointer that dangles would send the model at a file that never was.
+# Same sound anchor as the per-id poll assert — the captured tool RESULT text.
+t10_status_rows() { # t10_status_rows FILE RUNID → that run's <agent .../> tags from workflow_status results
+  python3 - "$1" "$2" <<'PYEOF'
+import json, re, sys
+tags = []
+for line in open(sys.argv[1]):
+    try: event = json.loads(line)
+    except Exception: continue
+    part = event.get("part") or {}
+    if event.get("type") in ("tool", "tool_use") and part.get("tool") == "workflow_status":
+        text = (part.get("state") or {}).get("output") or ""
+        if f'workflow-status run="{sys.argv[2]}"' in text:
+            tags += re.findall(r'<agent [^>]*/>', text)
+print("\n".join(dict.fromkeys(tags)))
+PYEOF
+}
+# The full row check in one place: a probe-labelled row, its child id, its
+# recording pointer, and that the pointer names a real file. Prints
+# `ok:<path>` / `norows` / `bad:<why>` and lets bash pick the assertion.
+t10_rows_valid() { # t10_rows_valid FILE RUNID →
+  python3 - "$1" "$2" <<'PYEOF'
+import json, re, os, sys
+tags = []
+for line in open(sys.argv[1]):
+    try: event = json.loads(line)
+    except Exception: continue
+    part = event.get("part") or {}
+    if event.get("type") in ("tool", "tool_use") and part.get("tool") == "workflow_status":
+        text = (part.get("state") or {}).get("output") or ""
+        if f'workflow-status run="{sys.argv[2]}"' in text:
+            tags += re.findall(r'<agent [^>]*/>', text)
+rows = [t for t in dict.fromkeys(tags) if 'label="probe"' in t]
+if not rows:
+    print("norows")
+    sys.exit(0)
+bad = []
+path = None
+for m in rows:
+    if 'child="ses_' not in m: {bad.append("a row without a child session id")}
+    found = re.search(r'recording="([^"]+)"', m)
+    if not found:
+        {bad.append("a row without a recording path")}
+    elif path is None:
+        path = found.group(1)
+if bad:
+    print(f"bad:{'; '.join(bad)}")
+elif path is not None:
+    print(f"ok:{path}" if os.path.isfile(path) else f"bad:the named recording does not exist on disk ({path})")
+PYEOF
+}
+ROWS_A="$(t10_rows_valid "$T10_FILE" "$T10_A")"
+ROWS_B="$(t10_rows_valid "$T10_FILE" "$T10_B")"
+if [ "${ROWS_A#ok:}" != "$ROWS_A" ] && [ "${ROWS_B#ok:}" != "$ROWS_B" ]; then
+  ok "workflow_status named the agent with its child session id and recording path (#150)"
+  if grep -q "PING" "${ROWS_A#ok:}" && grep -q "PING" "${ROWS_B#ok:}"; then
+    ok "each agent's named recording reads as the agent's part stream (prompt marker present)"
+  else
+    bad "an agent's recording lacks its prompt marker" "inspect ${ROWS_A#ok:} and ${ROWS_B#ok:}"
+  fi
+elif [ "$ROWS_A" = "norows" ] && [ "$ROWS_B" = "norows" ] &&
+     [ "$(manifest_status "$T10_A")" = "completed" ] && [ "$(manifest_status "$T10_B")" = "completed" ]; then
+  note "no per-agent rows in the poll results though both runs settled completed — the degenerate empty-completion flake left the stream without status tool results; inspect $T10_FILE"
+else
+  bad "workflow_status did not name each agent's transcript surfaces" "A: $ROWS_A, B: $ROWS_B — see $T10_FILE"
+fi
 # Both settled runs are resumable: -c continues the ultracode session, and each
 # resume replays its run's journal with zero live agents. T10 is the
 # load-bearing case, so its two resume turns carry pinned harness retries (#45).
