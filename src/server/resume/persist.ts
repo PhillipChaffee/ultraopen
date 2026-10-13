@@ -88,6 +88,12 @@ export async function beginRun(record: RunRecord, env?: NodeJS.ProcessEnv): Prom
  * the status: the first terminal record settles the run's whole settlement.
  */
 /**
+ * Receives a best-effort temp cleanup's failure (#163): a stranded temp is not an error.
+ * One shared receiver for the atomic write's catches — their cleanups stay best-effort.
+ */
+const forgetTemp = () => undefined
+
+/**
  * The terminal write WITH a last-instant re-check (#136).
  *
  * The atomic write widened the check-to-rename window (the temp write sits between the status
@@ -97,10 +103,28 @@ export async function beginRun(record: RunRecord, env?: NodeJS.ProcessEnv): Prom
  * window to two consecutive syscalls: if another terminal record landed since the caller's
  * check, this write abandons instead of overwriting it.
  */
+/**
+ * The terminal write WITH a bounded IO retry (#163).
+ *
+ * A transient stage or rename failure (ENOSPC, EBUSY) used to strand the run's disk record at
+ * whatever the run's open left it — the settle promise resolved honestly while the manifest
+ * still read `running`, as PR #162's CI proved and the diagnosis harness pinned. The write now
+ * takes markCancelled's bounded attempt budget on its IO failures and cleans its staged temp
+ * between attempts. The not-won that comes from a standing terminal record is a
+ * race decision, not an IO failure — it never retries, so first-terminal-write-wins is
+ * untouched. Exhausted retries return the same honest not-won as before: the record says
+ * `running`, journal and result stay unwritten, and a genuine lost settle stays loud.
+ */
 export async function writeTerminalManifest(
   runId: string,
   manifest: Manifest,
   env?: NodeJS.ProcessEnv,
+  /**
+   * Test-only fault injection (#163): fail the first N stage writes / renames, so a transient
+   * IO failure is deterministically exercisable — the blessed pattern atomicWriteFile already
+   * established, one level deeper. Never supplied in production.
+   */
+  inject?: { failStages?: number; failRenames?: number } | undefined,
 ): Promise<boolean> {
   // (#136) STAGE the content first, THEN re-check, THEN rename: the gap between the status
   // read and the rename collapses to two consecutive syscalls, so a concurrent terminal write
@@ -108,23 +132,38 @@ export async function writeTerminalManifest(
   // clobbered — first-terminal-write-wins holds on disk.
   const paths = artifactPaths(runId, env)
   const tmp = `${paths.manifestPath}.${randomUUID().slice(0, 8)}.tmp`
-  try {
-    await writeFile(tmp, JSON.stringify(manifest, null, 2), "utf8")
-  } catch {
-    // A stage failure (unwritable dir, ENOSPC) is "not won", not a throw: the caller's retry
-    // accounting sees the honest refusal and the exhausted-retry fallthrough reports it.
-    await unlink(tmp).catch(() => undefined)
-    return false
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      if (attempt <= (inject?.failStages ?? 0)) {
+        throw new Error(`injected stage failure (#163 test seam, attempt ${attempt})`)
+      }
+      await writeFile(tmp, JSON.stringify(manifest, null, 2), "utf8")
+    } catch {
+      // A stage failure (unwritable dir, ENOSPC) is "not won", not a throw: the caller's retry
+      // accounting sees the honest refusal, and #163's retry takes the next attempt.
+      await unlink(tmp).catch(forgetTemp)
+      continue
+    }
+    const current = await readManifest(runId, env)
+    if (current !== undefined && current.status !== "running") {
+      // No .catch here: the stage just succeeded, so an unlink failure is a real error worth
+      // rejecting into the callers' honest-failure paths — not a best-effort cleanup.
+      await unlink(tmp)
+      return false
+    }
+    try {
+      if (attempt <= (inject?.failRenames ?? 0)) {
+        throw new Error(`injected rename failure (#163 test seam, attempt ${attempt})`)
+      }
+      await rename(tmp, paths.manifestPath)
+      return true
+    } catch {
+      // A rename failure must not strand its staged temp: clean it, then take the next
+      // attempt. After the last attempt the loop falls through to the honest not-won.
+      await unlink(tmp).catch(forgetTemp)
+    }
   }
-  const current = await readManifest(runId, env)
-  if (current !== undefined && current.status !== "running") {
-    // No .catch here: the stage just succeeded, so an unlink failure is a real error worth
-    // rejecting into the callers' honest-failure paths — not a best-effort cleanup.
-    await unlink(tmp)
-    return false
-  }
-  await rename(tmp, paths.manifestPath)
-  return true
+  return false
 }
 
 export async function endRun(

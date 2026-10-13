@@ -472,6 +472,85 @@ test("the checked terminal write refuses when the manifest already settled (#136
   expect(entries.filter((e) => e.includes(".tmp"))).toEqual([])
 })
 
+describe("writeTerminalManifest — the settle's terminal write (#163)", () => {
+  /** Lists the run dir, the way the #136 residue assertions below do. */
+  const dirEntries = (): Promise<string[]> =>
+    readdir(dirname(artifactPaths("wf_abc123", env).manifestPath))
+  const tmpResidue = async (): Promise<string[]> => {
+    const entries = await dirEntries()
+    return entries.filter((e) => e.includes(".tmp"))
+  }
+
+  test("a transient stage failure is retried and still settles", async () => {
+    const manifest = await beginRun(record, env)
+    if (!manifest) {throw new Error("the run did not open")}
+    const won = await writeTerminalManifest(
+      "wf_abc123",
+      { ...manifest, status: "completed", endedAt: Date.now() },
+      env,
+      { failStages: 1 },
+    )
+    expect(won).toBe(true)
+    const settled = await readManifest("wf_abc123", env)
+    expect(settled?.status).toBe("completed")
+    expect(settled?.childSessionIDs).toEqual(manifest.childSessionIDs)
+    // The failed attempt strands nothing: the dir holds only real artifacts.
+    expect(await tmpResidue()).toEqual([])
+  })
+
+  test("a transient rename failure is retried and still settles", async () => {
+    const manifest = await beginRun(record, env)
+    if (!manifest) {throw new Error("the run did not open")}
+    const won = await writeTerminalManifest(
+      "wf_abc123",
+      { ...manifest, status: "completed", endedAt: Date.now() },
+      env,
+      { failRenames: 1 },
+    )
+    expect(won).toBe(true)
+    const settled = await readManifest("wf_abc123", env)
+    expect(settled?.status).toBe("completed")
+    // A rename failure must not strand its staged temp (the diagnosis found it did).
+    expect(await tmpResidue()).toEqual([])
+  })
+
+  test("exhausted stage retries still refuse with the record untouched", async () => {
+    // After the attempt budget is exhausted the outcome stays the honest one the callers
+    // already had: not-won, disk record exactly what the run's open left, no temp.
+    const manifest = await beginRun(record, env)
+    if (!manifest) {throw new Error("the run did not open")}
+    const won = await writeTerminalManifest(
+      "wf_abc123",
+      { ...manifest, status: "completed", endedAt: Date.now() },
+      env,
+      { failStages: 3 },
+    )
+    expect(won).toBe(false)
+    const standing = await readManifest("wf_abc123", env)
+    expect(standing?.status).toBe("running")
+    expect(standing?.childSessionIDs).toEqual([])
+    expect(await tmpResidue()).toEqual([])
+    // The not-won keeps the settle's skip: the journal and result were never promised.
+    expect(await readJournal("wf_abc123", env)).toEqual([])
+    expect(await Bun.file(artifactPaths("wf_abc123", env).resultPath).exists()).toBe(false)
+  })
+
+  test("exhausted rename retries still refuse without stranding the staged temp", async () => {
+    const manifest = await beginRun(record, env)
+    if (!manifest) {throw new Error("the run did not open")}
+    const won = await writeTerminalManifest(
+      "wf_abc123",
+      { ...manifest, status: "completed", endedAt: Date.now() },
+      env,
+      { failRenames: 3 },
+    )
+    expect(won).toBe(false)
+    const standing = await readManifest("wf_abc123", env)
+    expect(standing?.status).toBe("running")
+    expect(await tmpResidue()).toEqual([])
+  })
+})
+
 test("markCancelled never rejects, even on a caller error (#136)", async () => {
   // The reaper's fire-and-forget contract applies to the stop path too: the TUI stop and the
   // tool stop both call this without a handler, so a caller error (a missing manifest record)

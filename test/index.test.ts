@@ -536,6 +536,13 @@ describe("tool execution", () => {
      output = await tool.execute({ script, background: false }, { sessionID: "parent" }),
      runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1]
     expect(runId).toBeDefined()
+    // (#163) The settle promise resolves once the settle protocol ran, but a transiently
+    // refused terminal write retries — so the disk record must be waited for, not raced:
+    // poll to terminal the way this file's status reads do.
+    await waitFor(async () => {
+      const manifest = await readManifest(runId ?? "", undefined)
+      return manifest?.status === "completed"
+    }, "the completed run's manifest to settle")
     const manifest = await readManifest(runId ?? "", undefined)
     expect(manifest?.childSessionIDs).toEqual(["child"])
   })
@@ -1296,7 +1303,10 @@ describe("background launch contract", () => {
     await settle(runId)
     const status = statusToolOf(ultraopen({ client: stubClient }))
     if (!status) {throw new Error("status tool was not registered")}
-    const report = await status.execute({ runId }, { sessionID: "parent" })
+    // (#163) A zero wait returns the FIRST read — a settle whose terminal write is still
+    // unwinding (or retrying a transient refusal) reads as running forever. Poll to
+    // terminal like the sibling test above instead of racing the settle once.
+    const report = await status.execute({ runId, wait: 5 }, { sessionID: "parent" })
     expect(report).toContain(`status="failed"`)
     expect(report).toContain("boom mid-run")
     expect(report).toContain("<failure")
