@@ -75,7 +75,12 @@ jobs:
 
       - name: Publish to npm
         if: steps.publish-guard.outputs.skip == 'false'
-        run: npm publish
+        run: |
+          if [[ "${GITHUB_REF_NAME#v}" == *-* ]]; then
+            npm publish --tag next
+          else
+            npm publish
+          fi
 
       - name: Render release notes
         run: |
@@ -96,4 +101,9 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --title "ultraopen ${GITHUB_REF_NAME#v}" --notes-file release-notes.md
+        run: |
+          if [[ "${GITHUB_REF_NAME#v}" == *-* ]]; then
+            gh release create "$GITHUB_REF_NAME" --title "ultraopen ${GITHUB_REF_NAME#v}" --notes-file release-notes.md --prerelease
+          else
+            gh release create "$GITHUB_REF_NAME" --title "ultraopen ${GITHUB_REF_NAME#v}" --notes-file release-notes.md
+          fi

@@ -1,9 +1,24 @@
+import { readFile } from "node:fs/promises"
+import type { HostPort } from "../host/port.js"
+import type { LiveRunRecord, RuntimeCoordinator } from "../runtime/coordinator.js"
 import type { Manifest } from "../resume/journal.js"
 import { STOP_ABORT_REASON } from "../resume/journal.js"
 import { endRun, markCancelled } from "../resume/persist.js"
-import { artifactPaths, isSafeRunId, readManifest, runDir, writeFailure } from "../resume/store.js"
-import { registry } from "../singleton.js"
-import type { OpencodeClient } from "../types.js"
+import { progressPath } from "../resume/progress.js"
+import type { ProgressSnapshot } from "../resume/progress.js"
+import {
+  atomicWriteFile,
+  artifactPaths,
+  deletePendingNotification,
+  isProcessAlive,
+  isSafeRunId,
+  readManifest,
+  runDir,
+  writeFailure,
+  writePendingNotification,
+} from "../resume/store.js"
+import type { PendingNotification } from "../resume/store.js"
+import { rpcViewFromLive } from "../runtime/views.js"
 import { manifestTitleOf } from "./args-transport.js"
 import { renderResult, titleAttributeOf } from "./render.js"
 import type { WorkflowResult } from "./workflow.js"
@@ -12,429 +27,51 @@ import type { WorkflowResult } from "./workflow.js"
 // re-exported for the callers that read them off this module.
 export { STOP_ABORT_REASON, CONTROL_STOP_ABORT_REASON } from "../resume/journal.js"
 
+/** Which launch contract the host process can honor, decided from the process shape. */
+export type HostShape = "shared-service" | "ephemeral"
+
 /**
- * Which launch contract the host process can honor, decided from the process shape.
+ * Classifies the host process.
  *
- * The evidence is live-captured argv from the installed opencode 1.18.31 binary (reproduced
- * verbatim in the tests):
- *   - `opencode run` runs its server in-process and exits unconditionally after the turn
- *     (packages/opencode/src/index.ts, the `finally` block) — an unsettled detached run dies with
- *     the process. argv: ["bun", "/$bunfs/root/src/index.js", "run", "say hi"].
- *   - the TUI boots its server inside a Bun worker thread whose argv is the worker file alone,
- *     because a worker does not inherit the parent's argv:
- *     ["bun", "/$bunfs/root/src/cli/tui/worker.js"].
- *   - `opencode serve`, `opencode web` and `opencode acp` call `Server.listen` and live until
- *     killed; `--mini` is the interactive REPL.
- *
- * The failure directions are not symmetric. Freeing the turn in a process that is about to exit
- * loses the run mid-flight (journal and resume survive, the work does not); pinning the turn in a
- * long-lived host merely blocks the chat. Unknown shapes therefore keep the pinned contract.
+ * Every `--standalone` CLI command spawns `serve --stdio --port 0`, whose stdin EOF kills the
+ * server with the parent command, so `--stdio` and `run` are ephemeral. `service`, `serve`, `web`
+ * and `acp` without `--stdio` own a long-lived service lifetime. Anything unknown is ephemeral:
+ * freeing the turn in a process that dies loses the run, while pinning a shared service merely
+ * blocks the chat — the failure directions are not symmetric.
  */
-export function isLongLivedHost(argv: readonly string[] = process.argv): boolean {
+export function classifyHost(argv: readonly string[] = process.argv): HostShape {
   const tokens = argv.slice(1)
-  // The `run` subcommand and any driver built on it: the process exits after the
-  // turn, so the model must hold the turn by polling until the run settles.
-  if (tokens.includes("run")) {return false}
-  return tokens.some(
-    (token) =>
-      token === "serve" ||
-      token === "web" ||
-      token === "acp" ||
-      token === "--mini" ||
-      // The TUI's worker thread: plugins never load in the TUI parent process.
-      /tui[\\/]worker\.(?<ext>js|ts)$/u.test(token),
-  )
+  if (tokens.includes("--stdio") || tokens.includes("run")) {return "ephemeral"}
+  return tokens.some((token) => token === "service" || token === "serve" || token === "web" || token === "acp") ? "shared-service" : "ephemeral"
 }
 
-/**
- * The detached-run layer: everything that lets a run outlive its tool call.
- *
- * State lives at MODULE level for the same reason `singleton.ts` does: opencode
- * instantiates the plugin once per directory, so factory-closure state is not
- * shared. The registry here owns LAUNCH-GATING state only — which runs are
- * pending or live, per session — while disk (manifest/journal/progress) remains
- * the single source of truth for what a run did. Settled entries are dropped
- * immediately: the status tool reads disk, so keeping them would only invite
- * stale answers.
- *
- * There is deliberately no keepalive timer. `opencode run` calls
- * `process.exit()` in its CLI `finally`, which no timer can hold, and the TUI
- * and `opencode serve` persist on their own — see
- * tasks/async-runs/notes/host-lifecycle-facts.md.
- */
-
-type RunStatus = "pending" | "running"
-
-export interface DetachedRun {
-  runId: string
-  sessionID: string
-  status: RunStatus
-  startedAt: number
-  /**
-   * The workflow's meta name, recorded once the launch path has parsed the script. Absent in the
-   * window between registration and prepare (and on a run whose parse failed); the per-turn
-   * live-run reminder falls back to the run id for that window.
-   */
-  name?: string
-  /**
-   * The launch's `title` metadata (#142), recorded alongside the name once the launch path has
-   * read it; the reminder shows it as a parenthetical beside the name. Absent on untitled runs.
-   */
-  title?: string
+/** `true` only for a service-owned host that outlives the invoking CLI. */
+export function isLongLivedHost(argv: readonly string[] = process.argv): boolean {
+  return classifyHost(argv) === "shared-service"
 }
 
-const detached = new Map<string, DetachedRun>()
-
-/** runId -> the promise that resolves when the detached task settles. Exposed for tests. */
-const settling = new Map<string, Promise<void>>()
-
-/** Resolves when the named detached run has fully settled (or is unknown). */
-export function settlePromiseOf(runId: string): Promise<void> {
-  return settling.get(runId) ?? Promise.resolve()
-}
-
-/**
- * Registers a launch synchronously: the refusal check and this registration
- * are one await-free step, so two tool calls from one session cannot both
- * pass the check before either registers — the check-then-act race. The
- * entry starts `pending` and is promoted (or removed) as the launch proceeds.
- * The stamp fixes the entry's position in start-order queries; passing one
- * explicitly decouples that order from clock granularity.
- */
-export function registerPending(runId: string, sessionID: string, startedAt: number = Date.now()): void {
-  detached.set(runId, { runId, sessionID, status: "pending", startedAt })
-}
-
-/** Promotes a pending entry to running once the permission ask and manifest are in place. */
-export function promote(runId: string): void {
-  const entry = detached.get(runId)
-  if (entry) {entry.status = "running"}
-}
-
-/**
- * Records a launch's workflow name once prepare() has parsed the script, with the launch's
- * `title` metadata when the launch passed one (#142).
- *
- * Called from the launch path between registration and the permission ask, so even a pending
- * entry carries the name the reminder should show. The title must be a real non-blank string:
- * the auto-resume sweep passes the adopted manifest's title — JSON a human can edit — and a
- * non-string or blank would reach the reminder's renderer, which interpolates it into a line
- * whose shape must hold. Unknown ids are ignored: a dropped launch must not resurrect anything.
- */
-export function nameRun(runId: string, name: string, title?: string | undefined): void {
-  const entry = detached.get(runId)
-  if (entry) {
-    entry.name = name
-    const present = manifestTitleOf(title)
-    if (present !== undefined) {entry.title = present}
-  }
-}
-
-/** Drops a pending entry — the launch failed before the run went live. */
-export function dropPending(runId: string): void {
-  const entry = detached.get(runId)
-  if (entry && entry.status === "pending") {detached.delete(runId)}
-}
-
-/**
- * Drops a settled run's entry, whatever status it holds.
- *
- * The blocking contract keeps its gate entry from registration until its settle
- * protocol completes; that removal cannot be status-guarded (dropPending
- * deletes pending entries only), or a settle would strand the session gate and
- * the resume refusal forever.
- */
-export function dropSettled(runId: string): void {
-  detached.delete(runId)
-}
-
-/**
- * The abort reason the stop path stamps on a detached run's controller.
- *
- * It is carried on the AbortSignal so the journal can eventually tell a
- * deliberate stop apart from a parent-turn interrupt — the abort-reason copy
- * and its never-auto-resume invariant land with ticket #11; the marker exists
- * from here so that work has a single definition to read.
- */
-
-
-/** runId -> the controller whose signal drives that detached run's engine. */
-const stopHandles = new Map<string, AbortController>()
-
-/** Registers the controller a stop call will trip. One per detached run. */
-export function registerStopHandle(runId: string, controller: AbortController): void {
-  stopHandles.set(runId, controller)
-}
-
-/** Drops a run's controller — the run settled or never detached. */
-export function dropStopHandle(runId: string): void {
-  stopHandles.delete(runId)
-}
-
-/** The controller registered for a run, for tests and diagnostics. */
-export function stopHandleOf(runId: string): AbortController | undefined {
-  return stopHandles.get(runId)
-}
-
-/**
- * The stop path: `workflow({ stop: "<runId>" })` from any session.
- *
- * The contract (issue #10): validate the id, abort the run's engine via its
- * controller — the signal unwinds the script and the Run's own cleanup aborts
- * every child — record the manifest as `cancelled` first-terminal-write-wins,
- * and hydrate a confirmation into the run's parent session so the model knows
- * the stop landed. Every failure returns a clear error string, never a throw:
- * the tool result is the model's only feedback surface.
- */
-export async function stopRun(options: {
-  runId: string
-  client: OpencodeClient
-  bootId: string
-  /** Injectable for tests: the guarded cancel write whose race this branch reports. */
-  markCancelledFn?: typeof markCancelled
-}): Promise<string> {
-  const { runId, client, bootId } = options
-  if (!isSafeRunId(runId)) {
-    return stopRefused(`"${runId}" is not a valid run id — pass the id exactly as the launch result reported it.`)
-  }
-  // readManifest resolves undefined for a missing or unreadable manifest — no catch needed.
-  const manifest = await readManifest(runId)
-  if (manifest === undefined) {
-    return stopRefused(`No workflow run with id "${runId}" exists. Poll workflow_status for the ids of recent runs.`)
-  }
-  if (manifest.status !== "running") {
-    return stopRefused(`Run "${runId}" already finished with status "${manifest.status}" — nothing to stop.`)
-  }
-  if (manifest.bootId !== bootId && isProcessAlive(manifest.pid)) {
-    return stopRefused(
-      `Run "${runId}" is executing in another opencode process (pid ${manifest.pid}) — stop it from that session instead.`,
-    )
-  }
-  const handle = stopHandles.get(runId)
-  if (handle === undefined) {
-    if (isLive(runId)) {
-      return stopRefused(
-        `Run "${runId}" is running in the foreground of its session (blocking contract) — abort that conversation's turn to stop it. workflow({ stop }) only controls detached runs.`,
-      )
-    }
-    return stopRefused(`Run "${runId}" is not live in this opencode process — nothing to stop.`)
-  }
-  // Snapshot BEFORE tripping the signal: the unwind forgets the sessions, and the cancelled
-  // manifest should name what was alive at stop time.
-  const sessions = registry.sessionsOf(runId)
-  handle.abort(STOP_ABORT_REASON)
-  const settled = await (options.markCancelledFn ?? markCancelled)(manifest, sessions)
-  if (settled?.status !== "cancelled") {
-    return stopRefused(
-      `Run "${runId}" settled with status "${settled?.status ?? "unknown"}" while the stop was being applied — nothing was stopped. Its outcome notification will arrive on its own.`,
-    )
-  }
-  await notifyStopped({ client, sessionID: manifest.sessionID, runId, name: detached.get(runId)?.name })
-  return [
-    `<workflow-stopped run="${runId}"${nameAttribute(detached.get(runId)?.name)}>`,
-    "Stopped by request: the run's subagents are being aborted and the run is recorded as cancelled. No completion notification will arrive.",
-    `Completed agents remain on disk for a later resume — run dir: ${runDir(runId)}`,
-    "</workflow-stopped>",
-  ].join("\n")
-}
-
-/** Renders the stop refusal the way the launch and resume refusals do. */
-function stopRefused(reason: string): string {
-  return ["<workflow-refused>", reason, "</workflow-refused>"].join("\n")
-}
-
-/** The ` workflow="..."` attribute for a stop tag, empty when the name is unknown. */
-function nameAttribute(name: string | undefined): string {
-  return name === undefined || name === "" ? "" : ` workflow="${name}"`
-}
-
-/**
- * The stop confirmation, hydrated into the run's parent session.
- *
- * The tool result already told the CALLING session; this delivers the same
- * fact to the run's own conversation — which is the same session in the
- * common case, but not always. A direct promptAsync WITHOUT the idle-nudge
- * registration: a stop confirmation is informational, and the persisted
- * message carries it to the next turn even if the current one already ended.
- */
-export async function notifyStopped(options: {
-  client: OpencodeClient
-  sessionID: string
-  runId: string
-  name?: string | undefined
-}): Promise<void> {
-  const { client, sessionID, runId } = options
-  try {
-    const row = await client.session.get({ path: { id: sessionID } }).catch(() => undefined),
-      agent = row?.data?.agent,
-      text =
-        `<workflow-stopped run="${runId}"${nameAttribute(options.name)}>` +
-        "Stopped by request: this run's subagents were aborted and the run is recorded as cancelled. " +
-        "No completion notification will arrive." +
-        `</workflow-stopped>`
-    await client.session.promptAsync({
-      path: { id: sessionID },
-      body: { parts: [{ type: "text", synthetic: true, text }], ...(agent === undefined ? {} : { agent }) },
-    })
-  } catch {
-    // Fire-and-forget by contract, like every hydration: a rejected stop
-    // confirmation must not make the tool result lie about what it did.
-  }
-}
-
-/**
- * Every live entry for the session, oldest start first.
- *
- * Returned entries are copies: registry state is not mutable through them.
- */
-export function liveRunsForSession(sessionID: string): DetachedRun[] {
-  const live: DetachedRun[] = []
-  for (const entry of detached.values()) {
-    if (entry.sessionID === sessionID) {live.push({ ...entry })}
-  }
-  // Stable sort: entries stamped in the same millisecond keep Map insertion
-  // order — the stamp and the insertion happen in the same synchronous step,
-  // so insertion order is start order.
-  return live.toSorted((a, b) => a.startedAt - b.startedAt)
-}
-
-/**
- * The session's live entries except the named run — everything left is that
- * run's sibling, oldest start first.
- */
-export function siblingRunsForSession(sessionID: string, excludeRunId: string): DetachedRun[] {
-  return liveRunsForSession(sessionID).filter((entry) => entry.runId !== excludeRunId)
-}
-
-/** True while the run is registered as pending or running, in THIS process. */
-export function isLive(runId: string): boolean {
-  const entry = detached.get(runId)
-  return entry !== undefined && (entry.status === "pending" || entry.status === "running")
-}
-
-/**
- * True when the manifest names an owner that is still running, in any process.
- *
- * `isLive` only sees this process; a run launched by another boot (a second
- * server, an earlier session) must also be refused a resume while its pid is
- * alive, or two Run instances would write one run directory.
- */
-export function isLiveAnywhere(manifest: Manifest, observerBootId: string): boolean {
-  if (manifest.status !== "running") {return false}
-  if (manifest.bootId === observerBootId) {return isLive(manifest.runId)}
-  return isProcessAlive(manifest.pid)
-}
-
-export async function runDetached(options: {
-  runId: string
-  manifest: Manifest | undefined
-  task: () => Promise<void>
-  /**
-   * A settle the CALLER owns — it can join the flush chain, which this module
-   * cannot see. The degraded outcome is recorded even though the escaping
-   * rejection means the caller's own failure path broke. Optional: the module
-   * itself already persists the degraded record.
-   */
-  onEscapedRejection?: ((error: unknown) => Promise<void>) | undefined
-  /** Renders the error for failure.txt when the caller's settle cannot. */
-  renderFailure: (error: unknown, source?: string, runId?: string) => string
-}): Promise<void> {
-  promote(options.runId)
-  const promise = (async () => {
-    try {
-      await options.task()
-    } catch (error) {
-      // The task was contractually self-capturing; an escaping rejection means
-      // its own failure path broke. Persist the degraded record HERE (this
-      // module cannot settle the flush chain), and let the caller's callback
-      // add whatever more it can.
-      await writeFailure(options.runId, options.renderFailure(error)).catch(() => undefined)
-      await endRun(options.manifest, { status: "failed", entries: [], value: null, childSessionIDs: [] })
-      await options.onEscapedRejection?.(error)
-    } finally {
-      detached.delete(options.runId)
-      settling.delete(options.runId)
-      dropStopHandle(options.runId)
-      registry.forgetRun(options.runId)
-    }
-  })()
-  settling.set(options.runId, promise)
-  await promise
-}
-
-/** Injectable for tests; a live pid makes `isLiveAnywhere` trust the manifest. */
-export function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch {
-    return false
-  }
-}
-
-/**
- * Hydration: how a settled detached run's outcome reaches the conversation.
- *
- * The detached contract returns a launch handle, so the result must be DELIVERED. opencode's own
- * background task tool shows the way (`packages/opencode/src/tool/task.ts`, v1.18.31):
- * `injectBackgroundResult` prompts the PARENT session with a `synthetic: true` text part, which
- * the session loop picks up — the prompt service persists the user message before entering the
- * loop, and the loop re-reads messages each step, so a notification landing mid-turn is picked up
- * by the in-flight turn and one landing on an idle session starts a new turn. That injection drops
- * on the busy race (a notification arriving exactly as the turn ends is never read); the idle
- * nudge below covers it.
- *
- * The first `promptAsync` fires unconditionally at settle time — idle vs mid-turn is a server-side
- * distinction the loop resolves either way. The nudge exists ONLY for the turn-end race.
- */
-
-/**
- * The hydration notification's size cap, in characters.
- *
- * The decision is `capped-run-dir` (ticket #7, 2026-09-12): the synthetic message has NO
- * truncation layer — opencode's spill-to-file only wraps plugin TOOL output — so the render is
- * capped here and the full value stays on disk, one pointer line away.
- */
+/** The hydration notification's size cap, in characters. */
 export const HYDRATION_CAP = 4096
 
-/**
- * Cuts text to the cap at a line boundary — never splitting a line, so never splitting a tag.
- *
- * Returns the input unchanged when it already fits. When cutting, whole lines are kept while they
- * fit, and at least one line is always kept (a single over-cap line survives whole rather than
- * degrading to an empty notification). The caller appends the pointer line after the cap.
- */
+/** Cuts text to the cap at a line boundary, never splitting a line (so never splitting a tag). */
 export function capAtLineBoundary(text: string, cap: number = HYDRATION_CAP): string {
   if (text.length <= cap) {return text}
   const lines = text.split("\n")
   let kept = ""
   for (const line of lines) {
     const candidate = kept === "" ? line : `${kept}\n${line}`
-    // A single line longer than the cap is still kept: an empty body is worse than an over-cap one.
     if (candidate.length > cap && kept !== "") {break}
     kept = candidate
   }
   return kept
 }
 
-/**
- * The marker every hydration notification opens with, and its recogniser.
- *
- * The idle nudge matches this against the session's last user message, so the wrapper is
- * contract: change it and the nudge goes blind. Tolerant of leading whitespace — transcript
- * round-trips have been known to re-indent.
- */
-export const HYDRATION_NOTIFICATION_RE = /^\s*<workflow-(?:completed|failed) run="(?<runId>wf_[a-z0-9]{6,})"/u
-
 export interface HydrationOutcome {
   status: "completed" | "failed"
-  name: string
+  workflow: string
   runId: string
-  /**
-   * The launch's `title` metadata (#142), shown in the subject line beside the workflow name.
-   * Absent on untitled runs, whose subject line is byte-identical to the pre-#142 shape.
-   */
-  title?: string
+  /** The launch's title metadata (#142), shown beside the workflow name. */
+  title?: string | undefined
   /** The rendered result (completed) or failure text (failed) to wrap and cap. */
   body: string
 }
@@ -442,196 +79,415 @@ export interface HydrationOutcome {
 /**
  * Renders the synthetic notification for one settled run.
  *
- * The body is capped (see {@link HYDRATION_CAP}) and the full artifact is named on the pointer
- * line — `result.json` for a completion, `failure.txt` for a failure. The pointer is appended
- * AFTER the cap on purpose: `renderFailure` trails its run-dir line at the end of its text, so a
- * tail-cut failure would otherwise lose the very path the model needs to recover.
+ * The body is capped and the full artifact is named on the pointer line — `result.json` for a
+ * completion, `failure.txt` for a failure. The pointer is appended AFTER the cap so a failure's
+ * own trailing run-dir line survives the cut.
  */
 export function renderNotification(outcome: HydrationOutcome): string {
   const tag = outcome.status === "completed" ? "workflow-completed" : "workflow-failed",
-    // The title rides the subject line beside the workflow name (#142), escaped for the
-    // attribute; absent on untitled runs and on a hand-edited non-string value.
-    titleAttribute = titleAttributeOf(outcome.title),
-    { resultPath, failurePath } = artifactPaths(outcome.runId),
-    full = outcome.status === "completed" ? `full result: ${resultPath}` : `full failure: ${failurePath}`
+   titleAttribute = titleAttributeOf(outcome.title),
+   { resultPath, failurePath } = artifactPaths(outcome.runId),
+   full = outcome.status === "completed" ? `full result: ${resultPath}` : `full failure: ${failurePath}`
   return [
-    `<${tag} run="${outcome.runId}" workflow="${outcome.name}"${titleAttribute}>`,
+    `<${tag} run="${outcome.runId}" workflow="${outcome.workflow}"${titleAttribute}>`,
     capAtLineBoundary(outcome.body),
     `</${tag}>`,
     full,
   ].join("\n")
 }
 
+/** The deterministic admission outcome, including the cancellation gate's own result. */
+export type DeliveryResult = "admitted" | "session-missing" | "conflict" | "error" | "cancelled"
+
+const OUTCOME_PREFIX = "msg_ultraopen_outcome_"
+const STOP_PREFIX = "msg_ultraopen_stop_"
+
+const outboxOf = (sessionID: string, outcome: HydrationOutcome): PendingNotification => ({
+  id: `${OUTCOME_PREFIX}${outcome.runId}`,
+  sessionID,
+  runId: outcome.runId,
+  workflow: outcome.workflow,
+  status: outcome.status,
+  text: renderNotification(outcome),
+  description: `Workflow ${outcome.workflow} ${outcome.status}`,
+})
+
 /**
- * One pending hydration notification: a run whose notification may still be unanswered.
+ * Admits the outcome message into the parent session.
  *
- * Tracked so the idle nudge reads messages only for sessions this process actually hydrated —
- * the user's own sessions never pay a listing call on their idle events.
+ * V2's compound `session.synthetic` double handles inbox/transcript delivery directly and
+ * idempotently on the deterministic `msg_` id, so V1's idle nudge is gone. Never throws: the
+ * settle protocol already closed the manifest, and a failed hydration must not reverse that.
  */
-const pending = new Map<string, Map<string, string>>()
-
-/** Run ids this process has already nudged; a session is nudged once per run, ever. */
-const nudged = new Set<string>()
-
-/** Delivers the settlement notification to the run's parent session. Never throws. */
-export async function hydrateParent(options: {
-  client: OpencodeClient
-  sessionID: string
-  outcome: HydrationOutcome
-}): Promise<void> {
-  const { client, sessionID, outcome } = options
+export async function hydrateParent(host: HostPort, sessionID: string, outcome: HydrationOutcome): Promise<DeliveryResult> {
   try {
-    // The session's stored agent rides along: an omitted `agent` would resolve the prompt to the
-    // DEFAULT agent (prompt.ts:629-631), not the session's own. Absent or unreadable → omit and
-    // accept the default; a hydration under the default agent still beats no hydration.
-    const row = await client.session.get({ path: { id: sessionID } }).catch(() => undefined),
-      agent = row?.data?.agent,
-      text = renderNotification(outcome)
-    await client.session.promptAsync({
-      path: { id: sessionID },
-      body: { parts: [{ type: "text", synthetic: true, text }], ...(agent === undefined ? {} : { agent }) },
+    return await host.admitSynthetic({
+      sessionID,
+      id: `${OUTCOME_PREFIX}${outcome.runId}`,
+      text: renderNotification(outcome),
+      description: `Workflow ${outcome.workflow} ${outcome.status}`,
+      metadata: {
+        ultraopen: { kind: "outcome", runId: outcome.runId, workflow: outcome.workflow, status: outcome.status },
+      },
+      delivery: "steer",
+      resume: true,
     })
-    // The notification MAY now be unanswered (the turn-end race). Arm the nudge for this session.
-    const runs = pending.get(sessionID) ?? new Map<string, string>()
-    runs.set(outcome.runId, outcome.name)
-    pending.set(sessionID, runs)
   } catch {
-    // Fire-and-forget by contract: a rejected hydration must not break the settle protocol that
-    // already closed the manifest. The run's outcome is still on disk for workflow_status.
+    return "error"
   }
 }
 
-/**
- * Delivers one settled run's outcome to its parent session.
- *
- * The index.ts settle paths call this — wiring only. The completion body is the shared
- * `renderResult` render (sibling advisory included, this run excluded); a failure delivers the
- * failure text as rendered for failure.txt. Both are capped and pointed at the full artifact by
- * {@link renderNotification}. An optional `prefix` is prepended INSIDE the wrapper tag — the
- * auto-resume sweep uses it to explain that this result came from a resumed interrupted run.
- */
-export function deliverOutcome(options: {
-  client: OpencodeClient
+interface OutcomeDeliveryOptions {
+  host: HostPort
+  coordinator: RuntimeCoordinator
   sessionID: string
   runId: string
   workflow: string
-  /** The launch's `title` metadata (#142), shown in the subject line; absent when untitled. */
   title?: string | undefined
-  /** The completed run's result; its presence picks the completed shape. */
   result?: WorkflowResult
   resume?: { resumed: number; argsChanged: boolean }
-  /** The rendered failure text for a failed run. */
   failureText?: string
-  /** Prepended to the notification body, before the result render. */
   prefix?: string
-}): Promise<void> {
+  env?: NodeJS.ProcessEnv | undefined
+  /** Test seam: the two manifest reads around the outbox write. */
+  readManifestFn?: typeof readManifest | undefined
+}
+
+const outcomeOf = (options: OutcomeDeliveryOptions): HydrationOutcome => {
   const prefixLine = options.prefix === undefined ? "" : `${options.prefix}\n`,
-    title = options.title === undefined ? {} : { title: options.title }
+   title = options.title === undefined ? {} : { title: options.title }
   if (options.result !== undefined) {
-    return hydrateParent({
-      client: options.client,
-      sessionID: options.sessionID,
-      outcome: {
-        status: "completed",
-        name: options.workflow,
-        runId: options.runId,
-        ...title,
-        body: `${prefixLine}${renderResult(options.result, options.resume, siblingRunsForSession(options.sessionID, options.runId))}`,
-      },
-    })
+    return {
+      status: "completed",
+      workflow: options.workflow,
+      runId: options.runId,
+      ...title,
+      body: `${prefixLine}${renderResult(
+        options.result,
+        options.resume,
+        siblingRunsForSession(options.coordinator, options.sessionID, options.runId),
+      )}`,
+    }
   }
-  return hydrateParent({
-    client: options.client,
-    sessionID: options.sessionID,
-    outcome: { status: "failed", name: options.workflow, runId: options.runId, ...title, body: `${prefixLine}${options.failureText ?? ""}` },
-  })
+  return {
+    status: "failed",
+    workflow: options.workflow,
+    runId: options.runId,
+    ...title,
+    body: `${prefixLine}${options.failureText ?? ""}`,
+  }
 }
 
 /**
- * Delivers one settled run's outcome to its parent session, UNLESS a stop won the manifest.
+ * Delivers a settled run's outcome unless a stop won the manifest, through the durable outbox.
  *
- * The stop path hydrates its own confirmation, and a settlement notification (completed or
- * failed) landing after it would contradict the cancelled record — a run the model stopped
- * must never appear to have finished on its own. The manifest read is the arbiter: the
- * unwind may settle before, during, or after the stop, and whatever stands on disk decides.
+ * The outbox write sits between two manifest reads: a cancel that lands after the first read but
+ * before admission deletes the file and suppresses the message, so a run the user stopped never
+ * appears to have finished on its own. A host `error` keeps the file for the next boot's replay;
+ * `admitted` and `session-missing` both mean the message can never be owed again.
  */
-export async function deliverOutcomeUnlessStopped(options: {
-  client: OpencodeClient
-  sessionID: string
-  runId: string
-  workflow: string
-  /** The launch's `title` metadata (#142), shown in the subject line; absent when untitled. */
-  title?: string | undefined
-  result?: WorkflowResult
-  resume?: { resumed: number; argsChanged: boolean }
-  failureText?: string
-  /** Prepended to the notification body, before the result render. */
-  prefix?: string
-}): Promise<void> {
-  const settled = await readManifest(options.runId)
-  if (settled?.status === "cancelled") {return}
-  await deliverOutcome(options)
-}
-
-/**
- * The idle nudge: re-fire `promptAsync` once when a notification landed unanswered.
- *
- * Called from the plugin `event` hook on `session.idle` (captured at v1.18.31:
- * `packages/schema/src/session-status-event.ts` — `{ type: "session.idle", properties:
- * { sessionID } }`, deprecated upstream but still published from `session/status.ts:43`; the hook
- * itself is `(input: { event: Event }) => Promise<void>`, `packages/plugin/src/index.ts:224`).
- * Race the ticket fixes: the notification persists exactly as the loop finishes its final step,
- * so it is never read — the session idles with our notification as its last word.
- *
- * Once, ever, per run: the re-fire itself is a new user message, so a second idle would find the
- * notification no longer last and re-nudging would only stack duplicates.
- */
-export async function onSessionIdle(client: OpencodeClient, sessionID: string): Promise<void> {
-  const runs = pending.get(sessionID)
-  if (!runs || runs.size === 0) {return}
+export async function deliverOutcomeUnlessStopped(options: OutcomeDeliveryOptions): Promise<DeliveryResult> {
+  const read = options.readManifestFn ?? readManifest,
+   outcome = outcomeOf(options),
+   beforeWrite = await read(options.runId, options.env)
+  if (beforeWrite?.status === "cancelled") {return "cancelled"}
   try {
-    const messages = await client.session.messages({ path: { id: sessionID } })
-    const last = messages.data?.at(-1)
-    if (!last || last.info.role !== "user") {
-      // Answered (an assistant message follows) or the conversation moved on: the race is over.
-      pending.delete(sessionID)
-      return
-    }
-    const text = last.parts.map((part) => ("text" in part ? part.text : "")).join("\n"),
-      runId = HYDRATION_NOTIFICATION_RE.exec(text)?.groups?.["runId"],
-      name = runId === undefined ? undefined : runs.get(runId)
-    if (runId === undefined || name === undefined) {
-      pending.delete(sessionID)
-      return
-    }
-    if (nudged.has(runId)) {
-      pending.delete(sessionID)
-      return
-    }
-    nudged.add(runId)
-    await client.session.promptAsync({
-      path: { id: sessionID },
-      body: {
-        parts: [{
-          type: "text",
-          synthetic: true,
-          text: `<workflow-nudge run="${runId}" workflow="${name}">The completion notification above is still unanswered — ` +
-            `the turn ended as it landed. Read it and act on its result now.</workflow-nudge>`,
-        }],
-      },
-    })
-    pending.delete(sessionID)
+    await writePendingNotification(outboxOf(options.sessionID, outcome), options.env)
   } catch {
-    // A failed listing or re-fire is retried on the NEXT idle for this session: the pending entry
-    // is kept. Never throws — the event hook cannot afford a rejection.
+    // Losing crash durability must not lose the live delivery; the manifest is already closed.
+  }
+  const afterWrite = await read(options.runId, options.env)
+  if (afterWrite?.status === "cancelled") {
+    await deletePendingNotification(options.runId, options.env)
+    return "cancelled"
+  }
+  const result = await hydrateParent(options.host, options.sessionID, outcome)
+  if (result === "admitted" || result === "session-missing") {
+    await deletePendingNotification(options.runId, options.env)
+  }
+  return result
+}
+
+/**
+ * The stop confirmation, admitted into the run's own parent session.
+ *
+ * Informational only: `resume` defaults to false, so a stop never wakes an idle conversation just
+ * to say it stopped. The deterministic id makes a retry idempotent.
+ */
+export async function notifyStopped(host: HostPort, sessionID: string, runId: string, workflow: string | undefined, options: { resume?: boolean | undefined } = {}): Promise<DeliveryResult> {
+  try {
+    return await host.admitSynthetic({
+      sessionID,
+      id: `${STOP_PREFIX}${runId}`,
+      text: [
+        `<workflow-stopped run="${runId}"${nameAttribute(workflow)}>`,
+        "Stopped by request: this run's subagents were aborted and the run is recorded as cancelled. " +
+          "No completion notification will arrive.",
+        "</workflow-stopped>",
+      ].join("\n"),
+      description: `Workflow ${workflow ?? "run"} stopped`,
+      metadata: { ultraopen: { kind: "stopped", runId, ...(workflow === undefined ? {} : { workflow }) } },
+      delivery: "steer",
+      resume: options.resume ?? false,
+    })
+  } catch {
+    return "error"
   }
 }
 
-/** Test-only: restore clean module state. */
-export function resetForTests(): void {
-  detached.clear()
-  settling.clear()
-  pending.clear()
-  nudged.clear()
-  stopHandles.clear()
+const nameAttribute = (workflow: string | undefined): string =>
+  workflow === undefined || workflow === "" ? "" : ` workflow="${workflow}"`
+
+/** The launch-gating record's creation fields, resolved by the launch path. */
+export interface PendingRunInput {
+  runId: string
+  sessionID: string
+  projectKey: string
+  locationDir: string
+  name?: string | undefined
+  title?: string | undefined
+}
+
+/** Registers a launch synchronously, so the check-then-act launch gate has one writer. */
+export function registerPending(
+  coordinator: RuntimeCoordinator,
+  input: PendingRunInput,
+  startedAt: number = Date.now(),
+): LiveRunRecord {
+  const record: LiveRunRecord = {
+    runId: input.runId,
+    sessionID: input.sessionID,
+    projectKey: input.projectKey,
+    locationDir: input.locationDir,
+    status: "pending",
+    startedAt,
+    ...(input.name === undefined ? {} : { name: input.name }),
+    ...(input.title === undefined ? {} : { title: input.title }),
+  }
+  coordinator.runs.set(input.runId, record)
+  return record
+}
+
+export function promote(coordinator: RuntimeCoordinator, runId: string): void {
+  const run = coordinator.runs.get(runId)
+  if (run?.status === "pending") {run.status = "running"}
+}
+
+/** Records a launch's workflow name and title once the script has parsed (#142). */
+export function nameRun(coordinator: RuntimeCoordinator, runId: string, name: string, title?: string | undefined): void {
+  const run = coordinator.runs.get(runId)
+  if (run === undefined) {return}
+  run.name = name
+  const present = manifestTitleOf(title)
+  if (present !== undefined) {run.title = present}
+}
+
+/** Drops a pending entry — the launch failed before the run went live. */
+export function dropPending(coordinator: RuntimeCoordinator, runId: string): void {
+  if (coordinator.runs.get(runId)?.status === "pending") {coordinator.runs.delete(runId)}
+}
+
+/** Drops a settled run's entry, whatever status it holds. */
+export function dropSettled(coordinator: RuntimeCoordinator, runId: string): void {
+  coordinator.runs.delete(runId)
+}
+
+/** The session's live entries, oldest start first. */
+export function liveRunsForSession(coordinator: RuntimeCoordinator, sessionID: string): LiveRunRecord[] {
+  return [...coordinator.runs.values()]
+    .filter((run) => run.sessionID === sessionID)
+    .toSorted((left, right) => left.startedAt - right.startedAt)
+}
+
+/** The session's live entries except the named run. */
+export function siblingRunsForSession(coordinator: RuntimeCoordinator, sessionID: string, excludeRunId: string): LiveRunRecord[] {
+  return liveRunsForSession(coordinator, sessionID).filter((run) => run.runId !== excludeRunId)
+}
+
+/** True while the run is registered under this process's coordinator. */
+export function isLive(coordinator: RuntimeCoordinator, runId: string): boolean {
+  return coordinator.runs.has(runId)
+}
+
+/** True when the manifest names an owner still running, in this process or another live pid. */
+export function isLiveAnywhere(manifest: Manifest, coordinator: RuntimeCoordinator): boolean {
+  if (manifest.status !== "running") {return false}
+  return manifest.bootId === coordinator.processBootId ? isLive(coordinator, manifest.runId) : isProcessAlive(manifest.pid)
+}
+
+/** Resolves when the named detached run has fully settled (or is unknown). */
+export function settlePromiseOf(coordinator: RuntimeCoordinator, runId: string): Promise<void> {
+  return coordinator.settlingOf(runId)
+}
+
+/**
+ * Runs one detached task, with the degraded settle for an escaping rejection.
+ *
+ * The final cleanup drops the run and its child lineage from the coordinator, so a settled run
+ * leaves no live residue and no stale activity record.
+ */
+export function runDetached(
+  coordinator: RuntimeCoordinator,
+  options: {
+    runId: string
+    manifest: Manifest | undefined
+    task: () => Promise<void>
+    onEscapedRejection?: ((error: unknown) => Promise<void>) | undefined
+    renderFailure: (error: unknown, source?: string, runId?: string) => string
+    env?: NodeJS.ProcessEnv | undefined
+  },
+): Promise<void> {
+  promote(coordinator, options.runId)
+  const promise = (async (): Promise<void> => {
+    try {
+      await options.task()
+    } catch (error) {
+      await writeFailure(options.runId, options.renderFailure(error), options.env).catch((): undefined => undefined)
+      await endRun(options.manifest, { status: "failed", entries: [], value: null, childSessionIDs: [] }, options.env)
+      await options.onEscapedRejection?.(error)
+    } finally {
+      coordinator.runs.delete(options.runId)
+      coordinator.forgetRunChildren(options.runId)
+    }
+  })()
+  // The coordinator owns the settle promise: it outlives the live record deleted above, so the
+  // stop path and status callers can still join a run that finished between their reads.
+  coordinator.trackSettling(options.runId, promise)
+  return promise
+}
+
+/** The bounded wait the stop path gives a child interrupt or an engine unwind. */
+const DEFAULT_STOP_TIMEOUT_MS = 1000
+
+interface Bounded<T> {
+  readonly done: boolean
+  readonly value?: T
+}
+
+async function within<T>(promise: Promise<T>, ms: number): Promise<Bounded<T>> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<Bounded<T>>((resolve) => {
+    timer = setTimeout(() => {resolve({ done: false })}, ms)
+    timer.unref?.()
+  })
+  try {
+    return await Promise.race([
+      promise.then((value): Bounded<T> => ({ done: true, value })),
+      timeout,
+    ])
+  } finally {
+    if (timer !== undefined) {clearTimeout(timer)}
+  }
+}
+
+/**
+ * The stop marker for a run with NO wiring attached — a blocking launch whose settle has not
+ * started, or a record from a previous build. A missing progress file is a no-op.
+ */
+async function markProgressStoppingOnDisk(runId: string, env: NodeJS.ProcessEnv | undefined): Promise<void> {
+  try {
+    const snapshot = JSON.parse(await readFile(progressPath(runId, env), "utf8")) as ProgressSnapshot
+    snapshot.status = "stopping"
+    snapshot.updatedAt = Date.now()
+    await atomicWriteFile(progressPath(runId, env), JSON.stringify(snapshot))
+  } catch {
+    // A run without a progress file (a very early stop) has nothing to mark.
+  }
+}
+
+/** The stop path's result: the RPC layer maps these outcomes to its own typed errors. */
+export interface StopRunResult {
+  runId: string
+  outcome: "stopped" | "already_completed" | "already_stopped" | "not_found" | "stop_failed"
+  detail: string
+}
+
+export interface StopRunOptions {
+  env?: NodeJS.ProcessEnv | undefined
+  /** Bounded wait for each child interrupt and for the engine's own unwind. */
+  interruptTimeoutMs?: number | undefined
+  markCancelledFn?: typeof markCancelled | undefined
+}
+
+/**
+ * Stops one live run with confirmed settlement (#175).
+ *
+ * Ordering is the contract: the live record, progress file and RPC event all say `stopping`
+ * BEFORE any child is interrupted, so a poller never sees a half-stopped run. The cancel is
+ * committed last, after the interrupts and a bounded engine settle, and only then does the
+ * result claim `stopped`. A natural completion that wins the race reports `already_completed`;
+ * an interrupt the host cannot confirm reports `stop_failed` rather than a false success.
+ */
+export async function stopRun(
+  runId: string,
+  host: HostPort,
+  coordinator: RuntimeCoordinator,
+  options: StopRunOptions = {},
+): Promise<StopRunResult> {
+  const result = (outcome: StopRunResult["outcome"], detail: string): StopRunResult => ({ runId, outcome, detail })
+  if (!isSafeRunId(runId)) {
+    return result("not_found", `"${runId}" is not a valid run id — pass the id exactly as the launch result reported it.`)
+  }
+  const manifest = await readManifest(runId, options.env)
+  if (manifest === undefined) {
+    return result("not_found", `No workflow run with id "${runId}" exists.`)
+  }
+  if (manifest.status === "cancelled") {return result("already_stopped", `Run "${runId}" is already cancelled.`)}
+  if (manifest.status !== "running") {
+    return result("already_completed", `Run "${runId}" already finished with status "${manifest.status}".`)
+  }
+  const live = coordinator.runs.get(runId)
+  if (live === undefined) {
+    return result(
+      "not_found",
+      manifest.bootId !== coordinator.processBootId && isProcessAlive(manifest.pid)
+        ? `Run "${runId}" is executing in another opencode process (pid ${manifest.pid}) — stop it from that session instead.`
+        : `Run "${runId}" is not live in this opencode process — nothing to stop.`,
+    )
+  }
+
+  live.status = "stopping"
+  // The run's OWN writer first: `markStopping` sets the in-memory snapshot status synchronously
+  // before it awaits the flush, so a progress event interleaved with that flush already sees
+  // `stopping` and can never emit `running` over the stop. The disk fallback covers a record whose
+  // wiring has not assembled yet.
+  await (live.markStopping === undefined
+    ? markProgressStoppingOnDisk(runId, options.env)
+    : live.markStopping())
+  coordinator.emitRunUpdated(live.projectKey, rpcViewFromLive(live, "stopping"))
+  live.stopController?.abort(STOP_ABORT_REASON)
+
+  const sessions = coordinator.sessionsOf(runId),
+   timeoutMs = options.interruptTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS,
+   interrupts = await within(Promise.allSettled(sessions.map(async (id) => await host.interruptSession(id))), timeoutMs),
+   unconfirmed = interrupts.done !== true ||
+     interrupts.value?.some((entry) => entry.status === "rejected" || entry.value !== true) === true
+
+  if (live.settling !== undefined) {await within(live.settling, timeoutMs)}
+
+  const settled = await (options.markCancelledFn ?? markCancelled)(manifest, sessions, options.env)
+  // A natural completion that won the race still owes its settlement notification: deleting the
+  // outbox here would lose the crash-gap payload the boot sweep replays. Only a cancel owns the
+  // delete (a cancelled run must never be hydrated as finished).
+  if (settled?.status === "cancelled") {await deletePendingNotification(runId, options.env)}
+
+  if (settled?.status !== "cancelled") {
+    if (settled?.status === "completed") {return result("already_completed", `Run "${runId}" completed while the stop was being applied.`)}
+    return result(
+      "stop_failed",
+      `Run "${runId}" settled with status "${settled?.status ?? "unknown"}" while the stop was being applied — nothing was stopped.`,
+    )
+  }
+  if (unconfirmed) {
+    return result(
+      "stop_failed",
+      `Run "${runId}" was cancelled, but its child sessions could not be confirmed stopped within ${timeoutMs}ms.`,
+    )
+  }
+  // The durable half of the stop contract (T6b): the tool result tells the MODEL, and this
+  // synthetic tells the PARENT TRANSCRIPT what happened. `resume: false` is intentional — a
+  // stopped run must never wake an idle conversation just to announce that nothing is running.
+  await notifyStopped(host, live.sessionID, live.runId, live.name)
+  coordinator.emitRunUpdated(live.projectKey, rpcViewFromLive(live, "stopped"))
+  return result("stopped", `Run "${runId}" stopped. Completed agents remain on disk for a later resume — run dir: ${runDir(runId, options.env)}`)
 }

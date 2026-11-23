@@ -171,11 +171,8 @@ export function renderLaunch(
       `Poll workflow_status(runId: "${runId}", wait: 120) until the status is not "running" to get the final value or the failure. Before ending your turn, poll until the run settles.`,
     )
   } else {
-    const hold = siblings.length === 0
-      ? "Before ending your turn, poll until the run settles."
-      : "Before ending your turn, poll workflow_status for each live run id in this message until all runs settle."
     lines.push(
-      `Poll workflow_status(runId: "${runId}", wait: 120) until the status is not "running" to get the final value or the failure. ${hold}`,
+      `Poll workflow_status(runId: "${runId}", wait: 120) until the status is not "running" to get the final value or the failure. Before ending your turn, poll workflow_status for each live run id in this message until all runs settle.`,
     )
   }
   // The run just launched and is live, so the combined math counts it: siblings + this one.
@@ -194,14 +191,15 @@ export function renderLaunch(
  * The transcript hint: how a human opens an agent's child transcript (#150).
  *
  * One compact sentence pair reused by the launch result (and echoed by the TUI's agent rows,
- * which render the same affordances near the data). Two facts and no invention: children
- * appear in the picker under their titles, and the gesture keys are the upstream keybinds' —
- * leader+down to enter, bare right/left to cycle, bare up to return, all on the current
- * transcript line.
+ * which render the same affordances near the data). Two V2 paths and no invention: the
+ * `/sessions` picker files each child under its `ultraopen · <label>` title (children are
+ * created without `parentID`, so V2's own subagents picker does not list them), and the
+ * `/workflows` panel plus the status strip's clickable rows navigate straight to a child.
+ * V1's leader/arrow keymap is deliberately not named — those gestures no longer exist.
  */
 export function transcriptHint(): string {
   return "Agent transcripts: open `/sessions` and find each child under its `ultraopen · <label>` title; " +
-    "on a transcript line, leader+down enters the first child, bare right/left cycles children, bare up returns."
+    "the `/workflows` panel lists every child with one-step navigation, and clicking an agent in the live strip jumps straight to its transcript."
 }
 
 /** A run as the model-facing renders name it: its id and status. */
@@ -233,16 +231,22 @@ export function attributeValue(value: string): string {
  * The manifests are JSON files a human can edit, so a non-string value read off disk
  * degrades to untitled instead of throwing inside a render the settle protocol or the
  * status tool already committed to. Line breaks are flattened for display — the same
- * free-text shape rule the reminder's oneLine applies — so the tag stays one line; the
+ * free-text shape rule the live-run reminder applies — so the tag stays one line; the
  * manifest records the title verbatim.
  */
 export function titleAttributeOf(title: string | undefined): string {
-  return typeof title === "string" ? ` title="${attributeValue(oneLineTitle(title))}"` : ""
+  return typeof title === "string" ? ` title="${attributeValue(oneLineText(title))}"` : ""
 }
 
-/** Flattens a free-text title onto one line for a tag attribute (#142). */
-function oneLineTitle(title: string): string {
-  return title.replaceAll(/\s+/gu, " ").trim()
+/**
+ * Flattens free text onto one line (`#142`).
+ *
+ * The render tags and the live-run reminder share this rule: a newline inside a title
+ * would inject lines into a tag attribute or a `<system-reminder>` block, breaking the
+ * shape both surfaces keep stable.
+ */
+export function oneLineText(value: string): string {
+  return value.replaceAll(/\s+/gu, " ").trim()
 }
 
 /** The combined-spend math the sibling advisory appends when the per-run budget is set. */
@@ -477,11 +481,16 @@ export function renderStringifiedArgsRefusal(raw: string, reason: string): strin
 export function renderStatus(report: StatusReport): string {
   // The launch's title metadata (#142) rides the tag, appended after the existing
   // attributes so the untitled shape is byte-identical to the pre-#142 render.
-  const titleAttribute = titleAttributeOf(report.title)
+  const titleAttribute = titleAttributeOf(report.title),
+   // (#175) A stop in flight is still `running` at the manifest — the cancellation lands only
+   // after the children unwind — so the transitional state is an additive attribute plus a
+   // body line, never a change to the manifest-derived status.
+   stoppingAttribute = report.stopping ? ' stopping="true"' : ""
   const lines = [
-    `<workflow-status run="${report.runId}" status="${report.status}" dir="${report.dir}"${titleAttribute}>`,
+    `<workflow-status run="${report.runId}" status="${report.status}" dir="${report.dir}"${stoppingAttribute}${titleAttribute}>`,
     `agents total=${report.agents.total} running=${report.agents.running} done=${report.agents.done} failed=${report.agents.failed}`,
     `output_tokens=${report.outputTokens}`,
+    ...(report.stopping ? ["stopping: a stop was requested; the run is unwinding and will settle as cancelled unless completion won"] : []),
     // Capped runs surface the ceiling and the live spend against it; uncapped (total
     // null — unset, or a run whose snapshot never reached disk) stays silent.
     ...(report.budget.total === null ? [] : [`budget total=${report.budget.total} spent=${report.budget.spent}`]),
@@ -518,8 +527,8 @@ function agentRowTag(row: StatusAgentRow): string {
     ...(row.index === undefined ? [] : [`i="${row.index}"`]),
     `label="${attributeValue(row.label)}"`,
     `status="${row.status}"`,
-    ...(row.phase === undefined ? [] : [`phase="${attributeValue(oneLineTitle(row.phase))}"`]),
-    ...(row.reason === undefined ? [] : [`reason="${attributeValue(oneLineTitle(row.reason))}"`]),
+    ...(row.phase === undefined ? [] : [`phase="${attributeValue(oneLineText(row.phase))}"`]),
+    ...(row.reason === undefined ? [] : [`reason="${attributeValue(oneLineText(row.reason))}"`]),
     ...(row.outputTokens === undefined ? [] : [`tokens="${row.outputTokens}"`]),
     ...(row.sessionID === undefined ? [] : [`child="${attributeValue(row.sessionID)}"`]),
     ...(row.recordingPath === undefined ? [] : [`recording="${attributeValue(row.recordingPath)}"`]),
@@ -528,7 +537,13 @@ function agentRowTag(row: StatusAgentRow): string {
 }
 
 /**
- * The tools' argument schemas, as plain JSON-Schema-ish records.
+ * The tools' argument schemas: COMPLETE Draft 2020-12 JSON Schema objects.
+ *
+ * V2 hands `ToolInfo.input` to the provider verbatim, so a bare properties map is not a tool
+ * schema — the tool would not mount. Each schema therefore carries the object envelope:
+ * `type`, `properties`, `required` and `additionalProperties: false`. `workflow` has no
+ * required field because every argument is optional and its modes are selected by presence
+ * (script vs scriptPath, launch vs stop, and so on).
  *
  * `title` and `description` are honored as run metadata (#142) — a model trained on Claude Code
  * passes them on most launches (89% of the sampled corpus), and the fields are recorded and
@@ -536,6 +551,15 @@ function agentRowTag(row: StatusAgentRow): string {
  * as a schema validation error instead of the honored metadata.
  */
 export function workflowArgsSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: workflowProperties(),
+    required: [],
+    additionalProperties: false,
+  }
+}
+
+function workflowProperties(): Record<string, unknown> {
   return {
     script: { type: "string", description: "The workflow script. Must begin with `export const meta = {...}`." },
     scriptPath: {
@@ -574,8 +598,13 @@ export function workflowArgsSchema(): Record<string, unknown> {
 
 export function statusArgsSchema(): Record<string, unknown> {
   return {
-    runId: { type: "string", description: "The run id from the workflow launch result." },
-    wait: { type: "number", description: "Seconds to wait for the run to settle before returning (max 300). Prefer one long wait over many short polls." },
+    type: "object",
+    properties: {
+      runId: { type: "string", description: "The run id from the workflow launch result." },
+      wait: { type: "number", description: "Seconds to wait for the run to settle before returning (max 300). Prefer one long wait over many short polls." },
+    },
+    required: ["runId"],
+    additionalProperties: false,
   }
 }
 

@@ -64,6 +64,17 @@ describe("contract content", () => {
     expect(CONTRACTS.schema).toContain("Do the work FIRST")
   })
 
+  test("the schema contracts describe V2 capture: research with tools, then MUST call StructuredOutput", () => {
+    // V2 has no native structured output; the answer is captured from a tool call whose input
+    // schema the host rewrites per child. A contract that said "return the schema'd value"
+    // would leave the model with no tool to call.
+    for (const contract of [CONTRACTS.schema, CONTRACTS.agentTypeSchemaNote]) {
+      expect(contract).toContain("StructuredOutput")
+      expect(contract).toMatch(/MUST call StructuredOutput/u)
+      expect(contract).toContain("research")
+    }
+  })
+
   test("every contract discourages fabrication when blocked", () => {
     expect(CONTRACTS.returnValue).toContain("fabrication")
     expect(CONTRACTS.schema).toContain("rather than inventing")

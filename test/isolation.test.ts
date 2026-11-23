@@ -80,6 +80,44 @@ describe("createWorktree", () => {
   })
 })
 
+describe("per-project creation queues (V2 multi-project isolation)", () => {
+  test("independent queues do not block each other", async () => {
+    // Each project owns its queue: a held creation in one project must never stall a
+    // creation in another, or one busy repo serializes the whole machine.
+    let release: (() => void) | undefined
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    }),
+     queueA: { current: Promise<void> } = { current: held }
+    let slowDone = false
+    const slow = createWorktree({ worktreeRoot: repo, label: "slow", queue: queueA }).then((worktree) => {
+      slowDone = true
+      return worktree
+    })
+
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const timedOut = new Promise<undefined>((resolve) => {
+      timer = setTimeout(() => {
+        resolve(undefined)
+      }, 2000)
+    }),
+     fast = createWorktree({ worktreeRoot: repo, label: "fast", queue: { current: Promise.resolve() } })
+    try {
+      const started = await Promise.race([fast, timedOut])
+      // The free queue's creation lands while the held queue is still waiting.
+      expect(started).toBeDefined()
+      expect(slowDone).toBe(false)
+    } finally {
+      if (timer !== undefined) {clearTimeout(timer)}
+      release?.()
+      const slowWorktree = await slow,
+       fastWorktree = await fast
+      await fastWorktree?.release()
+      await slowWorktree?.release()
+    }
+  })
+})
+
 describe("release", () => {
   test("removes a clean worktree", async () => {
     const worktree = await createWorktree({ worktreeRoot: repo, label: "clean" })

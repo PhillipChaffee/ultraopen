@@ -1,9 +1,8 @@
-import { parseJournal } from "../resume/journal.js"
-import type { Manifest } from "../resume/journal.js"
-import { artifactPaths, isSafeRunId, recordingPath, runDir } from "../resume/store.js"
+import { latestFailureReasons, parseJournal } from "../resume/journal.js"
+import type { JournalEntry, Manifest } from "../resume/journal.js"
+import { artifactPaths, isProcessAlive, isSafeRunId, recordingPath, runDir } from "../resume/store.js"
 import type { ManifestRead } from "../resume/store.js"
 import type { ProgressSnapshot } from "../resume/progress.js"
-import { isProcessAlive } from "./background.js"
 import { manifestTitleOf } from "./args-transport.js"
 
 /**
@@ -77,6 +76,12 @@ export interface StatusReport {
    * state, never collapsed into "no run found". The journal may still be intact beside it.
    */
   status: "running" | "completed" | "failed" | "cancelled" | "orphaned" | "corrupt"
+  /**
+   * A stop request is in flight (#175): `progress.json` says `stopping` while the manifest is
+   * still `running`, because the cancellation lands only after the children unwind. The render
+   * surfaces this transitional state without changing the manifest-derived `status`.
+   */
+  stopping: boolean
   phase?: string | undefined
   phases: string[]
   /**
@@ -160,6 +165,7 @@ export async function executeStatus(args: StatusArgs, deps: StatusDeps = {}): Pr
         runId: args.runId,
         dir,
         status: "corrupt",
+        stopping: false,
         phases: [],
         agents: { total: 0, running: 0, done: 0, failed: 0 },
         agentRows: [],
@@ -208,9 +214,9 @@ export async function executeStatus(args: StatusArgs, deps: StatusDeps = {}): Pr
 interface JournalLine {
   key: string
   label: string
-  status?: string | undefined
+  status: JournalEntry["status"]
   phase?: string | undefined
-  reason?: string | undefined
+  reason?: JournalEntry["reason"]
   outputTokens?: number | undefined
   replayed?: boolean | undefined
 }
@@ -265,6 +271,9 @@ async function buildSnapshot(input: {
     runId: args.runId,
     dir,
     status,
+    // (#175) The snapshot is the only surface that knows about a stop before the manifest
+    // settles; a missing/torn snapshot or a pre-V2 one reads as not stopping.
+    stopping: progress?.status === "stopping",
     ...(launchTitle === undefined ? {} : { title: launchTitle }),
     phase: progress?.phase,
     phases,
@@ -391,16 +400,6 @@ function agentRowsOf(
       outputTokens: entry.outputTokens,
     }),
   )
-}
-
-/** Each failed label's latest journal-recorded reason — one sweep, no per-row re-read. */
-function latestFailureReasons(entries: JournalLine[]): Map<string, string> {
-  const reasons = new Map<string, string>()
-  for (const entry of entries) {
-    if (entry.status === "ok" || entry.reason === undefined) {continue}
-    reasons.set(entry.label, entry.reason)
-  }
-  return reasons
 }
 
 function unknownRunMessage(runId: string, env?: NodeJS.ProcessEnv): string {

@@ -1,4 +1,7 @@
 import { readFile } from "node:fs/promises"
+import type { HostPort } from "../host/port.js"
+import type { LiveRunRecord, ProjectRuntime, RuntimeCoordinator } from "../runtime/coordinator.js"
+import type { RpcRunStatus } from "../../rpc.js"
 import type { UltraopenOptions } from "../options.js"
 import { ProgressWriter } from "../resume/progress.js"
 import { endRun, markCancelled, writeTerminalManifest } from "../resume/persist.js"
@@ -7,9 +10,8 @@ import type { JournalEntry, Manifest } from "../resume/journal.js"
 import { flushJournalEntry, readManifest, runDir, writeFailure } from "../resume/store.js"
 import { watchControl } from "../runtime/control.js"
 import type { ControlCommand } from "../runtime/control.js"
-import { registry } from "../singleton.js"
-import type { OpencodeClient } from "../types.js"
-import { deliverOutcomeUnlessStopped, registerStopHandle, runDetached } from "./background.js"
+import { rpcViewFromProgress, terminalRpcStatus } from "../runtime/views.js"
+import { deliverOutcomeUnlessStopped, runDetached } from "./background.js"
 import { execute, renderFailure, WorkflowRunError } from "./workflow.js"
 import { manifestTitleOf } from "./args-transport.js"
 import { renderStopFailure, stopReasonOf } from "./render.js"
@@ -20,10 +22,9 @@ import type { PreparedWorkflow, WorkflowArgs } from "./workflow.js"
  *
  * Both detached contracts — the launch path's background branch and the boot-time auto-resume
  * sweep — need the identical machinery: the incremental journal flush chain, the progress writer
- * with crash-safe child persistence, the run-control channel, and the ONE settle protocol. It
- * lives here rather than in the two callers because the flush-join-before-endRun ordering is
- * crash safety, not style: two copies would drift, and a drift that lets a settled rewrite race a
- * floating append loses journal entries on the exact runs this exists to protect.
+ * with crash-safe child persistence, the run-control channel, the runUpdated emissions, and the
+ * ONE settle protocol. It lives here rather than in the two callers because the
+ * flush-join-before-endRun ordering is crash safety, not style.
  */
 
 /** The settle protocol's outcome shape, shared by every contract's settle path. */
@@ -37,7 +38,10 @@ export interface SettleOutcome {
 
 export interface SettlementSpec {
   runId: string
-  client: OpencodeClient
+  /** The run's host. Callers pass the coordinator's reloadable proxy, so it stays live. */
+  host: HostPort
+  project: ProjectRuntime
+  coordinator: RuntimeCoordinator
   sessionID: string
   /** The run's manifest, already on disk with status `running`. */
   manifest: Manifest
@@ -49,12 +53,7 @@ export interface SettlementSpec {
   options: UltraopenOptions
   /** The signal the run's engine obeys — the stop controller's for detached runs; the tool call's for blocking. */
   signal?: AbortSignal | undefined
-  /**
-   * The run-level cancelled gate for child-list rewrites: true once a stop is in
-   * flight, so a stop's manifest writes can never race a child-list rewrite.
-   * The detached contract gates on its stop controller; the blocking contract
-   * has no stop surface and never cancels.
-   */
+  /** The run-level cancelled gate for child-list rewrites. */
   cancelGate?: (() => boolean) | undefined
   named?: Record<string, string> | undefined
   /** The session's default model, for effort resolution. */
@@ -68,23 +67,14 @@ export interface SettlementSpec {
   executeFn?: typeof execute | undefined
   /** Reported on the hydration notification; the launch path carries the resume's own shape. */
   resume?: { resumed: number; argsChanged: boolean } | undefined
-  /**
-   * Injectable manifest read for tests: the child-list writer's cancel race (#156) needs
-   * the read gated mid-flight to drive the window deterministically. Defaults to the real
-   * read; scoped to writeChildren — the settle protocol's own reads stay on the real store.
-   */
+  /** Test seam: the child-list writer's manifest read. */
   readManifestFn?: typeof readManifest | undefined
-  /**
-   * Invoked for a control-channel stop-run command before it dispatches to the Run (#134).
-   *
-   * The detached contract supplies the hook: it owns the stop controller and the manifest,
-   * so it trips the engine signal with the control channel's own abort reason and records
-   * the manifest cancelled — exactly what `stopRun` does for the tool stop. The blocking
-   * contract omits the hook: its stop is aborting the conversation's turn (the tool stop
-   * refuses foreground runs), and tripping the tool call's own signal from a control
-   * command would fight the host.
-   */
+  /** The control-channel stop-run hook, owned by the detached contract. */
   onControlStopRun?: (() => void) | undefined
+  /** Sessions above the parent, nearest first, recorded on every child. */
+  ancestorSessionIDs?: readonly string[] | undefined
+  /** Repository root, enabling worktree isolation. */
+  worktreeRoot?: string | undefined
 }
 
 export interface RunWiring {
@@ -92,6 +82,13 @@ export interface RunWiring {
   flush: (entry: JournalEntry) => void
   /** The engine context: base context plus progress, journal, and control wiring. */
   executeContext: Parameters<typeof execute>[1]
+  /**
+   * Marks this run's own snapshot `stopping` (#175) and flushes it immediately.
+   *
+   * The stop path attaches this to the live record, so the flag lands on the in-memory snapshot
+   * the engine keeps folding events into — not just on the file the next event would overwrite.
+   */
+  markStopping: () => Promise<void>
   /** The ONE settle protocol: join the flush chain, close the manifest, persist failure text. */
   settle: (outcome: SettleOutcome) => Promise<void>
 }
@@ -99,55 +96,58 @@ export interface RunWiring {
 /**
  * Assembles the shared execution wiring for one run.
  *
- * Extracted from the launch path verbatim — the ordering inside `settle` (flushes settle BEFORE
- * the endRun rewrite, so the settled write can never race a floating append) is crash safety.
+ * Inside `settle` the flushes are joined BEFORE the endRun rewrite, so the settled write can never
+ * race a floating append. The terminal runUpdated is emitted after the manifest has closed, so a
+ * TUI reacting to it finds the disk already settled.
  */
 export function wireRun(spec: SettlementSpec): RunWiring {
-  const { runId, manifest } = spec,
-    // Flushes are CHAINED (appends stay in record order and never interleave) and joined before
-    // endRun, so the settled rewrite can never race a floating append. The store-level flush
-    // never rejects — a disk failure must not lose a live run.
-    flushChain = { current: Promise.resolve() },
-    flush = (entry: JournalEntry): void => {
-      flushChain.current = flushChain.current.then(() => flushJournalEntry(runId, entry, spec.env))
-    },
-    progress = new ProgressWriter({
-      runId,
-      workflow: spec.prepared.meta.name,
-      sessionID: spec.sessionID,
-      startedAt: Date.now(),
-      // Mirrors the run's ceiling in the snapshot so the sidebar can show spend against it.
-      // Null (uncapped) is passed through, not omitted, so the shape stays stable.
-      budgetTotal: spec.options.budgetTokens,
-      ...(spec.env === undefined ? {} : { env: spec.env }),
-    })
+  const { runId, manifest, coordinator, project } = spec,
+   flushChain = { current: Promise.resolve() },
+   flush = (entry: JournalEntry): void => {
+     flushChain.current = flushChain.current.then(() => flushJournalEntry(runId, entry, spec.env))
+   },
+   progress = new ProgressWriter({
+     runId,
+     workflow: spec.prepared.meta.name,
+     sessionID: spec.sessionID,
+     startedAt: Date.now(),
+     budgetTotal: spec.options.budgetTokens,
+     ...(spec.env === undefined ? {} : { env: spec.env }),
+   }),
+   emit = (status: RpcRunStatus): void => {
+     coordinator.emitRunUpdated(project.projectKey, rpcViewFromProgress(progress.snapshot, status))
+   },
+   /**
+    * The status a progress-driven emission must carry.
+    *
+    * Once the run is stopping — through this writer's own snapshot, the engine's cancel gate, or
+    * the live record the stop path flipped — an interleaved progress or note flush must never
+    * publish `running` over the stop. All three sources are checked because the ordering between
+    * them is a race, not a constant: the live record is set before `markStopping` flushes.
+    */
+   isStopping = (): boolean =>
+     progress.snapshot.status === "stopping" ||
+     spec.cancelGate?.() === true ||
+     coordinator.runs.get(runId)?.status === "stopping",
+   markStopping = async (): Promise<void> => await progress.markStopping(Date.now())
 
   // Crash safety: the manifest's child list is updated as sessions appear, so a server killed
-  // mid-run leaves the reaper a list of children to abort. The on-disk status guard keeps an
+  // mid-run leaves the reaper a list of children to interrupt. The on-disk status guard keeps an
   // unwind-time progress event from resurrecting a cancelled record.
   const readManifestOf = spec.readManifestFn ?? readManifest
   let persistedChildren = -1
   const writeChildren = async (): Promise<void> => {
-    // The cancelled gate is the run-level stop signal: once a stop is in flight, child-list
-    // rewrites are moot and must not race the cancel write.
     if (spec.cancelGate?.() === true) {return}
-    const sessions = registry.sessionsOf(runId)
+    const sessions = coordinator.sessionsOf(runId)
     if (sessions.length === persistedChildren) {return}
     persistedChildren = sessions.length
     try {
       const current = await readManifestOf(runId, spec.env)
-      // The gate re-check after the await (#156): a call that passed the gate check before
-      // its read resolved must not write when the cancel landed mid-read — the stale
-      // `running` read would clobber the just-landed cancelled record back to running and
-      // re-open the door for the unwind's endRun to write `failed` over it. Re-checking
-      // after the await collapses the window to the same shape writeTerminalManifest uses.
+      // The gate re-check after the await (#156): a call that passed before its read resolved must
+      // not write when the cancel landed mid-read.
       if (spec.cancelGate?.() === true) {return}
       if (current !== undefined && current.status === "running") {
-        // The child-list update carries the TERMINAL-WRITE discipline (#164): the stale
-        // running read can outlive a cancel that landed between the gate's re-check and
-        // this write, and a plain rewrite resurrects running over the cancelled record —
-        // which then legitimizes the unwind's later terminal rename. The rename's own
-        // re-check refuses any record that is no longer running.
+        // The child-list update carries the terminal-write discipline (#164).
         await writeTerminalManifest(runId, { ...current, childSessionIDs: sessions }, spec.env)
       }
     } catch {
@@ -155,33 +155,29 @@ export function wireRun(spec: SettlementSpec): RunWiring {
     }
   }
 
-  // The run-control channel: a per-run watcher reads the TUI's control file
-  // and dispatches to the Run; cleared when the run settles.
   let stopControl: (() => void) | undefined
 
   const executeContext: Parameters<typeof execute>[1] = {
-    client: spec.client,
+    host: spec.host,
+    project,
+    coordinator,
     sessionID: spec.sessionID,
     runId,
+    ancestorSessionIDs: spec.ancestorSessionIDs ?? [],
     deadlineMs: spec.options.agentDeadlineMs,
     idleMs: spec.options.agentIdleMs,
-    // Makes the schema-advertised `scriptPath` real: persisted scripts under the run
-    // directory can be re-run by path.
     readScript: (path: string) => readFile(path, "utf8"),
     ...(spec.defaultModel === undefined ? {} : { defaultModel: spec.defaultModel }),
     ...(spec.options.budgetTokens === null ? {} : { budgetTotal: spec.options.budgetTokens }),
-    signal: spec.signal,
+    ...(spec.signal === undefined ? {} : { signal: spec.signal }),
     ...(spec.named !== undefined && Object.keys(spec.named).length > 0 ? { named: spec.named } : {}),
+    ...(spec.worktreeRoot === undefined ? {} : { worktreeRoot: spec.worktreeRoot }),
     onProgress: (event: Parameters<ProgressWriter["apply"]>[0]) => {
       progress.apply(event, Date.now())
       void progress.flush()
-      // Persist on agent-start AND on log lines: a stall restart spawns a NEW child
-      // session without an agent-start, and a killed server must leave the reaper a
-      // list that includes it. writeChildren no-ops when the list is unchanged, so
-      // narration-heavy runs cost no extra writes. The child-created event (#150)
-      // deliberately does NOT trigger: the log the restart writes already carries the
-      // re survived child, and a checkpoint this close to the settle widens the
-      // #164 terminal-write window for no fresh information.
+      emit(isStopping() ? "stopping" : "running")
+      // Persist on agent-start AND on log lines: a stall restart spawns a NEW child session
+      // without an agent-start, and a killed server must leave the reaper a list that includes it.
       if (event.type === "agent-start" || event.type === "log") {void writeChildren()}
     },
     onJournal: flush,
@@ -189,10 +185,6 @@ export function wireRun(spec: SettlementSpec): RunWiring {
       stopControl = watchControl({
         runId,
         runDir: runDir(runId, spec.env),
-        // A stop-run command with a stop surface first fires the surface's hook — the
-        // trip is synchronous inside it, so the engine signal lands BEFORE the command
-        // dispatch aborts the children, and the in-flight agents journal the stop's
-        // own reason (#134). Without a surface the command dispatches unchanged.
         dispatch:
           spec.onControlStopRun === undefined
             ? dispatch
@@ -202,10 +194,8 @@ export function wireRun(spec: SettlementSpec): RunWiring {
               },
         onNote: (note) => {
           progress.apply({ type: "log", message: note }, Date.now())
-          // The control channel is the only writer that folds notes without an
-          // accompanying engine event, so it flushes its own log line — otherwise
-          // the note would sit in the snapshot until the next progress event.
           void progress.flush()
+          emit(isStopping() ? "stopping" : "running")
         },
       })
     },
@@ -216,22 +206,20 @@ export function wireRun(spec: SettlementSpec): RunWiring {
 
   const settle = async (outcome: SettleOutcome): Promise<void> => {
     stopControl?.()
-    // The chain variable is read live: appends queued before this await are
-    // included, however long the chain grew.
     await flushChain.current
     await endRun(manifest, outcome, spec.env)
     if (outcome.failureText !== undefined) {
-      // Best-effort like every persistence here: a failed write must not
-      // lose the settle itself.
       try {
         await writeFailure(runId, outcome.failureText, spec.env)
       } catch {
         // Nothing better is knowable on a failed write; the manifest still closed.
       }
     }
+    const standing = await readManifest(runId, spec.env)
+    emit(terminalRpcStatus(standing?.status, outcome.status))
   }
 
-  return { flush, executeContext, settle }
+  return { flush, executeContext, settle, markStopping }
 }
 
 /** The replayed-entry count of a (possibly partial) journal — the honest "replayed" number. */
@@ -240,29 +228,25 @@ function replayedCount(entries: readonly JournalEntry[] | undefined): number {
 }
 
 export interface DetachedRunSpec extends Omit<SettlementSpec, "signal" | "cancelGate"> {
-  /**
-   * Builds the line prepended to the hydration notification body, given how
-   * many agent calls the journal replayed. Omitted by the launch path, which
-   * hydrates with the plain result render.
-   */
+  /** Builds the line prepended to the hydration notification body, given the replay count. */
   explain?: ((replayed: number) => string) | undefined
 }
 
 /**
  * The control-channel stop for a detached run: the TUI-side mirror of `stopRun` (#134).
  *
- * Snapshots the run's live children BEFORE anything unwinds (the cancelled manifest names
- * what was alive at stop time, and the unwind forgets the sessions), trips the engine
- * signal with the control channel's own abort reason — the in-flight agents journal it,
- * which is what the cancel re-claim and the never-auto-resume sweep discriminate on —
- * and records the manifest cancelled first-terminal-write-wins. A settle that raced ahead
- * of the trip is re-claimed through the journal; one that settled genuinely keeps its
- * status. Fire-and-forget: the watcher's dispatch cannot await, and `markCancelled` never
- * rejects.
+ * Snapshots the run's live children BEFORE anything unwinds, trips the engine signal with the
+ * control channel's own abort reason, and records the manifest cancelled first-terminal-write-wins.
+ * Fire-and-forget: the watcher's dispatch cannot await, and `markCancelled` never rejects.
  */
-export function controlStopRun(manifest: Manifest, stopController: AbortController, env?: NodeJS.ProcessEnv): void {
+export function controlStopRun(
+  manifest: Manifest,
+  stopController: AbortController,
+  coordinator: RuntimeCoordinator,
+  env?: NodeJS.ProcessEnv,
+): void {
   void (async (): Promise<void> => {
-    const sessions = registry.sessionsOf(manifest.runId)
+    const sessions = coordinator.sessionsOf(manifest.runId)
     stopController.abort(CONTROL_STOP_ABORT_REASON)
     await markCancelled(manifest, sessions, env)
   })()
@@ -271,34 +255,45 @@ export function controlStopRun(manifest: Manifest, stopController: AbortControll
 /**
  * Starts a run under the detached contract and returns at once.
  *
- * The task fully captures its own outcome — flushes, manifest, failure text —
- * because nothing else is waiting on it anymore, and hydration fires AFTER the
- * settle protocol so a model reacting to the notification finds
- * workflow_status settled, not "running". The caller has already registered the
- * launch-gating entry (registerPending) and, where a stop surface exists, will
- * find its controller via registerStopHandle below.
+ * The live record is registered before the task starts, so the stop path can find the controller
+ * it must trip and the TUI can render the run. Hydration fires AFTER the settle protocol, through
+ * the durable outbox, so a model reacting to the notification finds workflow_status settled.
  */
 export function startDetachedRun(spec: DetachedRunSpec): void {
   const stopController = new AbortController(),
-    explain = spec.explain,
-    executeFn = spec.executeFn ?? execute,
-    wiring = wireRun({
-      ...spec,
-      signal: stopController.signal,
-      cancelGate: () => stopController.signal.aborted,
-      // The control-channel stop (a TUI-written stop-run command) mirrors the tool stop
-      // (#134) through controlStopRun above. The tool stop's confirmation hydration stays
-      // tool-path-only: the TUI's surfaces are the consumed-command note in the run log
-      // and the run's disappearance from the sidebar.
-      onControlStopRun: (): void => {controlStopRun(spec.manifest, stopController, spec.env)},
-    })
+   explain = spec.explain,
+   executeFn = spec.executeFn ?? execute,
+   wiring = wireRun({
+     ...spec,
+     signal: stopController.signal,
+     cancelGate: () => stopController.signal.aborted,
+     onControlStopRun: (): void => {controlStopRun(spec.manifest, stopController, spec.coordinator, spec.env)},
+   })
 
-  registerStopHandle(spec.runId, stopController)
-  void runDetached({
+  const title = manifestTitleOf(spec.manifest.title),
+   existing = spec.coordinator.runs.get(spec.runId),
+   live: LiveRunRecord = existing ?? {
+     runId: spec.runId,
+     sessionID: spec.sessionID,
+     projectKey: spec.project.projectKey,
+     locationDir: spec.host.location.directory,
+     status: "running",
+     startedAt: Date.now(),
+     name: spec.prepared.meta.name,
+   }
+  live.status = "running"
+  live.stopController = stopController
+  // The stop path marks the run through its OWN writer from here on, so a later progress event
+  // cannot rewrite `progress.json` back to running.
+  live.markStopping = wiring.markStopping
+  live.name = spec.prepared.meta.name
+  if (title !== undefined) {live.title = title}
+  spec.coordinator.runs.set(spec.runId, live)
+
+  void runDetached(spec.coordinator, {
     runId: spec.runId,
     manifest: spec.manifest,
     task: async (): Promise<void> => {
-      // The subject line's title (#142), under the presence rule every manifest reader applies.
       const launchTitle = manifestTitleOf(spec.manifest.title)
       try {
         const result = await executeFn(spec.args, wiring.executeContext)
@@ -306,15 +301,11 @@ export function startDetachedRun(spec: DetachedRunSpec): void {
           status: "completed",
           entries: result.journal,
           value: result.value,
-          // Captured inside the run before its cleanup forgot the sessions — reading the
-          // registry here would always yield [].
           childSessionIDs: result.childSessionIDs,
         })
-        // Hydration fires AFTER the settle protocol — the manifest is closed, so a model reacting
-        // to the notification finds workflow_status settled, not "running". The subject line
-        // carries the launch's title metadata (#142) off the manifest; absent when untitled.
         await deliverOutcomeUnlessStopped({
-          client: spec.client,
+          host: spec.host,
+          coordinator: spec.coordinator,
           sessionID: spec.manifest.sessionID,
           runId: spec.runId,
           workflow: spec.prepared.meta.name,
@@ -322,17 +313,14 @@ export function startDetachedRun(spec: DetachedRunSpec): void {
           result,
           ...(spec.resume === undefined ? {} : { resume: spec.resume }),
           ...(explain === undefined ? {} : { prefix: explain(replayedCount(result.journal)) }),
+          ...(spec.env === undefined ? {} : { env: spec.env }),
         })
       } catch (error) {
         const partial = error instanceof WorkflowRunError ? error.partial : undefined,
-          // A stopped run's failure surface names the stop (#135): the unwind's error is
-          // usually the script's own voice — the aborted agent's null interpolated into
-          // its template string — and that text points the debugging direction away from
-          // the stop. The signal's named reason is the honest arbiter of a stop.
-          stopReason = stopReasonOf(stopController.signal),
-          failureText = stopReason === undefined
-            ? renderFailure(error instanceof WorkflowRunError ? error.cause : error, spec.args.script, spec.runId)
-            : renderStopFailure(stopReason, spec.runId)
+         stopReason = stopReasonOf(stopController.signal),
+         failureText = stopReason === undefined
+           ? renderFailure(error instanceof WorkflowRunError ? error.cause : error, spec.args.script, spec.runId)
+           : renderStopFailure(stopReason, spec.runId)
         await wiring.settle({
           status: "failed",
           entries: partial?.journal ?? [],
@@ -341,21 +329,18 @@ export function startDetachedRun(spec: DetachedRunSpec): void {
           failureText,
         })
         await deliverOutcomeUnlessStopped({
-          client: spec.client,
+          host: spec.host,
+          coordinator: spec.coordinator,
           sessionID: spec.manifest.sessionID,
           runId: spec.runId,
           workflow: spec.prepared.meta.name,
           ...(launchTitle === undefined ? {} : { title: launchTitle }),
           failureText: explain === undefined ? failureText : `${explain(replayedCount(partial?.journal))}\n${failureText}`,
+          ...(spec.env === undefined ? {} : { env: spec.env }),
         })
       }
     },
-    // Last resort: the task above is contractually self-capturing, so an
-    // escaping rejection means its own failure path broke. Route through the
-    // same settle protocol — including the flush join — so the degraded
-    // record still follows the crash-safety ordering. The degraded record is
-    // disk-only (failure.txt + manifest); no hydration fires when even the
-    // failure path broke.
     renderFailure,
+    ...(spec.env === undefined ? {} : { env: spec.env }),
   })
 }

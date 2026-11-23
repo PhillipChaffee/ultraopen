@@ -37,6 +37,13 @@ export interface RunRecord {
   title?: string | undefined
   /** The launch's `description` argument (#142), absent when the launch passed none. */
   description?: string | undefined
+  /**
+   * The launching project's identity and directory (#175), stamped verbatim so auto-resume can
+   * scope recovery to its own project. Absent when the caller supplied neither, which keeps an
+   * unscoped manifest byte-identical to the pre-upgrade shape.
+   */
+  projectID?: string | undefined
+  directory?: string | undefined
 }
 
 /** Opens a run: creates its directory, persists the script, and marks it running. */
@@ -63,6 +70,10 @@ export async function beginRun(record: RunRecord, env?: NodeJS.ProcessEnv): Prom
       // absent field is omitted so untitled manifests stay byte-identical to the pre-#142 shape.
       ...(record.title === undefined ? {} : { title: record.title }),
       ...(record.description === undefined ? {} : { description: record.description }),
+      // V2 project scoping (#175): the same presence rule as the launch metadata, so an
+      // unscoped launch's manifest keeps the pre-upgrade byte shape.
+      ...(record.projectID === undefined ? {} : { projectID: record.projectID }),
+      ...(record.directory === undefined ? {} : { directory: record.directory }),
       status: "running",
       childSessionIDs: [],
       // Wall-clock, stamped by the host rather than the script — scripts cannot read the clock at
@@ -94,15 +105,16 @@ export async function beginRun(record: RunRecord, env?: NodeJS.ProcessEnv): Prom
 const forgetTemp = () => undefined
 
 /**
- * The terminal write WITH a last-instant re-check (#136).
+ * Withdraws a run's `result.json` (T6b).
  *
- * The atomic write widened the check-to-rename window (the temp write sits between the status
- * read and the rename), so a concurrent terminal write — a stop's `cancelled` landing while a
- * settle's `failed` was in flight — could land inside the gap and be clobbered by this rename,
- * breaking first-terminal-write-wins. The re-read immediately before the rename collapses the
- * window to two consecutive syscalls: if another terminal record landed since the caller's
- * check, this write abandons instead of overwriting it.
+ * A cancelled run owns no result: the artifact is only meaningful beside a completed record.
+ * Best-effort by construction — the manifest is the authority, and a missing file is the
+ * expected shape rather than an error.
  */
+async function forgetResult(runId: string, env?: NodeJS.ProcessEnv): Promise<void> {
+  await unlink(artifactPaths(runId, env).resultPath).catch(forgetTemp)
+}
+
 /**
  * The terminal write WITH a bounded IO retry (#163).
  *
@@ -177,6 +189,8 @@ export async function endRun(
   env?: NodeJS.ProcessEnv,
   /** Test-only seam (#164): swap the terminal write to stage a concurrent writer. */
   writeTerminalManifestFn: typeof writeTerminalManifest = writeTerminalManifest,
+  /** Test-only seam (T6b): swap the result publish to stage a cancel in the write→re-read gap. */
+  writeResultFn: typeof writeResult = writeResult,
 ): Promise<void> {
   if (!manifest) {return}
   try {
@@ -219,7 +233,15 @@ export async function endRun(
         continue
       }
       await appendJournal(manifest.runId, outcome.entries.map((entry) => JSON.stringify(entry)).join("\n"), env)
-      await writeResult(manifest.runId, outcome.value, env)
+      await writeResultFn(manifest.runId, outcome.value, env)
+      // The publish itself is not the end of the race: a stop's cancel can land between the
+      // result write and this read, leaving a cancelled record beside a result the settle just
+      // invented (caught live by the T6b stop assertion). The last-instant re-read withdraws
+      // it, so a manifest that no longer reads as this settle's outcome never keeps a result.
+      const published = await readManifest(manifest.runId, env)
+      if (published !== undefined && published.status !== outcome.status) {
+        await forgetResult(manifest.runId, env)
+      }
       return
     }
   } catch {
@@ -238,37 +260,22 @@ export async function endRun(
  * lands only over a still-`running` manifest, so a run that settled a moment
  * earlier keeps its own status and the stop reports the loss honestly.
  *
+ * The write retries a bounded number of times: a live run's own progress
+ * checkpoint can rewrite `running` in the instant between this read and this
+ * write (both are plain file writes), and a single clobber must not flip the
+ * run's settled status — the retry re-reads and re-claims until the cancelled
+ * record stands or another terminal status has already won.
+ *
+ * A cancelled write that WON can still be clobbered: the racing settle's
+ * rename passes its own still-`running` re-check before the cancel's rename
+ * and lands after it (check-then-rename is two syscalls, not one). The
+ * post-write read catches this, and the journal is the discriminator as
+ * everywhere: an abort's echo re-claims what the stop authored; a genuine
+ * settle keeps its status.
+ *
  * Returns whatever stands on disk after the attempt — `cancelled` when the
  * stop won, the earlier terminal status when it lost the race, `undefined`
  * when the disk could not be read at all.
- */
-/**
- * Marks a run `cancelled` — the stop path's terminal write.
- *
- * Deliberately NOT `endRun({ status: "cancelled" })`: `endRun` rewrites the
- * journal and result from the outcome it is handed, and the stop path has no
- * settlement of its own — its callers would pass empty entries, clobbering the
- * journal entries the run already flushed incrementally. The cancel write is
- * manifest-only, and it obeys the same first-terminal-write-wins rule: it
- * lands only over a still-`running` manifest, so a run that settled a moment
- * earlier keeps its own status and the stop reports the loss honestly.
- *
-* The write retries a bounded number of times: a live run's own progress
-  * checkpoint can rewrite `running` in the instant between this read and this
-  * write (both are plain file writes), and a single clobber must not flip the
-  * run's settled status — the retry re-reads and re-claims until the cancelled
-  * record stands or another terminal status has already won.
-  *
-  * A cancelled write that WON can still be clobbered: the racing settle's
-  * rename passes its own still-`running` re-check before the cancel's rename
-  * and lands after it (check-then-rename is two syscalls, not one). The
-  * post-write read catches this, and the journal is the discriminator as
-  * everywhere: an abort's echo re-claims what the stop authored; a genuine
-  * settle keeps its status.
-  *
-  * Returns whatever stands on disk after the attempt — `cancelled` when the
-  * stop won, the earlier terminal status when it lost the race, `undefined`
-  * when the disk could not be read at all.
  */
 /**
  * Whether a landed cancelled record still stands, polled over a bounded window (#164).
@@ -300,7 +307,11 @@ export async function markCancelled(
   try {
     const first = await readManifest(manifest.runId, env)
     if (first === undefined) {return first}
-    if (first.status === "cancelled") {return first}
+    if (first.status === "cancelled") {
+      // Idempotent cleanup for a cancel that raced an earlier settle's publish.
+      await forgetResult(manifest.runId, env)
+      return first
+    }
     // A terminal that already stands is the honest loss — UNLESS the run's journal records the
     // stop's own abort reason: then the terminal is the abort's echo (the settle racing the
     // stop that authored it, at CI speed the stop's abort precedes its manifest write), and
@@ -313,7 +324,10 @@ export async function markCancelled(
     for (let attempt = 0; attempt < 3; attempt++) {
       const current = await readManifest(manifest.runId, env)
       if (current === undefined) {return current}
-      if (current.status === "cancelled") {return current}
+      if (current.status === "cancelled") {
+        await forgetResult(manifest.runId, env)
+        return current
+      }
       if (current.status === "running") {
         const won = await writeTerminalManifestFn(
           manifest.runId,
@@ -327,7 +341,11 @@ export async function markCancelled(
             // Verified is not persisted (#164): a racing rename inside the gap can still
             // land over this record. The poll holds the record's persistence; a flip
             // re-enters the claim.
-            if (await cancelledPersists(manifest.runId, env)) {return after}
+            if (await cancelledPersists(manifest.runId, env)) {
+              // The cancellation won: a cancelled record never keeps a result.
+              await forgetResult(manifest.runId, env)
+              return after
+            }
             continue
           }
           if (after.status === "running") {continue}
@@ -362,6 +380,7 @@ export async function markCancelled(
       const after = await readManifest(manifest.runId, env)
       if (after !== undefined && after.status === "cancelled" && (await cancelledPersists(manifest.runId, env))) {
         // Same persistence discipline as the rename path above (#164).
+        await forgetResult(manifest.runId, env)
         return after
       }
     }

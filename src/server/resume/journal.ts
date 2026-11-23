@@ -75,6 +75,19 @@ export interface Manifest {
    * (undefined)").
    */
   sessionID: string
+  /**
+   * The project that launched the run, recorded from the host's project identity (#175).
+   * Auto-resume refuses a run whose `projectID` does not match the recovering project, so one
+   * project's sweep can never adopt another project's orphaned children. Absent on manifests
+   * written before the field existed; the sweep treats unscoped manifests as unverifiable.
+   */
+  projectID?: string
+  /**
+   * The project directory the run was launched from (#175) — the canonical checkout for a
+   * worktree-scoped session. Recorded for diagnosability and for the same-project check's
+   * directory fallback; absent on pre-upgrade manifests.
+   */
+  directory?: string
   sourceHash: string
   argsHash: string
   /**
@@ -209,4 +222,22 @@ function isEntry(value: unknown): value is JournalEntry {
     typeof record["key"] === "string" &&
     (record["status"] === "ok" || record["status"] === "null")
   )
+}
+
+/**
+ * Each failed label's latest journal-recorded reason, in one sweep.
+ *
+ * The journal is append-only and a retry reuses its label, so the LAST failure for a label wins;
+ * a later success does not erase the history, but the caller only reads a reason for a row it
+ * already rendered as failed. One pass, so a status report never re-scans per row.
+ */
+export function latestFailureReasons(
+  entries: readonly Pick<JournalEntry, "label" | "status" | "reason">[],
+): Map<string, string> {
+  const reasons = new Map<string, string>()
+  for (const entry of entries) {
+    if (entry.status === "ok" || entry.reason === undefined) {continue}
+    reasons.set(entry.label, entry.reason)
+  }
+  return reasons
 }

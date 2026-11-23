@@ -1,700 +1,139 @@
-import { randomUUID } from "node:crypto"
-import { readFile } from "node:fs/promises"
-import { join } from "node:path"
-import { resolveLaunchContract, resolveOptions } from "./options.js"
-import type { UltraopenOptions } from "./options.js"
-import { registry } from "./singleton.js"
-import { installConfig } from "./ultracode/config.js"
-import type { MutableConfig } from "./ultracode/config.js"
-import { execute, prepare, projectLaunchSize, renderFailure, WorkflowRunError } from "./tool/workflow.js"
-import { inspectArgsTransport, launchMetadataOf } from "./tool/args-transport.js"
-import type { WorkflowArgs } from "./tool/workflow.js"
-import { WORKFLOW_TOOL, STATUS_TOOL } from "./bridge/permission.js"
-import { asClient } from "./types.js"
-import type { OpencodeClient } from "./types.js"
-import { description, blockingDescription, longLivedDescription, statusDescription, withSizeAdvice } from "./tool/description.js"
-import {
-  liveRunsForSession,
-  siblingRunsForSession,
-  isLiveAnywhere,
-  isLongLivedHost,
-  registerPending,
-  nameRun,
-  dropPending,
-  dropSettled,
-  stopRun,
-} from "./tool/background.js"
-
-import { executeStatus } from "./tool/status.js"
-import type { StatusArgs } from "./tool/status.js"
-import {
-  renderResult,
-  renderLaunch,
-  renderRefusal,
-  renderCapRefusal,
-  renderResumeRefusal,
-  renderForeignSessionResumeRefusal,
-  renderUnrecordedSessionResumeRefusal,
-  renderMissingRunResumeRefusal,
-  renderArgsRefusal,
-  renderResumeDecorationRefusal,
-  renderScriptPathDecorationRefusal,
-  renderStringifiedArgsRefusal,
-  renderStatus,
-  renderStopFailure,
-  stopReasonOf,
-  workflowArgsSchema,
-  statusArgsSchema,
-  renderBothSourceRefusal,
-} from "./tool/render.js"
-import { listSavedWorkflows, scanNamedWorkflows } from "./tool/named.js"
-import { wireRun, startDetachedRun } from "./tool/settlement.js"
-import type { SettleOutcome } from "./tool/settlement.js"
-import { beginRun, loadResume } from "./resume/persist.js"
-import { ensureRunDir, isSafeRunId, readManifest, removeRunDir, writeScript } from "./resume/store.js"
-import { onBusEvent } from "./runtime/events.js"
-import type { JournalEntry, Manifest } from "./resume/journal.js"
-import { onChatMessage, onChatParams, onMessagesTransform } from "./ultracode/hooks.js"
-import { mode } from "./ultracode/mode.js"
-import { resolveEffort } from "./bridge/effort.js"
-import { bootSweep, newBootId } from "./resume/boot.js"
+import { Plugin } from "@opencode/plugin"
+import { resolveOptions } from "./options.js"
+import { createV2HostPort } from "./host/v2-adapter.js"
+import { getCoordinator } from "./runtime/coordinator.js"
+import { isLongLivedHost, stopRun } from "./tool/background.js"
+import { bootSweep } from "./resume/boot.js"
+import { loadBundledSkill, registerTransforms } from "./host/v2-transforms.js"
+import { registerHooks, startEventStream } from "./host/v2-hooks.js"
+import { registerRunRpc } from "./host/v2-rpc.js"
+import { parseSavedWorkflows, scanNamedWorkflows } from "./tool/named.js"
+import type { LaunchPermissionInput, WorkflowCommandState } from "./tool/launch.js"
 
 /**
- * The ultraopen server plugin.
+ * The ultraopen server plugin: the V2 composition root.
  *
- * Registers the `workflow` and `workflow_status` tools and installs ultracode's activation
- * surfaces. The TUI half is a SEPARATE entry (`./tui`) with its own default export: opencode
- * throws `must default export either server() or tui(), not both` if one module exports both, and
- * TUI plugins are read only from tui.json, never from opencode.json's `plugin` array.
+ * The TUI half is a SEPARATE entry (`./tui`) with its own default export. Every decision lives in
+ * the modules this file wires: `host/v2-adapter` owns the wire types, `host/v2-transforms` builds
+ * the model-facing surfaces, `host/v2-hooks` owns the per-turn containment and the event loop,
+ * `host/v2-rpc` owns the TUI-facing RPC, and `tool/launch` owns the workflow tool's contract.
+ *
+ * The coordinator is anchored on `globalThis`, so a same-PID plugin reload ADOPTS live runs instead
+ * of orphaning them (#180). `deactivateLocation` arms a 2000 ms `.unref()` handoff: a replacement
+ * `setup()` inside that window keeps the runs, while an explicit disable lets the timer fire and
+ * stop only this scope's runs.
  */
 
-interface ToolContext {
-  sessionID: string
-  messageID?: string
-  /**
-   * The driving agent's name, delivered by the host on the tool-execute context
-   * (verified against opencode 1.18.31 — packages/plugin/src/tool.ts). It is the
-   * `ultracode` agent's activation surface for the launch gate.
-   */
-  agent?: string
-  abort?: AbortSignal
-  ask?: (input: { permission: string; patterns: string[]; always: string[]; metadata?: unknown }) => Promise<void>
-}
+/** The cleanup handoff window; the coordinator's own default, stated here for the contract. */
+const HANDOFF_GRACE_MS = 2000
 
-interface PluginInput {
-  client: unknown
-  directory?: string
-  worktree?: string
-}
+/**
+ * Builds the plugin definition.
+ *
+ * `setup` registers the RPC-independent surfaces first (transforms, hooks), then RPC, and only
+ * after that activates the location, starts the event stream and starts the boot sweep — all three
+ * synchronously. RPC must be the LAST async registration: a `listRuns({ includeHints: true })`
+ * issued the instant the RPC surface exists would otherwise reach `bootSweepSettled()` before the
+ * sweep was tracked and silently retire its one-shot hint ask. A failure before `registerRunRpc`
+ * leaves nothing to roll back; a synchronous failure after it disposes the registration.
+ */
+export function createUltraopenServer(): Plugin.Plugin {
+  return Plugin.define({
+    id: "ultraopen",
 
-interface ShellEnvOutput { env: Record<string, string> }
+    async setup(ctx) {
+      const options = resolveOptions(ctx.options),
+       coordinator = getCoordinator(),
+       location = {
+         directory: ctx.location.directory,
+         project: { id: ctx.location.project.id, canonical: ctx.location.project.canonical },
+       },
+       project = coordinator.projectOf(location, options),
+       // The raw host is what this activation registers; the proxy is what every consumer holds,
+       // so a reload handoff reaches in-flight runs without touching them.
+       rawHost = createV2HostPort(ctx),
+       host = coordinator.hostFor(project.projectKey, location.directory, rawHost)
 
-/** Set in every engine-owned child's shell environment. */
-const ACTIVE_ENV = "ULTRAOPEN_ACTIVE"
+      // Transforms and hooks register no RPC and need no activation. Doing them BEFORE RPC keeps
+      // `registerRunRpc` as the last await in setup, so the synchronous activation/sweep tail below
+      // cannot be split by an inbound RPC handler.
+      // Read saved workflows asynchronously, before the synchronous command transform runs.
+      const named = await scanNamedWorkflows({
+         workflowPaths: options.workflowPaths,
+         directory: host.location.directory,
+         canonicalDirectory: host.location.canonical,
+       }),
+       entries = parseSavedWorkflows(named),
+       commandState: WorkflowCommandState = {
+         entries,
+         reload: () => {void ctx.command.reload()},
+       },
+       skill = await loadBundledSkill(),
+       assertPermission = (input: LaunchPermissionInput): Promise<void> =>
+         ctx.permission.assert({
+           sessionID: input.sessionID,
+           ...(input.agent === undefined ? {} : { agent: input.agent }),
+           action: input.action,
+           resources: [...input.resources],
+           ...(input.save === undefined ? {} : { save: [...input.save] }),
+           ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
+         })
 
-export function ultraopen(input: PluginInput, rawOptions?: unknown): Record<string, unknown> {
-  const options = resolveOptions(rawOptions),
-   client = asClient(input.client),
+      await registerTransforms(ctx, {
+        host,
+        project,
+        coordinator,
+        options,
+        bootId: coordinator.processBootId,
+        longLived: isLongLivedHost(),
+        commandState,
+        skill,
+        assertPermission,
+      })
 
-  // A nested `opencode` process would get a fresh server, a fresh plugin load and a fresh tool,
-  // escaping this process's concurrency cap, agent counter, budget and abort signal entirely.
-  // Refusing to register the tool at all is the one guard that survives every path a command
-  // pattern cannot match (`/usr/local/bin/opencode`, `sh -c '...'`, `env FOO=1 opencode`).
-   nested = process.env[ACTIVE_ENV] === "1"
+      await registerHooks(ctx, { host, project, coordinator })
 
-  registry.configureConcurrency(options.concurrency)
-  mode.setDefault(options.ultracode)
-  mode.setKeywordBehavior(options.keywordBehavior)
+      // The LAST async registration: everything after this line runs in the same tick, so the boot
+      // sweep is tracked before any RPC handler can call `bootSweepSettled()`.
+      const registration = await registerRunRpc(ctx, { host, coordinator })
 
-  // Decided once from the process shape: it picks which launch contract the
-  // tool description and every launch result serve (see tool/background.ts).
-  const longLived = isLongLivedHost()
+      try {
+        const activation = coordinator.activateLocation(location, rawHost, {
+          config: options,
+          emitRunUpdated: (view) => {
+            void registration.events.emit("runUpdated", { run: view })
+          },
+        })
+        startEventStream(ctx, { host, coordinator, activation })
 
-  // One sync scan at load builds the /workflow-<name> commands. The RUN path
-  // rescans per tool call (a file saved mid-session runs at once); only the
-  // command surface waits for the next start, because the config hook is
-  // synchronous by contract.
-  const savedWorkflows = listSavedWorkflows({
-    workflowPaths: options.workflowPaths,
-    directory: input.directory,
+        // Fire-and-forget: every stage of the boot sweep reports its own failures and never rejects.
+        void bootSweep(host, project, coordinator)
+
+        return (): void => {
+          coordinator.deactivateLocation(project.projectKey, location.directory, activation.generationId, {
+            graceMs: HANDOFF_GRACE_MS,
+            onDisableStop: (run) => {
+              // An explicit disable stops only runs registered under this exact project/location.
+              void stopRun(run.runId, host, coordinator)
+            },
+          })
+        }
+      } catch (error) {
+        // No await happens between registration and here, so this is only a synchronous failure.
+        // Nothing was activated before `activateLocation`, and a host must not be left with a
+        // handler table for a setup that never completed. A failed disposal must not mask the
+        // setup error that caused the rollback.
+        try {
+          await registration.dispose()
+        } catch {
+          // Ignored: the setup error below is the one worth surfacing.
+        }
+        throw error
+      }
+    },
   })
-
-  // One boot id per process. Runs still marked `running` under a DIFFERENT boot id belonged to a
-  // process that died, and their subagents are still alive and billing — opencode never cascades
-  // an abort to plain parentID children. Swept in the background so plugin init is never blocked
-  // by a slow or unreachable server.
-  const bootId = newBootId()
-  // No .catch(): every stage of the boot sweep is contractually non-throwing (every I/O failure
-  // is swallowed and reported in its result), and an unreachable handler here would be untestable
-  // defensive code.
-  void bootSweep(client, bootId, options, input.directory)
-
-  const hooks: Record<string, unknown> = {
-    /**
-     * Mutates the live config object. The return value is discarded — mutation is the only
-     * channel — and this MUST NOT await anything on `input.client` first: a client call re-enters
-     * the HTTP server and can materialise the agent list from the not-yet-mutated config,
-     * permanently caching an agent list without `ultracode` for this instance's lifetime.
-     */
-    config: (config: MutableConfig): void => {
-      // Resolved from this module's own location so it works from node_modules or a file spec.
-      installConfig(config, {
-        skillsPath: join(import.meta.dirname, "..", "skills"),
-        workflowCommands: savedWorkflows,
-      })
-    },
-
-    /**
-     * Detects the `ultracode` keyword and any instruction to stop fanning out, and raises the
-     * effort on the parent turn. Deliberately does NOT write parts: those are persisted, so a
-     * reminder here would accumulate one copy per user turn forever.
-     */
-    "chat.message": (
-      hookInput: Parameters<typeof onChatMessage>[0],
-      output: Parameters<typeof onChatMessage>[1],
-    ): void => {
-      onChatMessage(hookInput, output, {
-        resolveVariant: (effort) => resolveEffort(effort, { available: [] }).variant,
-      })
-    },
-
-    /**
-     * Injects the per-turn reminder. This hook operates on messages re-read from the database each
-     * step, so what it adds is ephemeral — unlike chat.message's parts.
-     */
-    "experimental.chat.messages.transform": (
-      _input: unknown,
-      output: Parameters<typeof onMessagesTransform>[0],
-    ): void => {
-      onMessagesTransform(output)
-    },
-
-    /** Belt-and-braces effort raise, read at a different point than the message variant. */
-    "chat.params": (
-      hookInput: Parameters<typeof onChatParams>[0],
-      output: Parameters<typeof onChatParams>[1],
-    ): void => {
-      onChatParams(hookInput, output, {
-        resolveVariant: (effort, available) => resolveEffort(effort, { available }).variant,
-      })
-    },
-
-    /**
-     * Turns the mode on when the user runs `/ultracode`.
-     *
-     * Fires before the prompt is built, so the same turn already sees the reminder.
-     */
-    "command.execute.before": (hookInput: { command: string; sessionID: string; arguments?: string }): void => {
-      if (hookInput.command !== "ultracode") {return}
-      // Case-insensitive: `/ultracode OFF` must not silently re-enable what the user asked to stop.
-      if (hookInput.arguments?.trim().toLowerCase() === "off") {mode.disable(hookInput.sessionID)}
-      else {mode.enable(hookInput.sessionID, "command")}
-    },
-
-    /**
-     * Marks shells inside engine-owned sessions, scoped so ordinary sessions are unaffected.
-     * Scoping matters: a blanket marker would disable the tool for the user's own work too.
-     */
-    "shell.env": (hookInput: { sessionID?: string }, output: ShellEnvOutput): void => {
-      if (hookInput.sessionID && registry.owns(hookInput.sessionID)) {output.env[ACTIVE_ENV] = "1"}
-    },
-
-    /**
-     * Feeds the idle deadline's activity map, records the per-agent recording (#150) and
-     * drives the hydration idle nudge — one seam, extracted to src/server/runtime/events.ts.
-     */
-    event: (hookInput: Parameters<typeof onBusEvent>[0]): void => {
-      onBusEvent(hookInput, client)
-    },
-  }
-
-  if (!nested) {
-    hooks["tool"] = {
-      [WORKFLOW_TOOL]: {
-        description: toolDescription(options, longLived),
-        args: workflowArgsSchema(),
-        execute: (args: WorkflowArgs, context: ToolContext): Promise<string> =>
-          launchWorkflow(args, context, options, client, bootId, input.directory, longLived),
-      },
-      [STATUS_TOOL]: {
-        description: statusDescription,
-        args: statusArgsSchema(),
-        execute: async (args: StatusArgs, context: ToolContext): Promise<string> => {
-          try {
-            return renderStatus(await executeStatus(args, { bootId, signal: context.abort }))
-          } catch (error) {
-            // An unknown or malformed run id is a clear error for the model, never a crash.
-            return error instanceof Error ? error.message : String(error)
-          }
-        },
-      },
-    }
-  }
-
-  return hooks
 }
 
-/**
- * The tool description for this instance's contract and configured size advice.
- *
- * Blocking is the explicit option (and the env kill switch); otherwise the host
- * decides which background contract the model reads (see tool/background.ts).
- */
-function toolDescription(options: UltraopenOptions, longLived: boolean): string {
-  if (options.runMode === "blocking") {return blockingDescription}
-  const base = longLived ? longLivedDescription : description
-  if (options.sizeGuideline === undefined) {return base}
-  return withSizeAdvice(base, options.sizeGuideline)
-}
-
-/**
- * The model-emitted zero-value decorations (#86): "", "null" and "undefined".
- *
- * One predicate for every field the launch boundary guards against decoration weather —
- * the decoration set is a single decided contract, not per-field trivia.
- */
-const isZeroValueDecoration = (value: string): boolean =>
-  value === "" || value === "null" || value === "undefined"
-
-/**
- * Launches one workflow run.
- *
- * Two contracts share this path. `background` — the default — returns the run id
- * at once and hands the run to a detached task, so the session stays free while
- * the run works; `blocking` waits for the final result, for one-shot hosts that
- * kill the process after the turn (see tasks/async-runs/notes/host-lifecycle-facts.md).
- * `dryRun` always blocks: it is free, finishes in milliseconds, and its whole
- * point is the fan-out preview inside the result.
- */
-async function launchWorkflow(
-  args: WorkflowArgs,
-  context: ToolContext,
-  options: UltraopenOptions,
-  client: OpencodeClient,
-  bootId: string,
-  projectDirectory: string | undefined,
-  longLived: boolean,
-): Promise<string> {
-  // The stop path short-circuits BEFORE the launch gate: a session with a live run must be able to stop it.
-  // An EMPTY stop value is a launch default, not a stop request — models emit optional fields as "".
-  if (args.stop !== undefined && args.stop !== "") {return await stopRun({ runId: args.stop, client, bootId })}
-
-  // Zero-value decoration weather (decided in #86): models emit the strings "", "null" or
-  // "undefined" for an absent optional `args` field. Refused loudly at the boundary, never
-  // normalized — the identity contract is that the script sees exactly what was passed, and a
-  // decorated resume hashes differently from its source baseline, so the argsChanged guard
-  // would refuse the replay and the string would run live as the script's `args`. Placement
-  // pins: after the stop dispatch (a stop call carrying decoration still stops), before the
-  // launch gate and the permission ask (a refused call registers no pending entry and burns
-  // no approval, #74's precedent). One guard covers launch, resume, and dryRun.
-  if (typeof args.args === "string" && isZeroValueDecoration(args.args)) {
-    return renderArgsRefusal(args.args)
-  }
-
-  // The same weather on `resumeFromRunId` (#132): the empty string is falsy and would
-  // otherwise skip the resume gate entirely — no refusal, no resume, no note — reading as
-  // a fresh launch; "null" and "undefined" would reach the gate only to be refused as
-  // malformed ids. Same placement pins as the args guard: refused before the launch gate,
-  // so the call registers no pending entry and burns no approval. A caller who means a
-  // fresh launch omits the field.
-  if (typeof args.resumeFromRunId === "string" && isZeroValueDecoration(args.resumeFromRunId)) {
-    return renderResumeDecorationRefusal(args.resumeFromRunId)
-  }
-
-  // The same weather on `scriptPath` (#141): a decorated scriptPath is a truthy string, so
-  // it wins the source precedence (scriptPath > script > name) and reaches script
-  // resolution, failing there with a bare filesystem error (observed: ENOENT open 'null')
-  // that never names the decoration. Same placement pins as the args and resumeFromRunId
-  // guards: refused before the launch gate, so the call registers no pending entry and
-  // burns no approval. A caller who means the inline script omits the field.
-  if (typeof args.scriptPath === "string" && isZeroValueDecoration(args.scriptPath)) {
-    return renderScriptPathDecorationRefusal(args.scriptPath)
-  }
-
-  // Both source fields (#143): the precedence is scriptPath > script, so a call carrying
-  // both silently discarded the inline script — usually the fuller source text — and a
-  // wrong or stale path killed it with a bare filesystem error naming neither field.
-  // Refused loudly at the boundary, same placement pins as the guards above: after the
-  // stop dispatch, before the launch gate and the permission ask, so the refusal
-  // registers no pending entry and burns no approval. The precedence itself is
-  // unchanged — a single-source call resolves exactly as before, and a decorated
-  // scriptPath above still takes the decoration treatment first. The truthiness test
-  // mirrors resolveSource's own, so the refusal fires exactly where the discard would
-  // have happened.
-  if (args.script && args.scriptPath) {
-    return renderBothSourceRefusal()
-  }
-
-  // Stringified-JSON transport (#78): a string that LOOKS like JSON but fails to parse is
-  // refused here — same placement pins as the zero-value guard, so the refusal registers no
-  // pending entry and burns no approval. Hydration is NOT done here: prepare() is the single
-  // mutation point, and it runs before the projection, the resume load and beginRun, so every
-  // downstream consumer — hashing included — sees the hydrated value.
-  const transport = inspectArgsTransport(args.args)
-  if (transport.action === "refuse") {
-    return renderStringifiedArgsRefusal(transport.raw, transport.reason)
-  }
-
-  const background = args.dryRun !== true &&
-    resolveLaunchContract(args.background, options) === "background",
-   runId = `wf_${randomUUID().replaceAll("-", "").slice(0, 12)}`,
-   // The launch's title/description metadata (#142): absent together on an untitled
-   // launch, present verbatim otherwise. Read once, consumed by the manifest, the
-   // launch handle and the live-run reminder.
-   launchMetadata = launchMetadataOf(args),
-   // The session's default model, so `effort` resolves against ITS variant set rather
-   // than a guess. A failure here is non-fatal: effort simply goes unapplied, and the run
-   // log says so.
-   defaultModel = await client.config
-    ?.get?.()
-    .then((response) => response.data?.model)
-    .catch(() => undefined)
-
-  // Saved workflows resolve from disk on every call: a file saved mid-session
-  // runs by name at once, and no cached map can drift from what is on disk.
-  const scanNotes: string[] = [],
-   named = await scanNamedWorkflows({
-    workflowPaths: options.workflowPaths,
-    directory: projectDirectory,
-    onNote: (note) => scanNotes.push(note),
-  }),
-   scanNoteLines = scanNotes.length > 0 ? ["", "<scan-notes>", ...scanNotes, "</scan-notes>"] : []
-
-  // One live run per session for non-ultracode sessions, for BOTH contracts (see
-  // lifecycle-policy.md): a blocking call inside a turn serializes itself anyway,
-  // but mixed contracts would put two agent-spending runs in one session. dryRun
-  // is exempt — it is free, stubbed, and the standard way to debug a script
-  // mid-run. Ultracode-active sessions (policy: docs/adr/0001-launch-concurrency-policy.md)
-  // bypass that refusal up to the live-run cap `ultracodeMaxRuns` — a launch at
-  // the cap is refused naming every live run — and demotion never changes the
-  // gate: it is prompt-level guidance only. Both contracts register: the resume
-  // gate defers to this registry on the same boot (isLiveAnywhere), so a
-  // blocking run invisible here would let a same-boot resume run two engines
-  // against one journal. Launch-gating state is registered SYNCHRONOUSLY, before
-  // the first await, so two calls from one session in the same tick cannot both
-  // pass the refusal check (the check-then-act race). Every early return below
-  // must drop it.
-  if (args.dryRun !== true) {
-    const live = liveRunsForSession(context.sessionID)
-    if (mode.isActive(context.sessionID, context.agent)) {
-      if (live.length >= options.ultracodeMaxRuns) {return renderCapRefusal(live, options.ultracodeMaxRuns)}
-    } else {
-      const [oldest] = live
-      if (oldest) {return renderRefusal(oldest)}
-    }
-    registerPending(runId, context.sessionID)
-  }
-
-  try {
-    // A resume that will be refused is refused BEFORE the permission ask: a call
-    // with a malformed resumeFromRunId, one whose source run is live elsewhere,
-    // one whose source run belongs to a different session, or one whose source
-    // run directory is gone (#131), would otherwise render
-    // the approval dialog, consume the user's approval, and only then refuse —
-    // nothing launches, and the approval is spent (the burned approval also
-    // cascades into a re-ask chain, since models retry after the refusal). The
-    // journal rationale still holds: two writers on one journal would interleave
-    // appends and race the endRun rewrite.
-    //
-    // The gate stands FIRST in the launch — before prepare() and before the run
-    // directory is created. It needs only the resume id and this session's
-    // identity, so running it after ensureRunDir/writeScript manufactured a
-    // manifest-less directory on every refusal: a phantom that executeStatus
-    // reads as "no run found" and pruneRuns can never remove, because pruning
-    // keys on a manifest — one leaked directory per refused resume, forever.
-    if (args.resumeFromRunId) {
-      // The id is model-supplied input and joins into a filesystem path below,
-      // exactly like the status tool's runId: rejected before any read.
-      if (!isSafeRunId(args.resumeFromRunId)) {
-        dropPending(runId)
-        return renderResumeRefusal(args.resumeFromRunId, undefined)
-      }
-      const source = await readManifest(args.resumeFromRunId)
-      // A well-formed id whose run directory or manifest is gone (#131): a typo'd
-      // id or a pruned run. Refused here rather than falling through to the ask
-      // and the silent empty replay that read as a fresh launch at full price.
-      if (!source) {
-        dropPending(runId)
-        return renderMissingRunResumeRefusal(args.resumeFromRunId)
-      }
-      if (isLiveAnywhere(source, bootId)) {
-        dropPending(runId)
-        return renderResumeRefusal(source.runId, source.pid)
-      }
-      // A manifest that records no session cannot prove provenance. The Manifest
-      // schema REQUIRES sessionID and every manifest writer since the first run
-      // store has recorded it, so a manifest without one is corrupt — not a
-      // pre-upgrade format — and the comparison below would refuse it as a
-      // foreign session whose id is "undefined", naming a session it never saw.
-      if (typeof source.sessionID !== "string") {
-        dropPending(runId)
-        return renderUnrecordedSessionResumeRefusal(source.runId)
-      }
-      // Cross-session refusal (#147), AFTER the live check: a foreign run that is
-      // still executing reports the live refusal, the more dangerous condition;
-      // a settled foreign run reports the cross-session situation instead of the
-      // silent empty replay that read as a successful empty resume.
-      if (source.sessionID !== context.sessionID) {
-        dropPending(runId)
-        return renderForeignSessionResumeRefusal(source.runId, source.sessionID)
-      }
-    }
-
-    // Parse BEFORE asking, so the permission prompt names the real workflow and can show
-    // what it intends to do. `meta` is a pure literal specifically so it can be read
-    // without running anything. Using the tool's `title` argument here instead would be
-    // wrong twice over: it is documented as ignored, and the model usually omits it.
-    const prepared = await prepare(args, {
-      client,
-      sessionID: context.sessionID,
-      runId,
-      // Makes the schema-advertised `scriptPath` real: persisted scripts under the run
-      // directory can be re-run by path.
-      readScript: (path: string) => readFile(path, "utf8"),
-    })
-
-    // The per-turn live-run reminder names the workflow, and prepare() is where the name is
-    // first known — recorded before the ask so even a pending entry carries it. The launch's
-    // title metadata rides along (#142); the reminder shows it beside the name.
-    nameRun(runId, prepared.meta.name, launchMetadata.title)
-
-    // Persist the script BEFORE the ask, so the user can open the real file
-    // while the prompt is on screen. beginRun writes it again (same bytes) when
-    // the run starts; an approved run therefore cannot desync. The run
-    // directory must exist for the write — created here, best-effort like the
-    // write itself: a failed write must not block the prompt, and a failure
-    // here resurfaces through beginRun's friendly launch-failure message.
-    // Reached only past the resume gate above, so a refused resume manufactures
-    // no directory of its own: no refusal leaves a manifest-less run behind.
-    await ensureRunDir(runId).catch(() => undefined)
-    await writeScript(runId, prepared.source).catch(() => undefined)
-
-    // `always` is scoped to this workflow's name rather than "*": an "always" grant is
-    // stored instance-wide, so approving once with "*" would permanently disable the
-    // prompt for every workflow in the directory.
-    //
-    // Before the ask, a free IN-MEMORY projection of the fresh-run fan-out: the prompt
-    // names what approving costs, and a large projected fan-out is flagged so an
-    // unattended launch can be caught before it spends. projectLaunchSize degrades any
-    // projection failure to undefined — advisory, never a gate. A dry run is its own
-    // free preview, so the pass is skipped for it.
-    const projectedAgents = args.dryRun === true
-      ? undefined
-      : await projectLaunchSize(prepared, named, { signal: context.abort })
-
-    await context.ask?.({
-      permission: WORKFLOW_TOOL,
-      patterns: [prepared.meta.name],
-      always: [prepared.meta.name],
-      metadata: {
-        runId,
-        name: prepared.meta.name,
-        description: prepared.meta.description,
-        phases: prepared.meta.phases?.map((phase) => phase.title) ?? [],
-        dryRun: args.dryRun === true,
-        background,
-        ...(projectedAgents === undefined ? {} : { projectedAgents }),
-        ...(projectedAgents !== undefined && projectedAgents >= options.largeWorkflowAgents ? { largeWorkflow: true } : {}),
-      },
-    })
-
-    // Resume BEFORE the run starts, so replayed calls never spawn anything; the
-    // refusal gates above already cleared a live source run.
-    const resume = args.resumeFromRunId
-      ? await loadResume(args.resumeFromRunId, prepared.argsValue, context.sessionID)
-      : undefined
-
-    // A dry run keeps the pre-ask script persistence above but runs NO manifest
-    // lifecycle (#138): no manifest, no journal, no progress, no result.json in
-    // the shared run space — a settled manifest that workflow_status resolves as
-    // a real run contradicts what a dry run is documented to be. The value comes
-    // back as the tool call's value, nothing more; the context below is the live
-    // blocking one minus every artifact writer, so the engine's log lines and
-    // any replayed entries stay in memory. A dry failure lands in the catch
-    // below, whose manifest check renders it bare (nothing to resume) — and
-    // (#161) deletes the pre-ask dir by the same gate. The success path here
-    // removes the dir itself: the pre-ask persistence exists only for the
-    // prompt's lifetime, so once the preview is done the data root gains
-    // nothing (#161; one dir per authoring pass was the accumulating shape).
-    if (args.dryRun === true) {
-      const dryContext: Parameters<typeof execute>[1] = {
-        client,
-        sessionID: context.sessionID,
-        runId,
-        deadlineMs: options.agentDeadlineMs,
-        idleMs: options.agentIdleMs,
-        readScript: (path: string) => readFile(path, "utf8"),
-        ...(defaultModel === undefined ? {} : { defaultModel }),
-        ...(options.budgetTokens === null ? {} : { budgetTotal: options.budgetTokens }),
-        signal: context.abort,
-        ...(Object.keys(named).length > 0 ? { named } : {}),
-        ...(resume !== undefined && resume.entries.length > 0
-          ? {
-              previousEntries: resume.entries,
-              ...(args.resumeFromRunId === undefined ? {} : { resumedFrom: args.resumeFromRunId }),
-            }
-          : {}),
-      }
-      const result = await execute(args, dryContext)
-      // Best-effort and never rejecting — the module's persistence style; the
-      // render below still carries the id/dir refs for debug continuity,
-      // annotated (next call) as not queryable.
-      await removeRunDir(runId)
-      return [renderResult(result, {
-        resumed: resume?.entries.length ?? 0,
-        argsChanged: resume?.argsChanged === true,
-      }, siblingRunsForSession(context.sessionID, runId), options.budgetTokens, { dry: true }), ...scanNoteLines].join("\n")
-    }
-
-    // The manifest MUST be on disk before this call returns: the launch result
-    // names a run id that `workflow_status` has to resolve, and a run without a
-    // manifest is invisible to the status tool and to the reaper. A beginRun
-    // failure therefore aborts the launch rather than starting a run that could
-    // never be reported on.
-    const manifest = await beginRun({
-      runId,
-      sessionID: context.sessionID,
-      source: prepared.source,
-      // The HYDRATED args value (#78): the manifest and its hash describe what the script sees.
-      args: prepared.argsValue,
-      bootId,
-      // A hydrated launch records what actually arrived (#78): args holds the hydrated value,
-      // argsRawString preserves the raw string the caller sent.
-      ...(prepared.argsHydrated === undefined ? {} : { argsRawString: prepared.argsHydrated.raw }),
-      // The launch's title/description metadata (#142), absent together when the launch passed none.
-      ...launchMetadata,
-    })
-    if (!manifest) {
-      dropPending(runId)
-      return "The workflow could not be started: its run directory could not be created. " +
-        "Nothing was executed and no tokens were spent."
-    }
-
-    // The shared execution wiring — flush chain, progress writer with crash-safe child
-    // persistence, run-control channel, and the ONE settle protocol — is assembled by
-    // tool/settlement.ts so the detached auto-resume path reuses it verbatim.
-    const shared = {
-      runId,
-      client,
-      sessionID: context.sessionID,
-      manifest,
-      prepared,
-      args,
-      options,
-      named: Object.keys(named).length > 0 ? named : undefined,
-      ...(defaultModel === undefined ? {} : { defaultModel }),
-      previousEntries: resume?.entries,
-      resumedFrom: args.resumeFromRunId,
-      resume: { resumed: resume?.entries.length ?? 0, argsChanged: resume?.argsChanged === true },
-    }
-
-    if (!background) {
-      // The blocking contract waits for the run and takes the tool call's abort signal: a
-      // parent-turn interrupt unwinds the script it is waiting on.
-      const wiring = wireRun({ ...shared, signal: context.abort })
-      const result = await runBlocking(args, { runId, manifest, resume, executeContext: wiring.executeContext, settleRun: wiring.settle, budgetTokens: options.budgetTokens, signal: context.abort })
-      return [result, ...scanNoteLines].join("\n")
-    }
-
-    // Detached: the run outlives this tool call. The task fully captures its own
-    // outcome — flushes, manifest, failure text — because nothing else is
-    // waiting on it anymore; startDetachedRun owns the stop controller the
-    // stop path trips.
-    startDetachedRun(shared)
-
-    const projection = projectedAgents === undefined ? undefined : { agents: projectedAgents, threshold: options.largeWorkflowAgents }
-    // The title rides the handle beside the workflow name (#142); absent on an untitled launch.
-    return [renderLaunch(prepared.meta.name, runId, longLived, siblingRunsForSession(context.sessionID, runId), projection, options.budgetTokens, launchMetadata.title), ...scanNoteLines].join("\n")
-  } catch (error) {
-    // Reached only by the launch phase itself: a parse failure or a rejected
-    // permission ask. The run never went live, so the pending entry is dropped.
-    dropPending(runId)
-    // The run id/dir footer renders only when the run went live (#133): a
-    // prepare-phase failure or a rejected ask has no manifest, and advertising
-    // the id sent the status tool to "No run found" — which the model read as
-    // its own fault. The disk is the arbiter, not a flag: a settle-phase throw
-    // after beginRun (the only post-launch error this catch can see) keeps its
-    // footer, because the manifest on disk proves the run is real and resumable.
-    const wentLive = (await readManifest(runId)) !== undefined
-    // (#161) The pre-ask dir is removed when this same read proves the run
-    // never went live — a launch that manufactured the dir for the prompt but
-    // died before any manifest must leave no phantom behind (no sweep ever
-    // skips past a manifest-less directory). wentLive keeps everything: the
-    // dir IS the failed live run's record. Never rejecting, like the
-    // persistence it rolls back.
-    if (!wentLive) {await removeRunDir(runId)}
-    return renderFailure(error, args.script, wentLive ? runId : undefined)
-  }
-}
-
-/** The shared settle protocol's signature; the ONE settle protocol lives in tool/settlement.ts. */
-type SettleRun = (outcome: SettleOutcome) => Promise<void>
-
-interface BlockingRun {
-  runId: string
-  manifest: Manifest
-  resume: { entries: JournalEntry[]; argsChanged: boolean } | undefined
-  executeContext: Parameters<typeof execute>[1]
-  settleRun: SettleRun
-  /** The plugin's per-run ceiling, for the blocking result's budget statement. */
-  budgetTokens: number | null
-  /** The tool call's abort signal, read for the stop-naming failure render (#135). */
-  signal?: AbortSignal | undefined
-}
-
-/**
- * The blocking contract: wait for the run, then return one consolidated result.
- *
- * Kept behaviorally identical to the pre-async tool — it is the documented kill
- * switch (`runMode: "blocking"` / `ULTRAOPEN_WORKFLOW_SYNC=1`). Dry runs no
- * longer pass through here: they run the engine alone and leave no artifacts
- * (#138). Its launch registered at the session gate like every other launch; the
- * finally drops that entry only after the settle protocol completed, so the
- * resume gate stays closed while the settle is writing and the next launch
- * finds no residue once it is done.
- */
-async function runBlocking(args: WorkflowArgs, run: BlockingRun): Promise<string> {
-  const { runId, manifest, resume, executeContext, settleRun, budgetTokens } = run
-  try {
-    const result = await execute(args, executeContext)
-    await settleRun({
-      status: "completed",
-      entries: result.journal,
-      value: result.value,
-      // Captured inside the run before its cleanup forgot the sessions — reading the
-      // registry here would always yield [].
-      childSessionIDs: result.childSessionIDs,
-    })
-    // The own entry is still registered at render time (the finally below drops
-    // it after the settle protocol), so the query excludes this run by id.
-    return renderResult(result, {
-      resumed: resume?.entries.length ?? 0,
-      argsChanged: resume?.argsChanged === true,
-    }, siblingRunsForSession(manifest.sessionID, runId), budgetTokens)
-  } catch (error) {
-    const partial = error instanceof WorkflowRunError ? error.partial : undefined
-    await settleRun({
-      status: "failed",
-      entries: partial?.journal ?? [],
-      value: null,
-      childSessionIDs: partial?.childSessionIDs ?? [],
-      // The blocking contract renders the failure as the tool result, the way
-      // the pre-async tool did; failure.txt is the detached contract's channel.
-    })
-    // A stopped run's result names the stop (#135), the same composition the detached
-    // contract writes to failure.txt. A reasonless abort is the parent-turn interrupt's
-    // shape and keeps the render it always had.
-    const stopReason = stopReasonOf(run.signal)
-    if (stopReason !== undefined) {return renderStopFailure(stopReason, runId)}
-    return renderFailure(error instanceof WorkflowRunError ? error.cause : error, args.script, runId)
-  } finally {
-    // Settled, whatever the outcome. The drop waits for the settle protocol
-    // (no resume may pass while the manifest is still being closed) and deletes
-    // unconditionally: a status-guarded drop could strand the gate.
-    dropSettled(runId)
-  }
-}
-
-const plugin = { id: "ultraopen", server: ultraopen }
+const plugin = createUltraopenServer()
 
 export default plugin

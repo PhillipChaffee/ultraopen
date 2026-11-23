@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises"
 import { join } from "node:path"
 import { atomicWriteFile, runDir } from "./store.js"
 import type { ProgressEvent } from "../runtime/run.js"
@@ -16,6 +17,12 @@ export interface AgentProgress {
   label: string
   phase?: string | undefined
   status: "running" | "done" | "failed"
+  /**
+   * The failure's machine reason (`aborted`, `idle-deadline`, …), copied from the agent-end
+   * event. The journal's own reason stays the settled source of truth for a status report; this
+   * field exists so the LIVE view can name why a row failed without reading the journal.
+   */
+  reason?: string | undefined
   /** The agent's output-token spend, once its call has settled. */
   outputTokens?: number | undefined
   /**
@@ -30,6 +37,13 @@ export interface ProgressSnapshot {
   runId: string
   workflow: string
   sessionID: string
+  /**
+   * The run's V2 lifecycle state (#175). `stopping` is written the instant a stop is
+   * requested, before the children have unwound and before the manifest settles as
+   * `cancelled`, so the TUI and the status tool can show the stop in flight. Absent on
+   * snapshots written before the field existed (readers treat absent as `running`).
+   */
+  status?: "running" | "stopping"
   phase?: string | undefined
   agents: AgentProgress[]
   logs: string[]
@@ -53,6 +67,27 @@ export function progressPath(runId: string, env?: NodeJS.ProcessEnv): string {
 }
 
 /**
+ * Reads one run's progress snapshot, tolerating a missing or torn file.
+ *
+ * Deliberately total: progress is disposable by design (the journal is authoritative), so a
+ * reader that cannot parse it answers "no snapshot" rather than rejecting a run listing.
+ */
+export async function readProgressSnapshot(
+  runId: string,
+  env?: NodeJS.ProcessEnv,
+): Promise<ProgressSnapshot | undefined> {
+  try {
+    const parsed: unknown = JSON.parse(await readFile(progressPath(runId, env), "utf8"))
+    // A total reader: `null`, an array, or any non-object JSON is not a snapshot. Returning it
+    // would crash the first `progress.workflow` / `progress.agents` access in a listing.
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {return undefined}
+    return parsed as ProgressSnapshot
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * Accumulates progress events into a snapshot and writes it out.
  *
  * Writes are coalesced on a short timer rather than issued per event: a 15-agent run emits
@@ -65,7 +100,7 @@ export class ProgressWriter {
   readonly #inject: { failRename?: boolean } | undefined
   readonly #flush: (path: string, body: string) => Promise<void>
   #dirty = false
-  #writing = false
+  #flushing: Promise<void> | undefined
 
   constructor(options: {
     runId: string
@@ -88,6 +123,7 @@ export class ProgressWriter {
       runId: options.runId,
       workflow: options.workflow,
       sessionID: options.sessionID,
+      status: "running",
       agents: [],
       logs: [],
       startedAt: options.startedAt,
@@ -145,6 +181,7 @@ export class ProgressWriter {
           agent.status = event.ok ? "done" : "failed"
           if (tokens !== undefined) {agent.outputTokens = tokens}
           if (sessionID !== undefined) {agent.sessionID = sessionID}
+          if (event.reason !== undefined) {agent.reason = event.reason}
         }
         // A replayed call never emits agent-start, so record it here rather than losing it.
         else {
@@ -155,6 +192,7 @@ export class ProgressWriter {
             status: event.ok ? "done" : "failed",
             ...(tokens === undefined ? {} : { outputTokens: tokens }),
             ...(sessionID === undefined ? {} : { sessionID }),
+            ...(event.reason === undefined ? {} : { reason: event.reason }),
           })
         }
         // The run-scoped spend accumulator: every settled call's outputTokens feeds it, the
@@ -169,24 +207,46 @@ export class ProgressWriter {
   }
 
   /**
-   * Writes the snapshot if anything changed.
+   * Records that a stop has been requested (#175) and flushes it immediately.
+   *
+   * The manifest stays `running` until the children have unwound, so the snapshot is the
+   * only surface that can report the stop in flight. Marking it dirty alone would leave the
+   * last coalesced write as the final word; the explicit flush makes the state observable to
+   * the next poll rather than whenever the next event happens to arrive.
+   */
+  async markStopping(now: number): Promise<void> {
+    this.snapshot.status = "stopping"
+    this.snapshot.updatedAt = now
+    this.#dirty = true
+    await this.flush()
+  }
+
+  /**
+   * Writes the snapshot until it is clean, serializing every caller onto one flush.
    *
    * Best-effort and non-overlapping: a failed or slow write must not stall the run, and progress
-   * is by definition disposable — the authoritative record is the journal.
+   * is by definition disposable — the authoritative record is the journal. A caller that arrives
+   * while a write is in flight gets THAT promise, not an early return: the drain loop re-checks
+   * `#dirty` after every write, so `await markStopping()` only resolves once the `stopping`
+   * snapshot has actually reached disk.
    */
-  async flush(): Promise<void> {
-    if (!this.#dirty || this.#writing) {return}
-    this.#writing = true
-    this.#dirty = false
-    try {
-      await this.#flush(progressPath(this.snapshot.runId, this.#env), JSON.stringify(this.snapshot))
-    } catch {
-      // Ignored: see above.
-    } finally {
-      this.#writing = false
-      // An event folded in while a write was in flight marked #dirty and was skipped by the
-      // guard above; without this re-check the last event of a run would never reach disk.
-      if (this.#dirty) {void this.flush()}
-    }
+  flush(): Promise<void> {
+    if (this.#flushing !== undefined) {return this.#flushing}
+    if (!this.#dirty) {return Promise.resolve()}
+    this.#flushing = (async (): Promise<void> => {
+      try {
+        while (this.#dirty) {
+          this.#dirty = false
+          try {
+            await this.#flush(progressPath(this.snapshot.runId, this.#env), JSON.stringify(this.snapshot))
+          } catch {
+            // Ignored: see above.
+          }
+        }
+      } finally {
+        this.#flushing = undefined
+      }
+    })()
+    return this.#flushing
   }
 }

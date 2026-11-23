@@ -30,15 +30,20 @@ export interface WorktreeOptions {
   worktreeRoot: string
   /** Distinguishes concurrent worktrees within a run. */
   label: string
+  /**
+   * The project's creation queue (#175). Each project owns one, so creations serialize per
+   * git repository instead of globally: a held creation in one project must never stall an
+   * unrelated project's worktree. Callers that omit it share the module-level default queue,
+   * preserving the original single-queue behaviour for a lone project.
+   *
+   * Only ever assigned promises settled by their own `resolve()`, so awaiting cannot reject.
+   */
+  queue?: { current: Promise<void> } | undefined
   onNote?: ((note: string) => void) | undefined
 }
 
-/**
- * Serialises creation: concurrent `git worktree add` calls race git's index lock.
- *
- * Only ever assigned a promise settled by its own `resolve()`, so awaiting it cannot reject.
- */
-let creating: Promise<void> = Promise.resolve()
+/** The shared queue for callers that supply none — a single project's serialisation. */
+const defaultQueue: { current: Promise<void> } = { current: Promise.resolve() }
 
 export async function isGitRepository(directory: string): Promise<boolean> {
   try {
@@ -62,9 +67,10 @@ export async function createWorktree(options: WorktreeOptions): Promise<Worktree
     return undefined
   }
 
-  const previous = creating
+  const queue = options.queue ?? defaultQueue,
+   previous = queue.current
   let signalDone: (() => void) | undefined
-  creating = new Promise<void>((resolve) => {
+  queue.current = new Promise<void>((resolve) => {
     signalDone = resolve
   })
 

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { CONTROL_STOP_ABORT_REASON, STOP_ABORT_REASON, Journal, isStopAbortDetail, parseJournal } from "../src/server/resume/journal.js"
-import type { JournalEntry } from "../src/server/resume/journal.js"
+import type { JournalEntry, Manifest } from "../src/server/resume/journal.js"
 
 const entry = (overrides: Partial<JournalEntry> = {}): JournalEntry => ({
   type: "result",
@@ -141,6 +141,31 @@ describe("empty-state behaviour", () => {
     journal.record(entry())
     expect(journal.entries.length).toBe(1)
     expect(journal.entries[0]?.key).toBe("k1")
+  })
+})
+
+describe("Manifest — V2 project scoping (#175)", () => {
+  test("carries optional projectID and directory fields alongside the v1 shape", () => {
+    const manifest: Manifest = {
+      runId: "wf_scope01",
+      bootId: "boot-1",
+      pid: 1,
+      sessionID: "ses_1",
+      sourceHash: "s",
+      argsHash: "a",
+      projectID: "prj_alpha",
+      directory: "/wt/alpha",
+      status: "running",
+      childSessionIDs: [],
+      startedAt: 0,
+    }
+    expect(manifest.projectID).toBe("prj_alpha")
+    expect(manifest.directory).toBe("/wt/alpha")
+    // Pre-upgrade manifests simply omit both, so they stay unverifiable only by scoping, not shape.
+    const unscoped: Manifest = { ...manifest }
+    delete unscoped.projectID
+    delete unscoped.directory
+    expect(unscoped.projectID).toBeUndefined()
   })
 })
 

@@ -1,10 +1,12 @@
 /**
- * Per-session ultracode state.
+ * Per-project ultracode state.
  *
- * Plugin-owned rather than stored on the session row. `session.agent` looks like the natural home,
- * but the TUI keeps the agent chip in a client-local store and sends it on every submit, so the
- * host reverts the row on the next plain turn — a mode stored there would silently switch itself
- * off after one message.
+ * Each {@link ProjectMode} is instantiated by the process-wide coordinator, one per project,
+ * so two projects in one server never see each other's toggles. A plugin-owned store rather
+ * than a session-row field: `session.agent` looks like the natural home, but the TUI keeps the
+ * agent chip in a client-local store and sends it on every submit, so the host reverts the row
+ * on the next plain turn — a mode stored there would silently switch itself off after one
+ * message.
  */
 
 export type ModeSource = "agent" | "keyword" | "command" | "option"
@@ -26,41 +28,15 @@ export interface ModeState {
  */
 export type KeywordBehavior = "one-shot" | "session"
 
-const sessions = new Map<string, ModeState>(),
-
-/**
- * Sessions where the user has told the agent NOT to fan out.
- *
- * Spec §1.6: an explicit instruction beats the mode. Ultracode's raised reasoning effort still
- * applies, but the standing opt-in reverts to ask-first.
- */
- demoted = new Set<string>()
-
-/**
- * Project-level default, from the plugin-options tuple.
- *
- * Applied per session on first sight rather than globally, so a later `/ultracode off` in one
- * session does not leak into another.
- */
-let defaultOn = false
-
-/** How a keyword mention behaves; set once at plugin init from the options tuple. */
-let keywordBehavior: KeywordBehavior = "one-shot"
-
-export const mode = {
+/** The ultracode state owned by ONE project. Every member is independent of every other project. */
+export interface ProjectMode {
   /** Sets the project-level default from plugin options. */
-  setDefault(active: boolean): void {
-    defaultOn = active
-  },
+  readonly setDefault: (active: boolean) => void
 
   /** Sets the keyword behaviour from plugin options. */
-  setKeywordBehavior(behavior: KeywordBehavior): void {
-    keywordBehavior = behavior
-  },
+  readonly setKeywordBehavior: (behavior: KeywordBehavior) => void
 
-  getKeywordBehavior(): KeywordBehavior {
-    return keywordBehavior
-  },
+  readonly getKeywordBehavior: () => KeywordBehavior
 
   /**
    * Ends a keyword turn.
@@ -69,25 +45,15 @@ export const mode = {
    * and the plugin option are deliberately untouched: the one-shot applies only
    * to what the keyword itself started.
    */
-  expireKeyword(sessionID: string): void {
-    const state = sessions.get(sessionID)
-    if (state?.source === "keyword") {sessions.delete(sessionID)}
-  },
+  readonly expireKeyword: (sessionID: string) => void
 
   /** Turns the mode on for a session. Later sources overwrite earlier ones. */
-  enable(sessionID: string, source: ModeSource, fromMessageID?: string): void {
-    // An explicit re-enable is a later instruction than an earlier "don't fan out", and wins.
-    demoted.delete(sessionID)
-    sessions.set(sessionID, { active: true, source, fromMessageID })
-  },
+  readonly enable: (sessionID: string, source: ModeSource, fromMessageID?: string) => void
 
-  disable(sessionID: string): void {
-    sessions.set(sessionID, { active: false, source: "command" })
-  },
+  readonly disable: (sessionID: string) => void
 
-  get(sessionID: string): ModeState | undefined {
-    return sessions.get(sessionID)
-  },
+  /** This session's stored state, or undefined when it has never been toggled. */
+  readonly stateOf: (sessionID: string) => ModeState | undefined
 
   /**
    * Whether ultracode is on for this turn.
@@ -97,28 +63,118 @@ export const mode = {
    * needs no state at all; but once the user has run `/ultracode off`, that command must beat
    * the agent they happen to be sitting on.
    */
-  isActive(sessionID: string, agentName?: string): boolean {
-    const state = sessions.get(sessionID)
-    if (state) {return state.active}
-    if (agentName === "ultracode") {return true}
-    return defaultOn
-  },
+  readonly isActive: (sessionID: string, agentName?: string) => boolean
 
   /** Records that the user asked for no automatic fan-out in this session. */
-  demote(sessionID: string): void {
-    demoted.add(sessionID)
-  },
+  readonly demote: (sessionID: string) => void
 
-  isDemoted(sessionID: string): boolean {
-    return demoted.has(sessionID)
-  },
+  readonly isDemoted: (sessionID: string) => boolean
 
-  resetForTests(): void {
+  /**
+   * Claims one admitted message for processing.
+   *
+   * V2's `prompt` hook can fire more than once for the same admitted message. Returns `true`
+   * exactly once per `(sessionID, messageID)`, so the retry reads as already processed and
+   * never applies the turn's state transition twice.
+   */
+  readonly markProcessedMessage: (sessionID: string, messageID: string) => boolean
+
+  /** Restores a clean mode: no sessions, no demotions, no processed ids, option defaults reset. */
+  readonly reset: () => void
+}
+
+/** Creates the mode state for one project. The coordinator holds exactly one per project key. */
+export function createProjectMode(): ProjectMode {
+  const sessions = new Map<string, ModeState>(),
+    /**
+     * Sessions where the user has told the agent NOT to fan out.
+     *
+     * Spec §1.6: an explicit instruction beats the mode. Ultracode's raised reasoning effort still
+     * applies, but the standing opt-in reverts to ask-first.
+     */
+    demoted = new Set<string>(),
+    /** Session id -> admitted message ids this project already acted on. */
+    processed = new Map<string, Set<string>>()
+
+  /**
+   * Project-level default, from the plugin-options tuple.
+   *
+   * Applied per session on first sight rather than globally, so a later `/ultracode off` in one
+   * session does not leak into another.
+   */
+  let defaultOn = false
+
+  /** How a keyword mention behaves; set once at plugin init from the options tuple. */
+  let keywordBehavior: KeywordBehavior = "one-shot"
+
+  const stateOf = (sessionID: string): ModeState | undefined => sessions.get(sessionID)
+
+  const reset = (): void => {
     sessions.clear()
     demoted.clear()
+    processed.clear()
     defaultOn = false
     keywordBehavior = "one-shot"
-  },
+  }
+
+  return {
+    setDefault(active: boolean): void {
+      defaultOn = active
+    },
+
+    setKeywordBehavior(behavior: KeywordBehavior): void {
+      keywordBehavior = behavior
+    },
+
+    getKeywordBehavior(): KeywordBehavior {
+      return keywordBehavior
+    },
+
+    expireKeyword(sessionID: string): void {
+      const state = sessions.get(sessionID)
+      if (state?.source === "keyword") {sessions.delete(sessionID)}
+    },
+
+    enable(sessionID: string, source: ModeSource, fromMessageID?: string): void {
+      // An explicit re-enable is a later instruction than an earlier "don't fan out", and wins.
+      demoted.delete(sessionID)
+      sessions.set(sessionID, { active: true, source, fromMessageID })
+    },
+
+    disable(sessionID: string): void {
+      sessions.set(sessionID, { active: false, source: "command" })
+    },
+
+    stateOf,
+
+    isActive(sessionID: string, agentName?: string): boolean {
+      const state = sessions.get(sessionID)
+      if (state) {return state.active}
+      if (agentName === "ultracode") {return true}
+      return defaultOn
+    },
+
+    demote(sessionID: string): void {
+      demoted.add(sessionID)
+    },
+
+    isDemoted(sessionID: string): boolean {
+      return demoted.has(sessionID)
+    },
+
+    markProcessedMessage(sessionID: string, messageID: string): boolean {
+      let seen = processed.get(sessionID)
+      if (seen === undefined) {
+        seen = new Set<string>()
+        processed.set(sessionID, seen)
+      }
+      if (seen.has(messageID)) {return false}
+      seen.add(messageID)
+      return true
+    },
+
+    reset,
+  }
 }
 
 /**

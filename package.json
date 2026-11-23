@@ -1,6 +1,6 @@
 {
   "name": "ultraopen",
-  "version": "0.1.0",
+  "version": "0.2.0-next.1",
   "description": "Deterministic multi-agent workflow orchestration and an ultracode effort mode for opencode",
   "license": "MIT",
   "author": "Phillip Chaffee",
@@ -12,11 +12,17 @@
   "bugs": "https://github.com/PhillipChaffee/ultraopen/issues",
   "type": "module",
   "exports": {
+    ".": {
+      "import": "./dist/server.js"
+    },
     "./server": {
       "import": "./dist/server.js"
     },
     "./tui": {
       "import": "./dist/tui.js"
+    },
+    "./rpc": {
+      "import": "./dist/rpc.js"
     }
   },
   "files": [
@@ -27,19 +33,20 @@
     "NOTICE"
   ],
   "engines": {
-    "opencode": ">=1.18.20"
+    "opencode": ">=2.3.2 <3"
   },
   "dependencies": {
+    "@opencode/plugin": "^2.3.2",
     "acorn": "8.15.0"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "^1.18.20",
-    "@opencode-ai/sdk": "^1.18.20",
-    "@opentui/core": "0.4.5",
-    "@opentui/solid": "0.4.5",
+    "@opencode/theme": "2.3.2",
+    "@opentui/core": "0.8.4",
+    "@opentui/solid": "0.8.4",
     "@types/bun": "^1.4.0",
     "@types/node": "^24.0.0",
     "oxlint": "^1.80.0",
+    "solid-js": "1.9.17",
     "typescript": "^5.9.0"
   },
   "scripts": {
@@ -62,8 +69,8 @@
     "ultracode"
   ],
   "peerDependencies": {
-    "@opentui/core": ">=0.4.5",
-    "@opentui/solid": ">=0.4.5",
+    "@opentui/core": ">=0.8.4",
+    "@opentui/solid": ">=0.8.4",
     "solid-js": ">=1.9.0"
   },
   "peerDependenciesMeta": {

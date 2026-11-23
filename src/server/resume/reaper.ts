@@ -1,8 +1,18 @@
-import { readFile, readdir, rm, writeFile } from "node:fs/promises"
+import { readFile, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
-import { artifactPaths, dataRoot, findOrphans, isSafeRunId, readManifest, readManifestState, runDir, writeManifest } from "./store.js"
+import {
+  INTERRUPTED_MARKER,
+  artifactPaths,
+  findOrphans,
+  isProcessAlive,
+  listRunIds,
+  readManifest,
+  readManifestState,
+  runDir,
+  writeManifest,
+} from "./store.js"
 import type { Manifest } from "./journal.js"
-import type { OpencodeClient } from "../types.js"
+import type { HostPort } from "../host/port.js"
 
 /**
  * Harvests resume candidates from runs a dead process left behind.
@@ -23,11 +33,6 @@ import type { OpencodeClient } from "../types.js"
  * live run.
  */
 
-/** Identifies this process. Regenerated on every start, which is exactly the point. */
-export function newBootId(): string {
-  return `${process.pid}-${Math.trunc(performance.timeOrigin)}`
-}
-
 export interface ReapResult {
   runs: number
   sessions: number
@@ -40,21 +45,6 @@ export interface ReapResult {
    * (TTL expiry, guards) keeps them safely orphaned on disk.
    */
   orphaned: Manifest[]
-}
-
-/**
- * Non-throwing probe: true when the process holding `pid` looks alive.
- *
- * EPERM means the process exists but we may not signal it — treated as alive. ESRCH is the
- * definitive dead signal. Injectable via options so tests never depend on the host process table.
- */
-export function defaultProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    return (error as NodeJS.ErrnoException | undefined)?.code === "EPERM"
-  }
 }
 
 /** Swallows a best-effort write failure — persistence must never reject the sweep. */
@@ -101,7 +91,7 @@ export function salvageSessionIDs(text: string | undefined): string[] {
  * before the resume sweep decides what the run itself deserves.
  */
 export async function reapOrphans(
-  client: OpencodeClient,
+  host: HostPort,
   bootId: string,
   options: {
     onNote?: ((note: string) => void) | undefined
@@ -113,8 +103,8 @@ export async function reapOrphans(
     // Quarantine pass FIRST (#136): a run whose manifest is unreadable is invisible to every
     // reader — status answers "no run found", findOrphans skips it, and nothing would ever stop
     // or prune it. Tombstone it orphaned so it surfaces and prunes like any interrupted run.
-    const alive = options.isProcessAlive ?? defaultProcessAlive
-    const quarantine = await quarantineCorruptRuns(client, { env: options.env, isProcessAlive: alive })
+    const alive = options.isProcessAlive ?? isProcessAlive
+    const quarantine = await quarantineCorruptRuns(host, { env: options.env, isProcessAlive: alive })
     // findOrphans swallows its own I/O errors and returns [], so no catch is needed here.
     const orphans = await findOrphans(bootId, options.env)
     if (orphans.length === 0) {
@@ -133,8 +123,10 @@ export async function reapOrphans(
     for (const manifest of reapable) {
       for (const sessionID of manifest.childSessionIDs ?? []) {
         try {
-          await client.session.abort({ path: { id: sessionID } })
-          sessions++
+          // V2's interrupt answers whether the host confirmed it; false is an unconfirmed stop,
+          // not a silent success (the refusal that used to arrive as a thrown abort).
+          if (await host.interruptSession(sessionID)) {sessions++}
+          else {failures++}
         } catch {
           failures++
         }
@@ -154,7 +146,7 @@ export async function reapOrphans(
       // and failed runs never hint. It is also the auto-resume sweep's claim
       // token: adopting a run renames it, so two boots cannot adopt one run.
       await writeFile(
-        join(runDir(manifest.runId, options.env), "interrupted.txt"),
+        join(runDir(manifest.runId, options.env), INTERRUPTED_MARKER),
         manifest.runId,
         "utf8",
       ).catch(ignore)
@@ -220,19 +212,13 @@ function quarantineNote(q: QuarantineOutcome): string {
  *    skips unhashable manifests by construction.
  */
 async function quarantineCorruptRuns(
-  client: OpencodeClient,
+  host: HostPort,
   options: { env?: NodeJS.ProcessEnv | undefined; isProcessAlive: (pid: number) => boolean },
 ): Promise<QuarantineOutcome> {
   const outcome: QuarantineOutcome = { quarantined: 0, live: 0, sessions: 0, failures: 0 }
-  const root = dataRoot(options.env)
-  let names: string[]
-  try {
-    names = await readdir(root)
-  } catch {
-    return outcome
-  }
-  for (const name of names) {
-    if (!isSafeRunId(name)) {continue}
+  // `listRunIds` is the module's one trust boundary: it drops every unsafe directory name and
+  // answers empty for an unreadable root, so this pass never re-checks what the listing owns.
+  for (const name of await listRunIds(options.env)) {
     const read = await readManifestState(name, options.env)
     if (read.state !== "corrupt") {continue}
     const paths = artifactPaths(name, options.env)
@@ -252,8 +238,8 @@ async function quarantineCorruptRuns(
     }
     for (const sessionID of salvageSessionIDs(torn)) {
       try {
-        await client.session.abort({ path: { id: sessionID } })
-        outcome.sessions++
+        if (await host.interruptSession(sessionID)) {outcome.sessions++}
+        else {outcome.failures++}
       } catch {
         outcome.failures++
       }
@@ -271,7 +257,7 @@ async function quarantineCorruptRuns(
       startedAt: now,
       endedAt: now,
     }, options.env).catch(ignore)
-    await writeFile(join(runDir(name, options.env), "interrupted.txt"), name, "utf8").catch(ignore)
+    await writeFile(join(runDir(name, options.env), INTERRUPTED_MARKER), name, "utf8").catch(ignore)
     outcome.quarantined++
   }
   return outcome
@@ -306,18 +292,12 @@ export async function pruneRuns(
     autoResumeTtlHours?: number | undefined
   } = {},
 ): Promise<number> {
-  let names: string[]
-  try {
-    names = await readdir(dataRoot(options.env))
-  } catch {
-    return 0
-  }
-
   const now = options.now ?? Date.now(),
    cutoff = now - RETENTION_MS,
    resumeCutoff = now - (options.autoResumeTtlHours ?? 0) * HOUR_MS
   let pruned = 0
-  for (const name of names) {
+  // The ids are already the safe subset, so the loop below never joins a foreign name into a path.
+  for (const name of await listRunIds(options.env)) {
     const manifest = await readManifest(name, options.env)
     if (!manifest || manifest.status === "running") {continue}
     if (manifest.status === "orphaned") {

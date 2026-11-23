@@ -1,22 +1,28 @@
 #!/usr/bin/env bash
-# visual.sh — visual/UX verification of ultraopen's three progress surfaces in a
-# REAL opencode TUI, driven through tmux: send-keys in, capture-pane out,
-# assertions on the literal markers the components render (src/tui/data.ts,
+# visual.sh — visual/UX verification of ultraopen's progress surfaces in a REAL
+# opencode TUI, driven through tmux: send-keys in, capture-pane out, assertions
+# on the literal markers the components render (src/tui/data.ts,
 # src/tui/index.tsx). Two modes run in one pass:
 #
-#   synthetic — fabricated run dirs rendered by the TUI's disk poller: no model
-#               in the loop, deterministic states, every surface exercisable.
+#   synthetic — fabricated run dirs rendered by the TUI's RPC-backed surfaces:
+#               no model in the loop, deterministic states, every surface
+#               exercisable. The session is pre-created over the HTTP API, so
+#               V2a–V2f and V5 make zero paid model calls.
 #   live      — a real workflow turn: markers appear mid-run, vanish on exit,
-#               the GenericTool transcript row shows the script echo.
+#               the GenericTool transcript row shows spinner/check glyphs.
+#
+# The opencode server half runs as `opencode serve`; the TUI attaches with
+# `opencode --server <url> --session <id> --auto`. There is no `--port` on the
+# TUI in V2, and every API probe authenticates with OPENCODE_PASSWORD.
 #
 # Frames (with colors, capture-pane -e) are dumped under test/e2e/artifacts/
 # for human review of layout and styling that text assertions can't see.
 #
 # Usage:  bash test/e2e/visual.sh [--fast|--keep|CASE...]
 #
-#   (no args)          the full suite: rest, synth, live, hydration, permission, hint
-#   --fast             the short version: rest, synth, hint — one model call
-#                      for session setup, no live workflow turns (~2 min)
+#   (no args)          the full suite: rest, synth, live, hydration, permission, hint, spike
+#   --fast             the short version: rest, synth, hint — zero model calls
+#                      (the session is pre-created), no live workflow turns (~2 min)
 #   CASE...            run only the named cases, in this order:
 #                        rest       V1  no markers at rest (cheap)
 #                        synth      V2a-V2f  synthetic runs, sidebar, failed
@@ -29,8 +35,9 @@
 #                        hint       V5  the interrupted-run hint on boot
 #   --keep             keep the scratch XDG home for post-mortem
 #
-# A case that needs a session creates one on demand (one cheap model call).
-# The full default pass makes real model calls (pennies on Together). Requires tmux.
+# A case that needs a session pre-creates it over the HTTP API (zero model
+# calls; the synthetic cases cost nothing). The live cases make real model
+# calls (pennies). Requires tmux.
 
 cd "$(dirname "$0")" || exit 1
 # shellcheck source=lib.sh
@@ -87,39 +94,75 @@ if build_plugin; then
 else
   bad "plugin build failed"; finish; exit 1
 fi
-stash_host_modules
-note "stashed node_modules/{solid-js,@opentui} so the TUI host injects its own instances"
 
+# V2's runtime loader injects the host Solid/OpenTUI instances, so the old
+# node_modules stash is gone. The server half starts on the first tui_start and
+# is reused across TUI reboots; the sidebar starts hidden via cli.json so the
+# explicit toggle below has a deterministic baseline.
 boot_tui() {
-  export OPENCODE_FAST_BOOT=1   # skip the loading screen; shortens the input-drop window
-  tui_start --auto
+  ensure_session
+  [ -n "$SID" ] || { bad "cannot boot the TUI without a session"; finish; exit 1; }
+  tui_start --auto --session "$SID"
   wait_tui_ready || { frame 00-boot-failed; finish; exit 1; }
   # No fixed settle for the TUI's startup input-drop window (~10s, opencode
-  # issue #42915): input-free steps (frame dumps, V1's rest assertions) run at
+  # issue #42915): input-free steps (frame dumps, the rest assertions) run at
   # once, and the first input-bearing step gates itself on its own effect
   # (probe_verify_retry).
   frame 00-boot
+  # The client half loads from `plugins` in the same config as the server. If
+  # that setup throws, every surface assertion below would fail for one root
+  # cause — report it here, with the host's own error, and stop.
+  sleep 2
+  if tui_plugin_setup_failed; then
+    bad "the ultraopen TUI plugin failed at setup" "$(tui_plugin_setup_error)"
+    frame 00-boot-plugin-failed
+    finish; exit 1
+  fi
   ok "TUI up in tmux (artifacts: $OUT)"
 }
 
-# The first real input after a boot is a one-word session prompt; its verify
-# is a NEW session row (sessions persist in the scratch across reboots, so an
-# any-session check would be pre-satisfied on the later boots).
-tui_ready_prompt() { tui_http_prompt "Reply with exactly the word READY."; }
+# The CLI writes plugin reconciliation failures to the scratch log with role=cli.
+tui_plugin_setup_failed() {
+  local log="$DATA_ROOT/log/opencode.log"
+  [ -f "$log" ] && rg -q 'message="plugin operation failed".*plugin=ultraopen.*role=cli' "$log"
+}
+tui_plugin_setup_error() {
+  rg 'message="plugin operation failed".*plugin=ultraopen.*role=cli' "$DATA_ROOT/log/opencode.log" 2>/dev/null | tail -1 | cut -c1-240
+}
 
 SID=""
+SESSION_ID=""
+
+# V2's GenericTool row can scroll above the visible pane once the prompt and transcript grow.
+# The visual surfaces are asserted separately; the tool call itself is proven in the session
+# part stream (the row is presentation, the part is the durable record).
+workflow_tool_call_in_db() {
+  python3 - "$XDG_DATA_HOME/opencode/opencode.db" <<'PY'
+import json, sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+for (data,) in db.execute("SELECT data FROM session_message WHERE type = 'assistant'"):
+    try:
+        message = json.loads(data)
+    except ValueError:
+        continue
+    for part in message.get("content", []):
+        if isinstance(part, dict) and part.get("type") == "tool" and part.get("name") == "workflow":
+            sys.exit(0)
+sys.exit(1)
+PY
+}
+
+# Session setup is a plain API call: V2 returns { data: Session.Info } from
+# POST /api/session, so the synthetic cases need no model call and no
+# input-window gate.
 ensure_session() {
   [ -n "$SID" ] && return 0
-  sessions_snapshot "$OUT/sessions-before-ensure.txt"
-  ensure_session_landed() { session_landed_since "$OUT/sessions-before-ensure.txt"; }
-  if probe_verify_retry tui_ready_prompt ensure_session_landed; then
-    assert_pane_contains "model replied in-session" "READY" 120
-    SID="$(current_session)"
-    ok "session id: $SID"
-  else
-    bad "could not create a session after 3 attempts"
-  fi
-  frame 02-session
+  server_start
+  wait_for "$E2E_WAIT_TIMEOUT" health_ok || { bad "opencode server never became ready"; return 1; }
+  warm_location
+  SID="$(session_create "ultraopen e2e")" || { bad "could not pre-create a session"; SID=""; return 1; }
+  SESSION_ID="$SID"
+  ok "session id: $SID"
 }
 
 # The sidebar starts closed; <leader>b opens it. The keystroke occasionally
@@ -145,8 +188,9 @@ if want rest; then
 fi
 
 if want synth || want live || want spike; then
-  section "V2 — create a session (routes the TUI to the session view)"
+  section "V2 — pre-created session (zero paid model calls)"
   ensure_session
+  [ -n "$SID" ] && ok "TUI is attached to session $SID" || bad "session setup failed"
 fi
 
 if want synth; then
@@ -154,7 +198,7 @@ if want synth; then
     bad "synthetic cases need a session" "the session setup failed"
   else
   section "V2a — synthetic run renders all three surfaces"
-  synth_run wf_synth_a "$SID" e2e-visual Verify "alpha:one" "running" "alpha:two" "done"
+  synth_run wf_syntha1 "$SID" e2e-visual Verify "alpha:one" "running" "alpha:two" "done"
   assert_pane_contains "prompt-row status appears (ultracode ⠋)" "ultracode ⠋ " 5
   assert_pane_contains "bottom strip appears (ultracode · e2e-visual)" "ultracode · e2e-visual" 5
   assert_pane_contains "strip agent details (one active run shows them)" "alpha:one" 5
@@ -176,15 +220,15 @@ if want synth; then
   # The transcript affordances hint rides under the rows (#150), naming the picker and the
   # gesture without any positional claim. The sidebar wraps its free text at the column width,
   # so assert the unambiguous fragment a wrap cannot split.
-  if pane_matches 'transcripts: /sessions'; then
+  if pane_matches 'transcripts: /workflows'; then
     ok "the transcript hint renders in the sidebar"
   else
-    bad "sidebar transcript hint not found" "expected the /sessions + gesture hint under the agent rows"
+    bad "sidebar transcript hint not found" "expected the /workflows + /sessions hint under the agent rows"
   fi
   frame 04-sidebar
 
   section "V2c — failed agent glyph and failure count"
-  synth_run wf_synth_a "$SID" e2e-visual Verify "alpha:one" "running" "alpha:two" "failed"
+  synth_run wf_syntha1 "$SID" e2e-visual Verify "alpha:one" "running" "alpha:two" "failed"
   assert_pane_contains "failed glyph renders" "✗ alpha:two" 5
   assert_pane_contains "failure count in summary" "· 1 failed" 5
   # The failed glyph must carry the theme's error color: a distinct SGR prefix
@@ -215,7 +259,7 @@ PYEOF
   section "V2c2 — large-run badge in the strip summary (advice only)"
   # The badge threshold is a constant shared with the server's own warning;
   # 20 synthetic agents cross it. ADVICE ONLY: the run continues normally.
-  python3 - "$RUN_ROOT/wf_synth_a" <<'PYL'
+  python3 - "$RUN_ROOT/wf_syntha1" <<'PYL'
 import json, sys, time
 d = sys.argv[1]
 now = int(time.time() * 1000)
@@ -235,8 +279,8 @@ PYL
   # concurrent-launch policy: docs/adr/0001-launch-concurrency-policy.md).
   # Run A's snapshot still holds V2c2's 20 bulk agents, which would clip run B
   # out of the sidebar panel — restore the two-agent shape first.
-  synth_run wf_synth_a "$SID" e2e-visual Verify "alpha:one" "running" "alpha:two" "done"
-  synth_run wf_synth_b "$SID" e2e-other Probe "beta:one" "running"
+  synth_run wf_syntha1 "$SID" e2e-visual Verify "alpha:one" "running" "alpha:two" "done"
+  synth_run wf_synthb1 "$SID" e2e-other Probe "beta:one" "running"
   assert_pane_contains "prompt status collapses to run count" "ultracode ⠋ 2 runs" 5
   assert_pane_contains "strip lists both runs" "ultracode · e2e-other" 5
   assert_pane_contains "strip keeps the first run" "ultracode · e2e-visual" 5
@@ -249,12 +293,18 @@ PYL
   assert_pane_contains "sidebar renders run B's agent row" "⠋ beta:one" 5
   # A run belonging to a DIFFERENT session must never reach this session's view:
   # every surface filters by session id.
-  synth_run wf_synth_stray "ses_stray0000000000000000" e2e-stray Stray "gamma:one" "running"
+  synth_run wf_synthstray "ses_stray0000000000000000" e2e-stray Stray "gamma:one" "running"
   assert_pane_lacks "a foreign session's run is filtered out of the strip" "ultracode · e2e-stray" 5
   assert_pane_lacks "a foreign session's run is filtered out of the sidebar" "gamma:one" 5
   frame 06-multi-run
 
   section "V2e — narrow pane keeps the marker prefixes"
+  # V2's `session.composer.top` slot gets the composer's width, not the terminal's. At 60 cols
+  # with the sidebar open that leaves ~17 columns and clips the workflow name; close it so the
+  # narrow-pane check tests the strip's own prefix rather than the sidebar split.
+  if sidebar_open; then
+    toggle_sidebar || true
+  fi
   tmx resize-window -x 60 2>/dev/null || tmx resize-pane -x 60 || true
   sleep 1
   assert_pane_contains "strip prefix survives 60 cols" "ultracode · e2e-visual" 5
@@ -263,10 +313,10 @@ PYL
   sleep 1
 
   section "V2f — terminal status makes surfaces vanish (live-only display)"
-  synth_finish wf_synth_a completed
-  synth_finish wf_synth_b completed
+  synth_finish wf_syntha1 completed
+  synth_finish wf_synthb1 completed
   # The foreign-session run settles too, so no later boot reaps it into a hint.
-  synth_finish wf_synth_stray completed
+  synth_finish wf_synthstray completed
   assert_pane_lacks "prompt-row marker gone after completion" "ultracode ⠋ " 5
   assert_pane_lacks "strip marker gone after completion" "ultracode · e2e-visual" 5
   frame 08-vanished
@@ -281,13 +331,16 @@ if want live; then
   LIVE_FIXTURE="${VISUAL_LIVE_FIXTURE:-parallel}"
   runs_snapshot "$OUT/runs-before-v3.txt"
   tui_http_prompt "$(wf_prompt "$LIVE_FIXTURE")"
-  assert_pane_contains "GenericTool transcript row shows the call" "⚙ workflow" 300
-  # The fixtures are named e2e-<fixture>, and the model can pop its end-of-turn
-  # question dialog at any moment, which overlays the prompt row — so assert
-  # the prompt status mid-flight before the longer strip poll leaves it time
-  # to appear.
-  assert_pane_contains "prompt status shows live run" "ultracode ⠋ " 300
-  assert_pane_contains "strip shows live run (ultracode · e2e-parallel)" "ultracode · e2e-$LIVE_FIXTURE" 300
+  # Check the live surfaces FIRST: the fixture is fast and the strip/prompt disappear the
+  # moment it settles. The tool row itself may scroll out of the pane, so the durable part
+  # stream proves the call while the strip/prompt prove the live rendering.
+  assert_pane_contains "prompt status shows live run" "ultracode ⠋ " 20
+  assert_pane_contains "strip shows live run (ultracode · e2e-parallel)" "ultracode · e2e-$LIVE_FIXTURE" 20
+  if wait_for 30 workflow_tool_call_in_db; then
+    ok "the workflow tool call is in the session part stream"
+  else
+    bad "no workflow tool call in the session part stream" "see $OUT for frames"
+  fi
   frame 09-live-midrun
   # Live turns occasionally stall on provider hiccups (same class the technical
   # suite's T8 retries) — interrupt and retry the turn once before failing.
@@ -313,21 +366,21 @@ if want live; then
 fi
 
 if want spike; then
-  section "SPIKE — child-transcript navigation + per-agent recordings (#150)"
-  # #150 spike: does upstream child navigation (session_child_first / cycle /
-  # parent keybinds: leader down / right / up) ENTER a workflow child and RENDER
-  # its transcript while it runs and after it settles — including a child that
-  # used a schema (whose REST message listing is poisoned by `format`)?
-  # Two agents, one plain and one schema'd, distinct markers; navigation order
-  # can land on either child, so every frame is searched for both.
-  #
-  # The same case is #150's e2e acceptance for the per-agent recording (ADR-0004):
-  # the run records BOTH agents — mid-run and after settle — and the schema'd
-  # child's native view stays blank, which is exactly why the recording exists.
+  section "SPIKE — /workflows panel + per-agent recordings (#150)"
+  # V2 has no custom transcript/tool-renderer slot and no V1 child-navigation
+  # gesture. The plugin's readable surfaces are the `/workflows` session panel
+  # (clickable child rows) and the always-on per-agent JSONL recordings
+  # (ADR-0004). Two agents, one plain and one schema'd; the schema'd child is
+  # the one whose native transcript view is unreliable, which is why the
+  # recording exists.
   runs_snapshot "$OUT/runs-before-spike.txt"
   tui_http_prompt "$(wf_prompt spike-mixed)"
-  assert_pane_contains "GenericTool transcript row shows the launch" "⚙ workflow" 300
-  assert_pane_contains "strip shows live run" "ultracode · e2e-spike" 300
+  assert_pane_contains "strip shows live run" "ultracode · e2e-spike" 20
+  if wait_for 30 workflow_tool_call_in_db; then
+    ok "the workflow tool call is in the session part stream"
+  else
+    bad "no workflow tool call in the session part stream" "see $OUT for frames"
+  fi
   frame 20-spike-midrun-before-nav
 
   recordings_count() { # recordings_count RUNID → jsonl file count in its recordings dir
@@ -361,86 +414,25 @@ PYEOF
     bad "recording files did not appear mid-run" "expected 2 jsonl files under $RUN_ROOT/$SPIKE_RUN/recordings"
   fi
 
-  child_markers() { # child_markers NAME — asserts the child context by probe text of BOTH frames
-    local pane text
-    pane="$(tui_capture)"
-    for text in "SPIKE-PLAIN-MARK-7391" "SPIKE-SCHEMA-MARK-7391"; do
-      if printf '%s' "$pane" | grep -qF -- "$text"; then
-        note "$1: rendered '$text'"
-      else
-        note "$1: did NOT render '$text'"
-      fi
-    done
-  }
-
-  # Enter the first child; name the SIDES via the strip/side labels so frames
-  # carry what the pane showed. The cycling gesture visits every child, so the
-  # pair order does not matter — both children get their frames either way.
-  tui_keys C-x; sleep 1; tui_keys Down; sleep 3
-  frame 21-spike-child1
-  child_markers "child1(down)"
-
-  tui_keys Right; sleep 3
-  frame 22-spike-child2-cycle
-  child_markers "child2(right)"
-
-  # One more cycle in case three (wrap) children exist, then return to parent.
-  tui_keys Right; sleep 3
-  frame 23-spike-child3-wrap
-  child_markers "child3(right)"
-
-  tui_keys Up; sleep 3
-  frame 24-spike-parent
-  child_markers "parent(up)"
-
-  render_result() {
-    python3 - "$OUT" <<'PYEOF'
-import sys, pathlib
-out = pathlib.Path(sys.argv[1])
-plain, schema = 0, 0
-for path in ["21-spike-child1.frame", "22-spike-child2-cycle.frame", "23-spike-child3-wrap.frame"]:
-    p = out / path
-    if not p.exists():
-        continue
-    text = p.read_text()
-    if "SPIKE-PLAIN-MARK-7391" in text:
-        plain += 1
-    if "SPIKE-SCHEMA-MARK-7391" in text:
-        schema += 1
-(out / "spike-verdict.txt").write_text(f"plain_frames={plain} schema_frames={schema}\n")
-PYEOF
-  }
-  render_result
-  note "spike verdict written: $(cat "$OUT/spike-verdict.txt")"
-  # Upstream's child-transcript rendering is a THREE-STATE swing observed on opencode
-  # 1.18.33 (evidence: the spike-verdict files of this suite's runs, 2026-10-12): every child
-  # renders, only the plain child renders (the documented gap — `format` poisons the message
-  # listing the view reads), or every child renders blank (a boot with several runs sharing
-  # the parent session). The plugin cannot and must not control which state appears — the
-  # RECORDING is the predictable view in all three, and its assertions above are hard.
-  # HARD here: navigation itself must still work — a Subagent HUD with its out/in gestures
-  # is what every state shows, entered children included.
-  SP_FRAME="$(rg "^  ┃ +Subagent \([0-9]+ of [0-9]+\)" "$OUT/21-spike-child1.frame" 2>/dev/null | head -1)"
-  if [ -n "$SP_FRAME" ]; then
-    ok "child navigation entered a subagent view (upstream HUD present): ${SP_FRAME//|//}"
+  # The `/workflows` panel is the inspection surface in V2: open it and assert
+  # the run summary and both clickable child rows. Navigation is the palette
+  # command (`/workflows`), never the removed V1 C-x Down/Right gesture.
+  open_workflows_panel() { tui_keys -l "/workflows"; sleep 0.5; tui_keys Enter; }
+  workflows_panel_open() { pane_contains "ultracode workflows"; }
+  if probe_verify_retry open_workflows_panel workflows_panel_open 8 3; then
+    ok "the /workflows panel opens"
   else
-    bad "child navigation never entered a subagent view" "the plain architecture regressed — inspect $OUT/21*.frame"
+    bad "the /workflows panel never opened" "the slash command did not render the session panel"
   fi
-  # The documented gap (#150 / ADR-0004), as evidence under the spelling the truth allows:
-  # in a boot where the plain child rendered, the schema'd child's blank-or-not verdict is
-  # recorded for the README's upstream note; both values observed on 2026-10-12.
-  VERDICT=$(python3 - "$OUT/spike-verdict.txt" <<'PYEOF'
-import re, sys
-text = open(sys.argv[1]).read()
-plain = re.search(r"plain_frames=(\d+)", text)
-schema = re.search(r"schema_frames=(\d+)", text)
-print(f'plain_frames={plain.group(1) if plain else 0} schema_frames={schema.group(1) if schema else 0}')
-PYEOF
-)
-  note "(#150 upstream-note refresh) $VERDICT — when plain renders, the recorded gap's verdict; when nothing renders, the shared-session boot's state avoids child transcripts entirely"
+  assert_pane_contains "panel lists the live run" "e2e-spike" 15
+  assert_pane_contains "panel lists the plain child row" "plain:one" 15
+  assert_pane_contains "panel lists the schema'd child row" "schema:two" 15
+  frame 21-workflows-panel
+  tui_keys Escape; sleep 1
 
-  # After the run settles: the HISTORICAL children get the same navigation, and the
-  # recordings hold BOTH agents' full streams — the schema'd child's only visibility.
+  # After the run settles: the panel still lists the run and its children (the
+  # RPC returns active/recent runs), and the recordings hold BOTH agents' full
+  # streams — the schema'd child's only predictable visibility.
   spike_done() { [ -n "$(newest_completed_run "$OUT/runs-before-spike.txt")" ]; }
   if wait_for 300 spike_done; then
     ok "spike run completed on disk"
@@ -461,16 +453,17 @@ PYEOF
       bad "the schema'd agent's recording lacks its marker" "the recording is that agent's ONLY view; without the marker it explains nothing"
     fi
   else
-    note "spike run did not complete in 300s — historical pass still attempted"
+    note "spike run did not complete in 300s — historical panel pass still attempted"
   fi
-  sleep 3
-  tui_keys C-x; sleep 1; tui_keys Down; sleep 3
-  frame 25-spike-historical-child1
-  child_markers "historical-child1"
-  tui_keys Right; sleep 3
-  frame 26-spike-historical-child2
-  child_markers "historical-child2"
-  tui_keys Up; sleep 2
+  sleep 2
+  if probe_verify_retry open_workflows_panel workflows_panel_open 8 3; then
+    ok "the /workflows panel still opens after settle"
+  else
+    note "the /workflows panel did not reopen after settle — the recordings above decide the case"
+  fi
+  assert_pane_contains "panel keeps the settled run visible" "e2e-spike" 15
+  frame 22-workflows-panel-settled
+  tui_keys Escape; sleep 1
 fi
 
 if want hydration; then
@@ -489,7 +482,11 @@ if want hydration; then
 $(cat "$E2E_DIR/fixtures/idle-hydration.js")
 
 The tool returns a launch result with a run id, not the outcome. Do NOT poll workflow_status and do not wait for the run: end your turn immediately after the launch result. A completion notification will arrive in this conversation when the run settles. When it arrives, reply with exactly HYDRA-VIS-ACK-7391 and nothing else."
-  assert_pane_contains "GenericTool transcript row shows the launch" "⚙ workflow" 300
+  if wait_for 30 workflow_tool_call_in_db; then
+    ok "the workflow tool call is in the session part stream"
+  else
+    bad "no workflow tool call in the session part stream" "see $OUT for frames"
+  fi
   v6_done() { [ -n "$(newest_completed_run "$OUT/runs-before-v6.txt")" ]; }
   if wait_for 300 v6_done; then
     ok "the idle run completed on disk: $(newest_completed_run "$OUT/runs-before-v6.txt")"
@@ -497,18 +494,17 @@ The tool returns a launch result with a run id, not the outcome. Do NOT poll wor
     bad "the idle-hydration run never completed" "see $OUT for frames"
   fi
   # The notification lands while the host idles; hydration starts a new turn.
-  # Upstream note: the TUI hides synthetic user messages from the visible
-  # timeline (opencode 1.18.31, packages/tui/src/routes/session/index.tsx:394
-  # filters `!part.synthetic`), so the notification asserts on the scratch db —
-  # the pane's visible effect is the ack turn it started (asserted on an
-  # assistant message after the notification, also db-level: the prompt echo
-  # renders the ack literal too, so the pane cannot decide it).
+  # V2 stores it in session_message (type = 'synthetic') and renders it inline
+  # as `◈ <description>` — the description is `Workflow <name> completed`. The
+  # pane row proves the visual surface; the db proves delivery; the assistant
+  # ack (also db-level, since the prompt echo renders the literal too) proves a
+  # new turn started from it.
   v6_notified() {
     python3 - "$XDG_DATA_HOME/opencode/opencode.db" <<'PYEOF'
 import sqlite3, sys
 db = sqlite3.connect(sys.argv[1])
 row = db.execute(
-    "SELECT 1 FROM part WHERE data LIKE '%\"synthetic\":true%' AND data LIKE '%<workflow-completed run=%' LIMIT 1"
+    "SELECT 1 FROM session_message WHERE type = 'synthetic' AND data LIKE '%<workflow-completed run=%' LIMIT 1"
 ).fetchone()
 sys.exit(0 if row else 1)
 PYEOF
@@ -518,22 +514,23 @@ PYEOF
   else
     bad "no synthetic notification in the transcript db" "inspect $SCRATCH/share/opencode/opencode.db"
   fi
+  assert_pane_contains "the synthetic transcript row renders (◈ description)" "◈ Workflow e2e-idle-hydration completed" 120
   frame 15-hydration-notification
   v6_acked() {
     python3 - "$XDG_DATA_HOME/opencode/opencode.db" <<'PYEOF'
 import sqlite3, sys
 db = sqlite3.connect(sys.argv[1])
 notif = db.execute(
-    "SELECT message_id FROM part WHERE data LIKE '%<workflow-completed run=%' ORDER BY rowid DESC LIMIT 1"
+    "SELECT seq, session_id FROM session_message "
+    "WHERE type = 'synthetic' AND data LIKE '%<workflow-completed run=%' "
+    "ORDER BY seq DESC LIMIT 1"
 ).fetchone()
 if notif is None:
     sys.exit(1)
 row = db.execute(
-    "SELECT p.data FROM part p JOIN message m ON m.id = p.message_id "
-    "WHERE m.session_id = (SELECT session_id FROM message WHERE id = ?) "
-    "AND m.data LIKE '%\"assistant\"%' AND p.data LIKE '%HYDRA-VIS-ACK-7391%' "
-    "AND m.rowid > (SELECT rowid FROM message WHERE id = ?) LIMIT 1",
-    (notif[0], notif[0]),
+    "SELECT 1 FROM session_message WHERE session_id = ? AND type = 'assistant' "
+    "AND seq > ? AND data LIKE '%HYDRA-VIS-ACK-7391%' LIMIT 1",
+    (notif[1], notif[0]),
 ).fetchone()
 sys.exit(0 if row else 1)
 PYEOF
@@ -551,10 +548,11 @@ if want permission; then
   tui_quit
   tmx kill-server 2>/dev/null || true
   sleep 1
-  SID=""
-  tui_start
-  wait_tui_ready || { frame 11-permission-boot-failed; finish; exit 1; }
+  # A fresh no-auto TUI over the same pre-created session: attaching with
+  # --auto is what suppresses the ask, so only a flagless boot proves it.
   ensure_session
+  tui_start --session "$SID"
+  wait_tui_ready || { frame 11-permission-boot-failed; finish; exit 1; }
   # Snapshot BEFORE the workflow prompt: the run dir is created the instant the
   # approved tool executes, so a later baseline would swallow it.
   runs_snapshot "$OUT/runs-before-v4.txt"
@@ -565,7 +563,7 @@ if want permission; then
   # the transcript echo of the tool-call args instead (echo false-positive
   # class, spec §5.2), so the name check is consciously removed.
   assert_pane_contains "the approval dialog renders the generic ask" "Permission required" 300
-  note "upstream gap: the dialog omits the ask's metadata (workflow name, description, phases) — 1.18.31"
+  note "upstream gap (carried from the V1 verification): the approval dialog omits the ask's metadata (workflow name, description, phases)"
   frame 11-permission-dialog
   tui_keys Enter   # dialog.select.submit = return -> Allow once
   sleep 1
@@ -614,19 +612,15 @@ if want hint; then
   tui_quit
   tmx kill-server 2>/dev/null || true
   sleep 1
-  synth_orphan wf_synth_orphan "${SID:-diag-session}" e2e-visual
-  tui_start
+  # Pre-created session + --session: the hint renders in session.composer.top,
+  # so the TUI must be routed to the session. No model call is needed.
+  ensure_session
+  synth_orphan wf_synthorphan "${SID:-diag-session}" e2e-visual
+  tui_start --session "$SID"
   wait_tui_ready || { frame 13-hint-boot-failed; finish; exit 1; }
-  # The hint needs the session routed to show session surfaces; the READY
-  # prompt is this boot's first input, so the ladder gates it (the verify is a
-  # new session — the scratch carries earlier cases' sessions).
-  sessions_snapshot "$OUT/sessions-before-v5.txt"
-  v5_session_landed() { session_landed_since "$OUT/sessions-before-v5.txt"; }
-  probe_verify_retry tui_ready_prompt v5_session_landed ||
-    note "READY prompt never landed in 3 attempts — the hint assert below decides"
-  assert_pane_contains "boot hint names the interrupted run" "interrupted: e2e-visual (wf_synth_orphan)" 120
+  assert_pane_contains "boot hint names the interrupted run" "interrupted: e2e-visual (wf_synthorphan)" 120
   frame 13-hint-shown
-  hint_count() { tui_capture | grep -c "interrupted: e2e-visual (wf_synth_orphan)" || true; }
+  hint_count() { tui_capture | grep -c "interrupted: e2e-visual (wf_synthorphan)" || true; }
   sleep 3
   if [ "$(hint_count)" -le 1 ]; then
     ok "the hint appears exactly once (once-only per boot)"
@@ -640,12 +634,13 @@ if ! want rest && ! want synth && ! want live && ! want hydration && ! want perm
   bad "no known case selected" "known cases: rest synth live hydration permission hint spike; --fast for the short pass"
 fi
 
-if want rest || want synth || want live || want permission || want hint || want spike; then
+if want rest || want synth || want live || want hydration || want permission || want hint || want spike; then
   # Teardown before the summary so port-freeness is asserted on the real end
   # state (the EXIT trap's shared teardown then finds nothing left). The port
   # probe is an assertion, never a kill input.
   tui_quit
   tmx kill-server 2>/dev/null || true
+  server_stop
   assert_port_free
 fi
 

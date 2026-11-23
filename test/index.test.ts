@@ -1,29 +1,43 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test"
-import { ultraopen } from "../src/server/index.js"
-import { registry } from "../src/server/singleton.js"
-import * as background from "../src/server/tool/background.js"
-import { STATUS_TOOL, WORKFLOW_TOOL } from "../src/server/bridge/permission.js"
-import { executeStatus } from "../src/server/tool/status.js"
-import { mode } from "../src/server/ultracode/mode.js"
-import type { MutableConfig } from "../src/server/ultracode/config.js"
-import { ensureRunDir, artifactPaths, dataRoot, readJournal, readManifest, writeManifest, writeScript } from "../src/server/resume/store.js"
-import { controlPath } from "../src/server/runtime/control.js"
+import { Error as ToolError } from "@opencode/plugin/promise/tool"
+import plugin, { createUltraopenServer } from "../src/server/index.js"
+import { getCoordinator, resetCoordinatorForTests } from "../src/server/runtime/coordinator.js"
+import type { RuntimeCoordinator } from "../src/server/runtime/coordinator.js"
+import { STATUS_TOOL, STRUCTURED_OUTPUT_TOOL, WORKFLOW_TOOL } from "../src/server/bridge/permission.js"
+import {
+  dropSettled,
+  registerPending,
+  settlePromiseOf,
+} from "../src/server/tool/background.js"
+import {
+  artifactPaths,
+  dataRoot,
+  ensureRunDir,
+  readManifest,
+  writeManifest,
+  writeScript,
+} from "../src/server/resume/store.js"
 import { argsHash } from "../src/server/resume/key.js"
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { makeFakePlugin, rpcContext } from "./v2-fixtures.js"
+import type { FakePlugin, FakeRpcCall } from "./v2-fixtures.js"
 
 /**
- * Point run artifacts at a temp directory.
+ * The V2 composition root, driven through a structural fake of `Plugin.Context`.
  *
- * The tool persists a manifest, journal, result and script per run. Without this the suite writes
- * real artifacts into the user's opencode data directory — ~27 stray run folders per `bun test`.
+ * These tests pin the cutover contracts that a live host cannot make cheaply: the plugin's id and
+ * cleanup, transform/hook/RPC wiring, the no-`output` tool result rule, permission rethrow with
+ * cleanup, StructuredOutput capture, the zero-token orphan interceptor, shell recursion
+ * containment, stale approval revocation, and the reload/disable scope.
  */
+
 let dataHome: string,
  savedDataHome: string | undefined
 
 beforeAll(async () => {
-  dataHome = await mkdtemp(join(tmpdir(), "ultraopen-testdata-"))
+  dataHome = await mkdtemp(join(tmpdir(), "ultraopen-v2-"))
   savedDataHome = process.env["XDG_DATA_HOME"]
   process.env["XDG_DATA_HOME"] = dataHome
 })
@@ -34,2920 +48,1443 @@ afterAll(async () => {
   await rm(dataHome, { recursive: true, force: true })
 })
 
+const META = "export const meta = { name: 'demo', description: 'a demo workflow' }\n"
+const runIdOf = (output: string): string => output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
+const listRoot = async (): Promise<string[]> => await readdir(dataRoot(undefined)).catch(() => [])
 
-interface ToolDef {
-  description: string
-  args: Record<string, unknown>
-  execute: (args: Record<string, unknown>, context: Record<string, unknown>) => Promise<string>
-}
-
-const META = "export const meta = { name: 'demo', description: 'a demo workflow' }\n",
-  /** promptAsync deliveries recorded across tests, newest last (read-only in assertions). */
-  hydrationCalls: { sessionID: string; text: string }[] = [],
-  idleListings: string[] = [],
-
-/** A client that never actually spawns — index tests exercise wiring, not the bridge. */
- stubClient = {
-  config: {
-    get: () => Promise.resolve({ data: {} }),
-    providers: () => Promise.resolve({ data: { providers: [] } }),
-  },
-  session: {
-    create: () => Promise.resolve({ data: { id: "child" } }),
-    get: () => Promise.resolve({ data: { id: "child" } }),
-    delete: () => Promise.resolve({}),
-    abort: () => Promise.resolve({}),
-    prompt: () => Promise.resolve({ data: { info: {}, parts: [] } }),
-    promptAsync: (options: { path: { id: string }; body: { parts: { text: string }[] } }) => {
-      hydrationCalls.push({ sessionID: options.path.id, text: options.body.parts[0]?.text ?? "" })
-      return Promise.resolve({ data: undefined })
-    },
-    messages: (options: { path: { id: string } }) => {
-      idleListings.push(options.path.id)
-      return Promise.resolve({ data: [] })
-    },
-  },
-},
-
-toolOf = (hooks: Record<string, unknown>): ToolDef | undefined => {
-  const tools = hooks["tool"] as Record<string, ToolDef> | undefined
-  return tools?.[WORKFLOW_TOOL]
- }
-
-/**
- * Swaps process.argv around a callback.
- *
- * The host-aware launch contract reads argv at plugin-registration time, so a
- * test controls which contract the plugin serves by standing in the host's
- * argv. The shapes are the live captures documented in tool/background.ts.
- */
-, withArgv = async (argv: string[], run: () => Promise<void> | void): Promise<void> => {
-  const saved = process.argv
-  process.argv = argv
-  try { await run() } finally { process.argv = saved }
-}
-
-/** Bounded polling: used where a launch phase runs concurrently with the test. */
 const waitFor = async (until: () => boolean | Promise<boolean>, what: string): Promise<void> => {
-  for (let waited = 0; waited < 400; waited++) {
+  for (let waited = 0; waited < 600; waited++) {
     if (await until()) {return}
-    await new Promise((resolve) => {setTimeout(resolve, 5)})
+    await new Promise((resolve) => {setTimeout(resolve, 10)})
   }
   throw new Error(`timed out waiting for ${what}`)
 }
 
-/** The launch result's run id, for tests that need to name a run they launched. */
-const runIdOf = (output: string): string => output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
+interface Started {
+  fake: FakePlugin
+  coordinator: RuntimeCoordinator
+  cleanup: () => Promise<void>
+}
 
-/** A permission-ask recorder: pass `ask` to the tool context, assert nothing was asked. */
-const askRecorder = () => {
-  const asked: unknown[] = []
+/** Starts the real plugin against a fresh fake context. */
+async function start(
+  options: Parameters<typeof makeFakePlugin>[0] = {},
+  pluginOptions: Record<string, unknown> = {},
+): Promise<Started> {
+  const fake = makeFakePlugin(options)
+  ;(fake.ctx as unknown as { options: Record<string, unknown> }).options = pluginOptions
+  const cleanup = await plugin.setup(fake.ctx)
+  if (cleanup === undefined) {throw new Error("setup returned no cleanup")}
+  fake.cleanup = cleanup
   return {
-    ask: (request: unknown) => { asked.push(request); return Promise.resolve() },
-    assertNoAsk: () => expect(asked).toEqual([]),
+    fake,
+    coordinator: getCoordinator(),
+    cleanup: async (): Promise<void> => {
+      await cleanup()
+      // Let the subscription loop observe the abort and exit.
+      await new Promise((resolve) => {setTimeout(resolve, 10)})
+    },
   }
 }
 
-/**
- * Lists the run directories under the data root.
- *
- * The root may not exist until a run is first written; an absent root lists as empty.
- */
-const listRoot = async (): Promise<string[]> => await readdir(dataRoot(undefined)).catch(() => [])
+/** A child-session record the tool/hook tests can drive directly. */
+function ownChild(
+  coordinator: RuntimeCoordinator,
+  sessionID: string,
+  overrides: Partial<Parameters<RuntimeCoordinator["registerChild"]>[1]> = {},
+): void {
+  coordinator.registerChild(sessionID, {
+    runId: "run-1",
+    projectKey: "project-1",
+    parentSessionID: "parent",
+    ancestorSessionIDs: ["parent"],
+    index: 0,
+    label: "worker",
+    lastActivityAt: Date.now(),
+    currentAttempt: 1,
+    ...overrides,
+  })
+}
 
-let savedEnv: string | undefined
+/** Writes one running manifest (and script) into the temp data root. */
+async function writeRunningRun(runId: string, sessionID: string, bootId = getCoordinator().processBootId): Promise<void> {
+  await ensureRunDir(runId)
+  await writeManifest(runId, {
+    runId,
+    bootId,
+    pid: process.pid,
+    sessionID,
+    sourceHash: "s",
+    argsHash: argsHash(undefined),
+    status: "running",
+    childSessionIDs: [],
+    startedAt: Date.now(),
+  })
+  await writeScript(runId, `${META}return 1\n`)
+}
 
 beforeEach(() => {
-  registry.resetForTests()
-  background.resetForTests()
-  mode.resetForTests()
-  hydrationCalls.length = 0
-  idleListings.length = 0
-  savedEnv = process.env["ULTRAOPEN_ACTIVE"]
-  delete process.env["ULTRAOPEN_ACTIVE"]
+  resetCoordinatorForTests()
 })
 
 afterEach(() => {
-  if (savedEnv === undefined) {delete process.env["ULTRAOPEN_ACTIVE"]}
-  else {process.env["ULTRAOPEN_ACTIVE"] = savedEnv}
+  delete process.env["ULTRAOPEN_ACTIVE"]
 })
 
-describe("plugin registration", () => {
-  test("registers the workflow tool under its bare id", () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    expect(tool).toBeDefined()
-    expect(typeof tool?.execute).toBe("function")
-    expect(tool?.description).toContain("orchestrates multiple subagents")
+describe("plugin definition and setup", () => {
+  test("the default export is a V2 Plugin.define with id ultraopen", () => {
+    expect(plugin.id).toBe("ultraopen")
+    expect(typeof plugin.setup).toBe("function")
+    expect(createUltraopenServer().id).toBe("ultraopen")
   })
 
-  test("exposes a config hook and a shell.env hook", () => {
-    const hooks = ultraopen({ client: stubClient })
-    expect(typeof hooks["config"]).toBe("function")
-    expect(typeof hooks["shell.env"]).toBe("function")
+  test("setup registers transforms, hooks, RPC and returns an async cleanup", async () => {
+    const started = await start()
+    try {
+      expect(started.fake.tools.get(WORKFLOW_TOOL)).toBeDefined()
+      expect(started.fake.tools.get(STATUS_TOOL)).toBeDefined()
+      expect(started.fake.tools.get(STRUCTURED_OUTPUT_TOOL)).toBeDefined()
+      expect(started.fake.agents.some((agent) => agent.id === "ultracode")).toBe(true)
+      expect(started.fake.commands.has("ultracode")).toBe(true)
+      expect(started.fake.skills.has("workflow-authoring")).toBe(true)
+      expect(started.fake.sessionHooks.has("prompt")).toBe(true)
+      expect(started.fake.sessionHooks.has("context")).toBe(true)
+      expect(started.fake.permissionHooks.has("evaluate")).toBe(true)
+      expect(started.fake.toolHooks.has("execute.before")).toBe(true)
+      expect(started.fake.shellHooks.has("create.before")).toBe(true)
+      expect(started.fake.rpcCalls[0]?.definition.id).toBe("ultraopen")
+      expect(typeof started.fake.cleanup).toBe("function")
+    } finally {
+      await started.cleanup()
+    }
   })
 
-  test("the args schema accepts title and description so a CC-trained model is not rejected", () => {
-    // The spec says both are accepted and IGNORED. Omitting them would turn a harmless extra
-    // argument into a schema validation error.
-    const args = toolOf(ultraopen({ client: stubClient }))?.args ?? {}
-    expect(Object.keys(args)).toContain("title")
-    expect(Object.keys(args)).toContain("description")
-    expect(Object.keys(args)).toContain("script")
-    expect(Object.keys(args)).toContain("dryRun")
-    // Resume is a headline feature; if the model cannot see the argument, it can never use it.
-    expect(Object.keys(args)).toContain("resumeFromRunId")
-    // The background contract's launch switch and the stop path are both model-visible.
-    expect(Object.keys(args)).toContain("background")
-    expect(Object.keys(args)).toContain("stop")
-  })
-
-  test("the stop arg's schema teaches the stop contract", () => {
-    // The schema is model-facing: a model that never learns what stop does cannot use it.
-    const args = toolOf(ultraopen({ client: stubClient }))?.args ?? {}
-    expect(JSON.stringify(args["stop"])).toContain("cancelled")
-    expect(JSON.stringify(args["stop"])).toContain("clear error")
-  })
-
-  test("the title and description args' schemas teach the metadata contract (#142)", () => {
-    // The fields stopped being ignored (#142); a stale "Ignored." description would teach the
-    // model a lie on a load-bearing surface. The prose is otherwise free to change — the
-    // pinned positive phrase is the manifest recording, the durable half of the contract.
-    const args = toolOf(ultraopen({ client: stubClient }))?.args ?? {}
-    expect(args["title"]).toBeDefined()
-    expect(args["description"]).toBeDefined()
-    const title = JSON.stringify(args["title"]) ?? ""
-    expect(title).not.toContain("Ignored")
-    expect(title).toContain("manifest")
-  })
-
-  test("the manifest records the title verbatim even when the render escapes it (#142)", async () => {
-    // Escape-on-display, verbatim-on-disk: the tag attribute is quoted for the model, the
-    // manifest keeps the exact string a resume or an operator reads back.
-    const tool = toolOf(ultraopen({ client: hangingClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute(
-      { script: `${META}await agent('a')\nreturn 1\n`, background: true, title: 'Fix the "login" bug' },
-      { sessionID: "parent" },
-    )
-    expect(output).toContain("title=\"Fix the &quot;login&quot; bug\"")
-    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
-    const manifest = await readManifest(runId, undefined)
-    expect(manifest?.title).toBe('Fix the "login" bug')
-  })
-
-  test("applies the configured concurrency to the process-wide gate", () => {
-    ultraopen({ client: stubClient }, { concurrency: 3 })
-    expect(registry.semaphore.limit).toBe(3)
-  })
-
-  test("a concurrency of 0 is clamped rather than honoured", () => {
-    // `0 ?? 8` is 0, and a limit below 1 makes every acquire wait forever with no throw.
-    ultraopen({ client: stubClient }, { concurrency: 0 })
-    expect(registry.semaphore.limit).toBeGreaterThanOrEqual(1)
+  test("the tool transforms use complete JSON schemas and codemode off", async () => {
+    const started = await start()
+    try {
+      const workflow = started.fake.tools.get(WORKFLOW_TOOL)
+      expect(workflow?.input["type"]).toBe("object")
+      expect(workflow?.input["additionalProperties"]).toBe(false)
+      expect(workflow?.options?.codemode).toBe(false)
+      expect(started.fake.tools.get(STATUS_TOOL)?.input["required"]).toEqual(["runId"])
+    } finally {
+      await started.cleanup()
+    }
   })
 })
 
-describe("host-aware launch contract", () => {
-  test("a long-lived host frees the turn: the description and the launch result end it after launch", async () => {
-    let tool: ToolDef | undefined,
-      output = ""
-    await withArgv(["bun", "/$bunfs/root/src/cli/tui/worker.js"], async () => {
-      tool = toolOf(ultraopen({ client: stubClient }))
-      if (!tool) {throw new Error("tool was not registered")}
-      output = await tool.execute(
-        { script: `${META}await agent('a')\nreturn 'LATE-VALUE'\n`, background: true },
-        { sessionID: "parent" },
-      )
-    })
-    expect(tool?.description).toContain("outlives your")
-    expect(output).toContain("<workflow-launched")
-    expect(output).toContain("end your turn and let it work")
-    expect(output).not.toContain("Before ending your turn")
-    expect(output).not.toContain("LATE-VALUE")
-    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
-    await background.settlePromiseOf(runId)
-  })
-
-  test("a one-shot host keeps the hold-the-turn contract", async () => {
-    let output = ""
-    await withArgv(["bun", "/$bunfs/root/src/index.js", "run", "say hi"], async () => {
-      const tool = toolOf(ultraopen({ client: stubClient }))
-      if (!tool) {throw new Error("tool was not registered")}
-      output = await tool.execute(
-        { script: `${META}await agent('a')\nreturn 'LATE-VALUE'\n`, background: true },
-        { sessionID: "parent" },
-      )
-    })
-    expect(output).toContain("Before ending your turn, poll until the run settles")
-    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
-    await background.settlePromiseOf(runId)
-  })
-
-  test("an explicit blocking runMode wins over a long-lived host", async () => {
-    let description = ""
-    await withArgv(["bun", "/$bunfs/root/src/cli/tui/worker.js"], () => {
-      description = toolOf(ultraopen({ client: stubClient }, { runMode: "blocking" }))?.description ?? ""
-    })
-    expect(description).toContain("This call BLOCKS until the run completes")
-    expect(description).not.toContain("outlives your")
-  })
-
-  test("the test runner's own argv is an unknown shape, so the pinned contract is the default", () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    expect(tool?.description).toContain("The run continues in the background while you keep")
-  })
-
-  test("both background contracts teach the notification, no-duplication and stop path", async () => {
-    // The description is load-bearing model behavior: a model that is not taught the
-    // notification contract polls, duplicates the run's work, or never learns it can stop.
-    const hosts: [string, string[]][] = [
-      ["one-shot", ["bun", "/$bunfs/root/src/index.js", "run", "say hi"]],
-      ["long-lived", ["bun", "/$bunfs/root/src/cli/tui/worker.js"]],
-    ]
-    for (const [label, hostArgv] of hosts) {
-      let text = ""
-      await withArgv(hostArgv, () => {
-        text = toolOf(ultraopen({ client: stubClient }))?.description ?? ""
+describe("tool results", () => {
+  test("a successful dry run returns content and NEVER an output key", async () => {
+    const started = await start()
+    try {
+      const result = await started.fake.runTool(WORKFLOW_TOOL, {
+        script: `${META}return { ok: 1 }\n`,
+        dryRun: true,
       })
-      expect(text, label).toContain("<workflow-completed>")
-      expect(text, label).toContain("<workflow-failed>")
-      expect(text, label).toContain("notification")
-      expect(text, label).toContain("duplicate this run's work")
-      expect(text, label).toContain('workflow({stop: "<runId>"})')
-      expect(text, label).not.toContain("end the opencode process")
+      expect("output" in result).toBe(false)
+      expect(String(result.content)).toContain(`<result workflow="demo"`)
+    } finally {
+      await started.cleanup()
     }
   })
 
-  test("the blocking contract teaches no notification — the call itself returns the result", async () => {
-    let description = ""
-    await withArgv(["bun", "/$bunfs/root/src/cli/tui/worker.js"], () => {
-      description = toolOf(ultraopen({ client: stubClient }, { runMode: "blocking" }))?.description ?? ""
+  test("the blocking contract returns the result as content, no output key", async () => {
+    const started = await start()
+    try {
+      const result = await started.fake.runTool(WORKFLOW_TOOL, {
+        script: `${META}await agent('a')\nreturn 'blocking-value'\n`,
+        background: false,
+      })
+      expect("output" in result).toBe(false)
+      expect(String(result.content)).toContain("blocking-value")
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("the status tool reads disk and returns content, no output key", async () => {
+    const started = await start()
+    try {
+      const launched = await started.fake.runTool(WORKFLOW_TOOL, {
+        script: `${META}await agent('a')\nreturn 'status-value'\n`,
+        background: true,
+      })
+      const runId = runIdOf(String(launched.content))
+      await settlePromiseOf(started.coordinator, runId)
+      const status = await started.fake.runTool(STATUS_TOOL, { runId, wait: 5 })
+      expect("output" in status).toBe(false)
+      expect(String(status.content)).toContain('status="completed"')
+      expect(String(status.content)).toContain("status-value")
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("an unknown status run id is a clear error, never a crash", async () => {
+    const started = await start()
+    try {
+      const status = await started.fake.runTool(STATUS_TOOL, { runId: "wf_missing000" })
+      expect(String(status.content)).toContain("No run found")
+    } finally {
+      await started.cleanup()
+    }
+  })
+})
+
+describe("permission.rethrow", () => {
+  test("a Tool.Error rejection cleans up the pending run dir and RETHROWS", async () => {
+    const started = await start({ assertPermission: () => Promise.reject(new ToolError({ message: "denied by user" })) })
+    try {
+      const before = new Set(await listRoot())
+      await expect(started.fake.runTool(WORKFLOW_TOOL, { script: `${META}return 1\n` })).rejects.toThrow("denied by user")
+      expect(started.coordinator.runs.size).toBe(0)
+      const after = await listRoot()
+      expect(after.filter((name) => !before.has(name))).toEqual([])
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("a plain rejection (no feedback) also rethrows instead of becoming tool text", async () => {
+    const started = await start({ assertPermission: () => Promise.reject(new Error("step aborted")) })
+    try {
+      const result = started.fake.runTool(WORKFLOW_TOOL, { script: `${META}return 1\n` })
+      await expect(result).rejects.toThrow("step aborted")
+    } finally {
+      await started.cleanup()
+    }
+  })
+})
+
+describe("StructuredOutput capture", () => {
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    required: ["answer"],
+    properties: { answer: { type: "string" } },
+  }
+
+  test("a valid payload is captured as a structuredClone for the CURRENT attempt", async () => {
+    const started = await start()
+    try {
+      ownChild(started.coordinator, "child", { schema, currentAttempt: 2 })
+      const payload = { answer: "yes" }
+      const result = await started.fake.runTool(STRUCTURED_OUTPUT_TOOL, payload, { sessionID: "child" })
+      expect("output" in result).toBe(false)
+      expect(result.metadata?.["structured"]).toEqual(payload)
+      const captured = started.coordinator.childOf("child")?.captured
+      expect(captured?.attempt).toBe(2)
+      expect(captured?.value).toEqual(payload)
+      // A clone, not the caller's object.
+      expect(captured?.value).not.toBe(payload)
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("an invalid payload throws Tool.Error for in-loop repair and records the errors", async () => {
+    const started = await start()
+    try {
+      ownChild(started.coordinator, "child", { schema })
+      await expect(
+        started.fake.runTool(STRUCTURED_OUTPUT_TOOL, { wrong: true }, { sessionID: "child" }),
+      ).rejects.toThrow(/did not match the required schema/u)
+      expect(started.coordinator.childOf("child")?.lastValidationErrors?.length).toBeGreaterThan(0)
+      expect(started.coordinator.childOf("child")?.captured).toBeUndefined()
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("a non-object root schema is wrapped in a { value } envelope", async () => {
+    const started = await start()
+    try {
+      ownChild(started.coordinator, "child", { schema: { type: "number" }, wrapped: true })
+      const result = await started.fake.runTool(STRUCTURED_OUTPUT_TOOL, { value: 42 }, { sessionID: "child" })
+      expect(result.metadata?.["structured"]).toEqual({ value: 42 })
+      expect(started.coordinator.childOf("child")?.captured?.value).toEqual({ value: 42 })
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("outside an owned child the tool refuses", async () => {
+    const started = await start()
+    try {
+      await expect(
+        started.fake.runTool(STRUCTURED_OUTPUT_TOOL, { answer: "x" }, { sessionID: "parent" }),
+      ).rejects.toThrow(/only available inside/u)
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("a child without a requested schema refuses StructuredOutput", async () => {
+    const started = await start()
+    try {
+      ownChild(started.coordinator, "child")
+      await expect(
+        started.fake.runTool(STRUCTURED_OUTPUT_TOOL, { answer: "x" }, { sessionID: "child" }),
+      ).rejects.toThrow(/no requested structured schema/u)
+    } finally {
+      await started.cleanup()
+    }
+  })
+})
+
+describe("hook(context) — child contract and tool filtering", () => {
+  test("a schema child gets its contract, the normalized schema, and no recursion tools", async () => {
+    const started = await start()
+    try {
+      ownChild(started.coordinator, "child", {
+        contractText: "CONTRACT-TEXT",
+        schema: { type: "number" },
+        disallowedTools: ["edit"],
+      })
+      const event = {
+        sessionID: "child",
+        agent: "build",
+        system: [] as { type: "text"; text: string }[],
+        messages: [],
+        tools: {
+          [WORKFLOW_TOOL]: { description: "", input: {} },
+          [STATUS_TOOL]: { description: "", input: {} },
+          subagent: { description: "", input: {} },
+          todowrite: { description: "", input: {} },
+          edit: { description: "", input: {} },
+          [STRUCTURED_OUTPUT_TOOL]: { description: "", input: {} },
+        },
+      }
+      await started.fake.hook("session", "context", event)
+      expect(event.system.some((part) => part.text === "CONTRACT-TEXT")).toBe(true)
+      const tools = event.tools as Record<string, { description: string; input: Record<string, unknown> }>
+      expect(tools[STRUCTURED_OUTPUT_TOOL]?.input["type"]).toBe("object")
+      expect(tools[STRUCTURED_OUTPUT_TOOL]?.input["properties"]).toEqual({ value: { type: "number" } })
+      for (const name of [WORKFLOW_TOOL, STATUS_TOOL, "subagent", "todowrite", "edit"]) {
+        expect(name in tools).toBe(false)
+      }
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("a non-schema child loses StructuredOutput", async () => {
+    const started = await start()
+    try {
+      ownChild(started.coordinator, "child")
+      const event = {
+        sessionID: "child",
+        agent: "build",
+        system: [],
+        messages: [],
+        tools: { [STRUCTURED_OUTPUT_TOOL]: { description: "", input: {} } },
+      }
+      await started.fake.hook("session", "context", event)
+      expect(STRUCTURED_OUTPUT_TOOL in event.tools).toBe(false)
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("a non-child session loses StructuredOutput", async () => {
+    const started = await start({ sessions: { parent: { id: "parent", projectID: "project-1", location: { directory: "/work" }, tokens: { output: 0 }, agent: "build" } } })
+    try {
+      const event = {
+        sessionID: "parent",
+        agent: "build",
+        system: [],
+        messages: [],
+        tools: { [STRUCTURED_OUTPUT_TOOL]: { description: "", input: {} } },
+      }
+      await started.fake.hook("session", "context", event)
+      expect(STRUCTURED_OUTPUT_TOOL in event.tools).toBe(false)
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("compaction and generate always delete StructuredOutput", async () => {
+    const started = await start()
+    try {
+      for (const hookName of ["compaction", "generate"]) {
+        const event = { tools: { [STRUCTURED_OUTPUT_TOOL]: { description: "", input: {} } } }
+        await started.fake.hook("session", hookName, event)
+        expect(STRUCTURED_OUTPUT_TOOL in event.tools).toBe(false)
+      }
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("an ordinary subagent session cannot see the workflow tools", async () => {
+    const started = await start({
+      sessions: {
+        sub: { id: "sub", projectID: "project-1", location: { directory: "/work" }, tokens: { output: 0 }, agent: "explore" },
+      },
     })
-    expect(description).not.toContain("<workflow-completed>")
-    expect(description).not.toContain("notification")
+    try {
+      const event = {
+        sessionID: "sub",
+        agent: "explore",
+        system: [],
+        messages: [],
+        tools: { [WORKFLOW_TOOL]: { description: "", input: {} }, [STATUS_TOOL]: { description: "", input: {} } },
+      }
+      await started.fake.hook("session", "context", event)
+      expect(WORKFLOW_TOOL in event.tools).toBe(false)
+      expect(STATUS_TOOL in event.tools).toBe(false)
+    } finally {
+      await started.cleanup()
+    }
   })
 })
 
-describe("nested-process guard", () => {
-  test("does NOT register the tool when ULTRAOPEN_ACTIVE is set", () => {
-    // A nested `opencode` gets a fresh server, plugin load and tool, escaping this process's
-    // concurrency cap, agent counter, budget and abort signal. This guard survives every path a
-    // bash command pattern cannot match.
-    process.env["ULTRAOPEN_ACTIVE"] = "1"
-    const hooks = ultraopen({ client: stubClient })
-    expect(hooks["tool"]).toBeUndefined()
-  })
+describe("single-pass ancestor resolution", () => {
+  const TEN_TOOLS = [
+    "shell", "edit", "read", "write", "patch",
+    "apply_patch", "list", "glob", "grep", "webfetch",
+  ]
 
-  test("still installs config and hooks when nested", () => {
-    process.env["ULTRAOPEN_ACTIVE"] = "1"
-    const hooks = ultraopen({ client: stubClient })
-    expect(typeof hooks["config"]).toBe("function")
-    expect(typeof hooks["shell.env"]).toBe("function")
-  })
-})
+  const toolsOf = (): Record<string, { description: string; input: Record<string, unknown> }> =>
+    Object.fromEntries(TEN_TOOLS.map((name) => [name, { description: "", input: {} }]))
 
-describe("shell.env hook", () => {
-  test("marks shells only inside engine-owned sessions", () => {
-    const hooks = ultraopen({ client: stubClient }),
-     hook = hooks["shell.env"] as (i: { sessionID?: string }, o: { env: Record<string, string> }) => void
-
-    registry.register("child", "run-1")
-
-    const owned = { env: {} as Record<string, string> }
-    hook({ sessionID: "child" }, owned)
-    expect(owned.env["ULTRAOPEN_ACTIVE"]).toBe("1")
-
-    // Scoping matters: a blanket marker would disable the tool for the user's own work too.
-    const foreign = { env: {} as Record<string, string> }
-    hook({ sessionID: "someone-elses" }, foreign)
-    expect(foreign.env["ULTRAOPEN_ACTIVE"]).toBeUndefined()
-
-    const anonymous = { env: {} as Record<string, string> }
-    hook({}, anonymous)
-    expect(anonymous.env["ULTRAOPEN_ACTIVE"]).toBeUndefined()
-  })
-})
-
-describe("config hook", () => {
-  test("installs the ultracode agent, command and permission default", () => {
-    const hooks = ultraopen({ client: stubClient }),
-     config: MutableConfig = {}
-    ;(hooks["config"] as (c: MutableConfig) => void)(config)
-
-    expect(config.agent?.["ultracode"]).toBeDefined()
-    expect(config.command?.["ultracode"]).toBeDefined()
-    expect((config.permission as Record<string, unknown>)["workflow"]).toBe("ask")
-    expect(config.experimental?.primary_tools).toContain(WORKFLOW_TOOL)
-  })
-
-  test("is synchronous — it must not return a promise", () => {
-    // The hook's return value is discarded; mutation is the only channel. Awaiting the client
-    // from inside it can cache an agent list built from the un-mutated config for the whole
-    // instance lifetime.
-    const hooks = ultraopen({ client: stubClient }),
-     result = (hooks["config"] as (c: MutableConfig) => unknown)({})
-    expect(result).toBeUndefined()
-  })
-})
-
-describe("tool execution", () => {
-  const run = async (args: Record<string, unknown>, context: Record<string, unknown> = {}): Promise<string> => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    return await tool.execute(args, { sessionID: "parent", ...context })
-  }
-
-  test("renders a successful dry run with the value and usage", async () => {
-    const output = await run({ script: `${META}return { ok: 1 }\n`, dryRun: true })
-    expect(output).toContain(`<result workflow="demo"`)
-    expect(output).toContain(`"ok": 1`)
-    expect(output).toContain("<usage")
-  })
-
-  test("includes log lines emitted by the script", async () => {
-    const output = await run({ script: `${META}log('hello from the script')\nreturn 1\n`, dryRun: true })
-    expect(output).toContain("<log>")
-    expect(output).toContain("hello from the script")
-  })
-
-  test("reports the agent count a dry run WOULD have spawned", async () => {
-    // agentCount must reflect the fan-out even when nothing was really spawned, or dryRun cannot
-    // be used to preview cost.
-    const script = `${META}await parallel([() => agent('a'), () => agent('b'), () => agent('c')])\nreturn 'done'\n`
-    expect(await run({ script, dryRun: true })).toContain('agents="3"')
-  })
-
-  test("a dry run leaves no run-lifecycle artifacts in the data root (#138)", async () => {
-    // A dry run is documented as free and stubbed; a settled manifest the status
-    // tool resolves as a real run contradicts that. The script still persists
-    // before the ask (the user opens the real file while the prompt is on screen),
-    // but the manifest lifecycle — manifest, journal, progress, result — never
-    // touches the shared run space, and the value comes back as the tool call's
-    // value, nothing more.
-    // Re-pinned deliberately (#161): the pre-ask persistence is scoped to the
-    // prompt's lifetime. While the ask is on screen the dir is exact —
-    // script.js alone, the #162 seam — and the script on it is the real source;
-    // once the preview is done the data root gains no directory.
-    const before = await listRoot(),
-      atAsk: { dir?: string[]; source?: string } = {}
-    const output = await run(
-      { script: `${META}return { ok: 1 }\n`, dryRun: true },
-      { ask: async (request: Record<string, unknown>) => {
-          const askRunId = ((request["metadata"] ?? {}) as { runId?: string }).runId ?? "",
-            dir = join(dataRoot(undefined), askRunId)
-          atAsk.dir = await readdir(dir)
-          atAsk.source = await readFile(join(dir, "script.js"), "utf8")
-        } },
-    )
-    expect(output).toContain(`<result workflow="demo"`)
-    expect(output).toContain("<usage")
-    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
-    expect(runId).toMatch(/^wf_/u)
-    // At the prompt: the dir exists exactly per the #162 seam, holding the real
-    // source, so the persisted script stays usable for a later scriptPath run.
-    expect(atAsk.dir).toEqual(["script.js"])
-    expect(atAsk.source).toBe(`${META}return { ok: 1 }\n`)
-    // (#161, decision 2) The successful dry render keeps the id/dir refs but
-    // states outright that the id is not queryable and nothing was persisted.
-    expect(output).toContain(
-      '<dry-run note="dry run — nothing was persisted to the run-data root; the run id above is not queryable" />',
-    )
-    expect(output).toContain(`run_dir="`)
-    // And the tool call leaves the data root exactly as it found it.
-    expect(await listRoot()).toEqual(before)
-  })
-
-  test("a failed dry run renders bare — no manifest means nothing to resume (#138)", async () => {
-    // With no manifest lifecycle, a dry failure is not a resumable run either:
-    // the render carries the diagnostic alone, and status is never sent to a
-    // run id the data root cannot resolve. Added (#161): the dry failure lands
-    // in the launch catch, whose pre-live gate deletes the pre-ask dir — no
-    // phantom either way a dry run ends — and the render stays bare without
-    // the success-only annotation.
-    const before = await listRoot(),
-      output = await run({ script: `${META}throw new Error('dry boom')\n`, dryRun: true })
-    expect(output).toContain("dry boom")
-    expect(output).not.toContain(`<run id="`)
-    expect(output).not.toContain("not queryable")
-    expect(await listRoot()).toEqual(before)
-  })
-
-  test("asks for permission using the workflow's real name, not the title arg", async () => {
-    // The script is parsed BEFORE asking so the prompt can name the workflow. The launch's
-    // `title` is run metadata (#142) — it surfaces on the run's own renders, never in the
-    // prompt — and models omit it, which showed up live as a permission prompt reading "null".
-    const asked: Record<string, unknown>[] = []
-    await run(
-      { script: `${META}return 1\n`, dryRun: true, title: "ignored-title" },
-      { ask: (request: Record<string, unknown>) => { asked.push(request); return Promise.resolve() } },
-    )
-    expect(asked.length).toBe(1)
-    expect(asked[0]?.["permission"]).toBe(WORKFLOW_TOOL)
-    expect(asked[0]?.["patterns"]).toEqual(["demo"])
-    // NOT ["*"]: an "always" grant is stored instance-wide, so approving with "*" would
-    // permanently disable the prompt for every workflow in the directory.
-    expect(asked[0]?.["always"]).toEqual(["demo"])
-  })
-
-  test("the permission metadata describes what will run", async () => {
-    const asked: Record<string, unknown>[] = [],
-     script = "export const meta = { name: 'audit', description: 'Audit auth', phases: [{ title: 'Find' }] }\nreturn 1\n"
-    await run(
-      { script, dryRun: true },
-      { ask: (request: Record<string, unknown>) => { asked.push(request); return Promise.resolve() } },
-    )
-    const metadata = asked[0]?.["metadata"] as Record<string, unknown>
-    expect(metadata["name"]).toBe("audit")
-    expect(metadata["description"]).toBe("Audit auth")
-    expect(metadata["phases"]).toEqual(["Find"])
-  })
-
-  test("a script that fails to parse is rejected BEFORE the permission prompt", async () => {
-    // No point asking the user to approve a run that cannot start.
-    const asked: unknown[] = [],
-     output = await run(
-      { script: `${META}const x: string[] = []\n`, dryRun: true },
-      { ask: (request: unknown) => { asked.push(request); return Promise.resolve() } },
-    )
-    expect(output).toContain("not TypeScript")
-    expect(asked).toEqual([])
-  })
-
-  test("a parse failure comes back as a rendered diagnostic, not a crash", async () => {
-    const output = await run({ script: `${META}const x: string[] = []\n`, dryRun: true })
-    expect(output).toContain("ParseError")
-    expect(output).toContain("not TypeScript")
-    // The caret line proves the source was threaded through to the renderer.
-    expect(output).toContain("^")
-  })
-
-  test("a prepare-phase failure renders bare — no run id or dir footer (#133)", async () => {
-    // The failure footer's resume pointer names a run only when the run went live.
-    // A parse failure dies in prepare — before the run directory exists — and the
-    // footer it used to advertise sent the status tool to "No run found", which the
-    // model read as its own fault. 40/40 sampled failure-render ids were absent.
-    const before = await listRoot(),
-      output = await run({ script: `${META}const x: string[] = []\n` })
-    expect(output).toContain("ParseError")
-    expect(output).not.toContain(`<run id="`)
-    expect(output).not.toContain(`dir="`)
-    // Nothing was created to resume: the data root gains no run directory.
-    expect(await listRoot()).toEqual(before)
-  })
-
-  test("a rejected permission ask renders bare — no run id or dir footer (#133)", async () => {
-    // The ask gates the launch, so a rejection means the run never went live:
-    // nothing to resume, nothing to advertise, nothing for status to miss. The
-    // render must not point at the pre-ask dir — and (#161) that dir does not
-    // outlive the call: the launch catch deletes it once the manifest read
-    // proves the run never went live, best-effort, while `wentLive` keeps a
-    // post-beginRun dir complete.
-    const before = await listRoot(),
-      output = await run(
-        { script: `${META}return 1\n` },
-        { ask: () => Promise.reject(new Error("user said no")) },
-      )
-    expect(output).toContain("user said no")
-    expect(output).not.toContain(`<run id="`)
-    expect(await listRoot()).toEqual(before)
-  })
-
-  test("a live-run failure keeps the run id/dir footer (#133)", async () => {
-    // The footer's purpose is resume recoverability: a run that went live has a
-    // journal to replay, so its failure render keeps naming it. Pinned so the
-    // prepare-phase bareness above cannot bleed into real runs.
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute(
-      { script: `${META}await agent('a')\nthrow new Error('boom mid-run')\n`, background: false },
-      { sessionID: "parent" },
-    )
-    expect(output).toContain("boom mid-run")
-    expect(output).toContain(`<run id="`)
-    expect(output).toMatch(/dir="[^"]+"/u)
-    // Added (#161): the launch catch's delete gate is the same manifest read
-    // that justifies the footer — wentLive keeps the dir, record intact.
-    const failedRunId = output.match(/<run id="(?<runId>[^"]+)"/u)?.[1] ?? ""
-    expect(await readManifest(failedRunId, undefined)).toBeDefined()
-  })
-
-  test("a missing script is reported clearly", async () => {
-    expect(await run({ dryRun: true })).toContain("needs a `script`")
-  })
-
-  test("a persisted script can be re-run via scriptPath", async () => {
-    // The schema advertises scriptPath; the execute path must actually read it, or the advertised
-    // surface errors at runtime (verified live before this was wired).
-    await ensureRunDir("wf_pathdemo01", undefined)
-    const paths = await writeScript("wf_pathdemo01", `${META}return 'from disk'\n`)
-    expect(await run({ scriptPath: paths, background: false })).toContain("from disk")
-  })
-
-  test("a failed run persists its PARTIAL journal so a resume can replay what succeeded", async () => {
-    // Without this, endRun on failure wrote an empty journal and destroyed the replayable prefix
-    // of agents that had already completed — resume would redo work it already paid for.
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const script = `${META}await agent('succeeds')\nthrow new Error('script blew up')\n`,
-     output = await tool.execute({ script, background: false }, { sessionID: "parent" })
-    expect(output).toContain("script blew up")
-
-    // Find the run id from the tool's rendered failure — the journal is keyed by run.
-    const runId = output.match(/id="(?<runId>[^"]+)"/u)?.[1]
-    expect(runId).toBeDefined()
-    const entries = await readJournal(runId ?? "")
-    expect(entries.length).toBe(1)
-    expect(entries[0]?.status).toBe("ok")
-    const manifest = await readManifest(runId ?? "", undefined)
-    expect(manifest?.status).toBe("failed")
-  })
-
-  test("a completed run persists its child sessions in the manifest", async () => {
-    // The manifest's child list is what the startup reaper reads; if it were only read from the
-    // registry after endRun — which abortAll has already cleared — it would always be []. This
-    // pins the completed path (the capture happens inside the run, before its cleanup).
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const script = `${META}await agent('a')\nreturn 'done'\n`,
-     output = await tool.execute({ script, background: false }, { sessionID: "parent" }),
-     runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1]
-    expect(runId).toBeDefined()
-    // (#163) The settle promise resolves once the settle protocol ran, but a transiently
-    // refused terminal write retries — so the disk record must be waited for, not raced:
-    // poll to terminal the way this file's status reads do.
-    await waitFor(async () => {
-      const manifest = await readManifest(runId ?? "", undefined)
-      return manifest?.status === "completed"
-    }, "the completed run's manifest to settle")
-    const manifest = await readManifest(runId ?? "", undefined)
-    expect(manifest?.childSessionIDs).toEqual(["child"])
-  })
-
-  test("a resume with changed args renders the args-changed note", async () => {
-    // A replayed run must never read as a fresh one — this note is the visible marker that
-    // nothing was replayed because the inputs changed.
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const script = `${META}await agent('a')\nreturn 'ok'\n`,
-
-     first = await tool.execute({ script, args: { topic: "one" }, background: false }, { sessionID: "parent" }),
-     runId = first.match(/run="(?<runId>[^"]+)"/u)?.[1]
-    expect(runId).toBeDefined()
-
-    const second = await tool.execute(
-      { script, args: { topic: "two" }, resumeFromRunId: runId, background: false },
-      { sessionID: "parent" },
-    )
-    expect(second).toContain('args changed since the previous run')
-  })
-
-  test("refuses to run inside a session the engine owns", async () => {
-    registry.register("parent", "outer-run")
-    expect(await run({ script: `${META}return 1\n`, dryRun: true })).toContain("cannot be called from inside")
-  })
-
-  test("surfaces failed agents rather than letting partial coverage read as full", async () => {
-    // A client whose session.create never returns data, so every agent fails to spawn.
-    const failing = { session: { ...stubClient.session, create: () => Promise.resolve({ error: "nope" }) } },
-     tool = toolOf(ultraopen({ client: failing })),
-     output = await tool?.execute(
-      { script: `${META}await parallel([() => agent('a'), () => agent('b')])\nreturn 'done'\n`, background: false },
-      { sessionID: "parent" },
-    )
-    expect(output).toContain("<failures")
-    expect(output).toContain('of="2"')
-  })
-})
-
-describe("model and effort wiring", () => {
-  const catalogClient = {
-    config: {
-      get: () => Promise.resolve({ data: { model: "opencode/claude-sonnet-4-6" } }),
-      providers: () =>
-        Promise.resolve({
-          data: {
-            providers: [
-              { id: "opencode", models: { "claude-sonnet-4-6": { variants: { low: {}, high: {}, max: {} } } } },
-            ],
-          },
-        }),
-    },
-    session: {
-      ...stubClient.session,
-      prompt: () =>
-        Promise.resolve({ data: { info: { tokens: { output: 1 } }, parts: [{ type: "text", text: "ok" }] } }),
-    },
-  }
-
-  test("reads the session's default model and resolves effort against ITS variants", async () => {
-    const tool = toolOf(ultraopen({ client: catalogClient })),
-     script = `${META}await agent('x', { effort: 'xhigh' })\nreturn 'done'\n`,
-     output = await tool?.execute({ script, background: false }, { sessionID: "parent" })
-
-    // The model has no xhigh, so the request is downgraded — and the run log SAYS so, rather than
-    // silently applying no extra thinking at all.
-    expect(output).toContain("<log>")
-    expect(output).toContain("unsupported")
-    expect(output).toContain("high")
-  })
-
-  test("a client whose config.get fails still runs", async () => {
-    const failing = {
-      config: {
-        get: () => Promise.reject(new Error("no config")),
-        providers: () => Promise.resolve({ data: { providers: [] } }),
-      },
-      session: catalogClient.session,
-    },
-     tool = toolOf(ultraopen({ client: failing })),
-     output = await tool?.execute({ script: `${META}return 'fine'\n`, background: false }, { sessionID: "parent" })
-    expect(output).toContain("fine")
-  })
-
-  test("a dry run skips the catalog entirely", async () => {
-    let fetched = false
-    const watched = {
-      config: {
-        get: () => Promise.resolve({ data: { model: "opencode/claude-sonnet-4-6" } }),
-        providers: () => {
-          fetched = true
-          return Promise.resolve({ data: { providers: [] } })
+  test("hook(context) resolves the ancestor chain ONCE across many child tools and keeps allow-overridden tools visible", async () => {
+    const started = await start({
+      agents: [
+        { id: "build", name: "build", mode: "primary", hidden: false, permissions: [] },
+        {
+          id: "gatekeeper",
+          name: "gatekeeper",
+          mode: "primary",
+          hidden: false,
+          permissions: [
+            { action: "shell", resource: "*", effect: "deny" },
+            { action: "shell", resource: "git status", effect: "allow" },
+            { action: "edit", resource: "*", effect: "deny" },
+          ],
+        },
+      ],
+      sessions: {
+        parent: {
+          id: "parent",
+          projectID: "project-1",
+          location: { directory: "/work" },
+          tokens: { output: 0 },
+          agent: "gatekeeper",
         },
       },
-      session: stubClient.session,
-    },
-     tool = toolOf(ultraopen({ client: watched }))
-    await tool?.execute({ script: `${META}return 1\n`, dryRun: true }, { sessionID: "parent" })
-    expect(fetched).toBe(false)
-  })
-})
-
-describe("startup orphan sweep", () => {
-  test("a failing sweep never takes down plugin init", async () => {
-    // The sweep runs in the background during init. A server that rejects an abort — or is not
-    // reachable at all — must not stop the plugin from registering.
-    const hostile = {
-      config: stubClient.config,
-      session: { ...stubClient.session, abort: () => Promise.reject(new Error("server down")) },
-    },
-     hooks = ultraopen({ client: hostile })
-    expect(toolOf(hooks)).toBeDefined()
-    // Let the detached sweep settle so an unhandled rejection would surface here.
-    await new Promise((resolve) => {
-      setTimeout(resolve, 5)
     })
+    try {
+      ownChild(started.coordinator, "child")
+      const raw = started.fake.ctx as unknown as {
+        session: { get: (input: { sessionID: string }) => Promise<unknown> }
+      }
+      const originalGet = raw.session.get
+      let fetched = 0
+      raw.session.get = (input) => {
+        fetched++
+        return originalGet(input)
+      }
+
+      const event = {
+        sessionID: "child",
+        agent: "build",
+        system: [] as { type: "text"; text: string }[],
+        messages: [],
+        tools: toolsOf(),
+      }
+      await started.fake.hook("session", "context", event)
+
+      // ONE walk of the ancestor chain serves all ten tools.
+      expect(fetched).toBe(1)
+      // The narrow "git status" allow comes last for the shell action, so the tool stays VISIBLE.
+      expect("shell" in event.tools).toBe(true)
+      expect("edit" in event.tools).toBe(false)
+      expect("read" in event.tools).toBe(true)
+    } finally {
+      await started.cleanup()
+    }
   })
 
-  test("a run interrupted by a dead process auto-resumes on init and hydrates its session", async () => {
-    // The acceptance shape of the durability default: relaunch, and the interrupted run continues
-    // from its journal on its own — no model turn, no permission ask, result delivered to the
-    // ORIGINAL session. The engine is real; the client is the suite's stub.
-    const runId = "wf_bootres1",
-     sessionID = "ses_orig",
-     manifest = {
-      runId,
-      bootId: "old-boot",
-      pid: 2 ** 31 - 2,
-      sessionID,
-      sourceHash: "s",
-      argsHash: argsHash({ a: 1 }),
-      args: { a: 1 },
-      status: "running" as const,
-      childSessionIDs: [],
-      startedAt: Date.now() - 60_000,
-     },
-     source = `${META}return 'ok'\n`
-    await ensureRunDir(runId)
-    await writeManifest(runId, manifest)
-    await writeScript(runId, source)
-    await writeFile(join(artifactPaths(runId).dir, "interrupted.txt"), runId, "utf8")
-
-    ultraopen({ client: stubClient })
-    await waitFor(async () => {
-      const booted = await readManifest(runId)
-      return booted?.status !== "orphaned"
-    }, "the sweep to adopt the run")
-    await waitFor(async () => {
-      const booted = await readManifest(runId)
-      return booted?.status === "completed" || booted?.status === "failed"
-    }, "the resumed run to settle")
-
-    const settled = await readManifest(runId)
-    expect(settled?.status).toBe("completed")
-    // Hydrated the original session, with the resume story attached to the result. The
-    // delivery is a fire-and-forget prompt — it can land after the settle — so wait for it
-    // instead of racing it (CI's slower runner lost this race once).
-    let delivery: { sessionID?: string; text: string } | undefined
-    await waitFor(() => {
-      delivery = hydrationCalls.find((call) => call.text.includes(`run="${runId}"`))
-      return delivery !== undefined
-    }, "the resume story to hydrate into the original session")
-    expect(delivery?.sessionID).toBe(sessionID)
-    expect(delivery?.text).toContain("<workflow-completed")
-    expect(delivery?.text).toContain(`${runId} was interrupted when opencode exited; it has been resumed`)
-    // The hint marker is consumed by adoption.
-    const marker = readFile(join(artifactPaths(runId).dir, "interrupted.txt"))
-    await expect(marker).rejects.toThrow()
-  })
-
-  test("autoResume: false keeps interrupted runs orphaned at init", async () => {
-    const runId = "wf_bootoff1",
-     manifest = {
-      runId,
-      bootId: "old-boot",
-      pid: 2 ** 31 - 2,
-      sessionID: "ses_orig",
-      sourceHash: "s",
-      argsHash: argsHash(undefined),
-      status: "running" as const,
-      childSessionIDs: [],
-      startedAt: Date.now() - 60_000,
-     },
-     source = `${META}return 'ok'\n`
-    await ensureRunDir(runId)
-    await writeManifest(runId, manifest)
-    await writeScript(runId, source)
-    await writeFile(join(artifactPaths(runId).dir, "interrupted.txt"), runId, "utf8")
-
-    ultraopen({ client: stubClient }, { autoResume: false })
-    // The boot sweep is fire-and-forget: wait for the orphaning instead of racing it
-    // with a fixed sleep (the same class of CI-visible race PR #153 de-flaked twice).
-    await waitFor(async () => {
-      const swept = await readManifest(runId)
-      return swept?.status === "orphaned"
-    }, "the orphaning sweep")
-
-    const orphaned = await readManifest(runId)
-    expect(orphaned?.status).toBe("orphaned")
-    expect(hydrationCalls.find((call) => call.text.includes(`run="${runId}"`))).toBeUndefined()
+  test("an unresolvable ancestor chain fails closed, keeping only the StructuredOutput capture channel", async () => {
+    const started = await start()
+    try {
+      ownChild(started.coordinator, "child", { schema: { type: "object" } })
+      const event = {
+        sessionID: "child",
+        agent: "build",
+        system: [] as { type: "text"; text: string }[],
+        messages: [],
+        tools: toolsOf(),
+      }
+      await started.fake.hook("session", "context", event)
+      expect(Object.keys(event.tools)).toEqual([STRUCTURED_OUTPUT_TOOL])
+    } finally {
+      await started.cleanup()
+    }
   })
 })
 
-describe("ultracode hooks are wired", () => {
-  type Hook = (...args: never[]) => unknown
-  const hookOf = (name: string): Hook => {
-    const hooks = ultraopen({ client: stubClient })
-    return hooks[name] as Hook
+/** Counts how many times one setup call disposed its RPC registration. */
+function countRegistrationDisposals(fake: FakePlugin): () => number {
+  const raw = fake.ctx as unknown as {
+    rpc: { register: (definition: unknown, handlers: unknown) => Promise<{ dispose: () => Promise<void> }> }
   }
-
-  test("chat.message detects the keyword and raises effort", () => {
-    const output = {
-      message: { id: "m1", model: { variant: undefined as string | undefined } },
-      parts: [{ type: "text", text: "ultracode this" }],
-    }
-    ;(hookOf("chat.message") as (i: unknown, o: unknown) => void)({ sessionID: "s1" }, output)
-    expect(mode.isActive("s1")).toBe(true)
-  })
-
-  test("messages.transform injects the reminder once the mode is on", () => {
-    const hook = hookOf("experimental.chat.messages.transform") as (i: unknown, o: unknown) => void
-    mode.enable("s1", "keyword")
-    const output = { messages: [{ info: { id: "m1", role: "user", sessionID: "s1" }, parts: [] as unknown[] }] }
-    hook({}, output)
-    expect(output.messages[0]?.parts.length).toBe(1)
-  })
-
-  test("messages.transform appends the live-run reminder while a background run holds", () => {
-    const hook = hookOf("experimental.chat.messages.transform") as (i: unknown, o: unknown) => void
-    background.registerPending("wf_runs0100", "s1", 100)
-    background.nameRun("wf_runs0100", "demo")
-    const output = { messages: [{ info: { id: "m1", role: "user", sessionID: "s1" }, parts: [] as unknown[] }] }
-    hook({}, output)
-    expect(output.messages[0]?.parts).toHaveLength(1)
-    const part = output.messages[0]?.parts[0] as Record<string, unknown> | undefined
-    expect(String(part?.["id"])).toBe("ultraopen-runs-m1")
-    expect(String(part?.["text"])).toContain('wf_runs0100 "demo"')
-  })
-
-  test("chat.params merges the variant's provider options", () => {
-    const hook = hookOf("chat.params") as (i: unknown, o: unknown) => void
-    mode.enable("s1", "keyword")
-    const output = { options: {} as Record<string, unknown> }
-    hook({ sessionID: "s1", model: { variants: { xhigh: { thinking: "adaptive" } } } }, output)
-    expect(output.options["thinking"]).toBe("adaptive")
-  })
-
-  test("/ultracode toggles the mode, and `off` turns it back off", () => {
-    const hook = hookOf("command.execute.before") as (i: unknown) => void
-    hook({ command: "ultracode", sessionID: "s1" })
-    expect(mode.isActive("s1")).toBe(true)
-    hook({ command: "ultracode", sessionID: "s1", arguments: "off" })
-    expect(mode.isActive("s1")).toBe(false)
-  })
-
-  test("`off` is case-insensitive — `/ultracode OFF` must not re-enable", () => {
-    const hook = hookOf("command.execute.before") as (i: unknown) => void
-    hook({ command: "ultracode", sessionID: "s1" })
-    hook({ command: "ultracode", sessionID: "s1", arguments: "OFF" })
-    expect(mode.isActive("s1")).toBe(false)
-  })
-
-  test("other commands are ignored", () => {
-    const hook = hookOf("command.execute.before") as (i: unknown) => void
-    hook({ command: "init", sessionID: "s1" })
-    expect(mode.isActive("s1")).toBe(false)
-  })
-
-  test("the plugin-options flag turns the mode on for fresh sessions", () => {
-    ultraopen({ client: stubClient }, { ultracode: true })
-    expect(mode.isActive("brand-new-session")).toBe(true)
-  })
-})
-
-/** A message.part.updated event naming one session, the shape the event hook actually receives. */
-const partEvent = (sessionID: string): { event: { type: string; properties: Record<string, unknown> } } => ({
-  event: { type: "message.part.updated", properties: { part: { sessionID } } },
-})
-
-describe("idle-deadline activity feed (event hook)", () => {
-  beforeEach(() => {
-    registry.resetForTests()
-  })
-
-  test("the hook is registered", () => {
-    const hooks = ultraopen({ client: stubClient })
-    expect(typeof hooks["event"]).toBe("function")
-  })
-
-  test("a part update for an engine-owned session touches its activity", () => {
-    const hooks = ultraopen({ client: stubClient }),
-     onEvent = hooks["event"] as (input: unknown) => void
-    registry.register("child-1", "run-1")
-    onEvent(partEvent("child-1"))
-    expect(registry.lastActivity("child-1")).toBeGreaterThan(0)
-  })
-
-  test("the user's own sessions are never touched", () => {
-    const hooks = ultraopen({ client: stubClient }),
-     onEvent = hooks["event"] as (input: unknown) => void
-    onEvent(partEvent("user-session"))
-    expect(registry.lastActivity("user-session")).toBe(0)
-  })
-
-  test("message.updated events are also recognised", () => {
-    const hooks = ultraopen({ client: stubClient }),
-     onEvent = hooks["event"] as (input: unknown) => void
-    registry.register("child-1", "run-1")
-    onEvent({ event: { type: "message.updated", properties: { info: { sessionID: "child-1" } } } })
-    expect(registry.lastActivity("child-1")).toBeGreaterThan(0)
-  })
-
-  test("an unrelated event type is ignored", () => {
-    const hooks = ultraopen({ client: stubClient }),
-     onEvent = hooks["event"] as (input: unknown) => void
-    registry.register("child-1", "run-1")
-    expect(() => onEvent({ event: { type: "session.idle", properties: {} } })).not.toThrow()
-    expect(registry.lastActivity("child-1")).toBe(0)
-  })
-
-  test("a malformed payload never throws", () => {
-    const hooks = ultraopen({ client: stubClient }),
-     onEvent = hooks["event"] as (input: unknown) => void
-    expect(() => onEvent({})).not.toThrow()
-    expect(() => onEvent({ event: { type: "message.part.updated", properties: { part: {} } } })).not.toThrow()
-  })
-})
-
-/**
- * A client whose child prompt never settles: the launch phase completes, the run
- * itself stays in flight — the state every background-contract test needs.
- */
-const hangingClient = {
-  config: stubClient.config,
-  session: { ...stubClient.session, prompt: () => new Promise(() => {}) },
-}
-
-/**
- * A client whose child prompt settles only when the test releases it, so a
- * blocking run can be observed live and then let settle on demand.
- */
-const gatedClient = () => {
-  let arm: (() => void) | undefined
-  const gate = new Promise<void>((resolve) => {arm = resolve})
-  return {
-    client: {
-      config: stubClient.config,
-      session: { ...stubClient.session, prompt: () => gate.then(() => ({ data: { info: {}, parts: [] } })) },
-    },
-    // The executor runs synchronously, so the release is armed before this returns.
-    release: (): void => {arm?.()},
-  }
-}
-
-describe("background launch contract", () => {
-  const statusToolOf = (hooks: Record<string, unknown>): ToolDef | undefined => {
-    const tools = hooks["tool"] as Record<string, ToolDef> | undefined
-    return tools?.[STATUS_TOOL]
-  }
-  const settle = background.settlePromiseOf
-
-  test("registers workflow_status next to workflow, with a read-only shape", () => {
-    const hooks = ultraopen({ client: stubClient })
-    const status = statusToolOf(hooks)
-    expect(status).toBeDefined()
-    expect(Object.keys(status?.args ?? {})).toContain("runId")
-    expect(Object.keys(status?.args ?? {})).toContain("wait")
-    expect(status?.description).toContain("wait")
-  })
-
-  test("the launch result names the run and says NOTHING about the outcome", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute(
-      { script: `${META}await agent('a')\nreturn 'SECRET-VALUE'\n`, background: true },
-      { sessionID: "parent" },
-    )
-    expect(output).toContain("<workflow-launched")
-    expect(output).toContain("workflow_status")
-    expect(output).not.toContain("<result")
-    expect(output).not.toContain("SECRET-VALUE")
-    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1]
-    expect(runId).toBeDefined()
-    await settle(runId ?? "")
-  })
-
-  test("a titled launch renders the title on the launch handle (#142)", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute(
-      { script: `${META}await agent('a')\nreturn 1\n`, background: true, title: "Fix the login bug" },
-      { sessionID: "parent" },
-    )
-    expect(output).toContain('workflow="demo" title="Fix the login bug"')
-    // The title reaches the live-run registry the per-turn reminder reads, before the run
-    // settles and the entry drops — the reminder surface's launch-path pin.
-    expect(background.liveRunsForSession("parent").at(0)?.title).toBe("Fix the login bug")
-    await settle(output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? "")
-  })
-
-  test("an untitled launch's handle carries no title attribute (#142)", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute(
-      { script: `${META}await agent('a')\nreturn 1\n`, background: true },
-      { sessionID: "parent" },
-    )
-    expect(output).toContain("<workflow-launched")
-    expect(output).not.toContain("title=")
-    await settle(output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? "")
-  })
-
-  test("the manifest is on disk BEFORE the tool call returns", async () => {
-    const tool = toolOf(ultraopen({ client: hangingClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute({ script: `${META}await agent('a')\nreturn 1\n`, background: true }, { sessionID: "parent" })
-    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
-    const manifest = await readManifest(runId, undefined)
-    // The launch result names a run id that workflow_status must resolve; a run
-    // whose manifest lands late would be unfindable between return and beginRun.
-    expect(manifest?.status).toBe("running")
-    expect(manifest?.sessionID).toBe("parent")
-    expect(manifest?.bootId).toBeDefined()
-  })
-
-  test("a titled launch round-trips title and description onto the manifest (#142)", async () => {
-    const tool = toolOf(ultraopen({ client: hangingClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute(
-      { script: `${META}await agent('a')\nreturn 1\n`, background: true, title: "Fix the login bug", description: "The auth flow" },
-      { sessionID: "parent" },
-    )
-    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
-    const manifest = await readManifest(runId, undefined)
-    expect(manifest?.title).toBe("Fix the login bug")
-    expect(manifest?.description).toBe("The auth flow")
-  })
-
-  test("an untitled launch records no title on the manifest (#142)", async () => {
-    const tool = toolOf(ultraopen({ client: hangingClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute({ script: `${META}await agent('a')\nreturn 1\n`, background: true }, { sessionID: "parent" })
-    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
-    const manifest = await readManifest(runId, undefined)
-    expect(manifest?.title).toBeUndefined()
-    expect(manifest?.description).toBeUndefined()
-  })
-
-  test.each([
-    ["empty string", ""],
-    ["whitespace-only", "   "],
-    ["null decoration", "null"],
-    ["undefined decoration", "undefined"],
-  ])("a %s title is absent everywhere — no placeholder noise (#142)", async (_label, blank) => {
-    // Models emit zero-value decorations; the presence rule treats blank and the
-    // documented decoration strings as absent on every surface and on the manifest,
-    // exactly like an omitted field.
-    const tool = toolOf(ultraopen({ client: hangingClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute(
-      { script: `${META}await agent('a')\nreturn 1\n`, background: true, title: blank, description: blank },
-      { sessionID: "parent" },
-    )
-    expect(output).toContain("<workflow-launched")
-    expect(output).not.toContain("title=")
-    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
-    const manifest = await readManifest(runId, undefined)
-    expect(manifest).not.toHaveProperty("title")
-    expect(manifest).not.toHaveProperty("description")
-  })
-
-  test("mixed presence: a real title with a blank description records only the title (#142)", async () => {
-    const tool = toolOf(ultraopen({ client: hangingClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute(
-      { script: `${META}await agent('a')\nreturn 1\n`, background: true, title: "Fix the login bug", description: "  " },
-      { sessionID: "parent" },
-    )
-    expect(output).toContain('title="Fix the login bug"')
-    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
-    const manifest = await readManifest(runId, undefined)
-    expect(manifest?.title).toBe("Fix the login bug")
-    expect(manifest).not.toHaveProperty("description")
-  })
-
-  test("a second launch from the same session is refused while one is live", async () => {
-    const tool = toolOf(ultraopen({ client: hangingClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const first = await tool.execute({ script: `${META}await agent('a')\nreturn 1\n`, background: true }, { sessionID: "parent" })
-    expect(first).toContain("<workflow-launched")
-    const second = await tool.execute({ script: `${META}return 2\n`, background: true }, { sessionID: "parent" })
-    expect(second).toContain("<workflow-refused>")
-    expect(second).toContain("workflow_status")
-    // The refused call never created a run directory of its own.
-    expect(second.match(/run="(?<runId>[^"]+)"/u)?.[1]).toBeUndefined()
-  })
-
-  test("two launches from one session in the same tick: exactly one succeeds", async () => {
-    // The refusal check and the registration are order-sensitive; both calls
-    // must not be able to pass the check before either registers.
-    const tool = toolOf(ultraopen({ client: hangingClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const [a, b] = await Promise.all([
-      tool.execute({ script: `${META}await agent('a')\nreturn 1\n`, background: true }, { sessionID: "parent" }),
-      tool.execute({ script: `${META}await agent('b')\nreturn 2\n`, background: true }, { sessionID: "parent" }),
-    ])
-    const launched = [a, b].filter((output) => output.includes("<workflow-launched"))
-    const refused = [a, b].filter((output) => output.includes("<workflow-refused>"))
-    expect(launched.length).toBe(1)
-    expect(refused.length).toBe(1)
-  })
-
-  test("a background run settles after the tool call returned", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute({ script: `${META}await agent('a')\nreturn 'done'\n`, background: true }, { sessionID: "parent" })
-    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
-    await settle(runId)
-    const manifest = await readManifest(runId, undefined)
-    expect(manifest?.status).toBe("completed")
-    const entries = await readJournal(runId)
-    expect(entries.length).toBe(1)
-    expect(entries[0]?.status).toBe("ok")
-  })
-
-  test("a settled background run hydrates the parent with a completion notification", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute({ script: `${META}await agent('a')\nreturn 'HYDRA-MARKER'\n`, background: true }, { sessionID: "parent" })
-    const runId = runIdOf(output)
-    await settle(runId)
-    await waitFor(() => hydrationCalls.length > 0, "the hydration promptAsync")
-    expect(hydrationCalls).toHaveLength(1)
-    expect(hydrationCalls[0]?.sessionID).toBe("parent")
-    const text = hydrationCalls[0]?.text ?? ""
-    expect(text).toContain(`<workflow-completed run="${runId}"`)
-    expect(text).toContain("HYDRA-MARKER")
-    // capped-run-dir policy: the pointer to the full result always rides along.
-    expect(text).toContain(`full result: ${artifactPaths(runId).resultPath}`)
-  })
-
-  test("a failed background run hydrates with the failure and its run dir", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute({ script: `${META}throw new Error('HYDRA-BOOM')\n`, background: true }, { sessionID: "parent" })
-    const runId = runIdOf(output)
-    await settle(runId)
-    await waitFor(() => hydrationCalls.length > 0, "the failure hydration")
-    const text = hydrationCalls[0]?.text ?? ""
-    expect(text).toContain(`<workflow-failed run="${runId}"`)
-    expect(text).toContain("HYDRA-BOOM")
-    // renderFailure's run dir line survives the cap.
-    expect(text).toContain(runId)
-  })
-
-  test("the blocking contract does not hydrate — the tool result already delivered", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute({ script: `${META}return 'sync-value'\n`, background: false }, { sessionID: "parent" })
-    expect(output).toContain("sync-value")
-    await new Promise((resolve) => {setTimeout(resolve, 20)})
-    expect(hydrationCalls).toHaveLength(0)
-  })
-
-  test("the event hook nudges once when a notification landed unanswered", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute({ script: `${META}return 'NUDGE-MARKER'\n`, background: true }, { sessionID: "parent" })
-    const runId = runIdOf(output)
-    await settle(runId)
-    await waitFor(() => hydrationCalls.length > 0, "the hydration promptAsync")
-    // The notification landed exactly as the turn ended: it is the session's last message.
-    const notification = hydrationCalls[0]?.text ?? ""
-    const idleClient = {
-      ...stubClient,
-      session: {
-        ...stubClient.session,
-        messages: () => Promise.resolve({ data: [{ info: { role: "user" }, parts: [{ type: "text", text: notification }] }] }),
-      },
-    }
-    const hooks = ultraopen({ client: idleClient }),
-      onEvent = hooks["event"] as (input: unknown) => void
-    onEvent({ event: { type: "session.idle", properties: { sessionID: "parent" } } })
-    await waitFor(() => hydrationCalls.length > 1, "the idle nudge")
-    expect(hydrationCalls[1]?.text).toContain(`<workflow-nudge run="${runId}"`)
-    // Once, ever: a second idle for the same session must not stack another nudge.
-    onEvent({ event: { type: "session.idle", properties: { sessionID: "parent" } } })
-    await new Promise((resolve) => {setTimeout(resolve, 20)})
-    expect(hydrationCalls).toHaveLength(2)
-  })
-
-  test("the event hook does not nudge when the notification was answered", async () => {
-    const answeringClient = {
-      ...stubClient,
-      session: {
-        ...stubClient.session,
-        messages: () =>
-          Promise.resolve({ data: [{ info: { role: "assistant" }, parts: [] }] }),
-      },
-    }
-    const tool = toolOf(ultraopen({ client: answeringClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute({ script: `${META}return 1\n`, background: true }, { sessionID: "parent" })
-    await settle(runIdOf(output))
-    await waitFor(() => hydrationCalls.length > 0, "the hydration promptAsync")
-    const hooks = ultraopen({ client: answeringClient }),
-      onEvent = hooks["event"] as (input: unknown) => void
-    onEvent({ event: { type: "session.idle", properties: { sessionID: "parent" } } })
-    await new Promise((resolve) => {setTimeout(resolve, 20)})
-    expect(hydrationCalls).toHaveLength(1)
-  })
-
-  test("aborting the tool call's signal does not abort the detached run", async () => {
-    // The parent turn being interrupted must not kill the run it just launched:
-    // the detached Run deliberately never sees the tool call's abort signal.
-    const controller = new AbortController(),
-      tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute(
-      { script: `${META}await agent('a')\nreturn 'ok'\n`, background: true },
-      { sessionID: "parent", abort: controller.signal },
-    )
-    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
-    controller.abort()
-    await settle(runId)
-    // The run's own end-of-script cleanup aborts children as always; what must
-    // NOT happen is a signal-driven abort mid-run killing the agent's prompt. The settle's
-    // manifest write lands right after its promise resolves — poll rather than race it.
-    let settledManifest = await readManifest(runId, undefined)
-    for (let i = 0; i < 100 && settledManifest?.status === "running"; i++) {
-      await new Promise((resolve) => {setTimeout(resolve, 20)})
-      settledManifest = await readManifest(runId, undefined)
-    }
-    expect(settledManifest?.status).toBe("completed")
-  })
-
-  test("resuming a run that is still executing is refused", async () => {
-    // Two Run instances on one journal would interleave appends and race the
-    // endRun rewrite; the live run must settle (or die) before a resume starts.
-    const tool = toolOf(ultraopen({ client: hangingClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const first = await tool.execute({ script: `${META}await agent('a')\nreturn 1\n`, background: true }, { sessionID: "other" })
-    const liveRunId = first.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
-    const asked: unknown[] = []
-    const second = await tool.execute(
-      { script: `${META}await agent('a')\nreturn 2\n`, background: false, resumeFromRunId: liveRunId },
-      {
-        sessionID: "parent",
-        ask: (request: unknown) => { asked.push(request); return Promise.resolve() },
-      },
-    )
-    expect(second).toContain("<workflow-refused>")
-    expect(second).toContain("still executing")
-    // Refused BEFORE the ask: the live-source refusal must not spend an approval
-    // on a call that never launches.
-    expect(asked).toEqual([])
-  })
-
-  test("a parse failure in the background contract does not leave a pending launch behind", async () => {
-    const tool = toolOf(ultraopen({ client: hangingClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute({ script: `${META}const x: string[] = []\n`, background: true }, { sessionID: "parent" })
-    expect(output).toContain("ParseError")
-    // The session is free to launch again.
-    const second = await tool.execute({ script: `${META}return 1\n`, dryRun: true }, { sessionID: "parent" })
-    expect(second).toContain("<result")
-  })
-
-  test("a rejected permission ask drops the pending launch", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute(
-      { script: `${META}return 1\n`, background: true },
-      { sessionID: "parent", ask: () => Promise.reject(new Error("user said no")) },
-    )
-    expect(output).toContain("user said no")
-    // The session must be free to launch again after the rejection.
-    const second = await tool.execute({ script: `${META}return 1\n`, background: true }, { sessionID: "parent" })
-    expect(second).toContain("<workflow-launched")
-    await settle(second.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? "")
-  })
-
-  test("dryRun always waits for its result even in background mode", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute({ script: `${META}return 1\n`, dryRun: true, background: true }, { sessionID: "parent" })
-    expect(output).toContain("<result")
-  })
-
-  test("a blocking launch while a detached run is live is refused too", async () => {
-    // One live run per session covers BOTH contracts; only dryRun is exempt
-    // (it is free and stubbed, the standard mid-run debugging tool).
-    const tool = toolOf(ultraopen({ client: hangingClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const first = await tool.execute({ script: `${META}await agent('a')\nreturn 1\n`, background: true }, { sessionID: "parent" })
-    expect(first).toContain("<workflow-launched")
-    const blocking = await tool.execute({ script: `${META}return 2\n`, background: false }, { sessionID: "parent" })
-    expect(blocking).toContain("<workflow-refused>")
-    // dryRun stays allowed while a run is live: it spawns nothing.
-    const dry = await tool.execute({ script: `${META}return 3\n`, dryRun: true }, { sessionID: "parent" })
-    expect(dry).toContain("<result")
-  })
-
-  test("the blocking contract's description describes blocking", () => {
-    // The description is model-training text: under the blocking contract it
-    // must not teach a polling rhythm for a result the call already returns.
-    const tool = toolOf(ultraopen({ client: stubClient }, { runMode: "blocking" }))
-    expect(tool?.description).toContain("BLOCKS until the run completes")
-    expect(tool?.description).not.toContain("RETURNS AT ONCE")
-    const backgroundTool = toolOf(ultraopen({ client: stubClient }))
-    expect(backgroundTool?.description).toContain("RETURNS AT ONCE")
-  })
-
-  test("the blocking option restores the pre-async contract", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }, { runMode: "blocking" }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute({ script: `${META}await agent('a')\nreturn 'blocking-value'\n` }, { sessionID: "parent" })
-    expect(output).toContain("<result")
-    expect(output).toContain("blocking-value")
-  })
-
-  test("the status tool reads the settled run from disk", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute({ script: `${META}await agent('a')\nreturn 'the-value'\n`, background: true }, { sessionID: "parent" })
-    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
-    await settle(runId)
-    const status = statusToolOf(ultraopen({ client: stubClient }))
-    if (!status) {throw new Error("status tool was not registered")}
-    // The settle's disk writes land just after its promise resolves (the atomic manifest write
-    // is the commit point; the artifacts follow) — the read must not race them: poll to terminal.
-    const report = await status.execute({ runId, wait: 5 }, { sessionID: "parent" })
-    expect(report).toContain(`status="completed"`)
-    expect(report).toContain("the-value")
-    expect(report).toContain("agents total=1 running=0 done=1 failed=0")
-  })
-
-  test("an unknown run id is a clear error, not a crash", async () => {
-    const status = statusToolOf(ultraopen({ client: stubClient }))
-    if (!status) {throw new Error("status tool was not registered")}
-    const report = await status.execute({ runId: "wf_missing000" }, { sessionID: "parent" })
-    expect(report).toContain("No run found")
-    expect(report).not.toContain("throw")
-    // A malformed id never reaches a path join.
-    const traversal = await status.execute({ runId: "../../etc" }, { sessionID: "parent" })
-    expect(traversal).toContain("No run found")
-  })
-
-  test("a failed background run persists its failure text for the status tool", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute(
-      { script: `${META}await agent('a')\nthrow new Error('boom mid-run')\n`, background: true },
-      { sessionID: "parent" },
-    )
-    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
-    await settle(runId)
-    const status = statusToolOf(ultraopen({ client: stubClient }))
-    if (!status) {throw new Error("status tool was not registered")}
-    // (#163) A zero wait returns the FIRST read — a settle whose terminal write is still
-    // unwinding (or retrying a transient refusal) reads as running forever. Poll to
-    // terminal like the sibling test above instead of racing the settle once.
-    const report = await status.execute({ runId, wait: 5 }, { sessionID: "parent" })
-    expect(report).toContain(`status="failed"`)
-    expect(report).toContain("boom mid-run")
-    expect(report).toContain("<failure")
-  })
-
-  test("the launch result never leaks the outcome even on failure", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute(
-      { script: `${META}await agent('a')\nthrow new Error('soon-boom')\n`, background: true },
-      { sessionID: "parent" },
-    )
-    expect(output).toContain("<workflow-launched")
-    expect(output).not.toContain("soon-boom")
-    await settle(output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? "")
-  })
-
-  test("ULTRAOPEN_WORKFLOW_SYNC restores the blocking contract without config", async () => {
-    // The kill switch must work with NO options object at all: one env var.
-    process.env["ULTRAOPEN_WORKFLOW_SYNC"] = "1"
-    try {
-      const tool = toolOf(ultraopen({ client: stubClient }))
-      if (!tool) {throw new Error("tool was not registered")}
-      const output = await tool.execute({ script: `${META}return 'sync-value'\n` }, { sessionID: "parent" })
-      expect(output).toContain("<result")
-      expect(output).toContain("sync-value")
-    } finally {
-      delete process.env["ULTRAOPEN_WORKFLOW_SYNC"]
-    }
-  })
-
-  test("the status report carries the run's log lines", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute(
-      { script: `${META}log('hello from the run')\nawait agent('a')\nreturn 1\n`, background: true },
-      { sessionID: "parent" },
-    )
-    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
-    await settle(runId)
-    const status = statusToolOf(ultraopen({ client: stubClient }))
-    if (!status) {throw new Error("status tool was not registered")}
-    const report = await status.execute({ runId }, { sessionID: "parent" })
-    expect(report).toContain("<log>")
-    expect(report).toContain("hello from the run")
-  })
-
-  test("a malformed resume id is refused before any path join", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const asked: unknown[] = []
-    const output = await tool.execute(
-      { script: `${META}return 1\n`, resumeFromRunId: "../../etc", background: false },
-      {
-        sessionID: "parent",
-        ask: (request: unknown) => { asked.push(request); return Promise.resolve() },
-      },
-    )
-    expect(output).toContain("not a valid run id")
-    // Refused BEFORE the ask: an approval spent on a call that refuses itself
-    // buys nothing and cascades into a re-ask chain when the model retries.
-    expect(asked).toEqual([])
-  })
-
-  test("a resume id whose run belongs to a DIFFERENT session is refused at the gate, before the ask", async () => {
-    // Same-session resume is by design; the bug was the SILENCE (#147): a foreign
-    // run's journal replayed nothing and looked exactly like a same-session resume
-    // with nothing replayable, then re-ran every agent at full price with no note.
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const launched = await tool.execute(
-      { script: `${META}await agent('a')\nreturn 'SOURCE-VALUE'\n`, background: true },
-      { sessionID: "other-session" },
-    )
-    const runId = runIdOf(launched)
-    await background.settlePromiseOf(runId)
-    const { ask, assertNoAsk } = askRecorder()
-    const output = await tool.execute(
-      { script: `${META}return 2\n`, resumeFromRunId: runId, background: false },
-      { sessionID: "parent", ask },
-    )
-    expect(output).toContain("<workflow-refused>")
-    // The refusal names the cross-session situation, the run, and who owns it.
-    expect(output).toContain("different session")
-    expect(output).toContain(runId)
-    expect(output).toContain("other-session")
-    // Refused BEFORE the permission ask: no approval is consumed by a call that
-    // refuses itself, and nothing launches.
-    assertNoAsk()
-    expect(background.liveRunsForSession("parent")).toHaveLength(0)
-  })
-
-  test("a well-formed resume id with no run refuses at the gate with the run-list hint, before the ask", async () => {
-    // The bug (#131): a well-formed but nonexistent id (typo'd or pruned) fell
-    // through the gate, spent the approval, and then loadResume turned the
-    // missing manifest into a silent empty replay — a fresh launch at full
-    // price dressed as a resume. The refusal must point at the status tool's
-    // run listing, where valid ids come from.
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    // Well-formed per the id shape (wf_ + [a-z0-9]{6,}), never launched here.
-    const missingId = "wf_nomach1"
-    const { ask, assertNoAsk } = askRecorder()
-    const output = await tool.execute(
-      { script: `${META}return 2\n`, resumeFromRunId: missingId, background: false },
-      { sessionID: "parent", ask },
-    )
-    expect(output).toContain("<workflow-refused>")
-    expect(output).toContain(missingId)
-    expect(output).toContain("workflow_status")
-    // Refused BEFORE the permission ask: no approval is consumed by a call
-    // that refuses itself, and nothing launches.
-    assertNoAsk()
-    expect(background.liveRunsForSession("parent")).toHaveLength(0)
-  })
-
-  test("a refused resume never manufactures a run directory of its own", async () => {
-    // The gate needs only the resume id and this session's identity — no prepared
-    // workflow, no run directory. It used to run AFTER ensureRunDir/writeScript, so
-    // every refused resume left a manifest-less directory behind: executeStatus reads
-    // it as "no run found" (clean, but useless) and pruneRuns can never remove it,
-    // because pruning keys on a manifest — one leaked directory per refusal, forever.
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const missingId = "wf_nodir001"
-    const before = new Set(await listRoot())
-    const { ask, assertNoAsk } = askRecorder()
-    const output = await tool.execute(
-      { script: `${META}return 2\n`, resumeFromRunId: missingId, background: false },
-      { sessionID: "parent", ask },
-    )
-    expect(output).toContain("<workflow-refused>")
-    assertNoAsk()
-    const after = await listRoot()
-    const added = after.filter((name) => !before.has(name))
-    expect(added).toEqual([])
-  })
-
-  test("a source manifest that records no session refuses honestly, not as a foreign session", async () => {
-    // The Manifest schema REQUIRES sessionID, and every manifest writer since the first
-    // run store has recorded it (traced through the store's history), so a manifest
-    // without one is corrupt — not a pre-upgrade format. readManifest trusts the disk
-    // with a plain cast, so the gate must not read the missing field as provenance:
-    // undefined !== sessionID would refuse with the foreign-session render, whose message
-    // names "(undefined)" as the session that owns the run — a session it never saw.
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const unrecorded = "wf_noses001"
-    await ensureRunDir(unrecorded, undefined)
-    const paths = artifactPaths(unrecorded, undefined)
-    await writeFile(
-      paths.manifestPath,
-      JSON.stringify({
-        runId: unrecorded,
-        bootId: "boot-x",
-        pid: 1,
-        sourceHash: "sha-x",
-        argsHash: argsHash(undefined),
-        status: "completed",
-        childSessionIDs: [],
-        startedAt: 1,
-        endedAt: 2,
-      }),
-      "utf8",
-    )
-    const { ask, assertNoAsk } = askRecorder()
-    const output = await tool.execute(
-      { script: `${META}return 2\n`, resumeFromRunId: unrecorded, background: false },
-      { sessionID: "parent", ask },
-    )
-    expect(output).toContain("<workflow-refused>")
-    expect(output).toContain(unrecorded)
-    expect(output).toContain("does not record")
-    // The lie must not fire: a manifest that names no session is not a DIFFERENT session.
-    expect(output).not.toContain("different session")
-    assertNoAsk()
-    expect(background.liveRunsForSession("parent")).toHaveLength(0)
-  })
-
-  test("executeStatus can be driven directly against real run artifacts", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute(
-      { script: `${META}await agent('a')\nreturn 'probe-value'\n`, background: true },
-      { sessionID: "parent" },
-    )
-    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
-    await settle(runId)
-    const report = await executeStatus({ runId }, { bootId: "other-boot" })
-    expect(report.status).toBe("completed")
-    expect(report.value).toBe("probe-value")
-    expect(report.outputTokens).toBe(0)
-  })
-})
-
-describe("blocking launch registration", () => {
-  test("a blocking launch registers a pending entry, so the resume gate covers it while it executes", async () => {
-    const { client, release } = gatedClient(),
-      tool = toolOf(ultraopen({ client }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const asked: { metadata?: { runId?: string } }[] = []
-    const blocking = tool.execute(
-      { script: `${META}await agent('a')\nreturn 'SETTLED-VALUE'\n`, background: false },
-      {
-        sessionID: "blocker",
-        ask: (request: { metadata?: { runId?: string } }) => { asked.push(request); return Promise.resolve() },
-      },
-    )
-    try {
-      await waitFor(() => asked.length > 0, "the permission ask")
-      const runId = asked[0]?.metadata?.runId ?? ""
-      // The gate entry exists before the manifest does; the resume refusal reads
-      // the manifest, so wait for the run to go live before attempting it.
-      await waitFor(async () => {
-        const manifest = await readManifest(runId, undefined)
-        return manifest?.status === "running"
-      }, "the manifest")
-      expect(background.liveRunsForSession("blocker")[0]?.runId).toBe(runId)
-      expect(background.isLive(runId)).toBe(true)
-      const second = await tool.execute(
-        { script: `${META}await agent('a')\nreturn 2\n`, resumeFromRunId: runId, background: false },
-        { sessionID: "parent" },
-      )
-      expect(second).toContain("<workflow-refused>")
-      expect(second).toContain("still executing")
-      // The refused resume attempt drops its own entry, never the live run's.
-      expect(background.liveRunsForSession("parent")).toHaveLength(0)
-      expect(background.liveRunsForSession("blocker")[0]?.runId).toBe(runId)
-    } finally {
-      release()
-      await blocking
-    }
-    // A settled blocking launch leaves no stale entry for the next launch to trip on.
-    expect(background.liveRunsForSession("blocker")).toHaveLength(0)
-    const settledRunId = asked[0]?.metadata?.runId ?? ""
-    // Resumed from the LAUNCHING session (#147): resume is same-session by design, and a
-    // different session's attempt is now refused at the gate instead of silently replaying
-    // nothing — this positive path pins that the gate reopens after settle.
-    const resumed = await tool.execute(
-      { script: `${META}await agent('a')\nreturn 2\n`, resumeFromRunId: settledRunId, background: false },
-      { sessionID: "blocker" },
-    )
-    expect(resumed).toContain("<result")
-  })
-
-  test("a failed blocking run drops its entry when it settles", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute(
-      { script: `${META}await agent('a')\nthrow new Error('boom mid-run')\n`, background: false },
-      { sessionID: "parent" },
-    )
-    expect(output).toContain("boom mid-run")
-    // The run failed, but it settled: the manifest is closed and the gate is open.
-    const runId = output.match(/id="(?<runId>[^"]+)"/u)?.[1] ?? ""
-    const manifest = await readManifest(runId, undefined)
-    expect(manifest?.status).toBe("failed")
-    expect(background.liveRunsForSession("parent")).toHaveLength(0)
-  })
-
-  test("dryRun stays exempt from registration as well as the gate", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    let registeredAtAsk: boolean | undefined
-    const output = await tool.execute(
-      { script: `${META}return 1\n`, dryRun: true },
-      {
-        sessionID: "parent",
-        ask: () => {
-          // Read mid-launch, at the ask: a dryRun must never hold the session's gate.
-          registeredAtAsk = background.liveRunsForSession("parent").length > 0
-          return Promise.resolve()
-        },
-      },
-    )
-    expect(output).toContain("<result")
-    expect(registeredAtAsk).toBe(false)
-    expect(background.liveRunsForSession("parent")).toHaveLength(0)
-  })
-
-  test("a rejected permission ask drops the blocking launch's entry", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute(
-      { script: `${META}return 1\n`, background: false },
-      { sessionID: "parent", ask: () => Promise.reject(new Error("user said no")) },
-    )
-    expect(output).toContain("user said no")
-    expect(background.liveRunsForSession("parent")).toHaveLength(0)
-    // The session must be free to launch again after the rejection.
-    const second = await tool.execute({ script: `${META}return 1\n`, dryRun: true }, { sessionID: "parent" })
-    expect(second).toContain("<result")
-  })
-
-  test("a malformed resume id on the blocking contract frees the session", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute(
-      { script: `${META}return 1\n`, resumeFromRunId: "../../etc", background: false },
-      { sessionID: "parent" },
-    )
-    expect(output).toContain("not a valid run id")
-    expect(background.liveRunsForSession("parent")).toHaveLength(0)
-    const second = await tool.execute({ script: `${META}return 1\n`, background: false }, { sessionID: "parent" })
-    expect(second).toContain("<result")
-  })
-})
-
-describe("sibling advisory on launch results", () => {
-  test("the blocking result names the session's sibling live runs", async () => {
-    // The one-live-run gate refuses any registered launch beside a live sibling,
-    // so the dryRun — which registers nothing — is the only launch that can
-    // render beside one.
-    background.registerPending("wf_sibl0001", "parent")
-    background.promote("wf_sibl0001")
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute({ script: `${META}return 1\n`, dryRun: true }, { sessionID: "parent" })
-    expect(output).toContain("<result")
-    expect(output).toContain("Sibling runs still live in this session, oldest first: wf_sibl0001 (running).")
-  })
-
-  test("a solo launch result carries no sibling advisory", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute({ script: `${META}return 1\n`, dryRun: true }, { sessionID: "parent" })
-    expect(output).toContain("<result")
-    expect(output).not.toContain("Sibling")
-  })
-})
-
-describe("background launch contract — unwritable run directory", () => {
-  let savedXDG: string | undefined
-
-  beforeEach(() => {
-    registry.resetForTests()
-    background.resetForTests()
-    mode.resetForTests()
-    savedXDG = process.env["XDG_DATA_HOME"]
-    // mkdir under /dev/null can never succeed, so beginRun cannot open the run
-    // directory — the launch must refuse instead of starting an unobservable run.
-    process.env["XDG_DATA_HOME"] = "/dev/null/nope"
-  })
-
-  afterEach(() => {
-    if (savedXDG === undefined) {delete process.env["XDG_DATA_HOME"]}
-    else {process.env["XDG_DATA_HOME"] = savedXDG}
-  })
-
-  test("a beginRun failure aborts the launch instead of starting an unreportable run", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute({ script: `${META}return 1\n`, background: true }, { sessionID: "parent" })
-    expect(output).toContain("could not be started")
-    expect(output).not.toContain("<workflow-launched")
-    // The launch-gating entry is dropped: the session can launch again.
-    if (savedXDG === undefined) {delete process.env["XDG_DATA_HOME"]}
-    else {process.env["XDG_DATA_HOME"] = savedXDG}
-    const second = await tool.execute({ script: `${META}return 1\n`, dryRun: true }, { sessionID: "parent" })
-    expect(second).toContain("<result")
-  })
-})
-
-describe("ultracode launch gate", () => {
-  // The gate reads the mode singleton at launch time; each test drives the real
-  // singleton (enable/default-on/agent), never a mock.
-  const launch = (tool: ToolDef, sessionID: string, over: Record<string, unknown> = {}): Promise<string> =>
-    tool.execute({ script: `${META}await agent('a')\nreturn 1\n`, background: true, ...over }, { sessionID })
-
-  test("a non-ultracode second launch keeps the plain one-live-run refusal verbatim", async () => {
-    const tool = toolOf(ultraopen({ client: hangingClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const first = await launch(tool, "parent")
-    expect(first).toContain("<workflow-launched")
-    const second = await launch(tool, "parent", { script: `${META}return 2\n` })
-    expect(second).toContain("<workflow-refused>")
-    // The pre-existing refusal text, unchanged: names THE one run, not a cap.
-    expect(second).toContain("already has a workflow run in flight")
-    expect(second).not.toContain("live-run cap")
-  })
-
-  test("an ultracode session holds concurrent live runs below the cap; each launch names its siblings", async () => {
-    mode.enable("parent", "command")
-    const tool = toolOf(ultraopen({ client: hangingClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const first = await launch(tool, "parent")
-    expect(first).toContain("<workflow-launched")
-    const second = await launch(tool, "parent", { script: `${META}await agent('b')\nreturn 2\n` })
-    expect(second).toContain("<workflow-launched")
-    // The second launch result names the first run as its sibling.
-    expect(second).toContain(`Sibling runs still live in this session, oldest first: ${runIdOf(first)} (running).`)
-  })
-
-  test("two ultracode launches in the same tick both succeed (the gate is conditional, not per-session)", async () => {
-    mode.enable("parent", "command")
-    const tool = toolOf(ultraopen({ client: hangingClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const [a, b] = await Promise.all([
-      tool.execute({ script: `${META}await agent('a')\nreturn 1\n`, background: true }, { sessionID: "parent" }),
-      tool.execute({ script: `${META}await agent('b')\nreturn 2\n`, background: true }, { sessionID: "parent" }),
-    ])
-    expect(a).toContain("<workflow-launched")
-    expect(b).toContain("<workflow-launched")
-  })
-
-  test("an at-cap launch is refused naming every live run id; finishing one frees a slot", async () => {
-    mode.enable("parent", "command")
-    const tool = toolOf(ultraopen({ client: hangingClient }, { ultracodeMaxRuns: 2 }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const first = await launch(tool, "parent"),
-      second = await launch(tool, "parent", { script: `${META}await agent('b')\nreturn 2\n` }),
-      firstRunId = runIdOf(first),
-      secondRunId = runIdOf(second)
-    const third = await launch(tool, "parent", { script: `${META}return 3\n` })
-    expect(third).toContain("<workflow-refused>")
-    expect(third).toContain("live-run cap of 2")
-    // Every live run id is named, so the model can wait on one.
-    expect(third).toContain(firstRunId)
-    expect(third).toContain(secondRunId)
-    // The refused call registered nothing and created no run dir of its own.
-    expect(background.liveRunsForSession("parent")).toHaveLength(2)
-    // Finishing one run frees a slot — runDetached's settle cleanup drops the
-    // entry (pinned at the registry seam); the tool must read the freed state.
-    background.dropSettled(firstRunId)
-    const fourth = await launch(tool, "parent", { script: `${META}return 4\n` })
-    expect(fourth).toContain("<workflow-launched")
-  })
-
-  test("the ultracode-agent activation surface: the agent name the host delivers on the tool context", async () => {
-    // No mode state at all — the driving agent's name is the only signal, the
-    // way the host delivers `agent` on the tool-execute context (cited on
-    // ToolContext in src/server/index.ts).
-    const tool = toolOf(ultraopen({ client: hangingClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const first = await launch(tool, "parent")
-    const concurrent = await tool.execute(
-      { script: `${META}await agent('b')\nreturn 2\n`, background: true },
-      { sessionID: "parent", agent: "ultracode" },
-    )
-    expect(concurrent).toContain("<workflow-launched")
-    // The concurrent launch names the earlier one as its sibling.
-    expect(concurrent).toContain(`Sibling runs still live in this session, oldest first: ${runIdOf(first)} (running).`)
-    // The same launch from a plain agent on the SAME session (and no mode state)
-    // is refused as ever — the agent name is the only difference.
-    const plain = await tool.execute(
-      { script: `${META}await agent('b')\nreturn 3\n`, background: true },
-      { sessionID: "parent", agent: "build" },
-    )
-    expect(plain).toContain("<workflow-refused>")
-    // And with NO agent name delivered, the plain refusal holds too.
-    const unnamed = await launch(tool, "parent", { script: `${META}return 4\n` })
-    expect(unnamed).toContain("<workflow-refused>")
-  })
-
-  test("the plugin-options ultracode flag (default-on) also opens the cap", async () => {
-    // Through the option itself, not a direct setDefault: plugin init sets the
-    // project default from the same tuple.
-    const tool = toolOf(ultraopen({ client: hangingClient }, { ultracode: true }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const first = await launch(tool, "fresh")
-    const second = await launch(tool, "fresh", { script: `${META}await agent('b')\nreturn 2\n` })
-    expect(second).toContain("<workflow-launched")
-    expect(second).toContain(`Sibling runs still live in this session, oldest first: ${runIdOf(first)} (running).`)
-  })
-
-  test("a demoted session's launch behaves like any ultracode launch (demotion is prompt-level)", async () => {
-    mode.enable("parent", "keyword")
-    mode.demote("parent")
-    const tool = toolOf(ultraopen({ client: hangingClient }, { ultracodeMaxRuns: 2 }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const first = await launch(tool, "parent")
-    const second = await launch(tool, "parent", { script: `${META}await agent('b')\nreturn 2\n` })
-    // Below the cap: demotion changed nothing — the launch succeeds normally.
-    expect(second).toContain("<workflow-launched")
-    const third = await launch(tool, "parent", { script: `${META}return 3\n` })
-    // At the cap: the same refusal as any ultracode session.
-    expect(third).toContain("<workflow-refused>")
-    expect(third).toContain("live-run cap of 2")
-    expect(third).toContain(runIdOf(first))
-  })
-
-  test("the env kill switch keeps forcing blocking in an ultracode session", async () => {
-    mode.enable("parent", "command")
-    process.env["ULTRAOPEN_WORKFLOW_SYNC"] = "1"
-    try {
-      const tool = toolOf(ultraopen({ client: stubClient }))
-      if (!tool) {throw new Error("tool was not registered")}
-      // No background arg: the env kill switch pins the contract via its
-      // documented precedence (env > option > default); no ultracode override.
-      const output = await launch(tool, "parent", { script: `${META}await agent('a')\nreturn 'sync-value'\n`, background: undefined })
-      expect(output).toContain("<result")
-      expect(output).not.toContain("<workflow-launched")
-    } finally {
-      delete process.env["ULTRAOPEN_WORKFLOW_SYNC"]
-    }
-  })
-
-  test("a pinned runMode: 'blocking' is respected under ultracode", async () => {
-    mode.enable("parent", "command")
-    const tool = toolOf(ultraopen({ client: stubClient }, { runMode: "blocking" }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await launch(tool, "parent", { background: undefined })
-    expect(output).toContain("<result")
-    expect(output).not.toContain("<workflow-launched")
-    expect(background.liveRunsForSession("parent")).toHaveLength(0)
-  })
-
-  test("the gate covers the blocking contract in ultracode: a launch beside a live blocking run sits below the cap, at the cap it is refused", async () => {
-    mode.enable("parent", "command")
-    const { client, release } = gatedClient(),
-      tool = toolOf(ultraopen({ client }, { ultracodeMaxRuns: 2 }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const asked: { metadata?: { runId?: string } }[] = []
-    let runId = ""
-    const blocking = tool.execute(
-      { script: `${META}await agent('a')\nreturn 1\n`, background: false },
-      { sessionID: "parent", ask: (request: { metadata?: { runId?: string } }) => { asked.push(request); return Promise.resolve() } },
-    )
-    try {
-      await waitFor(() => asked.length > 0, "the permission ask")
-      runId = asked[0]?.metadata?.runId ?? ""
-      await waitFor(async () => {
-        const manifest = await readManifest(runId, undefined)
-        return manifest?.status === "running"
-      }, "the manifest")
-      expect(background.isLive(runId)).toBe(true)
-      // Below the cap, a background launch beside the live blocking run succeeds.
-      const concurrent = await launch(tool, "parent", { script: `${META}await agent('b')\nreturn 2\n` })
-      expect(concurrent).toContain("<workflow-launched")
-      // The blocking run's gate entry is named, whatever its registration status.
-      expect(concurrent).toContain(`Sibling runs still live in this session, oldest first: ${runId} (pending).`)
-      // A seeded third live run puts the session at the cap: refused, naming all.
-      background.registerPending("wf_seed0001", "parent", 1)
-      const atCap = await launch(tool, "parent", { script: `${META}return 3\n` })
-      expect(atCap).toContain("<workflow-refused>")
-      expect(atCap).toContain("live-run cap of 2")
-      expect(atCap).toContain(runId)
-      expect(atCap).toContain("wf_seed0001")
-    } finally {
-      release()
-      await blocking
-    }
-    // The blocking run's own gate entry is dropped at settle; the concurrent
-    // background run (a never-settling client here) keeps its entry by design.
-    expect(background.isLive(runId)).toBe(false)
-  })
-
-  test("finishing a run through the REAL settle path frees its slot", async () => {
-    // Two gated clients: each run's prompt settles only when ITS gate is
-    // released, so a slot can be freed deterministically without registry
-    // surgery. The module-level registry is shared, so two tool instances see
-    // each other's entries.
-    mode.enable("parent", "command")
-    const gateA = gatedClient(),
-      gateB = gatedClient(),
-      toolA = toolOf(ultraopen({ client: gateA.client }, { ultracodeMaxRuns: 2 })),
-      toolB = toolOf(ultraopen({ client: gateB.client }, { ultracodeMaxRuns: 2 })),
-      toolFree = toolOf(ultraopen({ client: stubClient }, { ultracodeMaxRuns: 2 }))
-    if (!toolA || !toolB || !toolFree) {throw new Error("tool was not registered")}
-    const askedA: { metadata?: { runId?: string } }[] = [],
-      askedB: { metadata?: { runId?: string } }[] = []
-    const runA = toolA.execute(
-      { script: `${META}await agent('a')\nreturn 1\n`, background: false },
-      { sessionID: "parent", ask: (request: { metadata?: { runId?: string } }) => { askedA.push(request); return Promise.resolve() } },
-    )
-    const runB = toolB.execute(
-      { script: `${META}await agent('b')\nreturn 2\n`, background: false },
-      { sessionID: "parent", ask: (request: { metadata?: { runId?: string } }) => { askedB.push(request); return Promise.resolve() } },
-    )
-    try {
-      await waitFor(() => askedA.length > 0 && askedB.length > 0, "both permission asks")
-      const aId = askedA[0]?.metadata?.runId ?? "",
-        bId = askedB[0]?.metadata?.runId ?? ""
-      // At the cap of 2, a third launch is refused naming both live runs.
-      const third = await launch(toolA, "parent", { script: `${META}return 3\n` })
-      expect(third).toContain("<workflow-refused>")
-      expect(third).toContain(aId)
-      expect(third).toContain(bId)
-      // A real settle — the gate released, the run completed, runDetached's
-      // settle cleanup dropped the entry — must free the slot for the tool.
-      gateA.release()
-      await runA
-      await waitFor(() => !background.isLive(aId), "run A's settle")
-      // The freed slot is visible to a launch from a settling client (a gated
-      // client here would hang the turn on its own unreleased prompt).
-      const fourth = await launch(toolFree, "parent", { script: `${META}return 4\n` })
-      expect(fourth).toContain("<workflow-launched")
-      await background.settlePromiseOf(fourth.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? "")
-    } finally {
-      gateB.release()
-      await runB
-    }
-    expect(background.liveRunsForSession("parent")).toHaveLength(0)
-  })
-
-  test("dryRun stays exempt from the gate in ultracode too", async () => {
-    mode.enable("parent", "command")
-    const tool = toolOf(ultraopen({ client: stubClient }, { ultracodeMaxRuns: 1 }))
-    if (!tool) {throw new Error("tool was not registered")}
-    // A live run at the cap refuses a real launch...
-    background.registerPending("wf_seed0002", "parent")
-    const real = await launch(tool, "parent")
-    expect(real).toContain("<workflow-refused>")
-    // ...but a dryRun — which spawns nothing — still goes through.
-    const dry = await tool.execute({ script: `${META}return 2\n`, dryRun: true }, { sessionID: "parent" })
-    expect(dry).toContain("<result")
-  })
-})
-
-describe("saved workflows (context.named)", () => {
-  let configHome: string
-
-  beforeEach(() => {
-    registry.resetForTests()
-    background.resetForTests()
-    mode.resetForTests()
-  })
-
-  test("a saved workflow in the config directory runs by name", async () => {
-    const { mkdtemp: mkTemp, mkdir, rm: fsRm, writeFile: writeFileSaved } = await import("node:fs/promises"),
-      { tmpdir: osTmpdir } = await import("node:os"),
-      { join: cfgJoin } = await import("node:path")
-    configHome = await mkTemp(cfgJoin(osTmpdir(), "ultraopen-saved-"))
-    const saved = process.env["OPENCODE_CONFIG_DIR"]
-    process.env["OPENCODE_CONFIG_DIR"] = configHome
-    try {
-      const dir = cfgJoin(configHome, "ultraopen", "workflows")
-      await mkdir(dir, { recursive: true })
-      await writeFileSaved(
-        cfgJoin(dir, "deploy-check.js"),
-        "export const meta = { name: 'deploy-check', description: 'Deploy gate' }\nreturn 'saved-value'\n",
-      )
-      const tool = toolOf(ultraopen({ client: stubClient }))
-      if (!tool) {throw new Error("tool was not registered")}
-      const output = await tool.execute(
-        { script: `${META}return await workflow('deploy-check')\n`, background: false },
-        { sessionID: "parent" },
-      )
-      expect(output).toContain("saved-value")
-    } finally {
-      if (saved === undefined) {delete process.env["OPENCODE_CONFIG_DIR"]}
-      else {process.env["OPENCODE_CONFIG_DIR"] = saved}
-      await fsRm(configHome, { recursive: true, force: true })
-    }
-  })
-
-  test("a broken saved file is skipped with a note and never breaks the call", async () => {
-    const { mkdtemp: mkTemp, mkdir, rm: fsRm, writeFile: writeFileSaved } = await import("node:fs/promises"),
-      { tmpdir: osTmpdir } = await import("node:os"),
-      { join: cfgJoin } = await import("node:path")
-    configHome = await mkTemp(cfgJoin(osTmpdir(), "ultraopen-saved-"))
-    const saved = process.env["OPENCODE_CONFIG_DIR"]
-    process.env["OPENCODE_CONFIG_DIR"] = configHome
-    try {
-      const dir = cfgJoin(configHome, "ultraopen", "workflows")
-      await mkdir(dir, { recursive: true })
-      await writeFileSaved(cfgJoin(dir, "broken.js"), "const x: string[] = []\n")
-      const tool = toolOf(ultraopen({ client: stubClient }))
-      if (!tool) {throw new Error("tool was not registered")}
-      const output = await tool.execute({ script: `${META}return 1\n`, dryRun: true }, { sessionID: "parent" })
-      expect(output).toContain("<result")
-      expect(output).toContain("<scan-notes>")
-      expect(output).toContain("broken.js")
-    } finally {
-      if (saved === undefined) {delete process.env["OPENCODE_CONFIG_DIR"]}
-      else {process.env["OPENCODE_CONFIG_DIR"] = saved}
-      await fsRm(configHome, { recursive: true, force: true })
-    }
-  })
-
-  test("one /workflow-<name> command per saved workflow, template keeping $ARGUMENTS", async () => {
-    const { mkdtemp: mkTemp, mkdir, rm: fsRm, writeFile: writeFileSaved } = await import("node:fs/promises"),
-      { tmpdir: osTmpdir } = await import("node:os"),
-      { join: cfgJoin } = await import("node:path")
-    configHome = await mkTemp(cfgJoin(osTmpdir(), "ultraopen-cmds-"))
-    const saved = process.env["OPENCODE_CONFIG_DIR"]
-    process.env["OPENCODE_CONFIG_DIR"] = configHome
-    try {
-      const dir = cfgJoin(configHome, "ultraopen", "workflows")
-      await mkdir(dir, { recursive: true })
-      await writeFileSaved(
-        cfgJoin(dir, "deploy-check.js"),
-        "export const meta = { name: 'deploy-check', description: 'Deploy gate' }\nreturn 1\n",
-      )
-      const config: MutableConfig = {}
-      ;(ultraopen({ client: stubClient })["config"] as (c: MutableConfig) => void)(config)
-      const commands = config.command ?? {}
-      const installed = commands["workflow-deploy-check"] as { description?: string; template?: string } | undefined
-      expect(installed?.description).toBe("Deploy gate")
-      expect(installed?.template).toContain("$ARGUMENTS")
-      expect(installed?.template?.length ?? 0).toBeGreaterThan(0)
-      // A /workflow-resume command exists out of the box.
-      expect((commands["workflow-resume"] as { template?: string } | undefined)?.template).toContain("$ARGUMENTS")
-      expect((commands["workflow-resume"] as { template?: string } | undefined)?.template).toContain("resumeFromRunId")
-    } finally {
-      if (saved === undefined) {delete process.env["OPENCODE_CONFIG_DIR"]}
-      else {process.env["OPENCODE_CONFIG_DIR"] = saved}
-      await fsRm(configHome, { recursive: true, force: true })
-    }
-  })
-
-  test("a name with a path separator cannot become a command id", async () => {
-    // Guard-rail check on the command installer itself: hostile file names
-    // (a readdir only yields real files, but the contract is explicit).
-    const config: MutableConfig = {}
-    const { installConfig } = await import("../src/server/ultracode/config.js")
-    installConfig(config, { workflowCommands: [{ name: "../evil", description: undefined }] })
-    expect(config.command?.["workflow-../evil"]).toBeUndefined()
-  })
-})
-
-describe("safety rails — budget, size advice, script before ask", () => {
-  test("budgetTokens reaches the run's budget ceiling", async () => {
-    // The budget global is what makes a guarded loop terminate; an option that
-    // never reached the engine would be documentation, not a ceiling.
-    const tool = toolOf(ultraopen({ client: stubClient }, { budgetTokens: 50 }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute(
-      { script: `${META}return { total: budget.total, remaining: budget.remaining() }\n`, dryRun: true, background: false },
-      { sessionID: "parent" },
-    )
-    expect(output).toContain('"total": 50')
-  })
-
-  test("no budgetTokens means an uncapped budget", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute(
-      { script: `${META}return { capped: budget.total !== null }\n`, dryRun: true, background: false },
-      { sessionID: "parent" },
-    )
-    expect(output).toContain('"capped": false')
-    // Uncapped stays silent: no budget statement on the result (#32).
-    expect(output).not.toContain("Output-token budget")
-  })
-
-  test("a set budgetTokens states the per-run ceiling on the blocking result", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }, { budgetTokens: 50_000 }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute(
-      { script: `${META}return 'done'\n`, dryRun: true, background: false },
-      { sessionID: "parent" },
-    )
-    expect(output).toContain("Output-token budget: 50000 per run.")
-  })
-
-  test("a set budgetTokens states the per-run ceiling on the launch handle", async () => {
-    const tool = toolOf(ultraopen({ client: hangingClient }, { budgetTokens: 50_000 }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute(
-      { script: `${META}await agent('a')\nreturn 1\n`, background: true },
-      { sessionID: "parent" },
-    )
-    expect(output).toContain("Output-token budget: 50000 per run.")
-    // The detached task never settles here (the client hangs); the launch-gating
-    // state is reset by the suite's beforeEach, not by the run settling.
-  })
-
-  test("sizeGuideline appends the advice to the tool description", () => {
-    const withAdvice = toolOf(ultraopen({ client: stubClient }, { sizeGuideline: "keep runs under 8 agents" }))
-    expect(withAdvice?.description).toContain("Size guidance for this project")
-    expect(withAdvice?.description).toContain("keep runs under 8 agents")
-    // Unset means the line is absent entirely.
-    const without = toolOf(ultraopen({ client: stubClient }))
-    expect(without?.description).not.toContain("Size guidance for this project")
-  })
-
-  test("the script lands in the run directory before the ask resolves", async () => {
-    // The user can open the real file while the prompt is on screen.
-    const tool = toolOf(ultraopen({ client: hangingClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const asked: unknown[] = []
-    const output = await tool.execute(
-      { script: `${META}await agent('a')\nreturn 1\n`, background: true },
-      {
-        sessionID: "parent",
-        ask: (request: unknown) => {
-          asked.push(request)
-          return Promise.resolve()
-        },
-      },
-    )
-    const runId = output.match(/run="(?<runId>[^"]+)"/u)?.[1] ?? ""
-    expect(asked.length).toBe(1)
-    // The script must already be readable when the ask resolves: read it now.
-    const source = await import("node:fs/promises").then((fs) =>
-      fs.readFile(join(process.env["XDG_DATA_HOME"] ?? "", "opencode", "tool-output", "ultraopen", runId, "script.js"), "utf8"),
-    )
-    expect(source).toContain("await agent('a')")
-    // The detached task never settles here (the client hangs); the launch-gating
-    // state is reset by the suite's beforeEach, not by the run settling.
-  })
-})
-
-describe("launch projection — the ask names what approving costs", () => {
-  const FANOUT = `${META}await parallel([() => agent('a'), () => agent('b'), () => agent('c')])\nreturn 'done'\n`
-
-  test("the permission metadata carries the projected agent count", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const asked: { metadata?: Record<string, unknown> }[] = []
-    await tool.execute(
-      { script: FANOUT, background: false },
-      { sessionID: "parent", ask: (request: { metadata?: Record<string, unknown> }) => { asked.push(request); return Promise.resolve() } },
-    )
-    const metadata = asked[0]?.metadata ?? {}
-    expect(metadata["projectedAgents"]).toBe(3)
-    expect(metadata["largeWorkflow"]).toBeUndefined()
-  })
-
-  test("the launch handle states the projection below the threshold", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute({ script: FANOUT, background: true }, { sessionID: "parent" })
-    expect(output).toContain("~3 agents projected at launch.")
-    expect(output).not.toContain("Large workflow")
-  })
-
-  test("at or above the threshold, both surfaces render the large-workflow advisory", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }, { largeWorkflowAgents: 2 }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const asked: { metadata?: Record<string, unknown> }[] = []
-    const output = await tool.execute(
-      { script: FANOUT, background: true },
-      { sessionID: "parent", ask: (request: { metadata?: Record<string, unknown> }) => { asked.push(request); return Promise.resolve() } },
-    )
-    const metadata = asked[0]?.metadata ?? {}
-    expect(metadata["projectedAgents"]).toBe(3)
-    expect(metadata["largeWorkflow"]).toBe(true)
-    expect(output).toContain("Large workflow: ~3 agents projected (threshold 2)")
-  })
-
-  test("a dry run skips the projection: it is its own free preview", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const asked: { metadata?: Record<string, unknown> }[] = []
-    await tool.execute(
-      { script: FANOUT, dryRun: true },
-      { sessionID: "parent", ask: (request: { metadata?: Record<string, unknown> }) => { asked.push(request); return Promise.resolve() } },
-    )
-    expect(asked[0]?.metadata?.["projectedAgents"]).toBeUndefined()
-    expect(asked[0]?.metadata?.["largeWorkflow"]).toBeUndefined()
-  })
-
-  test("a projection failure degrades to no advisory and never blocks the ask", async () => {
-    // A script that throws mid-body makes its fan-out unknowable — the launch proceeds with
-    // no count rather than an invented one, and the run still fails on its own merits.
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const asked: { metadata?: Record<string, unknown> }[] = []
-    const output = await tool.execute(
-      { script: `${META}throw new Error('boom')\n`, background: false },
-      { sessionID: "parent", ask: (request: { metadata?: Record<string, unknown> }) => { asked.push(request); return Promise.resolve() } },
-    )
-    expect(asked.length).toBe(1)
-    expect(asked[0]?.metadata?.["projectedAgents"]).toBeUndefined()
-    // The launch itself was never blocked by the projection's failure: the run proceeded and
-    // failed with its own error.
-    expect(output).toContain("boom")
-  })
-
-  test("the projection never costs a spawn: the launched run's agents are the only ones", async () => {
-    // The projection runs the body in-memory; if it ever reached the live spawn path the
-    // client would see DOUBLE the sessions for one launch.
-    let spawns = 0
-    const countingClient = {
-      config: { get: () => Promise.resolve({ data: {} }), providers: () => Promise.resolve({ data: { providers: [] } }) },
-      session: {
-        create: () => {spawns++; return Promise.resolve({ data: { id: `child-${spawns}` } })},
-        get: () => Promise.resolve({ data: { id: "child" } }),
-        delete: () => Promise.resolve({}),
-        abort: () => Promise.resolve({}),
-        prompt: () => Promise.resolve({ data: { info: {}, parts: [] } }),
-        promptAsync: () => Promise.resolve({ data: undefined }),
-        messages: () => Promise.resolve({ data: [] }),
-      },
-    }
-    const tool = toolOf(ultraopen({ client: countingClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    await tool.execute({ script: FANOUT, background: false }, { sessionID: "parent" })
-    expect(spawns).toBe(3)
-  })
-})
-
-describe("stop path — workflow({ stop })", () => {
-  test("an empty stop value is a launch default, not a stop request", async () => {
-    // Models emit optional fields as empty strings; treating "" as a stop would reject
-    // every such launch (seen live in the T6b e2e probe).
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const launched = await tool.execute(
-      { script: `${META}return 'EMPTY-STOP-VALUE'\n`, stop: "", background: true },
-      { sessionID: "parent" },
-    )
-    expect(launched).toContain("<workflow-launched")
-    await background.settlePromiseOf(runIdOf(launched))
-  })
-
-  test("short-circuits BEFORE the launch gate: a session with a live run can still stop", async () => {
-    // The one-live-run-per-session gate refuses LAUNCHES; a stop call must never be
-    // mistaken for one, or a session could never stop its own run.
-    background.registerPending("wf_gatelive1", "parent")
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute({ stop: "wf_gatenone1" }, { sessionID: "parent" })
-    // The stop path ran (its refusal names the unknown id) — the gate refusal never fired.
-    expect(output).toContain('No workflow run with id "wf_gatenone1" exists')
-    expect(output).not.toContain("already has a workflow run in flight")
-  })
-
-  test("a stop unwinds a detached run: cancelled manifest, no settlement notification", async () => {
-    // A real detached launch against a parked child: the agent sits mid-flight until the
-    // test releases it, which can only happen after the stop has landed.
-    let release!: () => void
-    const parked = new Promise<void>((resolve) => {release = resolve})
-    const parkClient = {
-      ...stubClient,
-      session: {
-        ...stubClient.session,
-        prompt: (): Promise<unknown> => parked.then(() => ({ data: { info: {}, parts: [] } })),
-      },
-    }
-    const tool = toolOf(ultraopen({ client: parkClient }))
-    if (!tool) {throw new Error("tool was not registered")
-    }
-    const launched = await tool.execute(
-      { script: `${META}await agent('a')\nawait agent('b')\nreturn 'NEVER-SEEN'\n`, background: true },
-      { sessionID: "parent" },
-    )
-    expect(launched).toContain("Interrupting the turn (ESC) does not stop this run")
-    const runId = runIdOf(launched)
-    expect(background.stopHandleOf(runId)).toBeDefined()
-
-    const stopped = await tool.execute({ stop: runId }, { sessionID: "parent" })
-    expect(stopped).toContain(`<workflow-stopped run="${runId}"`)
-
-    // Unwind: the parked child finishes, the engine sees the aborted signal, the next
-    // agent() call throws, and the detached task settles WITHOUT a notification — the
-    // stop path already told the conversation.
-    release()
-    await background.settlePromiseOf(runId)
-
-    const manifest = await readManifest(runId)
-    expect(manifest?.status).toBe("cancelled")
-    expect(manifest?.childSessionIDs.length).toBeGreaterThan(0)
-    const deliveries = hydrationCalls.filter((call) => call.text.includes(`run="${runId}"`))
-    expect(deliveries.length).toBeGreaterThan(0)
-    for (const call of deliveries) {
-      expect(call.text).toContain("<workflow-stopped")
-    }
-  })
-
-  test("the stop confirmation is the only hydration a stopped run ever delivers", async () => {
-    // Same shape as above, but the run FAILS on unwind — the failure notification must be
-    // skipped exactly as the completion one is.
-    let release!: () => void
-    const parked = new Promise<void>((resolve) => {release = resolve})
-    const parkClient = {
-      ...stubClient,
-      session: {
-        ...stubClient.session,
-        prompt: (): Promise<unknown> => parked.then(() => ({ data: { info: {}, parts: [] } })),
-      },
-    }
-    const tool = toolOf(ultraopen({ client: parkClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    // A script that throws after the parked agent returns: the unwind takes the failure path.
-    const launched = await tool.execute(
-      { script: `${META}await agent('a')\nthrow new Error('post-stop blowup')\n`, background: true },
-      { sessionID: "parent" },
-    )
-    const runId = runIdOf(launched)
-
-    const stopped = await tool.execute({ stop: runId }, { sessionID: "parent" })
-    expect(stopped).toContain("<workflow-stopped")
-    release()
-    await background.settlePromiseOf(runId)
-
-    const cancelled = await readManifest(runId)
-    expect(cancelled?.status).toBe("cancelled")
-    const deliveries = hydrationCalls.filter((call) => call.text.includes(`run="${runId}"`))
-    for (const call of deliveries) {
-      expect(call.text).toContain("<workflow-stopped")
-      expect(call.text).not.toContain("<workflow-failed")
-    }
-  })
-})
-
-describe("stop path — the TUI control channel (#134)", () => {
-  /**
-   * The control channel is a file contract: the TUI writes control.jsonl into the run
-   * directory and the run's own watcher dispatches it. A stop-run command through that
-   * channel must settle the run exactly as `workflow({ stop })` does — cancelled, with
-   * no outcome notification contradicting the record.
-   */
-
-  test("a stop-run command settles the detached run cancelled and suppresses the outcome", async () => {
-    // A real detached launch against a parked child, driven through the REAL watcher:
-    // the engine parks mid-flight until the stop has landed and the test releases it.
-    let release!: () => void
-    const parked = new Promise<void>((resolve) => {release = resolve})
-    const parkClient = {
-      ...stubClient,
-      session: {
-        ...stubClient.session,
-        prompt: (): Promise<unknown> => parked.then(() => ({ data: { info: {}, parts: [] } })),
-      },
-    }
-    const tool = toolOf(ultraopen({ client: parkClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const launched = await tool.execute(
-      { script: `${META}await agent('a')\nawait agent('b')\nreturn 'NEVER-SEEN'\n`, background: true },
-      { sessionID: "parent" },
-    )
-    expect(launched).toContain("<workflow-launched")
-    const runId = runIdOf(launched)
-    expect(background.stopHandleOf(runId)).toBeDefined()
-
-    // The run is live; the stop command arrives the way the TUI writes it.
-    await waitFor(async () => {
-      const manifest = await readManifest(runId)
-      return manifest?.status === "running"
-    }, "the running manifest")
-    const dir = artifactPaths(runId).dir
-    await writeFile(
-      controlPath(dir),
-      `${JSON.stringify({ seq: 1, action: "stop-run", run: runId })}\n`,
-      "utf8",
-    )
-
-    // The watcher ticks every second; give the cancelled write its full window.
-    await waitFor(async () => {
-      const manifest = await readManifest(runId)
-      return manifest?.status === "cancelled"
-    }, "the control stop to settle the run cancelled")
-
-    // Unwind: the parked child finishes, the engine sees the aborted signal, the next
-    // agent() call throws, and the detached task settles WITHOUT a notification — the
-    // control stop carries no confirmation of its own, and no outcome may contradict
-    // the cancelled record.
-    release()
-    await background.settlePromiseOf(runId)
-
-    const manifest = await readManifest(runId)
-    expect(manifest?.status).toBe("cancelled")
-    expect(manifest?.childSessionIDs.length).toBeGreaterThan(0)
-    const deliveries = hydrationCalls.filter((call) => call.text.includes(`run="${runId}"`))
-    // Neither a workflow-failed (the run was stopped, it did not fail on its own) nor a
-    // workflow-stopped (that confirmation is the tool stop's surface) may have hydrated.
-    expect(deliveries).toEqual([])
-    // The stop handle went with the settle: a later tool stop reports not-live.
-    expect(background.stopHandleOf(runId)).toBeUndefined()
-  })
-})
-
-describe("the blocking failure render (#135)", () => {
-  /**
-   * The blocking contract renders the failure as the tool result. When the run was
-   * stopped — the signal carries a NAMED abort reason — the render must say so, the same
-   * composition the detached contract writes to failure.txt. A reasonless abort is the
-   * parent-turn interrupt's shape and keeps the text it always had.
-   */
-
-  /** A blocking run parked mid-flight, with the release for its parked child. */
-  const parkedBlocking = (): {
-    turn: Promise<string>
-    release: () => void
-    runId: () => Promise<string>
-    abort: (reason?: string) => void
-  } => {
-    let release!: () => void
-    const parked = new Promise<void>((resolve) => {release = resolve})
-    const parkClient = {
-      ...stubClient,
-      session: {
-        ...stubClient.session,
-        prompt: (): Promise<unknown> => parked.then(() => ({ data: { info: {}, parts: [] } })),
-      },
-    }
-    const controller = new AbortController(),
-      tool = toolOf(ultraopen({ client: parkClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const turn = tool.execute(
-      { script: `${META}await agent('a')\nawait agent('b')\nreturn 'NEVER'\n`, background: false },
-      { sessionID: "parent", abort: controller.signal },
-    )
+  let disposals = 0
+  const register = raw.rpc.register.bind(raw.rpc)
+  raw.rpc.register = async (definition, rpcHandlers) => {
+    const created = await register(definition, rpcHandlers)
     return {
-      turn,
-      release,
-      runId: async () => {
-        await waitFor(async () => {
-          const live = background.liveRunsForSession("parent")
-          if (live.length === 0) {return false}
-          const manifest = await readManifest(live[0]?.runId ?? "")
-          return manifest?.status === "running"
-        }, "the running blocking run")
-        return background.liveRunsForSession("parent")[0]?.runId ?? ""
-      },
-      abort: (reason?: string) => {
-        if (reason === undefined) {controller.abort()}
-        else {controller.abort(reason)}
+      ...created,
+      dispose: async (): Promise<void> => {
+        disposals++
+        await created.dispose()
       },
     }
   }
+  return () => disposals
+}
 
-  test("a named-abort blocking run's tool result names the stop, not the engine's error", async () => {
-    const run = parkedBlocking()
-    const runId = await run.runId()
-    run.abort(background.STOP_ABORT_REASON)
-    run.release()
-    const output = await run.turn
-    expect(output).toContain("The run was stopped")
-    expect(output).toContain(`Reason: ${background.STOP_ABORT_REASON}.`)
-    expect(output).toContain("Completed agents remain on disk for a later resume")
-    expect(output).not.toContain("aborted before this agent could start")
-    // The blocking contract has no cancel write — the settle stays its own; the RENDER
-    // is what names the stop.
-    const settled = await readManifest(runId)
-    expect(settled?.status).toBe("failed")
+/** Makes the fake's shell-hook registration fail — a real failure before `registerRunRpc`. */
+function failShellHook(fake: FakePlugin): void {
+  ;(fake.ctx as unknown as { shell: { hook: () => Promise<never> } }).shell.hook =
+    () => Promise.reject(new Error("shell hook register failed"))
+}
+
+describe("setup rollback", () => {
+  test("a registration failure before RPC leaves no activation and no handler table", async () => {
+    const fake = makeFakePlugin(),
+     disposals = countRegistrationDisposals(fake)
+    failShellHook(fake)
+    await expect(plugin.setup(fake.ctx)).rejects.toThrow(/shell hook register failed/u)
+    expect(getCoordinator().projects.get("project-1")?.activations.size ?? 0).toBe(0)
+    // RPC was never registered, so there is nothing to dispose.
+    expect(disposals()).toBe(0)
   })
 
-  test("a parent-turn interrupt keeps the render it always had", async () => {
-    // No reason on the abort: the host's ESC/interrupt shape. The failure render names
-    // the engine's own abort error, never the stop text.
-    const run = parkedBlocking()
-    await run.runId()
-    run.abort()
-    run.release()
-    const output = await run.turn
-    // The engine's own abort error (pre-start or queued at the permit gate — either is
-    // the text this contract always rendered for an interrupt).
-    expect(output).toContain("The run was aborted")
-    expect(output).not.toContain("did not fail on its own")
-  })
-})
-
-describe("args zero-value decoration guard", () => {
-  // Models emit "", "null" or "undefined" for an absent optional `args` field. Decided in
-  // #86: refused loudly at the tool boundary, never normalized — the script must see exactly
-  // what was passed, and a decorated resume hashes differently from its source baseline, so
-  // the argsChanged guard would refuse the replay and the string would run live. Placement
-  // pins: after the stop dispatch, before the launch gate and the permission ask.
-  const decorations = ["", "null", "undefined"]
-
-  test.each(decorations)("a launch whose args is %p is refused before the ask", async (value) => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const { ask, assertNoAsk } = askRecorder()
-    const output = await tool.execute(
-      { script: `${META}return args\n`, args: value, background: true },
-      { sessionID: "parent", ask },
-    )
-    expect(output).toContain("<workflow-refused>")
-    // The refusal is correctable: it names the value it saw and the fix.
-    expect(output).toContain(`"${value}"`)
-    expect(output).toContain("omit the `args` field")
-    // Refused BEFORE the ask: an approval spent on a call that refuses itself
-    // buys nothing and cascades into a re-ask chain (#74's pins).
-    assertNoAsk()
-  })
-
-  test.each(decorations)("a resume whose args is %p is refused even against a settled source run", async (value) => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const launched = await tool.execute({ script: `${META}await agent('a')\nreturn 1\n`, background: true }, { sessionID: "parent" })
-    const runId = runIdOf(launched)
-    await background.settlePromiseOf(runId)
-    const { ask, assertNoAsk } = askRecorder()
-    const output = await tool.execute(
-      { script: `${META}return 2\n`, args: value, resumeFromRunId: runId, background: false },
-      { sessionID: "parent", ask },
-    )
-    // The guard fires before any resume handling: a decorated resume can neither
-    // replay nor run live with the string as its args.
-    expect(output).toContain("<workflow-refused>")
-    assertNoAsk()
-  })
-
-  test("dryRun carries the same guard", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    for (const value of decorations) {
-      const output = await tool.execute({ script: `${META}return args\n`, args: value, dryRun: true }, { sessionID: "parent" })
-      expect(output).toContain("<workflow-refused>")
-    }
-  })
-
-  test("legitimate args values pass through to the script verbatim", async () => {
-    // 0, false and {} stay real JSON; a content-bearing string is not decoration.
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const cases: [unknown, string][] = [[0, "0"], [false, "false"], [{}, "{}"], ["review-targets", "review-targets"]]
-    for (const [value, rendered] of cases) {
-      const output = await tool.execute(
-        { script: `${META}return args\n`, args: value, dryRun: true },
-        { sessionID: "parent" },
-      )
-      expect(output).toContain("<result")
-      expect(output).toContain(rendered)
-    }
-  })
-
-  test("a refused call registers no pending launch entry", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const refused = await tool.execute({ script: `${META}return 1\n`, args: "null", background: true }, { sessionID: "parent" })
-    expect(refused).toContain("<workflow-refused>")
-    expect(background.liveRunsForSession("parent")).toHaveLength(0)
-    // The session is free to launch again at once.
-    const launched = await tool.execute({ script: `${META}await agent('a')\nreturn 1\n`, background: true }, { sessionID: "parent" })
-    expect(launched).toContain("<workflow-launched")
-    await background.settlePromiseOf(runIdOf(launched))
-  })
-
-  test("a stop call carrying decoration still stops the run", async () => {
-    // Placement pin: the guard sits AFTER the stop dispatch — the off-switch is never
-    // blocked by weather on a field the stop path ignores.
-    let release!: () => void
-    const parked = new Promise<void>((resolve) => {release = resolve})
-    const parkClient = {
-      ...stubClient,
-      session: {
-        ...stubClient.session,
-        prompt: (): Promise<unknown> => parked.then(() => ({ data: { info: {}, parts: [] } })),
-      },
-    }
-    const tool = toolOf(ultraopen({ client: parkClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const launched = await tool.execute(
-      { script: `${META}await agent('a')\nreturn 'NEVER-SEEN'\n`, background: true },
-      { sessionID: "parent" },
-    )
-    const runId = runIdOf(launched)
-    const stopped = await tool.execute({ stop: runId, args: "null" }, { sessionID: "parent" })
-    expect(stopped).toContain(`<workflow-stopped run="${runId}"`)
-    release()
-    await background.settlePromiseOf(runId)
-    const manifest = await readManifest(runId)
-    expect(manifest?.status).toBe("cancelled")
-  })
-
-  test("the schema description states the rule, and all three description variants carry the sentence", () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const argsSchema = tool?.args?.["args"] as { description?: string } | undefined
-    expect(argsSchema?.description).toContain("zero-value decorations")
-    expect(argsSchema?.description).toContain("omit the field for no arguments")
-    expect(tool?.description).toContain('refused as zero-value decorations')
-    // The variant paragraphs replace the base contract wholesale, so each carries
-    // the same sentence — a variant swap must not drop the rule.
-    const hooks = ultraopen({ client: stubClient }, { runMode: "blocking" })
-    expect(toolOf(hooks)?.description).toContain('refused as zero-value decorations')
-  })
-})
-
-describe("resumeFromRunId zero-value decoration guard (#132)", () => {
-  // The same weather on the resume id (decided in #132): models emit "", "null" or
-  // "undefined" for the optional `resumeFromRunId` field. The empty string is falsy, so
-  // without a guard it skips the resume gate entirely and reads as a fresh launch;
-  // "null" and "undefined" reach the gate only to be refused as malformed ids, never as
-  // the decoration they are. Refused loudly at the boundary — the same treatment `args`
-  // gets — with the same placement pins: after the stop dispatch, before the launch gate
-  // and the permission ask, so the refusal registers no pending entry and burns no
-  // approval. Callers who mean a fresh launch omit the field.
-  const decorations = ["", "null", "undefined"]
-
-  test.each(decorations)("a launch whose resumeFromRunId is %p is refused as decoration before the ask", async (value) => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const { ask, assertNoAsk } = askRecorder()
-    const output = await tool.execute(
-      { script: `${META}return 1\n`, resumeFromRunId: value, background: true },
-      { sessionID: "parent", ask },
-    )
-    expect(output).toContain("<workflow-refused>")
-    // The decoration treatment, not the malformed-id one: the refusal names the
-    // zero-value decoration, the value it saw, the field, and the omit-it fix.
-    expect(output).toContain("zero-value decoration")
-    expect(output).toContain(`"${value}"`)
-    expect(output).toContain("`resumeFromRunId`")
-    expect(output).toContain("omit the `resumeFromRunId` field")
-    // Refused BEFORE the ask: an approval spent on a call that refuses itself buys
-    // nothing and cascades into a re-ask chain (#74's pins).
-    assertNoAsk()
-    expect(background.liveRunsForSession("parent")).toHaveLength(0)
-  })
-
-  test("a refused decoration registers no pending entry, and an omitted resumeFromRunId still launches fresh", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const refused = await tool.execute(
-      { script: `${META}return 1\n`, resumeFromRunId: "", background: true },
-      { sessionID: "parent" },
-    )
-    expect(refused).toContain("<workflow-refused>")
-    expect(background.liveRunsForSession("parent")).toHaveLength(0)
-    // Omitting the field — explicitly undefined here — behaves exactly as before:
-    // a fresh launch, never a decorated-refusal casualty.
-    const launched = await tool.execute(
-      { script: `${META}await agent('a')\nreturn 1\n`, resumeFromRunId: undefined, background: true },
-      { sessionID: "parent" },
-    )
-    expect(launched).toContain("<workflow-launched")
-    await background.settlePromiseOf(runIdOf(launched))
-  })
-
-  test("the schema description states the rule", () => {
-    // The schema is model-facing: a model that never learns the rule keeps emitting the
-    // decoration. The args field's description carries the same sentence (#86's precedent).
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const argsSchema = tool?.args?.["resumeFromRunId"] as { description?: string } | undefined
-    expect(argsSchema?.description).toContain("zero-value decorations")
-    expect(argsSchema?.description).toContain("omit the field for a fresh launch")
-  })
-})
-
-describe("scriptPath zero-value decoration guard (#141)", () => {
-  // The same weather on `scriptPath` (decided in #141): a decorated scriptPath is a truthy
-  // string, so it wins the source precedence (scriptPath > script > name) and reaches script
-  // resolution, failing there with a bare filesystem error (observed: ENOENT open 'null')
-  // that never names the decoration it is. Refused loudly at the boundary — the same
-  // treatment `args` and `resumeFromRunId` get — with the same placement pins: after the
-  // stop dispatch, before the launch gate and the permission ask. A caller who means the
-  // inline script omits the field.
-  const decorations = ["", "null", "undefined"]
-
-  test.each(decorations)("a launch whose scriptPath is %p is refused as decoration before the ask", async (value) => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const { ask, assertNoAsk } = askRecorder()
-    const output = await tool.execute(
-      { scriptPath: value, background: true },
-      { sessionID: "parent", ask },
-    )
-    expect(output).toContain("<workflow-refused>")
-    // The decoration treatment, not the bare file error it read as before the guard: the
-    // refusal names the zero-value decoration, the value it saw, the field, and the fix.
-    expect(output).toContain("zero-value decoration")
-    expect(output).toContain(`"${value}"`)
-    expect(output).toContain("`scriptPath`")
-    expect(output).toContain("omit the `scriptPath` field")
-    // Refused BEFORE the ask: an approval spent on a call that refuses itself buys
-    // nothing and cascades into a re-ask chain (#74's pins).
-    assertNoAsk()
-    expect(background.liveRunsForSession("parent")).toHaveLength(0)
-  })
-
-  test("the schema description states the rule", () => {
-    // The schema is model-facing: a model that never learns the rule keeps emitting the
-    // decoration. The args and resumeFromRunId fields' descriptions carry the same
-    // sentence (#86's and #132's precedent).
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const argsSchema = tool?.args?.["scriptPath"] as { description?: string } | undefined
-    expect(argsSchema?.description).toContain("zero-value decorations")
-    expect(argsSchema?.description).toContain("omit the field")
-  })
-
-  test("a real scriptPath still resolves and runs (real paths untouched)", async () => {
-    // The guard fires on the three decoration strings only: a real path to a persisted
-    // script passes the boundary exactly as before, asks for permission like any launch,
-    // and runs to its value.
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    await ensureRunDir("wf_pathreal01", undefined)
-    const paths = await writeScript("wf_pathreal01", `${META}return 'real path intact'\n`)
-    const asked: unknown[] = []
-    const output = await tool.execute(
-      { scriptPath: paths, background: false },
-      { sessionID: "parent", ask: (request: unknown) => { asked.push(request); return Promise.resolve() } },
-    )
-    expect(output).not.toContain("<workflow-refused>")
-    expect(output).toContain("real path intact")
-    expect(asked).toHaveLength(1)
-  })
-
-  test("an omitted scriptPath still launches fresh (the omit-it fix works)", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const launched = await tool.execute(
-      { script: `${META}await agent('a')\nreturn 1\n`, scriptPath: undefined, background: true },
-      { sessionID: "parent" },
-    )
-    expect(launched).toContain("<workflow-launched")
-    await background.settlePromiseOf(runIdOf(launched))
-  })
-})
-
-describe("scriptPath + script together (#143)", () => {
-  // The precedence is scriptPath > script, so a call carrying both silently discarded the
-  // inline script — usually the fuller source text — and a stale path killed it with no
-  // signal. Refused loudly at the launch boundary, the same treatment and placement pins
-  // as the other boundary guards (#86, #132, #141): after the stop dispatch, before the
-  // launch gate and the permission ask. The precedence itself is unchanged; a
-  // single-source call resolves exactly as before.
-  test("a launch carrying both `script` and `scriptPath` refuses naming both fields and the precedence, before the ask", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const { ask, assertNoAsk } = askRecorder()
-    const output = await tool.execute(
-      // The scriptPath need not exist: the refusal fires before any read, which is the
-      // point — a stale path must not take the inline script down with it.
-      { script: `${META}await agent('a')\nreturn 1\n`, scriptPath: "wf_neverread/script.js", background: true },
-      { sessionID: "parent", ask },
-    )
-    expect(output).toContain("<workflow-refused>")
-    // The refusal names BOTH fields, the precedence that made one win, and the drop-one
-    // fix the brief pins: keep `script` inline, or keep `scriptPath` and delete the other.
-    expect(output).toContain("Both `script` and `scriptPath`")
-    expect(output).toContain("scriptPath > script")
-    expect(output).toContain("keep `script`")
-    expect(output).toContain("delete the `script` field")
-    // Refused BEFORE the ask: an approval spent on a call that refuses itself buys
-    // nothing and cascades into a re-ask chain (#74's pins).
-    assertNoAsk()
-    expect(background.liveRunsForSession("parent")).toHaveLength(0)
-  })
-
-  test("single-source launches are untouched: script only, and scriptPath only from disk", async () => {
-    // The refusal fires on BOTH-supplied calls only. A script-only launch resolves the
-    // inline source exactly as before, and a scriptPath-only launch resolves the file
-    // exactly as before — neither asks about the other, and neither is refused.
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const inline = await tool.execute(
-      { script: `${META}await agent('a')\nreturn 1\n`, background: true },
-      { sessionID: "parent" },
-    )
-    expect(inline).toContain("<workflow-launched")
-    await background.settlePromiseOf(runIdOf(inline))
-    await ensureRunDir("wf_single143", undefined)
-    const paths = await writeScript("wf_single143", `${META}return 'single source from disk'\n`)
-    const fromDisk = await tool.execute(
-      { scriptPath: paths, background: true },
-      { sessionID: "parent" },
-    )
-    expect(fromDisk).toContain("<workflow-launched")
-    await background.settlePromiseOf(runIdOf(fromDisk))
-  })
-
-  test("the schema description states the rule", () => {
-    // The schema is model-facing: a model that keeps passing both keeps getting refused,
-    // so the scriptPath description teaches the drop-one rule (#86's and #132's
-    // precedent). The old "Takes precedence over `script`" sentence actively licensed
-    // the both-supplied call and must go.
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const scriptPathSchema = tool?.args?.["scriptPath"] as { description?: string } | undefined
-    expect(scriptPathSchema?.description).toContain("Passing both `script` and `scriptPath` is refused")
-    expect(scriptPathSchema?.description).not.toContain("Takes precedence over")
-  })
-})
-
-describe("args transport repair (#78)", () => {
-  // Layer 1 at the tool boundary: a host or model serialization slip that stringifies the args
-  // object is repaired when it parses to an object or array, refused when it looks like JSON but
-  // does not parse, and left alone when it is an honest scalar string. Hydration happens before
-  // hashing, so a hydrated launch and an object-args resume replay as the same run.
-  const RAW = '{"diff":"none","repo":"dot-agents-alignment"}'
-
-  test("a stringified JSON object is hydrated: the script sees the object, not undefined", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute(
-      { script: `${META}return args.repo\n`, args: RAW, dryRun: true },
-      { sessionID: "parent" },
-    )
-    expect(output).toContain("dot-agents-alignment")
-    expect(output).not.toContain("undefined")
-    // The repair is loud: the run log carries the hydration line.
-    expect(output).toContain("args arrived as a JSON string; hydrated to object")
-  })
-
-  test("the manifest records the raw string received and the hydrated value", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const launched = await tool.execute(
-      { script: `${META}return args.repo\n`, args: RAW, background: true },
-      { sessionID: "parent" },
-    )
-    const runId = runIdOf(launched)
-    await background.settlePromiseOf(runId)
-    const manifest = await readManifest(runId)
-    expect(manifest?.args).toEqual({ diff: "none", repo: "dot-agents-alignment" })
-    expect(manifest?.argsRawString).toBe(RAW)
-    expect(manifest?.argsHash).toBe(argsHash({ diff: "none", repo: "dot-agents-alignment" }))
-  })
-
-  test("a JSON-looking string that fails to parse is refused before the ask", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const { ask, assertNoAsk } = askRecorder()
-    const output = await tool.execute(
-      { script: `${META}return args.repo\n`, args: '{"repo":', background: true },
-      { sessionID: "parent", ask },
-    )
-    expect(output).toContain("<workflow-refused>")
-    // The raw payload is previewed JSON-quoted.
-    expect(output).toContain(String.raw`"{\"repo\":"`)
-    expect(output).toContain("real JSON")
-    assertNoAsk()
-    expect(background.liveRunsForSession("parent")).toHaveLength(0)
-  })
-
-  test("honest scalar strings keep working — including JSON-parseable scalars", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    // A non-object string arg: a pass-through script sees it verbatim.
-    const pass = await tool.execute(
-      { script: `${META}return args\n`, args: "42", dryRun: true },
-      { sessionID: "parent" },
-    )
-    expect(pass).toContain("42")
-    expect(pass).not.toContain("hydrated")
-    // A dereferencing script fails at start naming the received type and preview — never
-    // silently reading undefined into prompts.
-    const deref = await tool.execute(
-      { script: `${META}return args.repo\n`, args: "review-targets", background: false },
-      { sessionID: "parent" },
-    )
-    expect(deref).toContain("args arrived as")
-    expect(deref).toContain("the string")
-    expect(deref).toContain("review-targets")
-  })
-
-  test("a hydrated launch and an object-args resume replay as the same run", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const script = `${META}await agent('a')\nreturn args.repo\n`
-    const launched = await tool.execute({ script, args: RAW, background: true }, { sessionID: "parent" })
-    const runId = runIdOf(launched)
-    await background.settlePromiseOf(runId)
-    // The resume re-issues the same agent call, so the journal's entry can replay.
-    const output = await tool.execute(
-      { script: `${META}await agent('a')\nreturn 2\n`, args: { diff: "none", repo: "dot-agents-alignment" }, resumeFromRunId: runId, background: false },
-      { sessionID: "parent" },
-    )
-    expect(output).toContain('replayed="1"')
-    expect(output).not.toContain("args changed")
-  })
-
-  test("an object-args launch resumed with the stringified args replays too", async () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const launched = await tool.execute(
-      { script: `${META}await agent('a')\nreturn args.repo\n`, args: { diff: "none", repo: "dot-agents-alignment" }, background: true },
-      { sessionID: "parent" },
-    )
-    const runId = runIdOf(launched)
-    await background.settlePromiseOf(runId)
-    const output = await tool.execute(
-      { script: `${META}await agent('a')\nreturn 2\n`, args: RAW, resumeFromRunId: runId, background: false },
-      { sessionID: "parent" },
-    )
-    expect(output).toContain('replayed="1"')
-  })
-
-  test("the schema description states the hydration/refusal/scalar contract", () => {
-    const tool = toolOf(ultraopen({ client: stubClient }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const argsSchema = tool?.args?.["args"] as { description?: string } | undefined
-    expect(argsSchema?.description).toContain("hydrated")
-    expect(argsSchema?.description).toContain("refused")
-    expect(argsSchema?.description).toContain("stays a scalar")
-  })
-})
-
-describe("launch contract precedence (#146)", () => {
-  // The env kill switch is ABSOLUTE (decided in #146): before the fix the per-call
-  // `background` flag was consulted after the switch had already forced the blocking
-  // contract, so a model-supplied argument silently beat the user's one-line emergency
-  // switch. The precedence is: env kill switch > per-call `background` arg > project
-  // option `runMode` > home-dir option `runMode` > built-in default `background`.
-  test("with the kill switch set, an explicit background:true launch takes the blocking contract", async () => {
-    process.env["ULTRAOPEN_WORKFLOW_SYNC"] = "1"
+  test("a failed replacement reload leaves the live activation and its grace timer untouched", async () => {
+    const first = await start(),
+     projectKey = "project-1",
+     previous = getCoordinator().projects.get(projectKey)?.activations.get("/work")
+    expect(previous).toBeDefined()
     try {
-      const tool = toolOf(ultraopen({ client: stubClient }))
-      if (!tool) {throw new Error("tool was not registered")}
-      const output = await tool.execute(
-        { script: `${META}await agent('a')\nreturn 'SWITCH-WINS'\n`, background: true },
-        { sessionID: "parent" },
-      )
-      // The blocking contract waits: the final result arrives in the tool call itself,
-      // not as a launch handle for a run the host may kill when the turn ends.
-      expect(output).toContain("SWITCH-WINS")
-      expect(output).not.toContain("<workflow-launched")
+      const replacement = makeFakePlugin(),
+       disposals = countRegistrationDisposals(replacement)
+      failShellHook(replacement)
+      await expect(plugin.setup(replacement.ctx)).rejects.toThrow(/shell hook register failed/u)
+
+      // The failed replacement never reached `activateLocation`: the live generation stands, its
+      // event stream is not aborted, and no RPC registration was created to dispose.
+      const current = getCoordinator().projects.get(projectKey)?.activations.get("/work")
+      expect(current).toBe(previous)
+      expect(current?.generationId).toBe(previous?.generationId)
+      expect(current?.abortController.signal.aborted).toBe(false)
+      expect(disposals()).toBe(0)
     } finally {
-      delete process.env["ULTRAOPEN_WORKFLOW_SYNC"]
+      await first.cleanup()
     }
   })
 
-  test("without the switch, the per-call flag beats the configured option — unchanged", async () => {
-    // Pinned untouched: the switch's new absoluteness must not disturb the
-    // no-switch precedence. A configured `runMode: "blocking"` still yields to
-    // an explicit `background: true`. The option row itself (no flag, option
-    // wins over the default) is pinned by "the blocking option restores the
-    // pre-async contract".
-    const tool = toolOf(ultraopen({ client: stubClient }, { runMode: "blocking" }))
-    if (!tool) {throw new Error("tool was not registered")}
-    const output = await tool.execute(
-      { script: `${META}await agent('a')\nreturn 'FLAG-WINS'\n`, background: true },
-      { sessionID: "parent" },
-    )
-    expect(output).toContain("<workflow-launched")
-    await background.settlePromiseOf(runIdOf(output))
+  test("a synchronous failure after RPC registration disposes it and leaves no activation", async () => {
+    const fake = makeFakePlugin(),
+     coordinator = getCoordinator(),
+     disposals = countRegistrationDisposals(fake),
+     patched = coordinator as unknown as { activateLocation: RuntimeCoordinator["activateLocation"] }
+    patched.activateLocation = () => {
+      throw new Error("activation boom")
+    }
+    try {
+      await expect(plugin.setup(fake.ctx)).rejects.toThrow(/activation boom/u)
+      expect(disposals()).toBe(1)
+      expect(coordinator.projects.get("project-1")?.activations.size ?? 0).toBe(0)
+    } finally {
+      delete (coordinator as unknown as Record<string, unknown>)["activateLocation"]
+    }
   })
+})
+
+describe("zero-token orphan interceptor", () => {
+  test("a stale ultraopen child gets no tools, is interrupted, and is denied permission", async () => {
+    const started = await start({
+      sessions: {
+        orphan: {
+          id: "orphan",
+          projectID: "project-1",
+          location: { directory: "/work" },
+          tokens: { output: 0 },
+          metadata: { ultraopen: { bootId: "old-boot", runId: "run-old" } },
+        },
+      },
+    })
+    try {
+      const event = {
+        sessionID: "orphan",
+        agent: "build",
+        system: [],
+        messages: [],
+        tools: { edit: { description: "", input: {} } },
+      }
+      await started.fake.hook("session", "context", event)
+      expect(event.tools as Record<string, unknown>).toEqual({})
+      await waitFor(() => started.fake.interrupted.includes("orphan"), "the orphan interrupt")
+      const permission = { sessionID: "orphan", action: "edit", resources: ["/work/a"], effect: "allow" as "allow" | "deny" | "ask" }
+      await started.fake.hook("permission", "evaluate", permission)
+      expect(permission.effect).toBe("deny")
+    } finally {
+      await started.cleanup()
+    }
+  })
+})
+
+describe("shell recursion containment", () => {
+  test("a child shell invoking opencode is blocked before creation", async () => {
+    const started = await start()
+    try {
+      ownChild(started.coordinator, "child")
+      await expect(
+        started.fake.hook("tool", "execute.before", {
+          tool: "shell",
+          sessionID: "child",
+          input: { command: "opencode run 'hi'" },
+        }),
+      ).rejects.toThrow(/another opencode process/u)
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("a legitimate child shell sets ULTRAOPEN_ACTIVE=1 only for its own creation", async () => {
+    const started = await start()
+    try {
+      ownChild(started.coordinator, "child")
+      await started.fake.hook("tool", "execute.before", {
+        tool: "shell",
+        sessionID: "child",
+        input: { command: "ls -la", cwd: "/work" },
+      })
+      const childShell = { command: "ls -la", cwd: "/work", env: {} as Record<string, string | undefined> }
+      await started.fake.hook("shell", "create.before", childShell)
+      expect(childShell.env["ULTRAOPEN_ACTIVE"]).toBe("1")
+
+      // A user shell with a different command never sees the marker.
+      const userShell = { command: "git status", cwd: "/work", env: {} as Record<string, string | undefined> }
+      await started.fake.hook("shell", "create.before", userShell)
+      expect(userShell.env["ULTRAOPEN_ACTIVE"]).toBeUndefined()
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("a child cannot call workflow/workflow_status/subagent/todowrite", async () => {
+    const started = await start()
+    try {
+      ownChild(started.coordinator, "child", { disallowedTools: ["edit"] })
+      for (const tool of [WORKFLOW_TOOL, STATUS_TOOL, "subagent", "todowrite", "edit"]) {
+        await expect(
+          started.fake.hook("tool", "execute.before", { tool, sessionID: "child", input: {} }),
+        ).rejects.toThrow(/not available inside/u)
+      }
+    } finally {
+      await started.cleanup()
+    }
+  })
+})
+
+describe("stale pending approval revocation (#149)", () => {
+  test("a parent switching to a tighter agent rejects a pending child edit", async () => {
+    const started = await start({
+      agents: [
+        { id: "build", name: "build", mode: "primary", hidden: false, permissions: [] },
+        {
+          id: "plan",
+          name: "plan",
+          mode: "primary",
+          hidden: false,
+          permissions: [{ action: "edit", resource: "*", effect: "deny" }],
+        },
+      ],
+      sessions: {
+        parent: { id: "parent", projectID: "project-1", location: { directory: "/work" }, tokens: { output: 0 }, agent: "plan" },
+      },
+      pendingPermissions: { child: [{ id: "perm-1", action: "edit", resources: ["/work/a.ts"] }] },
+    })
+    try {
+      ownChild(started.coordinator, "child")
+      registerPending(started.coordinator, {
+        runId: "run-1",
+        sessionID: "parent",
+        projectKey: "project-1",
+        locationDir: "/work",
+      })
+      started.fake.events.push({ type: "session.agent.selected", data: { sessionID: "parent" } })
+      await waitFor(() => started.fake.replies.some((reply) => reply.requestID === "perm-1"), "the revocation")
+      const reply = started.fake.replies.find((entry) => entry.requestID === "perm-1")
+      expect(reply?.decision).toBe("reject")
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("a failed revocation reply is swallowed so the event loop survives", async () => {
+    const started = await start({
+      agents: [
+        { id: "build", name: "build", mode: "primary", hidden: false, permissions: [] },
+        {
+          id: "plan",
+          name: "plan",
+          mode: "primary",
+          hidden: false,
+          permissions: [{ action: "edit", resource: "*", effect: "deny" }],
+        },
+      ],
+      sessions: {
+        parent: { id: "parent", projectID: "project-1", location: { directory: "/work" }, tokens: { output: 0 }, agent: "plan" },
+      },
+      pendingPermissions: { child: [{ id: "perm-1", action: "edit", resources: ["/work/a.ts"] }] },
+    })
+    try {
+      ownChild(started.coordinator, "child")
+      registerPending(started.coordinator, {
+        runId: "run-1",
+        sessionID: "parent",
+        projectKey: "project-1",
+        locationDir: "/work",
+      })
+      const raw = started.fake.ctx as unknown as { permission: { reply: () => Promise<never> } }
+      let attempts = 0
+      raw.permission.reply = () => {
+        attempts++
+        return Promise.reject(new Error("reply transport failed"))
+      }
+      started.fake.events.push({ type: "session.agent.selected", data: { sessionID: "parent" } })
+      await waitFor(() => attempts > 0, "the failed revocation attempt")
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("agent.updated triggers stale pending permission revocation across live children", async () => {
+    const started = await start({
+      agents: [
+        { id: "build", name: "build", mode: "primary", hidden: false, permissions: [] },
+        {
+          id: "plan",
+          name: "plan",
+          mode: "primary",
+          hidden: false,
+          permissions: [{ action: "edit", resource: "*", effect: "deny" }],
+        },
+      ],
+      sessions: {
+        parent: { id: "parent", projectID: "project-1", location: { directory: "/work" }, tokens: { output: 0 }, agent: "plan" },
+      },
+      pendingPermissions: { child: [{ id: "perm-1", action: "edit", resources: ["/work/a.ts"] }] },
+    })
+    try {
+      ownChild(started.coordinator, "child")
+      registerPending(started.coordinator, {
+        runId: "run-1",
+        sessionID: "parent",
+        projectKey: "project-1",
+        locationDir: "/work",
+      })
+      // An agent definition change is GLOBAL: every owned child re-evaluates its live chain.
+      started.fake.events.push({ type: "agent.updated", data: {} })
+      await waitFor(() => started.fake.replies.some((reply) => reply.requestID === "perm-1"), "the revocation")
+      expect(started.fake.replies.find((entry) => entry.requestID === "perm-1")?.decision).toBe("reject")
+    } finally {
+      await started.cleanup()
+    }
+  })
+})
+
+/** The first RPC registration's handlers, as the plugin registered them. */
+function handlers(fake: FakePlugin): FakeRpcCall["handlers"] {
+  const call = fake.rpcCalls[0]
+  if (call === undefined) {throw new Error("no RPC registration")}
+  return call.handlers
+}
+
+describe("RPC", () => {
+  test("listRuns combines live coordinator runs and disk manifests", async () => {
+    const started = await start()
+    try {
+      registerPending(started.coordinator, {
+        runId: "wf_live0001",
+        sessionID: "parent",
+        projectKey: "project-1",
+        locationDir: "/work",
+        name: "live-demo",
+      })
+      await writeRunningRun("wf_disk0001", "parent")
+      await writeFile(
+        artifactPaths("wf_disk0001").progressPath,
+        JSON.stringify({ runId: "wf_disk0001", workflow: "disk-demo", sessionID: "parent", status: "running", agents: [], logs: [], startedAt: 5 }),
+        "utf8",
+      )
+      const output = await handlers(started.fake)["listRuns"]?.({}, rpcContext()) as { runs: { runId: string; workflow: string }[] }
+      expect(output.runs.map((run) => run.runId)).toContain("wf_live0001")
+      expect(output.runs.map((run) => run.runId)).toContain("wf_disk0001")
+      const live = output.runs.find((run) => run.runId === "wf_live0001")
+      expect(live?.workflow).toBe("live-demo")
+      dropSettled(started.coordinator, "wf_live0001")
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("includeHints is consumed once", async () => {
+    const started = await start()
+    try {
+      await writeRunningRun("wf_hint0001", "parent")
+      await writeFile(join(artifactPaths("wf_hint0001").dir, "interrupted.txt"), "wf_hint0001", "utf8")
+      const first = await handlers(started.fake)["listRuns"]?.({ includeHints: true }, rpcContext()) as { hints?: { runId: string }[] }
+      expect(first.hints?.map((hint) => hint.runId)).toEqual(["wf_hint0001"])
+      const second = await handlers(started.fake)["listRuns"]?.({ includeHints: true }, rpcContext()) as { hints?: unknown[] }
+      expect(second.hints).toBeUndefined()
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("stopRun uses the confirmed stop path and emits runUpdated", async () => {
+    const started = await start()
+    try {
+      await writeRunningRun("wf_stop0001", "parent")
+      registerPending(started.coordinator, {
+        runId: "wf_stop0001",
+        sessionID: "parent",
+        projectKey: "project-1",
+        locationDir: "/work",
+      })
+      const output = await handlers(started.fake)["stopRun"]?.({ runId: "wf_stop0001" }, rpcContext()) as { outcome: string }
+      expect(output.outcome).toBe("stopped")
+      const stopped = await readManifest("wf_stop0001")
+      expect(stopped?.status).toBe("cancelled")
+      await waitFor(() => started.fake.emitted.some((event) => event.name === "runUpdated"), "the runUpdated event")
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("stopRun maps an unknown id to the typed not_found error", async () => {
+    const started = await start()
+    try {
+      const output = await handlers(started.fake)["stopRun"]?.({ runId: "wf_nomatch01" }, rpcContext()) as { type: string }
+      expect(output.type).toBe("not_found")
+    } finally {
+      await started.cleanup()
+    }
+  })
+})
+
+describe("launch gates", () => {
+  test("a second launch from one non-ultracode session is refused", async () => {
+    const started = await start()
+    try {
+      registerPending(started.coordinator, {
+        runId: "wf_gate0001",
+        sessionID: "parent",
+        projectKey: "project-1",
+        locationDir: "/work",
+      })
+      const result = await started.fake.runTool(WORKFLOW_TOOL, { script: `${META}return 1\n`, background: true })
+      expect(String(result.content)).toContain("<workflow-refused>")
+      expect(String(result.content)).toContain("already has a workflow run in flight")
+      expect(started.fake.assertCalls).toHaveLength(0)
+      dropSettled(started.coordinator, "wf_gate0001")
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("a malformed resume id is refused before the permission ask", async () => {
+    const started = await start()
+    try {
+      const result = await started.fake.runTool(WORKFLOW_TOOL, { script: `${META}return 1\n`, resumeFromRunId: "../../etc" })
+      expect(String(result.content)).toContain("not a valid run id")
+      expect(started.fake.assertCalls).toHaveLength(0)
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("a well-formed missing resume id is refused before the ask", async () => {
+    const started = await start()
+    try {
+      const result = await started.fake.runTool(WORKFLOW_TOOL, { script: `${META}return 1\n`, resumeFromRunId: "wf_nomach1" })
+      expect(String(result.content)).toContain("No run exists")
+      expect(started.fake.assertCalls).toHaveLength(0)
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("a foreign-session resume is refused before the ask", async () => {
+    const started = await start()
+    try {
+      await writeRunningRun("wf_foreign01", "someone-else")
+      const result = await started.fake.runTool(WORKFLOW_TOOL, { script: `${META}return 1\n`, resumeFromRunId: "wf_foreign01" })
+      expect(String(result.content)).toContain("different session")
+      expect(started.fake.assertCalls).toHaveLength(0)
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("a subagent caller is refused without launching", async () => {
+    const started = await start()
+    try {
+      const result = await started.fake.runTool(
+        WORKFLOW_TOOL,
+        { script: `${META}return 1\n`, background: true },
+        { agent: "explore" },
+      )
+      expect(String(result.content)).toContain("only to primary agents")
+      expect(started.fake.assertCalls).toHaveLength(0)
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("a dry run leaves no run directory behind", async () => {
+    const started = await start()
+    try {
+      const before = new Set(await listRoot())
+      const result = await started.fake.runTool(WORKFLOW_TOOL, { script: `${META}return 1\n`, dryRun: true })
+      expect(String(result.content)).toContain("<result")
+      const after = await listRoot()
+      expect(after.filter((name) => !before.has(name))).toEqual([])
+    } finally {
+      await started.cleanup()
+    }
+  })
+})
+
+describe("launch contract coverage", () => {
+  test("the stop path renders the confirmed stop", async () => {
+    const started = await start()
+    try {
+      await writeRunningRun("wf_stop0002", "parent")
+      registerPending(started.coordinator, {
+        runId: "wf_stop0002",
+        sessionID: "parent",
+        projectKey: "project-1",
+        locationDir: "/work",
+        name: "demo",
+      })
+      const result = await started.fake.runTool(WORKFLOW_TOOL, { stop: "wf_stop0002" })
+      expect(String(result.content)).toContain('<workflow-stopped run="wf_stop0002">')
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("a persisted scriptPath is read and run", async () => {
+    const started = await start()
+    try {
+      await ensureRunDir("wf_pathdemo01")
+      const path = await writeScript("wf_pathdemo01", `${META}return 'from disk'\n`)
+      const result = await started.fake.runTool(WORKFLOW_TOOL, { scriptPath: path, background: false })
+      expect(String(result.content)).toContain("from disk")
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("a failed default-model read degrades to no model rather than blocking the launch", async () => {
+    const started = await start({ modelDefaultRejects: true })
+    try {
+      const result = await started.fake.runTool(WORKFLOW_TOOL, { script: `${META}return 'fine'\n`, background: false })
+      expect(String(result.content)).toContain("fine")
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("an unwritable run directory aborts the launch with no live entry", async () => {
+    const saved = process.env["XDG_DATA_HOME"]
+    process.env["XDG_DATA_HOME"] = "/dev/null/nope"
+    const started = await start()
+    try {
+      const result = await started.fake.runTool(WORKFLOW_TOOL, { script: `${META}return 1\n`, background: true })
+      expect(String(result.content)).toContain("could not be started")
+      expect(started.coordinator.runs.size).toBe(0)
+    } finally {
+      await started.cleanup()
+      if (saved === undefined) {delete process.env["XDG_DATA_HOME"]}
+      else {process.env["XDG_DATA_HOME"] = saved}
+    }
+  })
+
+  test("a broken saved workflow is noted and does not break the launch", async () => {
+    const configHome = await mkdtemp(join(tmpdir(), "ultraopen-cfg-")),
+     saved = process.env["OPENCODE_CONFIG_DIR"]
+    process.env["OPENCODE_CONFIG_DIR"] = configHome
+    try {
+      const dir = join(configHome, "ultraopen", "workflows")
+      await mkdir(dir, { recursive: true })
+      await writeFile(join(dir, "broken.js"), "this is not a workflow", "utf8")
+      const started = await start()
+      try {
+        const result = await started.fake.runTool(WORKFLOW_TOOL, { script: `${META}return 'ok'\n`, background: false })
+        expect(String(result.content)).toContain("ok")
+        expect(String(result.content)).toContain("<scan-notes>")
+      } finally {
+        await started.cleanup()
+      }
+    } finally {
+      if (saved === undefined) {delete process.env["OPENCODE_CONFIG_DIR"]}
+      else {process.env["OPENCODE_CONFIG_DIR"] = saved}
+      await rm(configHome, { recursive: true, force: true })
+    }
+  })
+
+  test("a blocking run that fails mid-flight returns the failure text", async () => {
+    const started = await start()
+    try {
+      const result = await started.fake.runTool(WORKFLOW_TOOL, {
+        script: `${META}await agent('a')\nthrow new Error('boom mid-run')\n`,
+        background: false,
+      })
+      expect(String(result.content)).toContain("boom mid-run")
+      expect(String(result.content)).toContain("run id=")
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("a same-session resume replays the journal", async () => {
+    const started = await start()
+    try {
+      const script = `${META}await agent('a')\nreturn 'first'\n`,
+       first = await started.fake.runTool(WORKFLOW_TOOL, { script, background: false }),
+       runId = runIdOf(String(first.content))
+      const resumed = await started.fake.runTool(
+        WORKFLOW_TOOL,
+        { script, resumeFromRunId: runId, background: false },
+        { sessionID: "parent" },
+      )
+      expect(String(resumed.content)).toContain("<result")
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("an ultracode session at its live-run cap is refused naming every run", async () => {
+    const started = await start({}, { ultracodeMaxRuns: 1 })
+    try {
+      const project = started.coordinator.projectOf({ directory: "/work", project: { id: "project-1", canonical: "/work" } })
+      project.mode.enable("parent", "command")
+      registerPending(started.coordinator, {
+        runId: "wf_cap00001",
+        sessionID: "parent",
+        projectKey: "project-1",
+        locationDir: "/work",
+      })
+      const result = await started.fake.runTool(WORKFLOW_TOOL, { script: `${META}return 1\n`, background: true })
+      expect(String(result.content)).toContain("live-run cap of 1")
+      expect(String(result.content)).toContain("wf_cap00001")
+      dropSettled(started.coordinator, "wf_cap00001")
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("zero-value decorations and dual sources are refused before the ask", async () => {
+    const started = await start()
+    try {
+      const args = await started.fake.runTool(WORKFLOW_TOOL, { script: `${META}return 1\n`, args: "null" })
+      expect(String(args.content)).toContain("zero-value decoration")
+      const scriptPath = await started.fake.runTool(WORKFLOW_TOOL, { scriptPath: "undefined" })
+      expect(String(scriptPath.content)).toContain("zero-value decoration")
+      const both = await started.fake.runTool(WORKFLOW_TOOL, { script: `${META}return 1\n`, scriptPath: "/x.js" })
+      expect(String(both.content)).toContain("Both `script` and `scriptPath`")
+      const stringified = await started.fake.runTool(WORKFLOW_TOOL, { script: `${META}return 1\n`, args: "{bad" })
+      expect(String(stringified.content)).toContain("JSON")
+      expect(started.fake.assertCalls).toHaveLength(0)
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("a configured size guideline is appended to the tool description", async () => {
+    const started = await start({}, { sizeGuideline: "Keep fan-out under ten agents." })
+    try {
+      const description = String(started.fake.tools.get(WORKFLOW_TOOL)?.description)
+      expect(description).toContain("Keep fan-out under ten agents.")
+    } finally {
+      await started.cleanup()
+    }
+  })
+  test("a saved workflow added mid-session refreshes the command surface on the next launch", async () => {
+    const configHome = await mkdtemp(join(tmpdir(), "ultraopen-cfg-")),
+     saved = process.env["OPENCODE_CONFIG_DIR"]
+    process.env["OPENCODE_CONFIG_DIR"] = configHome
+    try {
+      const started = await start()
+      try {
+        const dir = join(configHome, "ultraopen", "workflows")
+        await mkdir(dir, { recursive: true })
+        await writeFile(
+          join(dir, "late.js"),
+          "export const meta = { name: 'late', description: 'Late' }\nreturn 'late-value'\n",
+          "utf8",
+        )
+        const result = await started.fake.runTool(WORKFLOW_TOOL, {
+          script: `${META}return await workflow('late')\n`,
+          background: false,
+        })
+        expect(String(result.content)).toContain("late-value")
+        expect(started.fake.commands.has("workflow-late")).toBe(true)
+      } finally {
+        await started.cleanup()
+      }
+    } finally {
+      if (saved === undefined) {delete process.env["OPENCODE_CONFIG_DIR"]}
+      else {process.env["OPENCODE_CONFIG_DIR"] = saved}
+      await rm(configHome, { recursive: true, force: true })
+    }
+  })
+
+  test("a dry run that fails renders bare and leaves no artifacts", async () => {
+    const started = await start()
+    try {
+      const before = new Set(await listRoot())
+      const result = await started.fake.runTool(WORKFLOW_TOOL, {
+        script: `${META}throw new Error('dry boom')\n`,
+        dryRun: true,
+      })
+      expect(String(result.content)).toContain("dry boom")
+      expect(String(result.content)).not.toContain("run id=")
+      const after = await listRoot()
+      expect(after.filter((name) => !before.has(name))).toEqual([])
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("a decorated resume id is refused before the ask and before any run dir", async () => {
+    const started = await start()
+    try {
+      const result = await started.fake.runTool(WORKFLOW_TOOL, {
+        script: `${META}return 1\n`,
+        resumeFromRunId: "null",
+      })
+      expect(String(result.content)).toContain("zero-value decoration")
+      expect(started.fake.assertCalls).toHaveLength(0)
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("a dry run can replay a completed run's journal", async () => {
+    const started = await start()
+    try {
+      const script = `${META}await agent('a')\nreturn 'first'\n`,
+       first = await started.fake.runTool(WORKFLOW_TOOL, { script, background: false }),
+       runId = runIdOf(String(first.content))
+      const dry = await started.fake.runTool(WORKFLOW_TOOL, { script, resumeFromRunId: runId, dryRun: true })
+      expect(String(dry.content)).toContain("<result")
+      expect(String(dry.content)).toContain("not queryable")
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("a dry run with scriptPath reads the persisted script", async () => {
+    const started = await start()
+    try {
+      await ensureRunDir("wf_drypath01")
+      const path = await writeScript("wf_drypath01", `${META}return 'dry-from-disk'\n`)
+      const result = await started.fake.runTool(WORKFLOW_TOOL, { scriptPath: path, dryRun: true })
+      expect(String(result.content)).toContain("dry-from-disk")
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("a stringified JSON args value is hydrated and noted", async () => {
+    const started = await start()
+    try {
+      const result = await started.fake.runTool(WORKFLOW_TOOL, {
+        script: `${META}return args.topic\n`,
+        args: '{"topic":"hydrated"}',
+        background: false,
+      })
+      expect(String(result.content)).toContain("hydrated")
+      expect(String(result.content)).toContain("hydrated to object")
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("a dropped event stream re-subscribes instead of ending the activation", async () => {
+    const started = await start()
+    try {
+      started.fake.failNextSubscribe()
+      // The loop catches the drop, waits out the retry delay, and keeps consuming.
+      await new Promise((resolve) => {setTimeout(resolve, 320)})
+      started.fake.events.push({ type: "session.status", data: { sessionID: "nobody" } })
+    } finally {
+      await started.cleanup()
+    }
+  })
+})
+
+describe("V2 hook paths", () => {
+  test("the prompt hook turns on ultracode and stamps the message id", async () => {
+    const started = await start()
+    try {
+      const event = {
+        sessionID: "s1",
+        messageID: "msg_prompt1",
+        prompt: { text: "ultracode this audit" },
+        metadata: undefined as Record<string, unknown> | undefined,
+      }
+      await started.fake.hook("session", "prompt", event)
+      const project = started.coordinator.projectOf({ directory: "/work", project: { id: "project-1", canonical: "/work" } })
+      expect(project.mode.isActive("s1")).toBe(true)
+      expect(event.metadata).toEqual({ ultraopenMsgID: "msg_prompt1" })
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("the model-resolve hook raises effort for a primary request", async () => {
+    const started = await start({
+      models: [{ id: "m", providerID: "p", variants: [{ id: "xhigh" }] }],
+    })
+    try {
+      const project = started.coordinator.projectOf({ directory: "/work", project: { id: "project-1", canonical: "/work" } })
+      project.mode.enable("s1", "keyword")
+      const event: {
+        sessionID: string
+        agent: string
+        kind: string
+        model: { providerID: string; id: string; variant?: string }
+      } = { sessionID: "s1", agent: "build", kind: "primary", model: { providerID: "p", id: "m" } }
+      await started.fake.hook("session", "experimental.model.resolve", event)
+      expect(event.model.variant).toBe("xhigh")
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("the context hook appends reminders on an ordinary session", async () => {
+    const started = await start({
+      sessions: { s1: { id: "s1", projectID: "project-1", location: { directory: "/work" }, tokens: { output: 0 }, agent: "build" } },
+    })
+    try {
+      const project = started.coordinator.projectOf({ directory: "/work", project: { id: "project-1", canonical: "/work" } })
+      project.mode.enable("s1", "keyword")
+      const event = {
+        sessionID: "s1",
+        agent: "build",
+        system: [],
+        messages: [{ role: "user" as const, id: "msg_1", content: [{ type: "text", text: "hi" }], metadata: { ultraopenMsgID: "msg_1" } }],
+        tools: {},
+      }
+      await started.fake.hook("session", "context", event)
+      expect(event.messages[0]?.content).toHaveLength(2)
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("permission evaluate denies a child shell that invokes opencode", async () => {
+    const started = await start()
+    try {
+      ownChild(started.coordinator, "child")
+      const event = { sessionID: "child", action: "shell", resources: ["opencode run x"], effect: "allow" as "allow" | "deny" | "ask" }
+      await started.fake.hook("permission", "evaluate", event)
+      expect(event.effect).toBe("deny")
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("a normal user session's permission is left unchanged", async () => {
+    const started = await start({
+      sessions: { parent: { id: "parent", projectID: "project-1", location: { directory: "/work" }, tokens: { output: 0 }, agent: "build" } },
+    })
+    try {
+      const event = { sessionID: "parent", action: "edit", resources: ["/work/a"], effect: "allow" as "allow" | "deny" | "ask" }
+      await started.fake.hook("permission", "evaluate", event)
+      expect(event.effect).toBe("allow")
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("a live ancestor's wholly-disabled tool is stripped from the child's context", async () => {
+    const started = await start({
+      agents: [
+        { id: "build", name: "build", mode: "primary", hidden: false, permissions: [] },
+        { id: "plan", name: "plan", mode: "primary", hidden: false, permissions: [{ action: "edit", resource: "*", effect: "deny" }] },
+      ],
+      sessions: {
+        parent: { id: "parent", projectID: "project-1", location: { directory: "/work" }, tokens: { output: 0 }, agent: "plan" },
+      },
+    })
+    try {
+      ownChild(started.coordinator, "child")
+      const event = {
+        sessionID: "child",
+        agent: "build",
+        system: [],
+        messages: [],
+        tools: { edit: { description: "", input: {} }, read: { description: "", input: {} } },
+      }
+      await started.fake.hook("session", "context", event)
+      expect("edit" in event.tools).toBe(false)
+      expect("read" in event.tools).toBe(true)
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("an owned child whose ancestor chain cannot resolve is denied", async () => {
+    const started = await start()
+    try {
+      ownChild(started.coordinator, "child")
+      const event = { sessionID: "child", action: "edit", resources: ["/work/a"], effect: "allow" as "allow" | "deny" | "ask" }
+      await started.fake.hook("permission", "evaluate", event)
+      // No parent session row exists, so the walk fails closed instead of widening the child.
+      expect(event.effect).toBe("deny")
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("a saved Allow always survives an ancestor ask when the child configured ask", async () => {
+    const started = await start({
+      agents: [
+        { id: "build", name: "build", mode: "primary", hidden: false, permissions: [] },
+        { id: "asker", name: "asker", mode: "primary", hidden: false, permissions: [{ action: "edit", resource: "*", effect: "ask" }] },
+      ],
+      sessions: {
+        parent: { id: "parent", projectID: "project-1", location: { directory: "/work" }, tokens: { output: 0 }, agent: "asker" },
+        child: {
+          id: "child",
+          projectID: "project-1",
+          location: { directory: "/work" },
+          tokens: { output: 0 },
+          agent: "build",
+          permissions: [{ action: "edit", resource: "*", effect: "ask" }],
+        },
+      },
+    })
+    try {
+      ownChild(started.coordinator, "child")
+      const event = { sessionID: "child", action: "edit", resources: ["/work/a"], effect: "allow" as "allow" | "deny" | "ask" }
+      await started.fake.hook("permission", "evaluate", event)
+      // The user already answered this exact ask with "Allow always"; the ancestor only asks too.
+      expect(event.effect).toBe("allow")
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("an ancestor ask escalates a child allow the user has not saved", async () => {
+    const started = await start({
+      agents: [
+        { id: "build", name: "build", mode: "primary", hidden: false, permissions: [{ action: "edit", resource: "*", effect: "allow" }] },
+        { id: "asker", name: "asker", mode: "primary", hidden: false, permissions: [{ action: "edit", resource: "*", effect: "ask" }] },
+      ],
+      sessions: {
+        parent: { id: "parent", projectID: "project-1", location: { directory: "/work" }, tokens: { output: 0 }, agent: "asker" },
+        child: { id: "child", projectID: "project-1", location: { directory: "/work" }, tokens: { output: 0 }, agent: "build" },
+      },
+    })
+    try {
+      ownChild(started.coordinator, "child")
+      const event = { sessionID: "child", action: "edit", resources: ["/work/a"], effect: "allow" as "allow" | "deny" | "ask" }
+      await started.fake.hook("permission", "evaluate", event)
+      expect(event.effect).toBe("ask")
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("the default-agent fallback resolves a parent session with no agent", async () => {
+    const started = await start({
+      agents: [{ id: "plan", name: "plan", mode: "primary", hidden: false, permissions: [] }],
+      sessions: {
+        parent: { id: "parent", projectID: "project-1", location: { directory: "/work" }, tokens: { output: 0 } },
+      },
+    })
+    try {
+      ownChild(started.coordinator, "child")
+      const event = { sessionID: "child", action: "edit", resources: ["/work/a"], effect: "allow" as "allow" | "deny" | "ask" }
+      await started.fake.hook("permission", "evaluate", event)
+      // The default agent contributes the host's default `ask`; the point is that the walk resolved it.
+      expect(event.effect).toBe("ask")
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("execute.after clears a shell token the creation hook never consumed", async () => {
+    const started = await start()
+    try {
+      ownChild(started.coordinator, "child")
+      await started.fake.hook("tool", "execute.before", { tool: "shell", sessionID: "child", input: { command: "ls" } })
+      await started.fake.hook("tool", "execute.after", { tool: "shell", sessionID: "child", input: { command: "ls" } })
+      const shell = { command: "ls", cwd: "/work", env: {} as Record<string, string | undefined> }
+      await started.fake.hook("shell", "create.before", shell)
+      expect(shell.env["ULTRAOPEN_ACTIVE"]).toBeUndefined()
+    } finally {
+      await started.cleanup()
+    }
+  })
+
+  test("the tool hook tolerates a malformed shell input", async () => {
+    const started = await start()
+    try {
+      ownChild(started.coordinator, "child")
+      await started.fake.hook("tool", "execute.before", { tool: "shell", sessionID: "child", input: {} })
+      await started.fake.hook("tool", "execute.after", { tool: "shell", sessionID: "child", input: {} })
+    } finally {
+      await started.cleanup()
+    }
+  })
+})
+
+describe("reload handoff and explicit disable", () => {
+  test("a replacement setup preserves live runs; an explicit disable stops only its scope's run", async () => {
+    const first = await start()
+    await writeRunningRun("wf_handoff01", "parent")
+    registerPending(first.coordinator, {
+      runId: "wf_handoff01",
+      sessionID: "parent",
+      projectKey: "project-1",
+      locationDir: "/work",
+    })
+    // A run in another location must survive this location's disable.
+    await writeRunningRun("wf_otherloc1", "parent")
+    registerPending(first.coordinator, {
+      runId: "wf_otherloc1",
+      sessionID: "parent",
+      projectKey: "project-1",
+      locationDir: "/elsewhere",
+    })
+
+    await first.cleanup()
+    const second = await start()
+    try {
+      // The replacement cancelled the handoff timer; the run is still live.
+      await new Promise((resolve) => {setTimeout(resolve, 50)})
+      expect(first.coordinator.runs.has("wf_handoff01")).toBe(true)
+    } finally {
+      await second.cleanup()
+    }
+    // The explicit disable's 2000ms grace has now started. Wait for it.
+    await waitFor(async () => {
+      const stopped = await readManifest("wf_handoff01")
+      return stopped?.status === "cancelled"
+    }, "the scoped disable")
+    const other = await readManifest("wf_otherloc1")
+    expect(other?.status).toBe("running")
+  }, 10_000)
 })

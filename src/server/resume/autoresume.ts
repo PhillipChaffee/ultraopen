@@ -1,72 +1,76 @@
-import { readFile, rename, rm } from "node:fs/promises"
-import { join } from "node:path"
-import type { UltraopenOptions } from "../options.js"
-import type { OpencodeClient } from "../types.js"
+import { readFile, realpath, rename, rm } from "node:fs/promises"
+import { join, resolve } from "node:path"
+import type { HostPort } from "../host/port.js"
+import { createAncestorLookup } from "../bridge/permission.js"
+import type { ProjectRuntime, RuntimeCoordinator } from "../runtime/coordinator.js"
 import { isStopAbortDetail } from "./journal.js"
 import { nameRun, registerPending } from "../tool/background.js"
 import { startDetachedRun } from "../tool/settlement.js"
+import { nativeAncestorSessionIDs } from "../tool/launch.js"
 import { prepare } from "../tool/workflow.js"
+import type { execute, PreparedWorkflow } from "../tool/workflow.js"
 import { inspectArgsTransport } from "../tool/args-transport.js"
-import type { PreparedWorkflow } from "../tool/workflow.js"
 import { scanNamedWorkflows } from "../tool/named.js"
 import type { Manifest } from "./journal.js"
 import { loadResume } from "./persist.js"
-import { defaultProcessAlive } from "./reaper.js"
-import { readJournal, runDir, writeManifest } from "./store.js"
+import { INTERRUPTED_MARKER, isProcessAlive, readJournal, runDir, writeManifest } from "./store.js"
 
 /**
  * Auto-resume-on-boot: re-execute the runs a process death interrupted.
  *
- * Claude Code's durability default for workflows is journal-replay-on-return; this is the
- * plugin-side equivalent at boot. The reaper has already stopped the orphaned children and
- * harvested the freshly-interrupted manifests; this sweep decides, run by run, whether the
- * interrupted work should continue on its own. The journal survives process death by
- * construction (incremental flush), so the resume replays every completed agent instantly and
- * re-runs only the missing tail — with the ORIGINAL run id, because journal continuity lives in
- * that run directory.
+ * The reaper has already stopped the orphaned children and harvested the interrupted manifests;
+ * this sweep decides, run by run, whether the interrupted work should continue. The journal
+ * survives process death by construction, so the resume replays every completed agent instantly
+ * and re-runs only the missing tail — with the ORIGINAL run id, because journal continuity lives
+ * in that run directory.
  *
  * Every decision is a policy guard, each testable:
- *   - the run's pid must be dead (the reaper's veto keeps a live concurrent process's run safe —
- *     re-checked here so the sweep never trusts a stale candidate list);
+ *   - the run's pid must be dead;
  *   - the interruption must be younger than `autoResumeTtlHours`;
- *   - the stored args must still hash to the manifest's `argsHash` (reusing loadResume's check —
- *     a hand-edited or pre-feature manifest is skipped, never replayed against guessed inputs);
- *   - the original session must still exist (opencode sessions persist across restarts, so this
- *     fails only when the session was truly deleted);
- *   - stopped runs never resume: a child that recorded "stopped by request" (see #10's stop
- *     path) keeps the run permanently off the resume path;
+ *   - the stored args must still hash to the manifest's `argsHash`;
+ *   - the run must belong to THIS project (`#175`): manifest `projectID` owns it, with the live
+ *     session's project as the fallback for a pre-upgrade manifest, and a recorded `directory`
+ *     that resolves to the host's canonical root counts as the same project (a directory alias
+ *     must not orphan a run the way `/var` vs `/private/var` did in T12);
+ *   - the parent session must still exist AND its agent must resolve — the session row may name
+ *     none, in which case the host's default primary agent is the one the child permission chain
+ *     would use — or adoption fails closed (`#149` #7);
+ *   - stopped runs never resume;
  *   - at most `autoResumeMax` runs adopt per boot, oldest interruption first.
  *
- * Adoption is claimed by RENAMING the reaper's `interrupted.txt` marker — an atomic same-
- * filesystem test-and-set — so two opencode processes booting at once cannot both execute one
- * journal. The manifest is then re-stamped (new bootId/pid, status `running`) BEFORE executing,
- * so a second restart during a resume re-orphans the run instead of double-adopting it.
+ * Adoption is claimed by RENAMING the reaper's `interrupted.txt` marker — an atomic
+ * same-filesystem test-and-set — so two processes booting at once cannot both execute one
+ * journal. The manifest is re-stamped BEFORE executing, so a second restart during a resume
+ * re-orphans the run instead of double-adopting it.
  */
-
-/** The reaper's hint marker; renaming it claims the run for adoption. */
-const INTERRUPTED_MARKER = "interrupted.txt"
 
 /** The claimed marker's name between the rename and the re-stamp. */
 const CLAIM_MARKER = "resuming.txt"
 
-/** Swallows a best-effort cleanup failure — adoption must never reject on cleanup. */
-const ignore = (): undefined => undefined
+/**
+ * Resolves a recorded directory to its physical path, so `/var/...` and `/private/var/...`
+ * aliases compare equal across processes (T12). A path that no longer exists falls back to its
+ * lexical form, which still matches an identical recorded string.
+ */
+async function physicalPath(path: string | undefined): Promise<string | undefined> {
+  if (path === undefined || path.trim() === "") {return undefined}
+  try {return await realpath(path)} catch {return resolve(path)}
+}
 
 export interface AutoResumeResult {
   /** Run ids that were adopted and re-executed. */
   resumed: string[]
-  /** Candidates skipped by a guard (TTL, argsChanged, session, stop, cap, veto). */
+  /** Candidates skipped by a guard (TTL, argsChanged, project, session, agent, stop, cap, veto). */
   skipped: number
   /** Candidates whose adoption itself failed (re-stamp unwritable). */
   failed: number
 }
 
-export interface AutoResumeDeps {
-  client: OpencodeClient
-  bootId: string
+export interface AutoResumeOptions {
+  /** The sweep's boot identity; the coordinator's process boot id is authoritative. */
+  bootId?: string | undefined
   /** Freshly-orphaned manifests from this boot's reap, in reaper order. */
   candidates: readonly Manifest[]
-  options: UltraopenOptions
   /** Project directory, for saved-workflow resolution of nested `workflow("name")` calls. */
   directory?: string | undefined
   env?: NodeJS.ProcessEnv | undefined
@@ -75,39 +79,36 @@ export interface AutoResumeDeps {
   /** Injectable for tests. */
   isProcessAlive?: ((pid: number) => boolean) | undefined
   /** Injectable engine for tests, passed through to the detached task. */
-  executeFn?: DetachedRunSpec["executeFn"] | undefined
+  executeFn?: typeof execute | undefined
   onNote?: ((note: string) => void) | undefined
 }
-
-type DetachedRunSpec = Parameters<typeof startDetachedRun>[0]
 
 /**
  * Resumes interrupted runs within the policy guards. NEVER REJECTS — every per-run failure is
  * swallowed and counted, like the reaper's sweep it follows, so callers can fire-and-forget.
  */
-export async function resumeInterruptedRuns(deps: AutoResumeDeps): Promise<AutoResumeResult> {
-  const { client, bootId, candidates, options, env } = deps,
-   alive = deps.isProcessAlive ?? defaultProcessAlive,
-   now = deps.now ?? Date.now(),
-   ttlMs = options.autoResumeTtlHours * 60 * 60 * 1000,
+export async function resumeInterruptedRuns(
+  host: HostPort,
+  project: ProjectRuntime,
+  coordinator: RuntimeCoordinator,
+  options: AutoResumeOptions,
+): Promise<AutoResumeResult> {
+  const { candidates, env } = options,
+   config = project.options,
+   alive = options.isProcessAlive ?? isProcessAlive,
+   now = options.now ?? Date.now(),
+   ttlMs = config.autoResumeTtlHours * 60 * 60 * 1000,
    result: AutoResumeResult = { resumed: [], skipped: 0, failed: 0 }
 
-  // The opt-out is a guard like the rest, so tests can pin it against the sweep itself.
-  if (!options.autoResume) {return { resumed: [], skipped: candidates.length, failed: 0 }}
+  if (!config.autoResume) {return { resumed: [], skipped: candidates.length, failed: 0 }}
 
-  // Saved workflows resolve from disk once per sweep, exactly like the launch path resolves them
-  // per call: a nested `workflow("name")` call in the resumed script needs the same map.
-  // scanNamedWorkflows never rejects, so there is no catch here — a broken path degrades to
-  // notes, the same way it does for a launch.
   const named = await scanNamedWorkflows({
-    workflowPaths: options.workflowPaths,
-    directory: deps.directory,
-    onNote: (note) => deps.onNote?.(note),
+    workflowPaths: config.workflowPaths,
+    directory: options.directory ?? host.location.directory,
+    onNote: (note) => options.onNote?.(note),
   })
 
-  // Oldest interruption first: when the boot cap binds, the longest-waiting work wins.
-  const ordered = [...candidates].toSorted((a, b) => a.startedAt - b.startedAt)
-
+  const ordered = [...candidates].toSorted((left, right) => left.startedAt - right.startedAt)
   for (const candidate of ordered) {
     try {
       const outcome = await adopt(candidate)
@@ -126,25 +127,45 @@ export async function resumeInterruptedRuns(deps: AutoResumeDeps): Promise<AutoR
     const runId = candidate.runId,
      dir = runDir(runId, env),
      renameBack = async (): Promise<void> => {
-       await rename(join(dir, CLAIM_MARKER), join(dir, INTERRUPTED_MARKER)).catch(ignore)
+       try {await rename(join(dir, CLAIM_MARKER), join(dir, INTERRUPTED_MARKER))} catch {
+         // Best-effort: the run stays orphaned whether or not the hint is restored.
+       }
      }
 
-    // The pid veto, re-checked: the candidates were filtered by the reaper, but this sweep runs
-    // concurrently with every other process on the shared data root — a run whose owner booted
-    // between the reaper's look and this one must not be adopted twice.
+    // The pid veto, re-checked: a stale candidate list cannot execute a journal another process
+    // may be writing.
     if (Number.isInteger(candidate.pid) && alive(candidate.pid)) {return "skipped"}
 
-    // The resume window: measured from the moment the run became a pending decision (the
-    // reaper's orphan stamp), not from the run's start — a run interrupted long ago but only
-    // discovered by this boot is still fresh enough to matter once.
     const interruptedAt = candidate.endedAt ?? candidate.startedAt
     if (typeof interruptedAt === "number" && now - interruptedAt > ttlMs) {return "skipped"}
 
-    // The claim: renaming the marker is atomic, so two boots racing to adopt the same run
-    // resolve to one winner and one clean skip. No marker means someone else already claimed it.
-    // (#136) ENOENT is the raced shape — the marker is gone. ANYTHING else (EACCES/EPERM/ENOSPC)
-    // is this attempt genuinely failing: reporting it "skipped" would hide an unwritable data
-    // root behind a benign count.
+    // Project ownership (#175) and the `#149` #7 resolvability gate, checked BEFORE the claim so
+    // a refused run keeps its hint marker and stays manually resumable.
+    const session = await host.getSession(candidate.sessionID).catch(() => undefined)
+    if (session === undefined) {return "skipped"}
+    const recordedProject = candidate.projectID ?? session.projectID
+    if (recordedProject !== host.location.projectID) {
+      // V2 mints a project id from the directory string, so one checkout reached through an
+      // alias (`/var/...` vs `/private/var/...`, or a symlinked worktree) yields two ids. The
+      // recorded directory resolving to this host's canonical root is the same project; a
+      // genuinely different directory is still refused.
+      const canonicalRoot = host.location.canonical.trim() === "" ? host.location.directory : host.location.canonical
+      const [recorded, canonical] = await Promise.all([physicalPath(candidate.directory), physicalPath(canonicalRoot)])
+      if (recorded === undefined || canonical === undefined || recorded !== canonical) {return "skipped"}
+    }
+    // The parent agent must still resolve, or adoption fails closed (#149 #7). V2's permission
+    // chain falls back to the host's default primary agent when the session row names none
+    // (`session.agent` is optional); auto-resume resolves the agent through the SAME lookup the
+    // chain uses, or every run launched from a plain `opencode run` session stays orphaned while
+    // its journal is perfectly replayable.
+    const lookup = createAncestorLookup(host),
+     agentID = session.agent ?? (await lookup.defaultAgentID(host.location.directory))
+    if (agentID === undefined || (await lookup.getAgent(agentID, host.location.directory)) === undefined) {
+      return "skipped"
+    }
+
+    // The claim: renaming the marker is atomic, so two boots racing resolve to one winner and one
+    // clean skip. ENOENT is the raced shape; anything else is this attempt genuinely failing.
     try {
       await rename(join(dir, INTERRUPTED_MARKER), join(dir, CLAIM_MARKER))
     } catch (error) {
@@ -152,24 +173,12 @@ export async function resumeInterruptedRuns(deps: AutoResumeDeps): Promise<AutoR
       return "failed"
     }
 
-    // Stopped runs never resume: if any child recorded a stop path's abort reason, the user
-    // asked for this work to end — the crash-mid-stop race (process died between the abort and
-    // the cancelled write) must not resurrect it. The recognizer covers the tool stop's bare
-    // reason and the run-control channel's provenance-suffixed one (#134).
     const journal = await readJournal(runId, env)
     if (journal.some((entry) => isStopAbortDetail(entry.detail))) {
       await renameBack()
       return "skipped"
     }
 
-    // The args guard, via loadResume's own hash check — never bypassed: the stored args are
-    // re-hashed against the manifest's argsHash, so a tampered manifest (or a pre-args manifest
-    // whose args were defined) is skipped rather than replayed against guessed inputs.
-    //
-    // The stored args pass through the SAME boundary the launch used (#78): a pre-hydration
-    // manifest holding the raw stringified payload hashes against its hydrated value and
-    // MISMATCHES, so the poisoned run stays unadopted (still manually resumable) instead of
-    // executing with a seed the old journal never used.
     const transport = inspectArgsTransport(candidate.args),
      sweepArgs = transport.action === "hydrate" ? transport.value : candidate.args
     const resume = await loadResume(runId, sweepArgs, candidate.sessionID, env)
@@ -178,69 +187,74 @@ export async function resumeInterruptedRuns(deps: AutoResumeDeps): Promise<AutoR
       return "skipped"
     }
 
-    // The original session must still exist: hydration and the run's own subagent parent both
-    // target it. Sessions persist across restarts, so absence means the session was deleted.
-    const row = await client.session.get({ path: { id: candidate.sessionID } }).catch(ignore)
-    if (row?.data === undefined) {
+    if (result.resumed.length >= config.autoResumeMax) {
       await renameBack()
       return "skipped"
     }
 
-    // The boot cap: at most `autoResumeMax` runs adopt per boot. Candidates beyond the cap keep
-    // their hint marker (restored above) and stay manually resumable.
-    if (result.resumed.length >= options.autoResumeMax) {
-      await renameBack()
-      return "skipped"
-    }
-
-    // Parse from disk BEFORE re-stamping: a corrupt persisted script is a permanent failure no
-    // amount of re-execution fixes, so the run keeps its orphaned record and its hint.
     let prepared: PreparedWorkflow
     try {
       prepared = await prepare(
         { script: await readFile(join(dir, "script.js"), "utf8"), args: sweepArgs },
-        { client, sessionID: candidate.sessionID, runId },
+        { host, project, coordinator, sessionID: candidate.sessionID, runId },
       )
     } catch {
       await renameBack()
       return "skipped"
     }
 
-    // Re-stamp BEFORE executing, so a second restart during the resume re-orphans this run
-    // instead of double-adopting it. The original runId is kept — journal continuity lives in
-    // this run directory — and the fresh child list starts empty, rebuilt by the run itself.
+    // Re-stamp BEFORE executing, so a second restart during the resume re-orphans this run. The
+    // original runId and project scope are kept; the fresh child list starts empty.
     const { endedAt: _dropped, ...rebase } = candidate,
-     adopted: Manifest = { ...rebase, status: "running", bootId, pid: process.pid, childSessionIDs: [] }
+     adopted: Manifest = {
+       ...rebase,
+       status: "running",
+       bootId: coordinator.processBootId,
+       pid: process.pid,
+       childSessionIDs: [],
+     }
     try {
       await writeManifest(runId, adopted, env)
     } catch {
       await renameBack()
       return "failed"
     }
-    // The claim token has served its purpose; the run is now live and the sidebar reads the
-    // manifest, not the hint.
-    await rm(join(dir, CLAIM_MARKER), { force: true }).catch(ignore)
+    try {await rm(join(dir, CLAIM_MARKER), { force: true })} catch {
+      // The claim token is disposable: a failed cleanup leaves a live run, not a wrong one.
+    }
 
-    deps.onNote?.(`ultraopen: resuming ${runId} — interrupted when opencode exited`)
+    options.onNote?.(`ultraopen: resuming ${runId} — interrupted when opencode exited`)
 
-    registerPending(runId, candidate.sessionID)
-    // The adopted manifest carries the original launch's title metadata (#142); the reminder
-    // shows it beside the name, exactly as the original session's live reminder did.
-    nameRun(runId, prepared.meta.name, candidate.title)
+    // The native chain above the run's parent, rebuilt from the live session row: the resumed
+    // run's children must record the SAME ancestry a fresh launch would, or the permission walk
+    // cannot rebuild the chain after the restart.
+    const ancestorSessionIDs = await nativeAncestorSessionIDs(host, candidate.sessionID)
+
+    registerPending(coordinator, {
+      runId,
+      sessionID: candidate.sessionID,
+      projectKey: project.projectKey,
+      locationDir: host.location.directory,
+    })
+    nameRun(coordinator, runId, prepared.meta.name, candidate.title)
     startDetachedRun({
       runId,
-      client,
+      host,
+      project,
+      coordinator,
+      worktreeRoot: host.location.canonical,
       sessionID: candidate.sessionID,
+      ancestorSessionIDs,
       manifest: adopted,
       prepared,
       args: { script: prepared.source, args: sweepArgs },
-      options,
+      options: config,
       previousEntries: resume.entries,
       resumedFrom: runId,
       resume: { resumed: resume.entries.length, argsChanged: false },
       named: Object.keys(named).length > 0 ? named : undefined,
       env,
-      executeFn: deps.executeFn,
+      executeFn: options.executeFn,
       explain: (replayed: number) =>
         `${runId} was interrupted when opencode exited; it has been resumed — ${replayed} agent(s) replayed from the journal`,
     })

@@ -1,56 +1,95 @@
 /**
- * Builds the dual-entry package.
+ * Builds the three ESM package entries (`server.js`, `rpc.js`, `tui.js`).
  *
- * The two halves are built SEPARATELY because both entry files are named `index`, and a single
- * build would have them overwrite each other. They never exchange objects — the server writes
- * progress to disk and the TUI reads it — so they do not need to share a chunk, and an
- * `instanceof` across the boundary never happens.
+ * The entries are built separately because `src/server/index.ts` and `src/tui/index.tsx` are both
+ * named `index`, and `tui.js` requires `@opentui/solid/bun-plugin`'s Solid JSX transform so
+ * reactive signals and `<Show>`/`<For>` compile to universal Solid calls instead of `jsx-runtime`.
  *
- * `--target node` because opencode ships a Node build and `PluginInput.$` is undefined whenever
- * `typeof Bun === "undefined"`.
+ * `--target node` because opencode ships a Node build and runtime hosts inject the externalized
+ * `@opencode/plugin*`, `effect*`, `solid-js*`, and `@opentui/*` modules.
  */
-import { rename, rm } from "node:fs/promises"
-import { join } from "node:path"
-
-const OUT = "dist",
+import { rm } from "node:fs/promises"
+import { createSolidTransformPlugin } from "@opentui/solid/bun-plugin"
 
 /**
- * Left unbundled at runtime.
+ * Left unbundled at runtime so OpenCode V2's runtime module loader injects the host's instances.
  *
- * The TUI runtime shares the host's module instances: a bundled second copy of solid-js would give
- * the plugin its own reactive owner graph, and its components would never update.
+ * Bundling a second copy of `solid-js`, `@opentui/*`, `@opencode/plugin*`, or `effect*` would
+ * break reactive ownership and host contract identity.
  */
- EXTERNAL = [
+const EXTERNAL = [
   "solid-js",
   "solid-js/*",
   "@opentui/core",
+  "@opentui/core/*",
   "@opentui/solid",
-  "@opencode-ai/plugin",
-  "@opencode-ai/plugin/*",
+  "@opentui/solid/*",
+  "@opencode/plugin",
+  "@opencode/plugin/*",
+  "effect",
+  "effect/*",
 ]
 
-await rm(OUT, { recursive: true, force: true })
+interface BuildEntry {
+  readonly entry: string
+  readonly name: string
+  readonly solid?: boolean
+}
 
-for (const [entry, name] of [
-  ["src/server/index.ts", "server.js"],
-  ["src/tui/index.tsx", "tui.js"],
-] as const) {
+/**
+ * The slice of `Bun.build`'s result the gate reads.
+ *
+ * Kept narrow so a test can inject a failed build and prove the gate throws
+ * instead of shipping a partial bundle — `Bun.build` itself rejects rather
+ * than resolving `success: false` for the failures we can provoke.
+ */
+interface BuildOutcome {
+  readonly success: boolean
+  readonly logs: readonly unknown[]
+}
+
+type EntryBuilder = (spec: BuildEntry) => BuildOutcome | Promise<BuildOutcome>
+
+const ENTRIES: readonly BuildEntry[] = [
+  { entry: "src/server/index.ts", name: "server.js" },
+  { entry: "src/rpc.ts", name: "rpc.js" },
+  { entry: "src/tui/index.tsx", name: "tui.js", solid: true },
+]
+
+async function buildEntry(spec: BuildEntry, outdir: string): Promise<BuildOutcome> {
   const result = await Bun.build({
-    entrypoints: [entry],
-    outdir: OUT,
+    entrypoints: [spec.entry],
+    outdir,
     target: "node",
     format: "esm",
     external: EXTERNAL,
+    naming: spec.name,
+    ...(spec.solid ? { plugins: [createSolidTransformPlugin()] } : {}),
   })
-
-  if (!result.success) {
-    for (const log of result.logs) {console.error(log)}
-    process.exit(1)
-  }
-
-  // Both entry files are called `index`, so rename to the names the exports map points at.
-  await rename(join(OUT, "index.js"), join(OUT, name))
-  console.log(`  ${OUT}/${name}`)
+  return result
 }
 
-console.log("built 2 entries")
+/** Builds all package entry points into `outdir`, throwing on the first failed entry. */
+export async function buildAll(
+  outdir = "dist",
+  build: EntryBuilder = (spec) => buildEntry(spec, outdir),
+): Promise<void> {
+  await rm(outdir, { recursive: true, force: true })
+
+  for (const spec of ENTRIES) {
+    const result = await build(spec)
+
+    if (!result.success) {
+      for (const log of result.logs) {console.error(log)}
+      throw new Error(`Failed to build ${spec.entry} -> ${outdir}/${spec.name}`)
+    }
+
+    console.log(`  ${outdir}/${spec.name}`)
+  }
+
+  console.log(`built ${ENTRIES.length} entries`)
+}
+
+if (import.meta.main) {
+  await buildAll()
+}

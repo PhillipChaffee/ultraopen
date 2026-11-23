@@ -1,127 +1,136 @@
-import { registry } from "../singleton.js"
+import type { LiveRunRecord, ProjectRuntime, RuntimeCoordinator } from "../runtime/coordinator.js"
 import { liveRunsForSession } from "../tool/background.js"
-import type { DetachedRun } from "../tool/background.js"
-import { mentionsKeyword, mode, requestsNoFanOut } from "./mode.js"
-import { decorate, decorateLatest, renderRunsReminder, ULTRACODE_DEMOTED, ULTRACODE_ON } from "./reminders.js"
-import type { LiveRunLine, MessageLike } from "./reminders.js"
+import { mentionsKeyword, requestsNoFanOut } from "./mode.js"
+import {
+  decorate,
+  decorateLatest,
+  renderRunsReminder,
+  ULTRACODE_DEMOTED,
+  ULTRACODE_ON,
+} from "./reminders.js"
+import type { LiveRunLine, RequestMessageLike } from "./reminders.js"
+import { resolveEffort } from "../bridge/effort.js"
 
 /**
- * The hooks that turn ultracode on and keep it visible to the model.
+ * The V2 hooks that turn ultracode on and keep it visible to the model.
  *
- * Three separate opencode hooks cooperate here, and each is used for exactly what it can do:
- *   - `chat.message` sees the user's text, so it detects the keyword. It must NOT write parts:
- *     those are persisted, and a reminder there would accumulate one copy per turn forever.
- *   - `experimental.chat.messages.transform` operates on messages re-read from the database each
- *     step, so anything it adds is ephemeral. That is where the reminder goes.
- *   - `chat.params` can raise reasoning effort for the parent turn itself.
+ * Three separate V2 hooks cooperate here, and each is used for exactly what it can do:
+ *   - `ctx.session.hook("prompt")` sees the user's admitted text, so it detects the keyword. It
+ *     stamps the message id on `event.metadata` so the ephemeral reminder's start point survives
+ *     into the request messages.
+ *   - `ctx.session.hook("context")` operates on request messages rebuilt for each model call, so
+ *     anything it adds is ephemeral. That is where the reminders go.
+ *   - `ctx.session.hook("experimental.model.resolve")` raises reasoning effort for one primary
+ *     request without mutating the session's saved model.
  */
 
-export interface ChatMessageInput {
-  sessionID: string
-  agent?: string
-  messageID?: string
+/** The structural subset of V2's `SessionPrompt` this module drives. */
+export interface SessionPromptEventLike {
+  readonly sessionID: string
+  readonly messageID: string
+  readonly prompt: { readonly text: string }
+  metadata?: Record<string, unknown>
 }
 
-export interface ChatMessageOutput {
-  message?: { id?: string; model?: { variant?: string | undefined } }
-  parts?: { type?: string; text?: string }[]
+/** The structural subset of V2's `SessionContext` the reminder decorator drives. */
+export interface SessionContextEventLike<Message extends RequestMessageLike> {
+  readonly sessionID: string
+  readonly agent?: string | undefined
+  messages: Message[]
 }
 
-export interface MessagesTransformOutput {
-  messages: MessageLike[]
+/** The structural subset of V2's `SessionModelResolve` this module drives. */
+export interface ModelResolveEventLike {
+  readonly sessionID: string
+  readonly agent: string
+  readonly kind: string
+  model: { readonly providerID: string; readonly id: string; readonly variant?: string | undefined }
 }
+
+/** Resolves the reasoning variant for one model; absent when the model offers no suitable one. */
+export type VariantResolver = (
+  model: ModelResolveEventLike["model"],
+) => string | undefined | Promise<string | undefined>
 
 /**
- * Reacts to a user turn: detects the keyword and any instruction to stop fanning out.
+ * Reacts to an admitted user turn: detects the keyword and any instruction to stop fanning out.
  *
- * Reads only. The one mutation it performs is on the message's own model variant, which the host
- * persists and later reads back — that is the supported way to raise effort for the parent turn.
+ * Idempotent on the host message id. V2's `prompt` hook can fire more than once for the same
+ * admitted message, and only the first firing may apply the turn's state transition.
+ *
+ * Returns `true` when this firing owned the message, `false` when it was a duplicate or an
+ * engine-owned child.
  */
-export function onChatMessage(
-  input: ChatMessageInput,
-  output: ChatMessageOutput,
-  options: { resolveVariant?: ((effort: string) => string | undefined) | undefined } = {},
-): void {
+export function onSessionPrompt(
+  event: SessionPromptEventLike,
+  project: ProjectRuntime,
+  coordinator: RuntimeCoordinator,
+): boolean {
   // Engine-owned children are never put into ultracode: they are the fan-out, and telling them to
   // fan out again is how a run turns into a fork bomb.
-  if (registry.owns(input.sessionID)) {return}
+  if (coordinator.owns(event.sessionID)) {return false}
+  if (!project.mode.markProcessedMessage(event.sessionID, event.messageID)) {return false}
 
   // One-shot keyword turn boundary: a keyword fans out exactly the task that
   // said it, so when the NEXT user message arrives, what the keyword started is
   // finished. `/ultracode` and the plugin option are deliberately untouched.
-  if (mode.getKeywordBehavior() === "one-shot") {mode.expireKeyword(input.sessionID)}
+  if (project.mode.getKeywordBehavior() === "one-shot") {project.mode.expireKeyword(event.sessionID)}
 
-  const text = (output.parts ?? [])
-    .filter((part) => part.type === "text" && typeof part.text === "string")
-    .map((part) => part.text ?? "")
-    .join("\n")
-
+  const text = event.prompt.text
   if (requestsNoFanOut(text)) {
-    mode.demote(input.sessionID)
+    project.mode.demote(event.sessionID)
   } else if (mentionsKeyword(text)) {
     // Only a source CHANGE re-enables. Re-mentioning the keyword while already active via the
     // keyword must not rewrite `fromMessageID`: the reminder is ephemeral and re-injected from
     // that message each turn, so moving it forward drops earlier messages' reminders and breaks
     // the byte-stable cache prefix. A negated mention ("don't use ultracode") demotes above and
     // never enables.
-    const state = mode.get(input.sessionID)
+    const state = project.mode.stateOf(event.sessionID)
     if (!(state?.active && state.source === "keyword")) {
-      mode.enable(input.sessionID, "keyword", output.message?.id ?? input.messageID)
+      project.mode.enable(event.sessionID, "keyword", event.messageID)
     }
   }
 
-  if (!mode.isActive(input.sessionID, input.agent)) {return}
-
-  // Raise effort for the PARENT turn. The variant lives on the user message, which the host reads
-  // back when building the request, so this is both effective and assertable afterwards.
-  const variant = options.resolveVariant?.("xhigh")
-  if (variant && output.message?.model) {output.message.model.variant = variant}
+  // The reminder's start point rides the request message metadata. The AI SDK message id may be
+  // absent, so the host message id is the durable correlator.
+  event.metadata = { ...event.metadata, ultraopenMsgID: event.messageID }
+  return true
 }
 
 /**
- * Injects the per-turn reminders.
+ * Appends the per-turn reminders to the request messages for one model call.
  *
  * Two decorations share this hook. The live-run reminder re-anchors any session holding live
  * background runs, independent of the ultracode mode; the ultracode reminder keeps the mode
- * visible. Both are ephemeral: the hook operates on messages re-read from the database each step,
- * so nothing it adds is persisted.
+ * visible. Both are ephemeral: the hook operates on request messages built for this call, so
+ * nothing it adds is persisted.
  *
- * The hook's input is an empty object, so the session and agent must be recovered from the
- * messages themselves.
+ * Returns the decorated message array, which the caller assigns back onto the event.
  */
-export function onMessagesTransform(
-  output: MessagesTransformOutput,
-  options: { compacting?: boolean; now?: (() => number) | undefined } = {},
-): number {
-  // Compaction runs this same hook over a clone that IS sent to the model. Decorating there would
-  // put the fan-out instruction into the summarizer's prompt, where it means nothing.
-  if (options.compacting === true) {return 0}
-
-  const {messages} = output
-  if (!Array.isArray(messages) || messages.length === 0) {return 0}
-
-  const sessionID = messages.at(-1)?.info?.sessionID
-  if (!sessionID) {return 0}
-  if (registry.owns(sessionID)) {return 0}
-
-  const lastUser = messages.findLast((message) => message.info?.role === "user"),
-   agentName = lastUser?.info?.agent
+export function onSessionContext<Message extends RequestMessageLike>(
+  event: SessionContextEventLike<Message>,
+  project: ProjectRuntime,
+  coordinator: RuntimeCoordinator,
+  options: { now?: (() => number) | undefined } = {},
+): Message[] {
+  // Children are the fan-out; a reminder there invites recursion.
+  if (coordinator.owns(event.sessionID)) {return event.messages}
 
   // The live-run reminder FIRST and unconditionally of ultracode: a session that launched a
   // background run needs the anchor even when it never fanned out. Elapsed time and agent counts
-  // read live state (the launch registry and the engine registry), so the text is computed per
-  // fire — decorateLatest replaces rather than stacks, keeping exactly one reminder per turn.
-  let runsDecorated = 0
-  const live: readonly DetachedRun[] = liveRunsForSession(sessionID)
-  if (lastUser !== undefined && live.length > 0) {
-    runsDecorated = decorateLatest(
+  // read live state, so the text is computed per fire — decorateLatest replaces rather than
+  // stacks, keeping exactly one reminder per turn.
+  let messages = event.messages
+  const live: readonly LiveRunRecord[] = liveRunsForSession(coordinator, event.sessionID)
+  if (live.length > 0) {
+    messages = decorateLatest(
       messages,
       renderRunsReminder(
         live.map((entry) => {
           const line: LiveRunLine = {
             runId: entry.runId,
             name: entry.name ?? entry.runId,
-            agents: registry.sessionsOf(entry.runId).length,
+            agents: coordinator.sessionsOf(entry.runId).length,
             startedAt: entry.startedAt,
           }
           if (entry.title !== undefined) {line.title = entry.title}
@@ -132,37 +141,44 @@ export function onMessagesTransform(
     )
   }
 
-  if (!mode.isActive(sessionID, agentName)) {return runsDecorated}
+  if (!project.mode.isActive(event.sessionID, event.agent)) {return messages}
 
   // §1.6: an explicit instruction beats the mode. Effort stays raised; the standing opt-in does not.
-  const demoted = mode.isDemoted(sessionID),
-   state = mode.get(sessionID)
+  const demoted = project.mode.isDemoted(event.sessionID),
+   state = project.mode.stateOf(event.sessionID)
 
   return decorate(messages, {
     text: demoted ? ULTRACODE_DEMOTED : ULTRACODE_ON,
-    fromMessageID: state?.fromMessageID,
-  }) + runsDecorated
+    ...(state?.fromMessageID === undefined ? {} : { fromMessageID: state.fromMessageID }),
+  })
 }
 
 /**
- * Raises reasoning effort on the parent turn's provider options.
+ * Raises reasoning effort for one primary request.
  *
- * Belt and braces alongside the user-message variant: the two paths are read at different points,
- * and a model whose variant map is unknown at message time can still be caught here.
+ * V2 applies a mutated `event.model.variant` only to this request; the session keeps its saved
+ * model, so the raise never leaks into later turns that no longer want it.
  */
-export function onChatParams(
-  input: { sessionID?: string; agent?: string; model?: { variants?: Record<string, unknown> } },
-  output: { options?: Record<string, unknown> },
-  options: { resolveVariant?: ((effort: string, available: string[]) => string | undefined) | undefined } = {},
-): void {
-  if (!input.sessionID || registry.owns(input.sessionID)) {return}
-  if (!mode.isActive(input.sessionID, input.agent)) {return}
+export async function onModelResolve(
+  event: ModelResolveEventLike,
+  project: ProjectRuntime,
+  coordinator: RuntimeCoordinator,
+  resolveVariant: VariantResolver,
+): Promise<boolean> {
+  if (event.kind !== "primary") {return false}
+  if (coordinator.owns(event.sessionID)) {return false}
+  if (!project.mode.isActive(event.sessionID, event.agent)) {return false}
 
-  const available = input.model?.variants ? Object.keys(input.model.variants) : [],
-   variant = options.resolveVariant?.("xhigh", available)
-  if (!variant || !output.options) {return}
+  const variant = await resolveVariant(event.model)
+  if (variant === undefined || variant === "") {return false}
+  event.model = { ...event.model, variant }
+  return true
+}
 
-  // Merge rather than replace: the host has already assembled provider options by this point.
-  const merged = input.model?.variants?.[variant]
-  if (typeof merged === "object" && merged !== null) {Object.assign(output.options, merged)}
+/** The default effort this plugin asks for when the mode is active. */
+export const ULTRACODE_EFFORT = "xhigh"
+
+/** Resolves `xhigh` against a model's real variant list, with the ladder's graceful downgrade. */
+export function resolveUltracodeVariant(available: readonly string[]): string | undefined {
+  return resolveEffort(ULTRACODE_EFFORT, { available }).variant
 }

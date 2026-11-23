@@ -1,73 +1,60 @@
 # Compatibility and known limits
 
-Verified against opencode 1.18.31 by the live e2e suites (`test/e2e/technical.sh`,
-`test/e2e/visual.sh`). Each probe carries a `bun run check`-clean implementation note in the
-suites.
+Verified against opencode V2.3.2 (`>= 2.3.2 < 3`) by the live e2e suites
+(`test/e2e/technical.sh`, `test/e2e/visual.sh`). Each probe carries a `bun run check`-clean
+implementation note in the suites. The V1 line is frozen at `0.1.0` and is not covered here.
 
 ## Working end to end
 
-- the background contract end to end (launch handle, per-turn live-run reminder, completion
-  notification in the parent session, `workflow({ stop })`, auto-resume after a process death)
+- the background contract end to end (launch handle, per-turn live-run reminder, synthetic
+  completion notification, `workflow({ stop })`, auto-resume after a process death)
 - parallel and pipeline fan-out
-- schema-forced structured output
-- per-model effort resolution
+- schema-forced structured output through the V2 `StructuredOutput` capture tool (no V1
+  `format`, no history poisoning)
+- per-model effort resolution (`experimental.model.resolve`)
 - resume across processes (journal replay returns the recorded values)
 - nested `workflow({ script })`
 - the per-agent idle limit and wall clock
 - all four ultracode activation surfaces
-- the three TUI progress surfaces
+- the reactive TUI surfaces (`session.composer.top`, `sidebar.content`, `prompt.footer`), the
+  `/workflows` panel, direct `/workflow-stop`, and `◈` synthetic transcript rows
+- live transitive parent permission inheritance (`#149`) and `isolation: "worktree"` child
+  creation
+- per-agent JSONL recordings (`ADR-0004`)
 
-## Known gaps the e2e probes confirmed
+## Known gaps the V2.3.2 probes confirmed
 
-- `agent()`'s `isolation: "worktree"` option is inert in the live wiring (`worktreeRoot` is
-  never passed).
-- Schema-forced agents (`schema:` on `agent()`) can fail against Together with an empty
-  `APIError` when ANY tool in the session's toolset carries a `$ref` in its JSON Schema (some
-  MCP servers do — Obsidian's `vault_patch` does). Together's grammar compiler misresolves
-  `$ref` pointers under the string form of `tool_choice: "required"` that opencode sends for
-  `format` calls; the identical request succeeds with the object form. Workaround: disable the
-  offending MCP server, or run those agents schema-less.
-- The permission approval dialog renders without the ask's `metadata` (the workflow name,
-  description and phases) on 1.18.31.
-- Workflow agents do not get transcript task-rows — the renderer builds those only from the
-  built-in task tool's parts (the row's child-session id lives in the part's
-  `metadata.sessionId`, which only the task tool writes), so a workflow's child sessions show no
-  transcript rows no matter what a plugin does. Per-agent progress shows on the three TUI
-  surfaces, and `Ctrl-x` then `down` navigates into each child session today. The upstream
-  proposal to render parented children generically is filed (policy and evidence in
-  [docs/adr/0002-transcript-task-rows.md](./adr/0002-transcript-task-rows.md)).
-
-The task-row, dialog and `$ref` gaps need upstream fixes; the transcript-echo collapse (this
-epic's original upstream PR target) is researched and ready to submit separately.
-
-## Plugin install fails through a symlinked cache path (upstream)
-
-The installer's first `opencode plugin <pkg>` install fails deterministically
-(`NpmInstallFailedError`) when the package cache sits on a symlinked path — any path under
-`/tmp` on macOS (`/tmp` → `/private/tmp`) qualifies. Arborist reify materializes the full tree,
-then rejects it: the tree's `node_modules/.package-lock.json` keys come out as `../`-relative
-escapes (the root in symlink form, the node paths realpath'd) instead of `node_modules/<name>`
-form. A retry short-circuits on the materialized tree and "succeeds", masking the failure.
-Redirecting `XDG_CACHE_HOME` to a symlink-free path installs cleanly; the default `~/.cache`
-never hits it. Isolation evidence on 1.18.32 is filed upstream at
-[anomalyco/opencode#23312](https://github.com/anomalyco/opencode/issues/23312) — that April
-report is Linux/1.4.11 with cache and config symlinked; ours adds the cache-only trigger, the
-lockfile keys, and the retry masking. Harness-relevant: never point `XDG_CACHE_HOME` at a
-symlinked path in install-touching harnesses — the e2e suites redirect `XDG_DATA_HOME` and
-`XDG_CONFIG_HOME` only.
+- **Workflow children are not in V2's native `down` picker.** They are created without
+  `parentID` by design: V2's `SubagentReport` wakes and steers the parent for every session that
+  carries one. Lineage lives in `metadata.ultraopen`; child inspection uses the `/workflows`
+  panel, `/sessions` titles (`ultraopen · <label>`), and the recordings.
+- **No transcript or custom tool-renderer slot.** V2's `GenericTool` renders `⠋`/`✓`/`✗ workflow`
+  and ignores tool metadata. The plugin's surfaces are the reactive slots, the `/workflows`
+  panel, `ctx.session.synthetic` (`◈ <description>`), and the recordings.
+- **Shell-wrapper gap on a shared service.** `shell.hook("create.before")` fires before
+  `OPENCODE_SESSION_ID` is set and `Plugin.Context` exposes no `session.environment`. The plugin
+  correlates owned child shells (`pendingChildShells` → `ULTRAOPEN_ACTIVE=1`); the residual edge
+  is a non-`opencode` wrapper binary talking directly to an already-running `shared-service`
+  daemon.
+- **No `permission.saved.list`.** Saved `Allow always` policies cannot be enumerated through
+  `Plugin.Context`. Child requests are evaluated against the host's effective policy and fail
+  closed wherever a saved allow cannot be verified to preserve the child's narrower bounds.
+- **Custom user primary agents defined only in config appear after plugins.** Config agents are
+  applied in `post`, so `agent.transform` sees built-ins and `ultracode` only. Custom subagents
+  are stripped in `hook("context")` and refused in `execute()`; custom primary agents fall back
+  to explicit `opencode.json` permission rules.
+- **`hook("context")` exposes no `toolChoice`.** The plugin keeps the three-attempt same-session
+  retry ladder with in-loop `Tool.Error` validation feedback and never parses assistant prose.
 
 ## Cosmetic limitations (upstream)
 
 - The transcript renderer echoes a tool call's raw arguments, so a `workflow` call displays its
-  full script (visible in the README's first screenshot).
+  full script (visible in the README's first screenshot). V2's `GenericTool` ignores metadata, so
+  the plugin cannot replace that row.
 - An open sidebar renders one blank line when no runs are active.
-- A failed agent's glyph keeps the muted color of its line (a single `<text>` node carries one
-  fg color) — the strong `✗` marker, the per-row failure reason, and the summary's failed count
-  carry the signal instead.
+- A failed agent's glyph uses the line's muted color where the host paints a single text node; the
+  strong `✗` marker, the per-row failure reason, and the summary's failed count carry the signal.
 - A half-failed run shows a failed count while live.
-- An interrupted run (its process died) shows a once-only resume hint in the strip: the first
-  boot that displays the hint removes its marker, so later starts show nothing.
-- The TUI hides synthetic user messages from the visible timeline (`!part.synthetic` filter,
-  1.18.x), so a `<workflow-completed>` notification never renders as its own row — what you see
-  is the turn it starts (the model replying to the result), and what you get is the outcome. The
-  e2e suites assert the notification at the session-database level for exactly this reason.
+- An interrupted run (its process died) shows a once-only resume hint in
+  `session.composer.top`: the first boot that displays the hint removes its marker, so later
+  starts show nothing.

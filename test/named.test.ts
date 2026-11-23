@@ -1,16 +1,19 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test"
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import {
   MAX_SCAN_FILES,
-  listSavedWorkflows,
+  parseSavedWorkflows,
   projectWorkflowDir,
   scanNamedWorkflows,
   userWorkflowDir,
   workflowDirectories,
 } from "../src/server/tool/named.js"
 import { execute } from "../src/server/tool/workflow.js"
-import type { OpencodeClient } from "../src/server/types.js"
+import type { HostPort, HostTurnResult } from "../src/server/host/port.js"
+import { resolveOptions } from "../src/server/options.js"
+import { getCoordinator, resetCoordinatorForTests } from "../src/server/runtime/coordinator.js"
+import type { ProjectRuntime, RuntimeCoordinator } from "../src/server/runtime/coordinator.js"
 import { join } from "node:path"
 
 /**
@@ -64,6 +67,19 @@ describe("workflow directories", () => {
     expect(userWorkflowDir({} as NodeJS.ProcessEnv)).toContain(".config/opencode")
   })
 
+  test("the user directory follows OPENCODE_CONFIG_DIR > XDG_CONFIG_HOME/opencode > ~/.config/opencode", () => {
+    // V2 resolves the config dir through XDG too; honoring only the legacy env var made a
+    // saved workflow invisible on hosts that set just XDG_CONFIG_HOME.
+    expect(userWorkflowDir({ XDG_CONFIG_HOME: "/xdg" } as NodeJS.ProcessEnv)).toBe("/xdg/opencode/ultraopen/workflows")
+    expect(
+      userWorkflowDir({ OPENCODE_CONFIG_DIR: "/cfg", XDG_CONFIG_HOME: "/xdg" } as NodeJS.ProcessEnv),
+    ).toBe("/cfg/ultraopen/workflows")
+    expect(userWorkflowDir({ OPENCODE_CONFIG_DIR: "  ", XDG_CONFIG_HOME: "/xdg" } as NodeJS.ProcessEnv)).toBe(
+      "/xdg/opencode/ultraopen/workflows",
+    )
+    expect(userWorkflowDir({ XDG_CONFIG_HOME: "" } as NodeJS.ProcessEnv)).toContain(".config/opencode")
+  })
+
   test("the project directory only exists when a project is known", () => {
     expect(projectWorkflowDir(undefined)).toBeUndefined()
     expect(projectWorkflowDir("/proj")).toContain(".opencode/ultraopen/workflows")
@@ -81,6 +97,30 @@ describe("workflow directories", () => {
   test("without a project, the user directory is the only default", () => {
     const dirs = workflowDirectories({ env: { OPENCODE_CONFIG_DIR: "/cfg" } as NodeJS.ProcessEnv })
     expect(dirs).toEqual(["/cfg/ultraopen/workflows"])
+  })
+
+  test("the canonical project is scanned before the worktree directory, which wins collisions", () => {
+    // A workflow saved in the canonical checkout must still resolve for an agent running in a
+    // worktree; the worktree's own copy is stronger (last), the canonical one is a fallback.
+    const dirs = workflowDirectories({
+      canonicalDirectory: "/canon",
+      directory: "/wt",
+      env: { OPENCODE_CONFIG_DIR: "/cfg" } as NodeJS.ProcessEnv,
+    })
+    expect(dirs).toEqual([
+      "/cfg/ultraopen/workflows",
+      "/canon/.opencode/ultraopen/workflows",
+      "/wt/.opencode/ultraopen/workflows",
+    ])
+  })
+
+  test("a canonical directory equal to the worktree directory is scanned once", () => {
+    const dirs = workflowDirectories({
+      canonicalDirectory: "/proj",
+      directory: "/proj",
+      env: { OPENCODE_CONFIG_DIR: "/cfg" } as NodeJS.ProcessEnv,
+    })
+    expect(dirs).toEqual(["/cfg/ultraopen/workflows", "/proj/.opencode/ultraopen/workflows"])
   })
 })
 
@@ -115,6 +155,23 @@ describe("scanNamedWorkflows", () => {
       readFile,
     })
     expect(named["same"]).toContain("'project'")
+  })
+
+  test("a workflow saved in the canonical project resolves from a worktree session", async () => {
+    const source = (body: string) => `${META}return ${body}\n`
+    const { readDir, readFile } = fakeFs({
+      "/canon/.opencode/ultraopen/workflows": { "from-canon.js": source("'canonical'") },
+      "/wt/.opencode/ultraopen/workflows": { "from-wt.js": source("'worktree'") },
+    })
+    const named = await scanNamedWorkflows({
+      env: { OPENCODE_CONFIG_DIR: "/cfg" } as NodeJS.ProcessEnv,
+      canonicalDirectory: "/canon",
+      directory: "/wt",
+      readDir,
+      readFile,
+    })
+    expect(Object.keys(named).toSorted()).toEqual(["from-canon", "from-wt"])
+    expect(named["from-canon"]).toContain("canonical")
   })
 
   test("a broken file is skipped and named in a note, never a crash", async () => {
@@ -177,26 +234,43 @@ describe("scanNamedWorkflows", () => {
   })
 })
 
+// A dry run never spawns: the host is a stub that only answers the recursion guard's session
+// lookup, which is undefined for an ordinary parent session.
+const makeHost = (): HostPort => ({
+  location: { directory: "/work", canonical: "/work", projectID: "project-1" },
+  defaultModel: () => Promise.resolve(undefined),
+  listModels: () => Promise.resolve([]),
+  getSession: () => Promise.resolve(undefined),
+  getAgent: () => Promise.resolve(undefined),
+  listAgents: () => Promise.resolve([]),
+  listPendingPermissions: () => Promise.resolve([]),
+  rejectPermission: () => Promise.resolve(),
+  createChildSession: () => Promise.resolve({ ok: true, sessionID: "child" }),
+  moveSession: () => Promise.resolve({ ok: true }),
+  runTurn: () => Promise.resolve({ ok: true, turn: { outcome: "succeeded", text: "ok", outputTokens: 0 } satisfies HostTurnResult }),
+  interruptSession: () => Promise.resolve(true),
+  admitSynthetic: () => Promise.resolve("admitted"),
+})
+
 describe("named resolution through the engine", () => {
-  // The engine's client type is wide; the engine only touches session APIs and
-  // the provider catalog when a run is LIVE, which dryRun never is. The cast
-  // keeps the fake honest about being a stub, not a real client.
-  const client = {
-    config: { get: () => Promise.resolve({ data: {} }), providers: () => Promise.resolve({ data: { providers: [] } }) },
-    session: {
-      create: () => Promise.resolve({ data: { id: "child" } }),
-      get: () => Promise.resolve({ data: { id: "child" } }),
-      delete: () => Promise.resolve({}),
-      abort: () => Promise.resolve({}),
-      prompt: () => Promise.resolve({ data: { info: { tokens: { output: 0 } }, parts: [{ type: "text", text: "ok" }] } }),
-    },
-  } as never as OpencodeClient
+  let coordinator: RuntimeCoordinator,
+   project: ProjectRuntime
+  beforeEach(() => {
+    resetCoordinatorForTests()
+    coordinator = getCoordinator()
+    project = coordinator.projectOf(
+      { directory: "/work", project: { id: "project-1", canonical: "/work" } },
+      resolveOptions({}),
+    )
+  })
 
   test("the named form runs the saved source and never throws when the name exists", async () => {
     const result = await execute(
       { script: `${META}return await workflow('saved-probe')\n`, dryRun: true },
       {
-        client,
+        host: makeHost(),
+        project,
+        coordinator,
         sessionID: "p",
         runId: "wf_named0001",
         named: { "saved-probe": `${META}return 'from saved'\n` },
@@ -209,7 +283,7 @@ describe("named resolution through the engine", () => {
     await expect(
       execute(
         { script: `${META}return await workflow('nope')\n`, dryRun: true },
-        { client, sessionID: "p", runId: "wf_named0002" },
+        { host: makeHost(), project, coordinator, sessionID: "p", runId: "wf_named0002" },
       ),
     ).rejects.toThrow(/No saved workflow named/u)
   })
@@ -218,42 +292,33 @@ describe("named resolution through the engine", () => {
     await expect(
       execute(
         { script: `${META}return await workflow('../../etc/passwd')\n`, dryRun: true },
-        { client, sessionID: "p", runId: "wf_named0003" },
+        { host: makeHost(), project, coordinator, sessionID: "p", runId: "wf_named0003" },
       ),
     ).rejects.toThrow(/cannot contain a path separator/u)
   })
-
 })
 
-describe("listSavedWorkflows — sync, for command registration", () => {
-  let dataHome: string,
-   savedXDG: string | undefined
-
-  beforeEach(async () => {
-    dataHome = await mkdtemp(join(tmpdir(), "ultraopen-named-"))
-    savedXDG = process.env["OPENCODE_CONFIG_DIR"]
-    process.env["OPENCODE_CONFIG_DIR"] = dataHome
+describe("parseSavedWorkflows — the synchronous command surface", () => {
+  test("parses every scanned source into an entry with its meta description and source", () => {
+    const entries = parseSavedWorkflows({
+      "deploy-check": "export const meta = { name: 'deploy-check', description: 'Deploy gate' }\nreturn 1\n",
+      bare: `${META}return 2\n`,
+    })
+    expect(entries).toEqual([
+      {
+        name: "deploy-check",
+        description: "Deploy gate",
+        source: "export const meta = { name: 'deploy-check', description: 'Deploy gate' }\nreturn 1\n",
+      },
+      { name: "bare", description: "x", source: `${META}return 2\n` },
+    ])
   })
 
-  afterEach(async () => {
-    if (savedXDG === undefined) {delete process.env["OPENCODE_CONFIG_DIR"]}
-    else {process.env["OPENCODE_CONFIG_DIR"] = savedXDG}
-    await rm(dataHome, { recursive: true, force: true })
+  test("a source that no longer parses loses its command instead of throwing", () => {
+    expect(parseSavedWorkflows({ broken: "const x: string[] = []\n" })).toEqual([])
   })
 
-  test("registers only parseable files, with their meta descriptions", async () => {
-    const { mkdir, writeFile } = await import("node:fs/promises")
-    const dir = userWorkflowDir()
-    await mkdir(dir, { recursive: true })
-    await writeFile(`${dir}/deploy-check.js`, "export const meta = { name: 'deploy-check', description: 'Deploy gate' }\nreturn 1\n")
-    await writeFile(`${dir}/broken.js`, "const x: string[] = []\n")
-    const saved = listSavedWorkflows({ env: process.env })
-    expect(saved.map((entry) => entry.name)).toEqual(["deploy-check"])
-    expect(saved[0]?.description).toBe("Deploy gate")
-  })
-
-  test("a missing configuration directory is not an error", () => {
-    const saved = listSavedWorkflows({ env: { OPENCODE_CONFIG_DIR: "/nowhere-else" } as NodeJS.ProcessEnv })
-    expect(saved).toEqual([])
+  test("an empty scan is an empty command surface", () => {
+    expect(parseSavedWorkflows({})).toEqual([])
   })
 })

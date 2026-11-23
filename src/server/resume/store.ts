@@ -90,6 +90,130 @@ export function artifactPaths(runId: string, env?: NodeJS.ProcessEnv): RunArtifa
 }
 
 /**
+ * The durable settlement outbox (#180): one file per run holding the notification the host
+ * still owes the parent session.
+ *
+ * The terminal manifest is committed FIRST, then this file is written, then the notification
+ * is admitted. A crash between the commit and the admission leaves the payload here, and the
+ * next boot sweep replays it with the SAME deterministic `msg_` id — the host deduplicates on
+ * that id, so a replay can never double-deliver. The file is deleted once the host reports the
+ * notification admitted (or the session is gone) and whenever a run is cancelled.
+ */
+export const PENDING_NOTIFICATION_FILE = "pending-notification.json"
+
+/**
+ * The reaper's marker on an interrupted run (#136/#175).
+ *
+ * Orphaning a run writes this file into its directory; the resume sweep renames it to claim the
+ * run atomically, and the RPC's `includeHints` poll consumes (reads and deletes) it once. Keeping
+ * the name in ONE module is what stops those three surfaces from drifting apart.
+ */
+export const INTERRUPTED_MARKER = "interrupted.txt"
+
+/**
+ * Non-throwing liveness probe for a recorded owner pid.
+ *
+ * `EPERM` means the process EXISTS but this user may not signal it — alive is the honest answer.
+ * `ESRCH` is the definitive dead signal; any other failure reads as dead too, because a pid that
+ * cannot be probed must never be treated as a reason to skip reaping forever.
+ */
+export function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException | undefined)?.code === "EPERM"
+  }
+}
+
+export interface PendingNotification {
+  /** The deterministic `msg_ultraopen_outcome_<runId>` / `msg_ultraopen_stop_<runId>` id. */
+  id: string
+  sessionID: string
+  runId: string
+  workflow: string
+  status: "completed" | "failed"
+  /** The settlement's model-facing text, stored verbatim for an idempotent replay. */
+  text: string
+  /** The one-line description the synthetic transcript entry displays. */
+  description: string
+}
+
+export function pendingNotificationPath(runId: string, env?: NodeJS.ProcessEnv): string {
+  return join(runDir(runId, env), PENDING_NOTIFICATION_FILE)
+}
+
+/**
+ * Persists the outbox record atomically (temp + rename), so a killed write either leaves the
+ * previous payload whole or none, never a torn file the boot sweep would drop.
+ *
+ * Unlike the readers this can reject: the settlement path decides whether a failed outbox
+ * write blocks the notification or merely loses crash durability, and swallowing the error
+ * here would hide that choice from it.
+ */
+export async function writePendingNotification(
+  record: PendingNotification,
+  env?: NodeJS.ProcessEnv,
+): Promise<string> {
+  if (!isSafeRunId(record.runId)) {throw new Error(`unsafe run id: ${record.runId}`)}
+  const path = pendingNotificationPath(record.runId, env)
+  await atomicWriteFile(path, JSON.stringify(record, null, 2))
+  return path
+}
+
+/**
+ * Reads one outbox record, tolerating a missing file, a torn write and a wrong-shaped JSON
+ * value: a corrupt notification is absent, never a throw that would abort a boot sweep.
+ */
+export async function readPendingNotification(
+  runId: string,
+  env?: NodeJS.ProcessEnv,
+): Promise<PendingNotification | undefined> {
+  try {
+    const parsed: unknown = JSON.parse(await readFile(pendingNotificationPath(runId, env), "utf8"))
+    return isPendingNotification(parsed) ? parsed : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Deletes one outbox record; absent and unremovable files are both no-ops. */
+export async function deletePendingNotification(runId: string, env?: NodeJS.ProcessEnv): Promise<void> {
+  try {
+    await rm(pendingNotificationPath(runId, env), { force: true })
+  } catch {
+    // Best-effort like the rest of the outbox: a stale file is replayed, not fatal.
+  }
+}
+
+/**
+ * Every surviving outbox record under the run-data root, ordered by run id so a boot sweep's
+ * replays are deterministic. Corrupt, foreign and unsafe entries are skipped silently.
+ */
+export async function listPendingNotifications(env?: NodeJS.ProcessEnv): Promise<PendingNotification[]> {
+  const records: PendingNotification[] = []
+  for (const runId of await listRunIds(env)) {
+    const record = await readPendingNotification(runId, env)
+    if (record !== undefined) {records.push(record)}
+  }
+  return records.toSorted((left, right) => left.runId.localeCompare(right.runId))
+}
+
+function isPendingNotification(value: unknown): value is PendingNotification {
+  if (typeof value !== "object" || value === null) {return false}
+  const record = value as Record<string, unknown>
+  return (
+    typeof record["id"] === "string" &&
+    typeof record["sessionID"] === "string" &&
+    typeof record["runId"] === "string" &&
+    typeof record["workflow"] === "string" &&
+    (record["status"] === "completed" || record["status"] === "failed") &&
+    typeof record["text"] === "string" &&
+    typeof record["description"] === "string"
+  )
+}
+
+/**
  * A run id that can never collide with opencode's own artifacts.
  *
  * Rejecting anything unusual outright — rather than sanitising it — keeps a caller-supplied id
@@ -97,6 +221,34 @@ export function artifactPaths(runId: string, env?: NodeJS.ProcessEnv): RunArtifa
  */
 export function isSafeRunId(runId: string): boolean {
   return /^wf_[a-z0-9]{6,}$/u.test(runId)
+}
+
+/**
+ * Every directory under the run-data root that names a run, sorted for determinism.
+ *
+ * The listing IS the trust boundary: `readdir` returns whatever is on disk, including opencode's
+ * own artifacts and anything a user put there, so the unsafe names are dropped here rather than
+ * re-checked by each of the readers below. An unreadable data root lists nothing.
+ */
+export async function listRunIds(env?: NodeJS.ProcessEnv): Promise<string[]> {
+  try {
+    const names = await readdir(dataRoot(env))
+    return names.filter((name) => isSafeRunId(name)).toSorted()
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Every readable run manifest under the run-data root, loaded in one parallel pass.
+ *
+ * Malformed, torn and unsafe entries are skipped by construction: `readManifest` answers
+ * `undefined` for anything it cannot parse, and the ids came from {@link listRunIds}.
+ */
+export async function listManifests(env?: NodeJS.ProcessEnv): Promise<Manifest[]> {
+  const runIds = await listRunIds(env),
+   manifests = await Promise.all(runIds.map(async (runId) => await readManifest(runId, env)))
+  return manifests.filter((manifest): manifest is Manifest => manifest !== undefined)
 }
 
 export async function ensureRunDir(runId: string, env?: NodeJS.ProcessEnv): Promise<RunArtifacts> {
@@ -290,18 +442,9 @@ export async function readJournal(runId: string, env?: NodeJS.ProcessEnv): Promi
  * running here" from "abandoned by a dead process" — a pid alone would be ambiguous after reuse.
  */
 export async function findOrphans(bootId: string, env?: NodeJS.ProcessEnv): Promise<Manifest[]> {
-  const root = dataRoot(env)
-  let names: string[]
-  try {
-    names = await readdir(root)
-  } catch {
-    return []
-  }
-
   const orphans: Manifest[] = []
-  for (const name of names) {
-    if (!isSafeRunId(name)) {continue}
-    const manifest = await readManifest(name, env)
+  for (const runId of await listRunIds(env)) {
+    const manifest = await readManifest(runId, env)
     if (!manifest) {continue}
     if (manifest.status === "running" && manifest.bootId !== bootId) {orphans.push(manifest)}
   }

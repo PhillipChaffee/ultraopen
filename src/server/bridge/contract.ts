@@ -14,6 +14,11 @@ import type { AgentOptions } from "../runtime/run.js"
  * Four variants, selected by whether a schema was requested and whether the caller pinned a
  * specific agent type. The agentType cases are phrased as an additive NOTE, because that agent
  * already has its own instructions and this must not read as a replacement for them.
+ *
+ * V2 has no native structured-output channel: the host injects a direct `StructuredOutput` tool
+ * whose input schema it rewrites per child. The schema contracts therefore describe that tool
+ * by name — research with the normal tools first, then MUST call `StructuredOutput` with the
+ * final answer — so the child is never left looking for a `format` field that no longer exists.
  */
 
 const RETURN_VALUE_CONTRACT = `You are running as a step inside an automated workflow, not in a conversation.
@@ -33,9 +38,9 @@ human will read it directly, and nothing will parse prose out of it.
 Your answer must be delivered by calling the StructuredOutput tool with a value matching the
 required schema. That value is captured directly into a variable in a script.
 
-- Do the work FIRST. Read files, run searches, verify claims — you are free to use every other
-  tool before producing the final value, and you should.
-- Then call StructuredOutput exactly once with the complete result.
+- Do the work FIRST. Read files, run searches, verify claims — you can use every other tool to
+  research before producing the final value, and you should.
+- Then you MUST call StructuredOutput exactly once with your final answer.
 - Populate every required field. If something could not be determined, say so in the field itself
   rather than inventing a value or omitting the key.
 - Any prose you write alongside the tool call is discarded, so put everything into the value.`,
@@ -54,8 +59,9 @@ a reply to a person. Omit conversational framing and return the result itself.`,
 
 NOTE: you have been invoked as a step inside an automated workflow. Follow your own instructions
 above, with one change: deliver your answer by calling the StructuredOutput tool with a value
-matching the required schema. Do your normal work first, then call it exactly once. Prose written
-alongside the tool call is discarded.`
+matching the required schema. Do your normal work first — you can use your tools to research
+before delivering — then you MUST call StructuredOutput exactly once with your final answer.
+Prose written alongside the tool call is discarded.`
 
 /**
  * Selects the contract for a call.

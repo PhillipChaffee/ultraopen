@@ -44,9 +44,9 @@ TURN_SECS="${E2E_TURN_SECS:-600}"
 # whole suite — so SIGKILL finishes the job before wait.
 oc_run_capture() { # FILE SECONDS args...
   local out="$1" secs="$2"; shift 2
-  opencode run --auto "$@" >"$out" 2>&1 &
+  opencode run --standalone --auto "$@" >"$out" 2>&1 &
   local pid=$!
-  manifest_pid "$pid" "opencode run --auto $*"
+  manifest_pid "$pid" "opencode run --standalone --auto $*"
   local deadline=$((SECONDS + secs))
   while kill -0 "$pid" 2>/dev/null && [ $SECONDS -lt $deadline ]; do sleep 2; done
   if kill -0 "$pid" 2>/dev/null; then
@@ -346,11 +346,12 @@ if [ -n "$RUN6" ]; then
     python3 - "$XDG_DATA_HOME/opencode/opencode.db" "$RUN6" <<'PYEOF'
 import sqlite3, sys
 db = sqlite3.connect(sys.argv[1])
-# The part text lives inside JSON, so the quotes around the run id are
-# backslash-escaped in the stored bytes — the pattern must not anchor on them.
+# V2 stores synthetic messages in session_message (type = 'synthetic'); the
+# text lives inside JSON, so the run id's surrounding quotes are escaped in
+# the stored bytes — the pattern must not anchor on them.
 row = db.execute(
-    "SELECT data FROM part WHERE data LIKE ? AND data LIKE ? LIMIT 1",
-    ('%"synthetic":true%', f'%workflow-completed run=%{sys.argv[2]}%'),
+    "SELECT data FROM session_message WHERE type = 'synthetic' AND data LIKE ? LIMIT 1",
+    (f'%workflow-completed run=%{sys.argv[2]}%',),
 ).fetchone()
 sys.exit(0 if row else 1)
 PYEOF
@@ -408,8 +409,8 @@ if [ -n "$RUN6B" ]; then
 import sqlite3, sys
 db = sqlite3.connect(sys.argv[1])
 row = db.execute(
-    "SELECT data FROM part WHERE data LIKE ? AND data LIKE ? LIMIT 1",
-    ('%"synthetic":true%', f'%workflow-stopped run=%{sys.argv[2]}%'),
+    "SELECT data FROM session_message WHERE type = 'synthetic' AND data LIKE ? LIMIT 1",
+    (f'%workflow-stopped run=%{sys.argv[2]}%',),
 ).fetchone()
 sys.exit(0 if row else 1)
 PYEOF
@@ -469,9 +470,9 @@ t6c_prompt() {
 }
 runs_snapshot "$OUT/runs-before-t6c.txt"
 T6C_PROMPT="$(t6c_prompt)"
-opencode run --auto --format json "$T6C_PROMPT" >"$OUT/t6c.json" 2>&1 &
+opencode run --standalone --auto --format json "$T6C_PROMPT" >"$OUT/t6c.json" 2>&1 &
 T6C_PID=$!
-manifest_pid "$T6C_PID" "opencode run --auto --format json (t6c control-stop turn)"
+manifest_pid "$T6C_PID" "opencode run --standalone --auto --format json (t6c control-stop turn)"
 RUN6C=""
 for _ in $(seq 1 240); do
   RUN6C="$(newest_run "$OUT/runs-before-t6c.txt")"
@@ -515,8 +516,8 @@ else
 import sqlite3, sys
 db = sqlite3.connect(sys.argv[1])
 row = db.execute(
-    "SELECT 1 FROM part WHERE data LIKE ? AND (data LIKE ? OR data LIKE ?) LIMIT 1",
-    ('%"synthetic":true%', f'%workflow-failed run=%{sys.argv[2]}%', f'%workflow-stopped run=%{sys.argv[2]}%'),
+    "SELECT 1 FROM session_message WHERE type = 'synthetic' AND (data LIKE ? OR data LIKE ?) LIMIT 1",
+    (f'%workflow-failed run=%{sys.argv[2]}%', f'%workflow-stopped run=%{sys.argv[2]}%'),
 ).fetchone()
 sys.exit(0 if row is None else 1)
 PYEOF
@@ -699,16 +700,16 @@ else
   bad "both runs must settle completed" "A: $(manifest_status "$T10_A"), B: $(manifest_status "$T10_B")"
 fi
 # Both notifications arrive (ticket #14, scenario 2): hydration is unconditional on
-# settle, so a parallel pair must leave TWO synthetic workflow-completed parts in
-# the parent session — one naming each run id. Same db-level proof as T6 (the
-# literal pixel is upstream-hidden in the TUI on 1.18.x).
+# settle, so a parallel pair must leave TWO synthetic session_message rows in
+# the parent session — one naming each run id. db-level because the message
+# text is the durable artifact; the TUI renders the same rows as `◈`.
 t10_notifications() {
   python3 - "$XDG_DATA_HOME/opencode/opencode.db" "$T10_A" "$T10_B" <<'PYEOF'
 import sqlite3, sys
 db = sqlite3.connect(sys.argv[1])
 missing = [run_id for run_id in sys.argv[2:4] if not db.execute(
-    "SELECT 1 FROM part WHERE data LIKE ? AND data LIKE ? LIMIT 1",
-    ('%"synthetic":true%', f'%workflow-completed run=%{run_id}%'),
+    "SELECT 1 FROM session_message WHERE type = 'synthetic' AND data LIKE ? LIMIT 1",
+    (f'%workflow-completed run=%{run_id}%',),
 ).fetchone()]
 sys.exit(1 if missing else 0)
 PYEOF
@@ -980,9 +981,9 @@ t12_prompt() {
 }
 runs_snapshot "$OUT/runs-before-t12.txt"
 T12_PROMPT="$(t12_prompt)"
-opencode run --auto --format json "$T12_PROMPT" >"$OUT/t12.json" 2>&1 &
+opencode run --standalone --auto --format json "$T12_PROMPT" >"$OUT/t12.json" 2>&1 &
 T12_PID=$!
-manifest_pid "$T12_PID" "opencode run --auto --format json (t12 launch)"
+manifest_pid "$T12_PID" "opencode run --standalone --auto --format json (t12 launch)"
 # The kill must land mid-run: poll tightly for the first settled agent (the journal's
 # replayable prefix) and SIGKILL immediately — six sequential agents give a ~10s+ margin
 # before the run could settle on its own.
@@ -1010,20 +1011,23 @@ else
   # Phase 2: the relaunch. A long-lived serve host so the resumed run outlives turns.
   scratch_write_config '{"autoResume": true}'
   T12_PORT="${E2E_RESUME_PORT:-18889}"
-  opencode serve --port "$T12_PORT" >"$OUT/t12-serve.log" 2>&1 &
+  OPENCODE_PASSWORD="$E2E_PASSWORD" opencode serve --port "$T12_PORT" --hostname 127.0.0.1 \
+    >"$OUT/t12-serve.log" 2>&1 &
   T12_SERVE_PID=$!
-  manifest_pid "$T12_SERVE_PID" "opencode serve --port $T12_PORT (t12 resume host)"
-  t12_health_ok() { curl -sf -m "$E2E_CURL_TIMEOUT" "http://127.0.0.1:$T12_PORT/global/health" >/dev/null 2>&1; }
+  manifest_pid "$T12_SERVE_PID" "opencode serve --port $T12_PORT --hostname 127.0.0.1 (t12 resume host)"
+  t12_health_ok() { curl -sf -m "$E2E_CURL_TIMEOUT" -u "opencode:$E2E_PASSWORD" "http://127.0.0.1:$T12_PORT/api/info" 2>/dev/null | grep -q '"version"'; }
   if wait_for "$E2E_WAIT_TIMEOUT" t12_health_ok; then
-    ok "the relaunched server is up (the boot sweep runs at plugin init)"
+    ok "the relaunched server is up (the boot sweep runs at plugin location init)"
   else
     bad "the relaunched server never became healthy" "see $OUT/t12-serve.log"
   fi
 
-  # `opencode serve` defers its server instance (and the plugin init that runs the boot sweep)
-  # until the first instance-scoped request — /global/health is server-level and never creates
-  # one, so touch the instance explicitly and give the sweep a beat.
-  curl -sf -m "$E2E_CURL_TIMEOUT" "http://127.0.0.1:$T12_PORT/session" >/dev/null 2>&1 || true
+  # V2 location plugins boot lazily: /api/info is server-level and never
+  # creates the location services the boot sweep runs inside. Warm the
+  # location explicitly, then give the sweep a beat.
+  curl -sf -m "$E2E_CURL_TIMEOUT" -u "opencode:$E2E_PASSWORD" -G \
+    --data-urlencode "location[directory]=$WORK_DIR" \
+    "http://127.0.0.1:$T12_PORT/api/agent" >/dev/null 2>&1 || true
   sleep 2
 
   t12_settled() { [ "$(manifest_status "$RUN12")" = "completed" ]; }
@@ -1046,7 +1050,7 @@ else
   if [ -z "$SESSION12" ]; then
     bad "no session id in the launch stream" "cannot address the original session"
   else
-    curl -sf -m "$E2E_CURL_TIMEOUT" "http://127.0.0.1:$T12_PORT/session/$SESSION12/message" >"$OUT/t12-messages.json" 2>/dev/null || true
+    curl -sf -m "$E2E_CURL_TIMEOUT" -u "opencode:$E2E_PASSWORD" "http://127.0.0.1:$T12_PORT/api/session/$SESSION12/message" >"$OUT/t12-messages.json" 2>/dev/null || true
     if [ -f "$OUT/t12-messages.json" ] && grep -q "workflow-completed" "$OUT/t12-messages.json" && grep -qF "$RUN12" "$OUT/t12-messages.json"; then
       ok "the original session received the completion notification"
     else

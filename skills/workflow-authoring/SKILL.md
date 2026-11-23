@@ -49,7 +49,8 @@ workflow.
 | `workflow({ script } \| 'name', args?)` | Runs another workflow inline — by inline script or by saved name (the shipped plugin populates `context.named`, and the e2e suite exercises the named form live). One level only. THROWS on failure, unlike `agent()`. |
 
 `agent()` opts: `label`, `phase`, `schema`, `model`, `effort`, `agentType`, `isolation`,
-`disallowedTools`.
+`disallowedTools`. `isolation: "worktree"` gives the agent its own git worktree; V2 plumbs the
+worktree root through child creation and verifies the session landed there.
 
 ## Choosing between pipeline and parallel
 
@@ -123,8 +124,10 @@ default for the whole host.
   states which contract applies — follow it.
 - **Stop.** `workflow({ stop: "<runId>" })` aborts the run's subagents, records the run
   `cancelled`, and hydrates a `<workflow-stopped>` confirmation — no completion notification
-  follows a stop. Interrupting the turn (ESC) never stops a background run. `workflow_status`
-  reports `cancelled` as terminal.
+  follows a stop. Interrupting the turn (ESC) never stops a background run. In the TUI,
+  `/workflow-stop <runId>` stops a run directly through `UltraopenRpc` with no confirmation. The
+  `/workflows` panel lists runs and their child sessions. `workflow_status` reports `cancelled`
+  as terminal.
 - **Parallel runs.** A session outside ultracode holds one live run — a second launch is refused
   naming the active run id. An ultracode-active session may hold `ultracodeMaxRuns` (default 8,
   clamped 1–32); every launch result names its sibling live runs, oldest first. The stop argument
@@ -132,9 +135,10 @@ default for the whole host.
 - **Per-turn reminder.** While the session holds a live run, each turn carries an ephemeral
   reminder naming the run id, the workflow, the agents spawned and the elapsed time. It is never
   persisted and refiring replaces it, so there is exactly one per turn.
-- **Crash recovery is automatic.** On the next start, a run its dead process interrupted
-  re-executes from the journal under the SAME run id: completed agents replay instantly, the
-  missing tail re-runs, and the original session is hydrated with the outcome. Guards: the
+- **Crash recovery is automatic.** On the next start of the plugin's location runtime, a run its
+  dead process interrupted re-executes from the journal under the SAME run id: completed agents
+  replay instantly, the missing tail re-runs, and the original session is hydrated with the
+  outcome. In the TUI, a `⠋` hint in the composer names the interrupted run. Guards: the
   interruption must be younger than `autoResumeTtlHours` (default 24 h), at most `autoResumeMax`
   (default 1) run adopts per boot, and a run stopped with the stop argument never resumes. Opt
   out with `autoResume: false`; resume any older run manually with `resumeFromRunId`.
