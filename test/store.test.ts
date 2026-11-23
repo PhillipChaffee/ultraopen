@@ -3,15 +3,23 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import {
+  PENDING_NOTIFICATION_FILE,
   appendJournal,
   appendJournalEntry,
   artifactPaths,
   dataRoot,
+  deletePendingNotification,
   ensureRunDir,
   findOrphans,
   flushJournalEntry,
+  isProcessAlive,
   isSafeRunId,
+  listManifests,
+  listPendingNotifications,
+  listRunIds,
+  pendingNotificationPath,
   readJournal,
+  readPendingNotification,
   atomicWriteFile,
   readManifest,
   readManifestState,
@@ -20,10 +28,12 @@ import {
   removeRunDir,
   runDir,
   writeManifest,
+  writePendingNotification,
   writeResult,
   writeScript,
 } from "../src/server/resume/store.js"
 import type { JournalEntry, Manifest } from "../src/server/resume/journal.js"
+import type { PendingNotification } from "../src/server/resume/store.js"
 
 const entry = (key: string): JournalEntry =>
   ({ type: "result", key, scopePath: "root", ordinal: 0, label: "l", outputTokens: 0, status: "ok" }) as JournalEntry
@@ -41,6 +51,18 @@ const manifest = (overrides: Partial<Manifest> = {}): Manifest => ({
   status: "running",
   childSessionIDs: [],
   startedAt: 0,
+  ...overrides,
+})
+
+/** A complete outbox record; tests override only the field under study. */
+const notification = (overrides: Partial<PendingNotification> = {}): PendingNotification => ({
+  id: "msg_ultraopen_outcome_wf_abc123",
+  sessionID: "ses_parent",
+  runId: "wf_abc123",
+  workflow: "demo",
+  status: "completed",
+  text: "the final value",
+  description: "workflow completed: demo",
   ...overrides,
 })
 
@@ -229,6 +251,66 @@ test("flushJournalEntry never rejects — a disk failure must not lose a live ru
   })
 })
 
+describe("the durable notification outbox (#180)", () => {
+  test("round-trips a notification through write, read, list and delete", async () => {
+    await ensureRunDir("wf_abc123", env)
+    expect(pendingNotificationPath("wf_abc123", env)).toBe(
+      join(runDir("wf_abc123", env), PENDING_NOTIFICATION_FILE),
+    )
+    await writePendingNotification(notification(), env)
+    expect(await readPendingNotification("wf_abc123", env)).toEqual(notification())
+    expect(await listPendingNotifications(env)).toEqual([notification()])
+
+    await deletePendingNotification("wf_abc123", env)
+    expect(await readPendingNotification("wf_abc123", env)).toBeUndefined()
+    expect(await listPendingNotifications(env)).toEqual([])
+  })
+
+  test("a failed notification keeps its failure text and status", async () => {
+    await ensureRunDir("wf_abc123", env)
+    await writePendingNotification(notification({ status: "failed", text: "it blew up" }), env)
+    const read = await readPendingNotification("wf_abc123", env)
+    expect(read?.status).toBe("failed")
+    expect(read?.text).toBe("it blew up")
+  })
+
+  test("a corrupt or malformed notification reads as absent instead of throwing", async () => {
+    await ensureRunDir("wf_abc123", env)
+    const path = pendingNotificationPath("wf_abc123", env)
+    await writeFile(path, "{torn", "utf8")
+    expect(await readPendingNotification("wf_abc123", env)).toBeUndefined()
+    // A parseable JSON value with the wrong shape is corrupt too, not a crash.
+    await writeFile(path, JSON.stringify({ id: "msg_x" }), "utf8")
+    expect(await readPendingNotification("wf_abc123", env)).toBeUndefined()
+    // A missing notification is simply absent.
+    expect(await readPendingNotification("wf_missing1", env)).toBeUndefined()
+  })
+
+  test("listing skips corrupt notifications, unsafe dirs and missing data roots", async () => {
+    await ensureRunDir("wf_abc123", env)
+    await writePendingNotification(notification(), env)
+    await ensureRunDir("wf_bad001", env)
+    await writeFile(pendingNotificationPath("wf_bad001", env), "{torn", "utf8")
+    await mkdir(join(dataRoot(env), "not-a-run"), { recursive: true })
+
+    const listed = await listPendingNotifications(env)
+    expect(listed.map((pending) => pending.runId)).toEqual(["wf_abc123"])
+    expect(await listPendingNotifications({ XDG_DATA_HOME: join(base, "absent") } as NodeJS.ProcessEnv)).toEqual([])
+  })
+
+  test("deleting an absent notification never rejects", async () => {
+    await expect(deletePendingNotification("wf_abc123", env)).resolves.toBeUndefined()
+    await expect(deletePendingNotification("wf_../../escape", env)).resolves.toBeUndefined()
+  })
+
+  test("the write is atomic: it leaves no temp file behind", async () => {
+    await ensureRunDir("wf_abc123", env)
+    await writePendingNotification(notification(), env)
+    const entries = await readdir(runDir("wf_abc123", env))
+    expect(entries.filter((name) => name.includes(".tmp"))).toEqual([])
+  })
+})
+
 describe("orphan detection", () => {
   test("finds runs left running by a DIFFERENT boot", async () => {
     // The parent server never cascades an abort to plain parentID children, so a process that died
@@ -260,6 +342,43 @@ describe("orphan detection", () => {
 
   test("returns nothing when the data root does not exist yet", async () => {
     expect(await findOrphans("boot", { XDG_DATA_HOME: join(base, "absent") } as NodeJS.ProcessEnv)).toEqual([])
+  })
+})
+
+/** An errno-shaped failure, for driving the liveness probe's two syscall outcomes. */
+const errno = (code: string): Error => Object.assign(new Error(code), { code })
+
+describe("liveness and directory helpers", () => {
+  test("isProcessAlive treats EPERM as alive and ESRCH as dead; listRunIds skips unsafe names; listManifests loads valid manifests", async () => {
+    const original = process.kill
+    try {
+      process.kill = (() => true) as typeof process.kill
+      expect(isProcessAlive(process.pid)).toBe(true)
+      // EPERM means the process EXISTS but we may not signal it — alive is the honest answer.
+      process.kill = (() => {
+        throw errno("EPERM")
+      }) as typeof process.kill
+      expect(isProcessAlive(process.pid)).toBe(true)
+      // ESRCH is the definitive dead signal.
+      process.kill = (() => {
+        throw errno("ESRCH")
+      }) as typeof process.kill
+      expect(isProcessAlive(process.pid)).toBe(false)
+    } finally {
+      process.kill = original
+    }
+
+    await ensureRunDir("wf_abc123", env)
+    await writeManifest("wf_abc123", manifest(), env)
+    await mkdir(join(dataRoot(env), "not-a-run"), { recursive: true })
+    await ensureRunDir("wf_nomani1", env)
+
+    expect(await listRunIds(env)).toEqual(["wf_abc123", "wf_nomani1"])
+    const manifests = await listManifests(env)
+    expect(manifests.map((loaded) => loaded.runId)).toEqual(["wf_abc123"])
+    // A missing data root lists nothing instead of throwing.
+    expect(await listRunIds({ XDG_DATA_HOME: join(base, "absent") } as NodeJS.ProcessEnv)).toEqual([])
+    expect(await listManifests({ XDG_DATA_HOME: join(base, "absent") } as NodeJS.ProcessEnv)).toEqual([])
   })
 })
 

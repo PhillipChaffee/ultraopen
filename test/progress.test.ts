@@ -1,24 +1,11 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { ProgressWriter } from "../src/server/resume/progress.js"
 import { LARGE_RUN_AGENTS } from "../src/server/script/limits.js"
-import { RunPoller, activeRuns, agentRowText, dataRoot, formatElapsed, glyph, hintLine, loadAllRuns, loadFailedReasons, loadInterruptedRuns, stripAgentText, summarize, toView, transcriptHint } from "../src/tui/data.js"
+import { agentRowText, formatElapsed, glyph, hintLine, stripAgentText, summarize, transcriptHint } from "../src/tui/data.js"
 import type { RunView } from "../src/tui/data.js"
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-
-/** A null journal entry, for reason-derivation fixtures. */
-const nullEntry = (label: string, reason: string): string =>
-  JSON.stringify({ type: "result", key: `k-${label}`, label, status: "null", reason, outputTokens: 0 })
-
-/** Bounded waiting for a subscriber's async refresh — the wait-instead-of-race idiom. */
-const waitFor = async (until: () => boolean): Promise<void> => {
-  for (let waited = 0; waited < 200; waited++) {
-    if (until()) {return}
-    await Bun.sleep(5)
-  }
-  throw new Error("timed out waiting for the poller's refresh")
-}
 
 const writer = (writes: { path: string; body: string }[]) =>
   new ProgressWriter({
@@ -249,57 +236,79 @@ describe("ProgressWriter", () => {
   })
 })
 
+describe("ProgressWriter — stopping state (#175)", () => {
+  test("a live snapshot reports running by default", () => {
+    expect(writer([]).snapshot.status).toBe("running")
+  })
+
+  test("markStopping(now) flips the snapshot to stopping and flushes it", async () => {
+    const writes: { path: string; body: string }[] = [],
+     progress = writer(writes)
+    progress.apply({ type: "log", message: "before the stop" }, 1)
+    await progress.flush()
+
+    await progress.markStopping(1234)
+
+    expect(progress.snapshot.status).toBe("stopping")
+    expect(progress.snapshot.updatedAt).toBe(1234)
+    // The mark itself flushes: a stop request that only lived in memory would leave the
+    // TUI and the status tool reading a stale running snapshot.
+    expect(writes.length).toBe(2)
+    const written = JSON.parse(writes[1]?.body ?? "{}") as { status?: string }
+    expect(written.status).toBe("stopping")
+  })
+
+  test("markStopping on an unchanged writer still writes, so the request is observable", async () => {
+    const writes: { path: string; body: string }[] = [],
+     progress = writer(writes)
+    await progress.markStopping(9)
+    expect(writes.length).toBe(1)
+    expect(JSON.parse(writes[0]?.body ?? "{}")).toMatchObject({ status: "stopping", updatedAt: 9 })
+  })
+
+  test("markStopping waits for a flush already in flight before it resolves", async () => {
+    // Regression: flush() used to return immediately when a write was in flight. markStopping
+    // awaited that no-op, resolved, and the stop path emitted `stopped` while `progress.json` still
+    // said `running` — until the in-flight write happened to land.
+    let releaseWrite!: () => void
+    const gate = new Promise<void>((resolve) => {
+       releaseWrite = resolve
+     }),
+     writes: string[] = [],
+     progress = new ProgressWriter({
+       runId: "wf_abc123",
+       workflow: "d",
+       sessionID: "s",
+       startedAt: 0,
+       write: async (_path, body) => {
+         // The FIRST write blocks on the gate; later writes land immediately.
+         if (writes.length === 0 && releaseWrite !== undefined) {await gate}
+         writes.push(body)
+       },
+     })
+
+    progress.apply({ type: "log", message: "before" }, 1)
+    const inFlight = progress.flush()
+    await Promise.resolve()
+    const stopping = progress.markStopping(2)
+    let resolved = false
+    void stopping.then(() => (resolved = true))
+    await Promise.resolve()
+    await Promise.resolve()
+    // Still blocked behind the earlier write: `stopping` is not on disk yet.
+    expect(resolved).toBe(false)
+    expect(writes).toEqual([])
+
+    releaseWrite()
+    await inFlight
+    await stopping
+    // The drain loop wrote the FIRST snapshot, then re-checked `#dirty` and wrote `stopping`.
+    expect(writes.length).toBe(2)
+    expect(JSON.parse(writes[1] ?? "{}")).toMatchObject({ status: "stopping", updatedAt: 2 })
+  })
+})
+
 describe("TUI view shaping", () => {
-  test("counts done and failed agents", () => {
-    const view = toView(
-      {
-        runId: "wf_a",
-        workflow: "demo",
-        startedAt: 0,
-        agents: [
-          { index: 0, label: "a", status: "done" },
-          { index: 1, label: "b", status: "failed" },
-          { index: 2, label: "c", status: "running" },
-        ],
-      },
-      60_000,
-    )
-    expect(view.done).toBe(1)
-    expect(view.failed).toBe(1)
-    expect(view.total).toBe(3)
-    expect(view.elapsedSeconds).toBe(60)
-  })
-
-  test("tolerates a partially-written snapshot", () => {
-    // The file is read while it is being written, so missing fields are normal rather than a bug.
-    const view = toView({}, 0)
-    expect(view.workflow).toBe("workflow")
-    expect(view.agents).toEqual([])
-    expect(view.elapsedSeconds).toBe(0)
-  })
-
-  test("tolerates a valid agents array containing non-object entries", () => {
-    // A hand-edited or corrupt progress.json must degrade to a shorter list, never throw — a
-    // throw here would loop on every poll cycle.
-    const view = toView(
-      {
-        runId: "wf_a",
-        agents: [
-          { index: 0, label: "a", status: "done" },
-          null,
-          42,
-          { label: "no status" },
-        ],
-        logs: ["ok", 7, null],
-      } as unknown as Parameters<typeof toView>[0],
-      0,
-    )
-    expect(view.agents.length).toBe(1)
-    expect(view.agents[0]?.label).toBe("a")
-    expect(view.total).toBe(1)
-    expect(view.logs).toEqual(["ok"])
-  })
-
   test.each([
     [5, "5s"],
     [59, "59s"],
@@ -336,91 +345,22 @@ describe("TUI view shaping", () => {
     expect(stripAgentText({ index: 0, label: "a", status: "running" })).toBe("⠋ a")
   })
 
-  test("the transcript hint names the picker and the gesture without positional claims (#150)", () => {
+  test("the transcript hint names the V2 affordances without positional claims (#150)", () => {
     const hint = transcriptHint()
+    expect(hint).toContain("/workflows")
+    expect(hint).toContain("clickable")
     expect(hint).toContain("/sessions")
     expect(hint).toContain("ultraopen · <label>")
-    expect(hint).toContain("leader+down")
-    expect(hint).toContain("right/left")
-    expect(hint).toContain("up")
+    expect(hint).not.toContain("leader+down")
     expect(hint).not.toMatch(/row \d/u)
     expect(hint).not.toContain("child 2")
   })
-
-  test("a snapshot's agent session ids reach the view shape unharmed", () => {
-    const view = toView(
-      {
-        runId: "wf_a",
-        workflow: "demo",
-        startedAt: 0,
-        agents: [{ index: 0, label: "a", status: "running", sessionID: "ses_child_0" }],
-      },
-      0,
-    )
-    expect(view.agents[0]?.sessionID).toBe("ses_child_0")
-  })
 })
 
-const seed = async (
-  root: string,
-  runId: string,
-  manifest: Record<string, unknown>,
-  progress?: Record<string, unknown>,
-): Promise<void> => {
-  await mkdir(join(root, runId), { recursive: true })
-  await writeFile(join(root, runId, "manifest.json"), JSON.stringify(manifest), "utf8")
-  if (progress) {await writeFile(join(root, runId, "progress.json"), JSON.stringify(progress), "utf8")}
-}
-
-describe("activeRuns", () => {
-  test("returns only running runs for THIS session", async () => {
-    const root = await mkdtemp(join(tmpdir(), "ultraopen-tui-"))
-    await seed(root, "wf_a", { status: "running", sessionID: "s1" }, { runId: "wf_a", workflow: "mine", startedAt: 0 })
-    await seed(root, "wf_b", { status: "completed", sessionID: "s1" }, { runId: "wf_b", startedAt: 0 })
-    await seed(root, "wf_c", { status: "running", sessionID: "other" }, { runId: "wf_c", startedAt: 0 })
-
-    const runs = await activeRuns({ root, sessionID: "s1", now: 0 })
-    expect(runs.map((run) => run.runId)).toEqual(["wf_a"])
-    expect(runs[0]?.workflow).toBe("mine")
-  })
-
-  test("skips a run with no progress file yet", async () => {
-    const root = await mkdtemp(join(tmpdir(), "ultraopen-tui-"))
-    await seed(root, "wf_a", { status: "running", sessionID: "s1" })
-    expect(await activeRuns({ root, sessionID: "s1", now: 0 })).toEqual([])
-  })
-
-  test("skips unreadable entries rather than breaking the UI", async () => {
-    const root = await mkdtemp(join(tmpdir(), "ultraopen-tui-"))
-    await mkdir(join(root, "not-a-run"), { recursive: true })
-    await seed(root, "wf_a", { status: "running", sessionID: "s1" }, { runId: "wf_a", startedAt: 0 })
-    await writeFile(join(root, "wf_bad", "manifest.json").replace("wf_bad/", ""), "x").catch(() => undefined)
-
-    const result = await activeRuns({ root, sessionID: "s1", now: 0 })
-    expect(result.length).toBe(1)
-  })
-
-  test("returns nothing when the root does not exist", async () => {
-    expect(await activeRuns({ root: "/definitely/not/here", sessionID: "s1", now: 0 })).toEqual([])
-  })
-
-  test("orders runs stably so a long run does not jump around", async () => {
-    const root = await mkdtemp(join(tmpdir(), "ultraopen-tui-"))
-    await seed(root, "wf_zzz", { status: "running", sessionID: "s1" }, { runId: "wf_zzz", startedAt: 0 })
-    await seed(root, "wf_aaa", { status: "running", sessionID: "s1" }, { runId: "wf_aaa", startedAt: 0 })
-    const result = await activeRuns({ root, sessionID: "s1", now: 0 })
-    expect(result.map((run) => run.runId)).toEqual(["wf_aaa", "wf_zzz"])
-    await rm(root, { recursive: true, force: true })
-  })
-})
-
-describe("dataRoot", () => {
-  test("agrees with the server half on where runs live", () => {
-    expect(dataRoot({ XDG_DATA_HOME: "/data" } as NodeJS.ProcessEnv, "/home/u")).toBe(
-      join("/data", "opencode", "tool-output", "ultraopen"),
-    )
-    expect(dataRoot({} as NodeJS.ProcessEnv, "/home/u")).toBe(
-      join("/home/u", ".local", "share", "opencode", "tool-output", "ultraopen"),
+describe("hintLine — the interrupted-run affordance", () => {
+  test("names the workflow, the run id, and the resume path", () => {
+    expect(hintLine({ runId: "wf_orphan01", workflow: "research" })).toBe(
+      "interrupted: research (wf_orphan01) — ask to resume it",
     )
   })
 })
@@ -452,163 +392,6 @@ describe("default write path", () => {
   })
 })
 
-/** A controllable timer, so poller tests are instant and deterministic. */
-const fakeTimers = () => {
-  const pending: (() => void)[] = [],
-   cleared: unknown[] = []
-  return {
-    api: {
-      setInterval: (fn: () => void) => {
-        pending.push(fn)
-        return pending.length
-      },
-      clearInterval: (handle: unknown) => {
-        cleared.push(handle)
-      },
-    },
-    tick: () => {
-      const snapshot = [...pending]
-      for (const fn of snapshot) {
-        fn()
-      }
-    },
-    cleared,
-  }
-}
-
-describe("RunPoller", () => {
-  test("with no injected timers, the real interval path works and stops on unsubscribe", async () => {
-    // The default timer arrows are the only path the fake-timer tests never reach. A fast real
-    // interval proves ticks fire, and that no tick lands after unsubscribe — i.e. cleanup is
-    // real, not a no-op.
-    const root = "/definitely/not/here",
-     poller = new RunPoller({ root: () => root, pollMs: 5 })
-    let calls = 0
-    const unsubscribe = poller.subscribe(() => "s1", () => {
-      calls++
-    })
-    try {
-      // At least one tick fires while subscribed.
-      await Bun.sleep(30)
-      const settled = calls
-      expect(settled).toBeGreaterThanOrEqual(1)
-
-      unsubscribe()
-      await Bun.sleep(30)
-      expect(calls).toBe(settled)
-    } finally {
-      unsubscribe()
-    }
-  })
-
-  test("one timer serves every subscriber surface, filtered per session", async () => {
-    const root = await mkdtemp(join(tmpdir(), "ultraopen-poll-"))
-    await seed(root, "wf_a", { status: "running", sessionID: "s1" }, { runId: "wf_a", startedAt: 0 })
-    await seed(root, "wf_b", { status: "running", sessionID: "s2" }, { runId: "wf_b", startedAt: 0 })
-    const timers = fakeTimers(),
-     poller = new RunPoller({ root: () => root, pollMs: 1000, timers: timers.api }),
-
-     mine: RunView[][] = [],
-     other: RunView[][] = [],
-     unsub1 = poller.subscribe(() => "s1", (runs) => mine.push(runs))
-    // The immediate refresh fires at subscribe time — waited for, not slept for: under load
-    // a fixed sleep can cut the refresh off and race the counts below.
-    await waitFor(() => mine.length > 0)
-    const unsub2 = poller.subscribe(() => "s2", (runs) => other.push(runs))
-    await waitFor(() => other.length > 0)
-
-    expect(mine.at(-1)?.map((run) => run.runId)).toEqual(["wf_a"])
-    expect(other.at(-1)?.map((run) => run.runId)).toEqual(["wf_b"])
-
-    // One interval fires once; BOTH subscribers get fresh data from that single directory pass.
-    const mineBefore = mine.length,
-     otherBefore = other.length
-    timers.tick()
-    await waitFor(() => mine.length >= mineBefore + 1 && other.length >= otherBefore + 1)
-    expect(mine.length).toBe(mineBefore + 1)
-    expect(other.length).toBe(otherBefore + 1)
-
-    // With every surface gone, the interval is cleared and ticking produces no more updates.
-    const mineAfter = mine.length
-    unsub2()
-    unsub1()
-    // The one started interval was actually cleared.
-    expect(timers.cleared.length).toBe(1)
-    timers.tick()
-    // The negative direction, bounded: no update may land after the unsubscribe. A fixed
-    // sleep could false-pass when a buggy refresh lands after it, so poll for the absence.
-    for (let waited = 0; waited < 20; waited++) {
-      if (mine.length !== mineAfter || other.length !== otherBefore + 1) {
-        throw new Error("an update landed after every surface unsubscribed")
-      }
-      await Bun.sleep(10)
-    }
-    expect(mine.length).toBe(mineAfter)
-    expect(other.length).toBe(otherBefore + 1)
-
-    await rm(root, { recursive: true, force: true })
-  })
-})
-
-describe("failed reasons from the journal", () => {
-  let root: string
-
-  beforeEach(async () => {
-    root = await mkdtemp(join(tmpdir(), "ultraopen-tui-"))
-  })
-
-  afterEach(async () => {
-    await rm(root, { recursive: true, force: true })
-  })
-
-  test("maps each failed agent's label to its LATEST reason", async () => {
-    const dir = join(root, "wf_reasons1")
-    await mkdir(dir, { recursive: true })
-    await writeFile(join(dir, "journal.jsonl"), [
-      nullEntry("a", "deadline"),
-      nullEntry("b", "api-error"),
-      // A stall restart appends another entry for the same key; the newest wins.
-      nullEntry("a", "api-error"),
-      JSON.stringify({ type: "result", key: "k-ok", label: "c", status: "ok", outputTokens: 1 }),
-      "{torn",
-    ].join("\n"))
-    const reasons = await loadFailedReasons(dir)
-    expect(reasons.get("a")).toBe("api-error")
-    expect(reasons.get("b")).toBe("api-error")
-    expect(reasons.get("c")).toBeUndefined()
-  })
-
-  test("a missing or torn journal yields an empty map, never a throw", async () => {
-    const missing = await loadFailedReasons(join(root, "missing"))
-    expect(missing.size).toBe(0)
-    const dir = join(root, "wf_torn")
-    await mkdir(dir, { recursive: true })
-    await writeFile(join(dir, "journal.jsonl"), "not json at all\n")
-    const torn = await loadFailedReasons(dir)
-    expect(torn.size).toBe(0)
-  })
-
-  test("loadRun attaches the reason to failed agent rows", async () => {
-    const dir = join(root, "wf_attach")
-    await mkdir(dir, { recursive: true })
-    await writeFile(
-      join(dir, "manifest.json"),
-      JSON.stringify({ runId: "wf_reasons1", bootId: "b", pid: 1, sessionID: "s1", status: "running", startedAt: 0 }),
-    )
-    await writeFile(
-      join(dir, "progress.json"),
-      JSON.stringify({ runId: "wf_reasons1", workflow: "demo", sessionID: "s1", startedAt: 0, agents: [{ index: 0, label: "probe", status: "failed" }] }),
-    )
-    await writeFile(
-      join(dir, "journal.jsonl"),
-      `${JSON.stringify({ type: "result", key: "k", label: "probe", status: "null", reason: "deadline", outputTokens: 0 })}\n`,
-    )
-    const views = await loadAllRuns(root, 60_000)
-    const first = views[0]?.agents[0]
-    expect(first?.reason).toBe("deadline")
-  })
-})
-
 describe("agentRowText", () => {
   test("failed rows carry the reason; other rows do not", () => {
     expect(agentRowText({ index: 0, label: "a", status: "failed", reason: "deadline" })).toBe("✗ a — deadline")
@@ -617,73 +400,25 @@ describe("agentRowText", () => {
   })
 })
 
-describe("interrupted-run hints", () => {
-  let root: string
-
-  beforeEach(async () => {
-    root = await mkdtemp(join(tmpdir(), "ultraopen-hints-"))
-  })
-
-  afterEach(async () => {
-    await rm(root, { recursive: true, force: true })
-  })
-
-  test("a marker file yields a hint with the run id and workflow", async () => {
-    const dir = join(root, "wf_orphan01")
-    await mkdir(dir, { recursive: true })
-    await writeFile(join(dir, "interrupted.txt"), "wf_orphan01")
-    await writeFile(
-      join(dir, "progress.json"),
-      JSON.stringify({ runId: "wf_orphan01", workflow: "research", sessionID: "s" }),
-    )
-    const hints = await loadInterruptedRuns(root)
-    expect(hints).toEqual([{ runId: "wf_orphan01", workflow: "research" }])
-    expect(hintLine(hints[0]!)).toBe("interrupted: research (wf_orphan01) — ask to resume it")
-  })
-
-  test("runs without a marker never hint (completed and failed stay silent)", async () => {
-    const done = join(root, "wf_done0001")
-    await mkdir(done, { recursive: true })
-    await writeFile(join(done, "manifest.json"), JSON.stringify({ runId: "wf_done0001", status: "completed" }))
-    expect(await loadInterruptedRuns(root)).toEqual([])
-  })
-
-  test("a missing or malformed marker or manifest never blocks the read", async () => {
-    const broken = join(root, "wf_broken1")
-    await mkdir(broken, { recursive: true })
-    await writeFile(join(broken, "interrupted.txt"), "wf_broken1")
-    await writeFile(join(broken, "progress.json"), "not json\n")
-    const hints = await loadInterruptedRuns(root)
-    // The run id falls back to the directory name when nothing else parses.
-    expect(hints).toEqual([{ runId: "wf_broken1", workflow: "workflow" }])
-    expect(await loadInterruptedRuns(join(root, "nope"))).toEqual([])
-  })
-
-  test("an empty marker is not a hint", async () => {
-    const empty = join(root, "wf_empty01")
-    await mkdir(empty, { recursive: true })
-    await writeFile(join(empty, "interrupted.txt"), "")
-    expect(await loadInterruptedRuns(root)).toEqual([])
-  })
+const runView = (total: number): RunView => ({
+  runId: "wf_a",
+  workflow: "demo",
+  sessionID: "s1",
+  agents: [],
+  done: 0,
+  failed: 0,
+  total,
+  elapsedSeconds: 0,
+  logs: [],
 })
 
 describe("large-run badge in the strip summary", () => {
   test("a run at or above the threshold is flagged as a large run", () => {
-    const view = toView(
-      {
-        runId: "wf_a",
-        workflow: "demo",
-        startedAt: 0,
-        agents: Array.from({ length: LARGE_RUN_AGENTS }, (_, i) => ({ index: i, label: `a${i}`, status: "done" as const })),
-      },
-      60_000,
-    )
-    expect(summarize(view)).toContain("· large run")
+    expect(summarize(runView(LARGE_RUN_AGENTS))).toContain("· large run")
   })
 
   test("a small run carries no badge", () => {
-    const view = toView({ runId: "wf_a", workflow: "demo", startedAt: 0, agents: [{ index: 0, label: "a", status: "running" }] }, 0)
-    expect(summarize(view)).not.toContain("large run")
+    expect(summarize(runView(1))).not.toContain("large run")
   })
 })
 

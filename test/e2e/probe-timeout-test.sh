@@ -108,14 +108,15 @@ bad_() { printf '  ✗ %s\n' "$1"; fails=$((fails + 1)); }
 good_() { printf '  ✓ %s\n' "$1"; }
 
 # wedge_proven — the wedge must be proven, not assumed: a curl with the same
-# probe shape as health_ok must burn its FULL max-time and exit 28
-# (28 = timed out; 7 = refused → holder dead or port raced; 0 = a responding
-# foreign listener stole the port). Retry past the bind window, bounded (~10s).
+# probe shape as health_ok (V2: GET /api/info behind Basic auth) must burn its
+# FULL max-time and exit 28 (28 = timed out; 7 = refused → holder dead or port
+# raced; 0 = a responding foreign listener stole the port). Retry past the bind
+# window, bounded (~10s).
 wedge_proven() {
   local waited=0 rc
   while [ "$waited" -lt 20 ]; do
     rc=0
-    curl -sf -m "$E2E_CURL_TIMEOUT" "http://127.0.0.1:$E2E_PORT/global/health" >/dev/null 2>&1 || rc=$?
+    curl -sf -m "$E2E_CURL_TIMEOUT" -u "opencode:${E2E_PASSWORD:-probe}" "http://127.0.0.1:$E2E_PORT/api/info" >/dev/null 2>&1 || rc=$?
     case "$rc" in
       28) return 0 ;;
       7)  sleep 0.5; waited=$((waited + 1)) ;;

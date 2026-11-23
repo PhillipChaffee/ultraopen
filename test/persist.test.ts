@@ -3,7 +3,7 @@ import { chmod, mkdir, mkdtemp, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { beginRun, endRun, loadResume, markCancelled, writeTerminalManifest } from "../src/server/resume/persist.js"
-import { artifactPaths, appendJournalEntry, ensureRunDir, readJournal, readManifest, writeManifest } from "../src/server/resume/store.js"
+import { artifactPaths, appendJournalEntry, ensureRunDir, readJournal, readManifest, writeManifest, writeResult } from "../src/server/resume/store.js"
 import { CONTROL_STOP_ABORT_REASON, STOP_ABORT_REASON } from "../src/server/resume/journal.js"
 import type { JournalEntry, Manifest } from "../src/server/resume/journal.js"
 
@@ -27,6 +27,19 @@ const record = {
   status: "ok",
   value: "v",
   outputTokens: 3,
+}
+
+/**
+ * Test seam for the T6b publish race: writes the result, then lands a cancel in the
+ * write→re-read gap (module scope because the lint rule forbids a scope-free closure per call).
+ */
+const cancelAfterResultWrite = async (runId: string, value: unknown, e?: NodeJS.ProcessEnv): Promise<string> => {
+  const path = await writeResult(runId, value, e)
+  const standing = await readManifest(runId, e)
+  if (standing !== undefined) {
+    await writeManifest(runId, { ...standing, status: "cancelled", childSessionIDs: [] }, e)
+  }
+  return path
 }
 
 beforeEach(async () => {
@@ -77,6 +90,25 @@ describe("beginRun", () => {
     const onDisk = await readManifest("wf_abc123", env)
     expect(onDisk?.title).toBe("Fix the login bug")
     expect(onDisk?.description).toBe("The auth flow")
+  })
+
+  test("stamps the V2 project id and directory for strictly scoped recovery (#175)", async () => {
+    const manifest = await beginRun({ ...record, projectID: "prj_alpha", directory: "/wt/alpha" }, env)
+    expect(manifest?.projectID).toBe("prj_alpha")
+    expect(manifest?.directory).toBe("/wt/alpha")
+    // Round-trip: the scoping is on disk, where autoresume reads it.
+    const onDisk = await readManifest("wf_abc123", env)
+    expect(onDisk?.projectID).toBe("prj_alpha")
+    expect(onDisk?.directory).toBe("/wt/alpha")
+  })
+
+  test("an unscoped launch omits both fields — the manifest shape stays unchanged", async () => {
+    const manifest = await beginRun(record, env)
+    expect(manifest).not.toHaveProperty("projectID")
+    expect(manifest).not.toHaveProperty("directory")
+    const onDisk = await readManifest("wf_abc123", env)
+    expect(onDisk).not.toHaveProperty("projectID")
+    expect(onDisk).not.toHaveProperty("directory")
   })
 
   test("an untitled launch records neither field — the manifest shape is unchanged", async () => {
@@ -184,6 +216,69 @@ describe("the terminal-write race (#164)", () => {
     await clobberPromise
     const settledStanding = await readManifest("wf_abc123", env)
     expect(settledStanding?.status).toBe("completed")
+  })
+})
+
+describe("the settle↔stop publish race (T6b)", () => {
+  test("a cancel landing before the settle publishes leaves no journal or result", async () => {
+    // The settle wins the terminal commit; the stop's cancel lands immediately after, before
+    // the settle's journal/result publish. The settle must abandon rather than publish beside
+    // a record it no longer owns.
+    const opened = await beginRun(record, env)
+    if (!opened) {throw new Error("the run did not open")}
+    let staged = false
+    const cancellingWrite = async (runId: string, manifest: Manifest, e?: NodeJS.ProcessEnv): Promise<boolean> => {
+      const won = await writeTerminalManifest(runId, manifest, e)
+      if (won && !staged) {
+        staged = true
+        await writeManifest(runId, { ...manifest, status: "cancelled", childSessionIDs: [] }, e)
+      }
+      return won
+    }
+    await endRun(opened, { status: "completed", entries: [entry], value: { done: true }, childSessionIDs: ["c1"] }, env, cancellingWrite)
+    const standing = await readManifest("wf_abc123", env)
+    expect(standing?.status).toBe("cancelled")
+    expect(await readJournal("wf_abc123", env)).toEqual([])
+    expect(await Bun.file(artifactPaths("wf_abc123", env).resultPath).exists()).toBe(false)
+  })
+
+  test("a cancel landing after the result write withdraws the result", async () => {
+    // The settle published result.json, and the stop's cancel landed in the write→re-read gap.
+    // endRun's last-instant read must withdraw the artifact the cancelled record cannot own.
+    const opened = await beginRun(record, env)
+    if (!opened) {throw new Error("the run did not open")}
+    await endRun(
+      opened,
+      { status: "completed", entries: [entry], value: { done: true }, childSessionIDs: ["c1"] },
+      env,
+      undefined,
+      cancelAfterResultWrite,
+    )
+    const standing = await readManifest("wf_abc123", env)
+    expect(standing?.status).toBe("cancelled")
+    expect(await Bun.file(artifactPaths("wf_abc123", env).resultPath).exists()).toBe(false)
+  })
+
+  test("a cancellation that wins removes a result a racing settle already published", async () => {
+    // The stop path's own half: even when the settle got its result onto disk, a winning
+    // markCancelled leaves a cancelled manifest with no result beside it.
+    const opened = await beginRun(record, env)
+    if (!opened) {throw new Error("the run did not open")}
+    await writeResult(opened.runId, { published: true }, env)
+    const settled = await markCancelled(opened, [], env)
+    expect(settled?.status).toBe("cancelled")
+    const standing = await readManifest("wf_abc123", env)
+    expect(standing?.status).toBe("cancelled")
+    expect(await Bun.file(artifactPaths("wf_abc123", env).resultPath).exists()).toBe(false)
+  })
+
+  test("a genuine completed run keeps its result", async () => {
+    const opened = await beginRun(record, env)
+    await endRun(opened, { status: "completed", entries: [entry], value: { done: true }, childSessionIDs: [] }, env)
+    const standing = await readManifest("wf_abc123", env)
+    expect(standing?.status).toBe("completed")
+    const result = JSON.parse(await Bun.file(artifactPaths("wf_abc123", env).resultPath).text())
+    expect(result).toEqual({ done: true })
   })
 })
 

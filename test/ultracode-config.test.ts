@@ -1,193 +1,205 @@
-import { describe, expect, test } from "bun:test"
-import { STATUS_TOOL, WORKFLOW_TOOL } from "../src/server/bridge/permission.js"
-import { installConfig } from "../src/server/ultracode/config.js"
-import type { MutableConfig } from "../src/server/ultracode/config.js"
+import { beforeEach, describe, expect, test } from "bun:test"
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { createV2HostPort } from "../src/server/host/v2-adapter.js"
+import { loadBundledSkill, registerTransforms } from "../src/server/host/v2-transforms.js"
+import { getCoordinator, resetCoordinatorForTests } from "../src/server/runtime/coordinator.js"
+import { STATUS_TOOL, STRUCTURED_OUTPUT_TOOL, WORKFLOW_TOOL } from "../src/server/bridge/permission.js"
+import { resolveOptions } from "../src/server/options.js"
+import type { SavedWorkflow, WorkflowCommandState } from "../src/server/tool/launch.js"
+import { makeFakePlugin } from "./v2-fixtures.js"
 
-/** Narrows an installed block for property inspection — the schema types these fields as `unknown`. */
-function asRecord(value: unknown): Record<string, unknown> {
-  return value as Record<string, unknown>
+beforeEach(() => {
+  resetCoordinatorForTests()
+})
+
+function harness(saved: SavedWorkflow[] = []) {
+  const fake = makeFakePlugin({
+      agents: [
+        { id: "build", name: "build", mode: "primary", hidden: false, permissions: [] },
+        { id: "explore", name: "explore", mode: "subagent", hidden: false, permissions: [] },
+      ],
+    }),
+    coordinator = getCoordinator(),
+    host = createV2HostPort(fake.ctx),
+    project = coordinator.projectOf(fake.location, resolveOptions(undefined)),
+    commandState: WorkflowCommandState = { entries: saved, reload: () => {void fake.reloadCommands()} },
+    skill = {
+      id: "workflow-authoring",
+      name: "workflow-authoring",
+      description: "authoring reference",
+      path: "/repo/skills/workflow-authoring/SKILL.md",
+      content: "# Workflow authoring",
+    }
+
+  const register = (): Promise<void> =>
+    registerTransforms(fake.ctx, {
+      host,
+      project,
+      coordinator,
+      options: resolveOptions(undefined),
+      bootId: coordinator.processBootId,
+      longLived: false,
+      commandState,
+      skill,
+      assertPermission: () => Promise.resolve(),
+    })
+
+  return { fake, coordinator, project, commandState, skill, register }
 }
 
-describe("installConfig — agent", () => {
-  test("creates config.agent.ultracode with mode, description, permission and options", () => {
-    const config: MutableConfig = {}
-    installConfig(config, {})
+const permissionTriple = (agent: { permissions: { action: string; resource: string; effect: string }[] }) =>
+  agent.permissions.map((rule) => `${rule.action}:${rule.resource}:${rule.effect}`)
 
-    const agent = asRecord(asRecord(config.agent)["ultracode"])
-    expect(agent["mode"]).toBe("primary")
-    expect(typeof agent["description"]).toBe("string")
-    expect((agent["description"] as string).length).toBeGreaterThan(0)
-    expect(agent["permission"]).toEqual({ [WORKFLOW_TOOL]: "ask", [STATUS_TOOL]: "allow" })
-    expect(agent["options"]).toEqual({ ultracode: true })
+describe("agent transform", () => {
+  test("upserts the ultracode primary agent without a system prompt", async () => {
+    const { fake, register } = harness()
+    await register()
+    const ultracode = fake.agents.find((agent) => agent.id === "ultracode")
+    expect(ultracode).toBeDefined()
+    expect(ultracode?.mode).toBe("primary")
+    expect(ultracode?.name).toBe("ultracode")
+    // `system` replaces the provider base prompt; the plugin must leave it unset.
+    expect(ultracode?.system).toBeUndefined()
+    expect(permissionTriple(ultracode ?? { permissions: [] })).toContain(`${WORKFLOW_TOOL}:*:ask`)
+    expect(permissionTriple(ultracode ?? { permissions: [] })).toContain(`${STATUS_TOOL}:*:allow`)
   })
 
-  test("carries no prompt key", () => {
-    // An agent prompt REPLACES the provider base prompt instead of appending to it, which would
-    // lobotomise the agent — the ultracode instruction is injected elsewhere instead.
-    const config: MutableConfig = {}
-    installConfig(config, {})
-
-    const agent = asRecord(asRecord(config.agent)["ultracode"])
-    expect("prompt" in agent).toBe(false)
+  test("primary agents get workflow:ask and workflow_status:allow", async () => {
+    const { fake, register } = harness()
+    await register()
+    const build = fake.agents.find((agent) => agent.id === "build")
+    expect(permissionTriple(build ?? { permissions: [] })).toContain(`${WORKFLOW_TOOL}:*:ask`)
+    expect(permissionTriple(build ?? { permissions: [] })).toContain(`${STATUS_TOOL}:*:allow`)
   })
 
-  test("carries no variant key", () => {
-    // An agent-configured variant is only honoured when the resolved model equals the agent's own
-    // configured model, so setting one here would silently do nothing for a user on any other model.
-    const config: MutableConfig = {}
-    installConfig(config, {})
-
-    const agent = asRecord(asRecord(config.agent)["ultracode"])
-    expect("variant" in agent).toBe(false)
+  test("subagents get both workflow tools denied", async () => {
+    const { fake, register } = harness()
+    await register()
+    const explore = fake.agents.find((agent) => agent.id === "explore")
+    expect(permissionTriple(explore ?? { permissions: [] })).toContain(`${WORKFLOW_TOOL}:*:deny`)
+    expect(permissionTriple(explore ?? { permissions: [] })).toContain(`${STATUS_TOOL}:*:deny`)
   })
 
-  test("a user's existing config.agent.ultracode block wins", () => {
-    // User config is applied BEFORE plugin config hooks run, so a straight assignment here would
-    // clobber the user's overrides — the installer must spread the user's block last.
-    const config: MutableConfig = { agent: { ultracode: { description: "mine", model: "x/y" } } }
-    installConfig(config, {})
-
-    const agent = asRecord(asRecord(config.agent)["ultracode"])
-    expect(agent["description"]).toBe("mine")
-    expect(agent["model"]).toBe("x/y")
-  })
-})
-
-describe("installConfig — command", () => {
-  test("creates config.command.ultracode with a non-empty string template", () => {
-    // The command service calls hints(template) eagerly while building its state, so a missing or
-    // non-string template throws there and takes out EVERY command for the directory, including /init.
-    const config: MutableConfig = {}
-    installConfig(config, {})
-
-    const command = asRecord(asRecord(config.command)["ultracode"])
-    expect(typeof command["template"]).toBe("string")
-    expect((command["template"] as string).length).toBeGreaterThan(0)
-  })
-
-  test("carries no agent key", () => {
-    // Leaving it undefined means `cmd.agent ?? input.agent` preserves whichever primary agent the
-    // user is already on, rather than force-switching them.
-    const config: MutableConfig = {}
-    installConfig(config, {})
-
-    const command = asRecord(asRecord(config.command)["ultracode"])
-    expect("agent" in command).toBe(false)
-  })
-
-  test("a user's existing config.command.ultracode block wins", () => {
-    const config: MutableConfig = { command: { ultracode: { template: "mine", agent: "build" } } }
-    installConfig(config, {})
-
-    const command = asRecord(asRecord(config.command)["ultracode"])
-    expect(command["template"]).toBe("mine")
-    expect(command["agent"]).toBe("build")
+  test("a user policy that already denies workflow is not softened back to ask", async () => {
+    const fake = makeFakePlugin({
+      agents: [
+        {
+          id: "build",
+          name: "build",
+          mode: "primary",
+          hidden: false,
+          permissions: [{ action: WORKFLOW_TOOL, resource: "*", effect: "deny" }],
+        },
+      ],
+    })
+    const coordinator = getCoordinator(),
+      host = createV2HostPort(fake.ctx),
+      project = coordinator.projectOf(fake.location, resolveOptions(undefined))
+    await registerTransforms(fake.ctx, {
+      host,
+      project,
+      coordinator,
+      options: resolveOptions(undefined),
+      bootId: coordinator.processBootId,
+      longLived: false,
+      commandState: { entries: [], reload: () => {} },
+      skill: undefined,
+      assertPermission: () => Promise.resolve(),
+    })
+    const build = fake.agents.find((agent) => agent.id === "build")
+    expect(permissionTriple(build ?? { permissions: [] })).toContain(`${WORKFLOW_TOOL}:*:deny`)
+    expect(permissionTriple(build ?? { permissions: [] })).not.toContain(`${WORKFLOW_TOOL}:*:ask`)
   })
 })
 
-describe("installConfig — permission", () => {
-  test("on an empty config, config.permission.workflow is 'ask'", () => {
-    const config: MutableConfig = {}
-    installConfig(config, {})
+describe("command transform", () => {
+  test("registers /ultracode, /workflow-resume and one /workflow-<name>", async () => {
+    const { fake, commandState, project, register } = harness([
+      { name: "deploy-check", description: "Deploy gate", source: "export const meta = { name: 'deploy-check', description: 'Deploy gate' }" },
+    ])
+    await register()
+    expect([...fake.commands.keys()]).toContain("ultracode")
+    expect([...fake.commands.keys()]).toContain("workflow-resume")
+    expect([...fake.commands.keys()]).toContain("workflow-deploy-check")
+    expect(fake.commands.get("workflow-deploy-check")?.description).toBe("Deploy gate")
 
-    expect(asRecord(config.permission)[WORKFLOW_TOOL]).toBe("ask")
+    const command = fake.commands.get("workflow-deploy-check")
+    await command?.execute({ sessionID: "s1", prompt: { text: "with args" }, delivery: "steer" })
+    expect(fake.prompts.at(-1)?.text).toContain("workflow('deploy-check')")
+
+    // A rescan replaces the entries; reload rebuilds the command surface.
+    commandState.entries = [{ name: "audit", description: "Audit", source: "x" }]
+    await fake.reloadCommands()
+    expect(fake.commands.has("workflow-audit")).toBe(true)
+    expect(project.mode.isActive("s1")).toBe(false)
   })
 
-  test("the read-only status tool defaults to 'allow' so polling never prompts", () => {
-    const config: MutableConfig = {}
-    installConfig(config, {})
-
-    expect(asRecord(config.permission)[STATUS_TOOL]).toBe("allow")
+  test("/ultracode toggles the project mode, and off disables it", async () => {
+    const { fake, project, register } = harness()
+    await register()
+    const command = fake.commands.get("ultracode")
+    await command?.execute({ sessionID: "s1", prompt: { text: "" }, delivery: "steer" })
+    expect(project.mode.isActive("s1")).toBe(true)
+    await command?.execute({ sessionID: "s1", prompt: { text: "OFF" }, delivery: "steer" })
+    expect(project.mode.isActive("s1")).toBe(false)
+    // The toggle itself prompts nothing; a non-empty payload is forwarded.
+    await command?.execute({ sessionID: "s1", prompt: { text: "ultracode this task" }, delivery: "steer" })
+    expect(fake.prompts.at(-1)?.text).toBe("ultracode this task")
   })
 
-  test("an existing permission.workflow value is not overwritten", () => {
-    const config: MutableConfig = { permission: { [WORKFLOW_TOOL]: "allow" } }
-    installConfig(config, {})
-
-    expect(asRecord(config.permission)[WORKFLOW_TOOL]).toBe("allow")
-  })
-
-  test("a string permission value is left untouched and installConfig does not throw", () => {
-    // `config.permission` can legitimately be the scalar string "deny" rather than an object —
-    // writing into it as if it were a record would throw at runtime or shred the user's setting.
-    const config: MutableConfig = { permission: "deny" }
-
-    expect(() => {
-      installConfig(config, {})
-    }).not.toThrow()
-    expect(config.permission).toBe("deny")
-  })
-})
-
-describe("installConfig — experimental.primary_tools", () => {
-  test("on an empty config, experimental.primary_tools contains WORKFLOW_TOOL and STATUS_TOOL", () => {
-    // Both `experimental` and `primary_tools` are optional in the schema, so an optional-chained
-    // `.push()` would be a silent no-op on the overwhelmingly common default config.
-    const config: MutableConfig = {}
-    installConfig(config, {})
-
-    expect(config.experimental?.primary_tools).toContain(WORKFLOW_TOOL)
-    expect(config.experimental?.primary_tools).toContain(STATUS_TOOL)
-  })
-
-  test("an existing primary_tools array is preserved and appended to", () => {
-    const config: MutableConfig = { experimental: { primary_tools: ["foo"] } }
-    installConfig(config, {})
-
-    expect(config.experimental?.primary_tools).toEqual(["foo", WORKFLOW_TOOL, STATUS_TOOL])
-  })
-
-  test("calling installConfig twice does not duplicate the primary_tools entry", () => {
-    const config: MutableConfig = {}
-    installConfig(config, {})
-    installConfig(config, {})
-
-    const tools = config.experimental?.primary_tools ?? []
-    expect(tools.filter((tool) => tool === WORKFLOW_TOOL)).toHaveLength(1)
+  test("/workflow-resume forwards the run id (or asks for one)", async () => {
+    const { fake, register } = harness()
+    await register()
+    const command = fake.commands.get("workflow-resume")
+    await command?.execute({ sessionID: "s1", prompt: { text: "wf_resume01" }, delivery: "steer" })
+    expect(fake.prompts.at(-1)?.text).toContain("The run id is wf_resume01")
+    await command?.execute({ sessionID: "s1", prompt: { text: "" }, delivery: "steer" })
+    expect(fake.prompts.at(-1)?.text).toContain("ask which run to resume")
   })
 })
 
-describe("installConfig — skills", () => {
-  test("appends a supplied skillsPath to config.skills.paths", () => {
-    const config: MutableConfig = {}
-    installConfig(config, { skillsPath: "/skills/workflow" })
-
-    expect(config.skills?.paths).toEqual(["/skills/workflow"])
-  })
-
-  test("an existing skills.paths array is preserved and appended to", () => {
-    const config: MutableConfig = { skills: { paths: ["/existing"] } }
-    installConfig(config, { skillsPath: "/skills/workflow" })
-
-    expect(config.skills?.paths).toEqual(["/existing", "/skills/workflow"])
-  })
-
-  test("config.skills is left untouched when skillsPath is undefined", () => {
-    const config: MutableConfig = {}
-    installConfig(config, {})
-
-    expect(config.skills).toBeUndefined()
-  })
-
-  test("calling installConfig twice does not duplicate the skills path", () => {
-    const config: MutableConfig = {}
-    installConfig(config, { skillsPath: "/skills/workflow" })
-    installConfig(config, { skillsPath: "/skills/workflow" })
-
-    const paths = config.skills?.paths ?? []
-    expect(paths.filter((path) => path === "/skills/workflow")).toHaveLength(1)
+describe("bundled skill loading", () => {
+  test("a layout with no SKILL.md degrades to no skill", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ultraopen-no-skill-"))
+    try {
+      await expect(loadBundledSkill(undefined, dir)).resolves.toBeUndefined()
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })
 
-describe("installConfig — idempotency", () => {
-  test("calling installConfig twice produces the same result as calling it once", () => {
-    const once: MutableConfig = {}
-    installConfig(once, { skillsPath: "/skills/workflow" })
+describe("skill and tool transforms", () => {
+  test("publishes the bundled skill with a path ending in SKILL.md", async () => {
+    const { fake, register } = harness()
+    await register()
+    const skill = fake.skills.get("workflow-authoring")
+    expect(skill?.path.endsWith("SKILL.md")).toBe(true)
+    expect(skill?.content).toContain("Workflow authoring")
+  })
 
-    const twice: MutableConfig = {}
-    installConfig(twice, { skillsPath: "/skills/workflow" })
-    installConfig(twice, { skillsPath: "/skills/workflow" })
+  test("registers workflow, workflow_status and StructuredOutput with codemode off", async () => {
+    const { fake, register } = harness()
+    await register()
+    for (const name of [WORKFLOW_TOOL, STATUS_TOOL, STRUCTURED_OUTPUT_TOOL]) {
+      expect(fake.tools.get(name)?.options?.codemode).toBe(false)
+    }
+    expect(fake.tools.get(WORKFLOW_TOOL)?.input["type"]).toBe("object")
+    expect(fake.tools.get(STATUS_TOOL)?.input["required"]).toEqual(["runId"])
+    expect(fake.tools.get(STRUCTURED_OUTPUT_TOOL)?.input["additionalProperties"]).toBe(true)
+  })
 
-    expect(twice).toEqual(once)
+  test("ULTRAOPEN_ACTIVE=1 skips registering the tools but still installs the agent transform", async () => {
+    process.env["ULTRAOPEN_ACTIVE"] = "1"
+    try {
+      const { fake, register } = harness()
+      await register()
+      expect(fake.tools.size).toBe(0)
+      expect(fake.agents.some((agent) => agent.id === "ultracode")).toBe(true)
+    } finally {
+      delete process.env["ULTRAOPEN_ACTIVE"]
+    }
   })
 })

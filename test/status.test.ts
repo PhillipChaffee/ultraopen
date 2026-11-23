@@ -226,6 +226,32 @@ describe("executeStatus — derivations", () => {
     expect(report.title).toBeUndefined()
   })
 
+  test("a stopping progress snapshot surfaces stopping on the report (#175)", async () => {
+    // The stop path flips progress.json to `stopping` before the manifest settles as
+    // cancelled; the status tool must let the model see the stop is in flight.
+    const report = await executeStatus({ runId: RUN }, deps({
+      "progress.json": JSON.stringify({
+        runId: RUN,
+        workflow: "demo",
+        sessionID: "parent",
+        status: "stopping",
+        agents: [],
+        logs: [],
+        startedAt: 1,
+        updatedAt: 2,
+      }),
+    }))
+    expect(report.status).toBe("running")
+    expect(report.stopping).toBe(true)
+  })
+
+  test("a running snapshot reports stopping false, and so does a corrupt one", async () => {
+    const running = await executeStatus({ runId: RUN }, deps()),
+     corrupt = await executeStatus({ runId: RUN }, deps({ "progress.json": "not json" }))
+    expect(running.stopping).toBe(false)
+    expect(corrupt.stopping).toBe(false)
+  })
+
   test("output tokens exclude replayed entries and sum the rest", async () => {
     const journal = [
       entry({ outputTokens: 100 }),

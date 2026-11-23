@@ -22,26 +22,31 @@ standing guidance, never the gate; `dryRun` is exempt; resuming a still-executin
 ## Stopping a run
 
 Interrupting the turn (ESC) never stops a background run — the launch result says so, and the
-sidebar carries the same hint: to stop a detached run, call `workflow({ stop: "<runId>" })`. Its
-subagents abort, the run is recorded `cancelled`, a `<workflow-stopped>` confirmation hydrates
-into the run's session, and no completion notification follows — a run you stopped must never
-appear to have finished on its own. A run owned by another process must be stopped from that
-session, and a stop call that cannot act returns a clear refusal.
+sidebar carries the same hint: to stop a detached run, call `workflow({ stop: "<runId>" })`, or in
+the TUI use `/workflow-stop <runId>` (it calls `UltraopenRpc.stopRun` directly, no confirmation).
+Its subagents abort, the run is recorded `cancelled`, a synthetic `<workflow-stopped>`
+confirmation hydrates into the run's session, and no completion notification follows — a run you
+stopped must never appear to have finished on its own. A run owned by another process must be
+stopped from that session, and a stop call that cannot act returns a clear refusal.
 
 ## The notification
 
-When a detached run settles, the outcome is delivered to the run's session: a synthetic message
-wrapping the same render the blocking result carries, capped at 4096 characters (cut at a line
-boundary) with a pointer line to the full `result.json` or `failure.txt`. If the turn ended
-exactly as the notification landed, one idle nudge re-fires it — once per run, ever. While the
-run is live, each turn also carries an ephemeral one-line reminder naming the run id, the
-workflow, and its elapsed time — what keeps the model from duplicating work already in flight.
+When a detached run settles, the outcome is delivered to the run's session through V2's
+`ctx.session.synthetic` — a deterministic `msg_ultraopen_outcome_<runId>` message whose text wraps
+the same render the blocking result carries, capped at 4096 characters (cut at a line boundary)
+with a pointer line to the full `result.json` or `failure.txt`. V2's compound synthetic delivery
+is idempotent on that id and handles inbox and transcript delivery directly; the V1 idle nudge is
+gone. The TUI renders the entry inline as `◈ Workflow <name> completed`. While the run is live,
+each turn also carries an ephemeral one-line reminder naming the run id, the workflow, and its
+elapsed time — what keeps the model from duplicating work already in flight.
 
 ## Auto-resume
 
-A detached run survives process death up to its journal: on the next start, runs the dead
-process interrupted re-execute automatically under the same run id — completed agents replay
-from the journal, the missing tail re-runs, and the original session is hydrated with the
-outcome. Guards keep it bounded: the interruption must be younger than `autoResumeTtlHours`, at
-most `autoResumeMax` runs adopt per boot, oldest first, a run stopped by request never resumes,
-and the stored args must still hash to the run's manifest.
+A detached run survives process death up to its journal: on the next start of the plugin's
+location-scoped runtime, runs the dead process interrupted re-execute automatically under the same
+run id — completed agents replay from the journal, the missing tail re-runs, and the original
+session is hydrated with the outcome. On `opencode serve`, location plugins boot lazily; the boot
+sweep runs when the location is first exercised (the harness warms it through
+`GET /api/agent?location[directory]=…`). Guards keep it bounded: the interruption must be younger
+than `autoResumeTtlHours`, at most `autoResumeMax` runs adopt per boot, oldest first, a run stopped
+by request never resumes, and the stored args must still hash to the run's manifest.

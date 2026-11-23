@@ -11,14 +11,17 @@
 # The TUI half resolves the run-data root exactly like the server half
 # ($XDG_DATA_HOME else ~/.local/share, then opencode/tool-output/ultraopen),
 # so pointing XDG_DATA_HOME at the scratch dir makes the TUI poll the very
-# runs this harness creates (src/server/resume/store.ts:27-31, src/tui/data.ts:39-43).
+# runs this harness creates (src/server/resume/store.ts, src/tui/data.ts).
 #
-# The TUI at opencode 1.18.x only exposes its HTTP server when started with
-# --port (otherwise it is an in-process worker), so the visual suite always
-# passes --port and readiness-gates on /global/health before any input, then
-# gates the first input itself with probe_verify_retry: the TUI's startup
-# input-drop window (~10s — opencode issue #42915) has no ready signal, so the
-# input's own effect is the only honest verdict.
+# OpenCode V2.3.2 splits the two halves: `opencode serve --port --hostname`
+# owns the HTTP API and the plugin's server runtime, and the TUI attaches with
+# `opencode --server <url> --session <id> --auto` — there is no `--port` on the
+# TUI and no in-process worker. Every `/api/*` route is Basic-auth protected,
+# even with OPENCODE_PASSWORD unset (the server invents a random password), so
+# the harness exports a deterministic one and authenticates every probe. The
+# input-drop window still exists (~10s — opencode issue #42915) and still has
+# no ready signal, so the first input gates itself with probe_verify_retry:
+# the input's own effect is the only honest verdict.
 
 set -euo pipefail
 
@@ -28,7 +31,7 @@ E2E_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # absolute: CWD change
 # checkout; E2E_PLUGIN_PATH overrides it to any installed tree so a re-proof
 # runs the real suites against that tree with zero copies (#113), e.g. the
 # registry install:
-#   E2E_PLUGIN_PATH=~/.cache/opencode/packages/ultraopen@latest/node_modules/ultraopen \
+#   E2E_PLUGIN_PATH=~/.cache/opencode/npm/ultraopen@latest/<install>/node_modules/ultraopen \
 #     bash test/e2e/technical.sh
 PLUGIN_PATH="${E2E_PLUGIN_PATH:-$REPO_ROOT}"
 ARTIFACTS_ROOT="$REPO_ROOT/test/e2e/artifacts"
@@ -49,6 +52,11 @@ E2E_UNIT_ID="${E2E_UNIT_ID//[^a-zA-Z0-9_-]/-}"   # tmux sockets reject '/'
 E2E_TMUX_SOCKET="${E2E_TMUX_SOCKET:-ultraopen-e2e-${E2E_UNIT_ID}}"
 E2E_PORT="${E2E_PORT:-$((18880 + $(printf '%s' "$E2E_UNIT_ID" | cksum | cut -d' ' -f1) % 19))}"
 E2E_RESUME_PORT="${E2E_RESUME_PORT:-$((E2E_PORT + 1))}"
+# V2.3.2 enforces HTTP Basic Auth on every /api route, with a random password
+# when OPENCODE_PASSWORD is unset. A deterministic per-run secret keeps the
+# harness probes authenticating against the server it started and nothing else.
+E2E_PASSWORD="${E2E_PASSWORD:-e2e-${E2E_UNIT_ID}-pw}"
+export OPENCODE_PASSWORD="$E2E_PASSWORD"
 E2E_WAIT_TIMEOUT="${E2E_WAIT_TIMEOUT:-120}"   # seconds, default for wait_for
 E2E_POLL_INTERVAL="${E2E_POLL_INTERVAL:-1}"   # seconds between polls
 # seconds, hard max-time on every harness curl probe (#89): a wedged server
@@ -106,27 +114,33 @@ probe_verify_retry() { # SEND VERIFY [WAIT] [ATTEMPTS]
 SCRATCH=""
 DATA_ROOT=""   # $XDG_DATA_HOME/opencode — sessions, auth symlink, run dirs
 RUN_ROOT=""    # $DATA_ROOT/tool-output/ultraopen — the plugin's run dirs
+WORK_DIR=""    # $SCRATCH/project — the server's location (plugin scope)
+CONFIG_ROOT="" # $XDG_CONFIG_HOME/opencode — opencode.json + cli.json
 
 scratch_new() {
   SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/ultraopen-e2e.XXXXXX")"
   export XDG_DATA_HOME="$SCRATCH/share"
-  # opencode merges $XDG_CONFIG_HOME/opencode config files into every load on
-  # top of OPENCODE_CONFIG_DIR, so leaving this unset lets the developer's real
-  # global config (permissions, agents, global MCP servers) leak into each run.
+  # V2 keeps its package cache and service registration in their own XDG roots;
+  # leaving either at the developer's real path leaks installed plugins and a
+  # registered background server into every run.
   export XDG_CONFIG_HOME="$SCRATCH/config"
-  export OPENCODE_CONFIG_DIR="$SCRATCH/config"
-  # third isolation channel — config leakage (e2e): override env inherited from
-  # the invoking process
-  unset OPENCODE_CONFIG OPENCODE_CONFIG_CONTENT OPENCODE_PERMISSION OPENCODE_TUI_CONFIG
-  # non-product per-process weight (1.18.31 flags, flag.ts:23,29 + runtime-flags.ts:19,21)
-  export OPENCODE_DISABLE_DEFAULT_PLUGINS=1
-  export OPENCODE_DISABLE_EXTERNAL_SKILLS=1
-  export OPENCODE_DISABLE_AUTOUPDATE=1
+  export XDG_CACHE_HOME="$SCRATCH/cache"
+  export XDG_STATE_HOME="$SCRATCH/state"
+  mkdir -p "$SCRATCH/tmp" "$XDG_CACHE_HOME" "$XDG_STATE_HOME"
+  export TMPDIR="$SCRATCH/tmp"  # Config leakage (e2e): override env inherited from the invoking process.
+  # OPENCODE_CONFIG_DIR used to force V1's config directory; V2 reads
+  # $XDG_CONFIG_HOME/opencode, so the variable is dropped rather than set.
+  unset OPENCODE_CONFIG_DIR OPENCODE_CONFIG OPENCODE_CONFIG_CONTENT \
+    OPENCODE_CLI_CONFIG_CONTENT OPENCODE_SERVER OPENCODE_DB OPENCODE_API_KEY \
+    OPENCODE_PERMISSION OPENCODE_TUI_CONFIG
   DATA_ROOT="$XDG_DATA_HOME/opencode"
   RUN_ROOT="$DATA_ROOT/tool-output/ultraopen"
-  mkdir -p "$DATA_ROOT" "$OPENCODE_CONFIG_DIR" "$SCRATCH/project"
+  CONFIG_ROOT="$XDG_CONFIG_HOME/opencode"
+  WORK_DIR="$SCRATCH/project"
+  mkdir -p "$DATA_ROOT" "$CONFIG_ROOT" "$WORK_DIR"
 
-  # Provider auth stays real; everything else is scratch.
+  # Provider auth stays real; everything else is scratch. V2 auto-migrates the
+  # auth.json symlink into its SQLite credential table on first boot.
   local real_auth="$HOME/.local/share/opencode/auth.json"
   if [ -f "$real_auth" ]; then
     ln -s "$real_auth" "$DATA_ROOT/auth.json"
@@ -138,27 +152,32 @@ scratch_new() {
   # on for its own relaunch (technical.sh T12).
   scratch_write_config '{"autoResume": false}'
 
-  cd "$SCRATCH/project"
+  cd "$WORK_DIR"
 }
 
 # scratch_write_config OPTIONS_JSON — OPTIONS_JSON "null" for the plain form,
-# or a JSON object for the tuple form (plugin options).
+# or a JSON object for the plugin's option bag. V2 reads `plugins` (an ordered
+# list of strings or {package, options} entries) and always reads cli.json from
+# $XDG_CONFIG_HOME/opencode; there is no V1 tui.json.
 scratch_write_config() {
   local plugin_entry
   if [ "$1" = "null" ]; then
     plugin_entry="\"$PLUGIN_PATH\""
   else
-    plugin_entry="[\"$PLUGIN_PATH\", $1]"
+    plugin_entry="{\"package\": \"$PLUGIN_PATH\", \"options\": $1}"
   fi
-  cat > "$OPENCODE_CONFIG_DIR/opencode.json" <<EOF
+  cat > "$CONFIG_ROOT/opencode.json" <<EOF
 {
   "\$schema": "https://opencode.ai/config.json",
   "model": "$E2E_MODEL",
-  "plugin": [$plugin_entry]
+  "update": "disable",
+  "plugins": [$plugin_entry]
 }
 EOF
-  cat > "$OPENCODE_CONFIG_DIR/tui.json" <<EOF
-{ "\$schema": "https://opencode.ai/config.json", "plugin": ["$PLUGIN_PATH"] }
+  # The sidebar starts open at 200x50 in V2; hide it so the visual suite's
+  # explicit Ctrl-x b toggle has a deterministic starting state.
+  cat > "$CONFIG_ROOT/cli.json" <<EOF
+{ "\$schema": "https://opencode.ai/config.json", "session": { "sidebar": "hide" } }
 EOF
 }
 
@@ -168,37 +187,6 @@ scratch_destroy() {
 
 build_plugin() {
   (cd "$REPO_ROOT" && bun run build >/dev/null)
-}
-
-# The TUI half only renders when the HOST injects its own Solid/OpenTUI
-# instances, which only happens when the plugin directory cannot resolve
-# those packages locally. A dev checkout's node_modules shadows the injection
-# (Solid's node export condition is the SSR build, dist/server.js: signals
-# never update, surfaces silently render nothing). Stash the shadowing
-# packages for the TUI's lifetime; restore afterwards. Published installs
-# don't ship these packages and don't need this.
-ULTRAOPEN_STASH="${TMPDIR:-/tmp}/ultraopen-e2e-nm-stash"
-
-stash_host_modules() {
-  # A previous abnormal exit may have left a stale stash; fold it back first —
-  # the existence guard below would otherwise silently skip stashing.
-  restore_host_modules
-  mkdir -p "$ULTRAOPEN_STASH"
-  local m
-  for m in solid-js @opentui; do
-    if [ -d "$PLUGIN_PATH/node_modules/$m" ]; then
-      mv "$PLUGIN_PATH/node_modules/$m" "$ULTRAOPEN_STASH/$m"
-    fi
-  done
-}
-
-restore_host_modules() {
-  local m
-  for m in solid-js @opentui; do
-    if [ -d "$ULTRAOPEN_STASH/$m" ]; then
-      mv "$ULTRAOPEN_STASH/$m" "$PLUGIN_PATH/node_modules/$m"
-    fi
-  done
 }
 
 # Cleanup guarantee (#44, evidence #40) ------------------------------------------
@@ -273,13 +261,13 @@ e2e_kill_manifest() { # argv-guarded kill of every recorded PID
 }
 
 # e2e_marker_check PID — exit 0 when the process's environment carries an e2e
-# marker (XDG_DATA_HOME / OPENCODE_CONFIG_DIR under ultraopen-e2e.*). The
+# marker (XDG_DATA_HOME / XDG_CONFIG_HOME under ultraopen-e2e.*). The
 # ps -E text itself is never printed.
 e2e_marker_check() {
   local out
   out="$(ps -wwE -o command= -p "$1" 2>/dev/null || true)"
   case "$out" in
-    *XDG_DATA_HOME=*ultraopen-e2e.*|*OPENCODE_CONFIG_DIR=*ultraopen-e2e.*) return 0 ;;
+    *XDG_DATA_HOME=*ultraopen-e2e.*|*XDG_CONFIG_HOME=*ultraopen-e2e.*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -317,7 +305,7 @@ e2e_sweep() { # MODE startup|exit
     [ "$pid" = "$$" ] && continue
     [ -n "$REAPER_PID" ] && [ "$pid" = "$REAPER_PID" ] && continue
     case "$rest" in
-      *XDG_DATA_HOME=*ultraopen-e2e.*|*OPENCODE_CONFIG_DIR=*ultraopen-e2e.*) ;;
+      *XDG_DATA_HOME=*ultraopen-e2e.*|*XDG_CONFIG_HOME=*ultraopen-e2e.*) ;;
       *) continue ;;
     esac
     scratch="$(e2e_scratch_of "$rest")"
@@ -372,11 +360,9 @@ e2e_teardown() { # KIND technical|visual
   if [ "$1" = "visual" ]; then
     tmx kill-server 2>/dev/null || true
   fi
+  server_stop
   e2e_kill_manifest
   e2e_sweep exit
-  if [ "$1" = "visual" ]; then
-    restore_host_modules
-  fi
   if [ -f "$OUT/keep.flag" ]; then
     sweep_note "scratch kept: $SCRATCH"
   else
@@ -508,8 +494,10 @@ assert_run_failed() {
   fi
 }
 
-# opencode run wrapper: fresh process, scratch env, auto-approved permissions.
-oc_run() { opencode run --auto "$@"; }
+# opencode run wrapper: fresh standalone process, scratch env, auto-approved
+# permissions. V2's --standalone spawns a private stdio server so the turn
+# cannot leak into a developer's background service.
+oc_run() { opencode run --standalone --auto "$@"; }
 
 # Artifacts ----------------------------------------------------------------------
 artifacts_dir() { # artifacts_dir suite-name → prints a fresh dir
@@ -519,33 +507,122 @@ artifacts_dir() { # artifacts_dir suite-name → prints a fresh dir
   echo "$dir"
 }
 
+# HTTP helpers (server half) -----------------------------------------------------
+API_BASE="http://127.0.0.1:$E2E_PORT"
+SERVER_PID=""
+
+# Every /api request carries the deterministic password: V2 returns 401 without
+# it (and a V1 route would return 200 text/html, so a route typo must not be
+# able to look like success).
+api_curl() { curl -sf -m "$E2E_CURL_TIMEOUT" -u "opencode:$E2E_PASSWORD" "$@"; }
+
+health_ok() { api_curl "$API_BASE/api/info" 2>/dev/null | grep -q '"version"'; }
+
+# Location plugins boot lazily on opencode serve: /api/info and /api/session do
+# NOT boot them, so the visual suite warms the location before it asserts any
+# plugin surface, and T12 does the same before it relies on the boot sweep.
+warm_location() {
+  curl -sf -m "$E2E_CURL_TIMEOUT" -u "opencode:$E2E_PASSWORD" -G \
+    --data-urlencode "location[directory]=$WORK_DIR" \
+    "$API_BASE/api/agent" >/dev/null 2>&1 || true
+}
+
+server_start() {
+  health_ok && return 0
+  OPENCODE_PASSWORD="$E2E_PASSWORD" opencode serve --port "$E2E_PORT" --hostname 127.0.0.1 \
+    >"${OUT:-/dev/null}/serve.log" 2>&1 &
+  SERVER_PID=$!
+  manifest_pid "$SERVER_PID" "opencode serve --port $E2E_PORT --hostname 127.0.0.1"
+}
+
+server_stop() {
+  [ -n "$SERVER_PID" ] || return 0
+  e2e_kill_pid "$SERVER_PID"
+  SERVER_PID=""
+}
+
+# Session rows from the server. V2 wraps pages as { data: [...], cursor } and
+# `order=desc` puts the newest first. The snapshot/new-since pair mirrors
+# runs_snapshot/runs_new_since; a NEW session row is the honest verify that a
+# prompt landed, because sessions persist in the scratch across reboots.
+sessions_list() {
+  api_curl "$API_BASE/api/session?order=desc" 2>/dev/null | python3 -c '
+import json, sys
+try: data = json.load(sys.stdin)
+except Exception: sys.exit(0)
+for s in data.get("data", []):
+    if isinstance(s, dict) and isinstance(s.get("id"), str):
+        print(s["id"])' | sort -u || true
+}
+sessions_snapshot() { sessions_list > "$1"; }                  # usage: sessions_snapshot file
+sessions_new_since() { comm -13 "$1" <(sessions_list) | grep -v '^$' || true; }
+session_landed_since() { [ -n "$(sessions_new_since "$1")" ]; }
+
+# Current (newest) session id from the server.
+current_session() {
+  api_curl "$API_BASE/api/session?order=desc" 2>/dev/null | python3 -c '
+import json, sys
+try: data = json.load(sys.stdin)
+except Exception: sys.exit(0)
+rows = data.get("data") or []
+if rows and isinstance(rows[0], dict) and isinstance(rows[0].get("id"), str):
+    print(rows[0]["id"])' 2>/dev/null || true
+}
+
+# Create a session without a model call; V2 returns { data: Session.Info }.
+session_create() { # [TITLE] → echoes the new session id
+  api_curl -X POST -H 'Content-Type: application/json' \
+    -d "{\"title\":\"${1:-e2e session}\"}" \
+    "$API_BASE/api/session" | python3 -c '
+import json, sys
+try: body = json.load(sys.stdin)
+except Exception: sys.exit(1)
+data = body.get("data") or {}
+sid = data.get("id")
+if isinstance(sid, str) and sid: print(sid)
+else: sys.exit(1)'
+}
+
 # tmux helpers (visual suite) — a dedicated tmux server per suite ---------------
 tmx() { tmux -L "$E2E_TMUX_SOCKET" "$@"; }
 
-tui_start() { # tui_start [extra opencode flags...]
-  tmx new-session -d -s tui -x 200 -y 50 "opencode --port $E2E_PORT $*"
+# tui_start [extra opencode flags...] — start the V2 server half, warm its
+# location plugin, then attach the TUI inside tmux. The server stays up across
+# TUI reboots (V4/V5) so a synthetic case costs zero model calls.
+tui_start() { # tui_start [opencode --session ID --auto ...]
+  server_start
+  if ! wait_for "$E2E_WAIT_TIMEOUT" health_ok; then
+    bad "opencode server never became ready" "poll /api/info on port $E2E_PORT"
+    return 1
+  fi
+  warm_location
+  tmx new-session -d -s tui -x 200 -y 50 \
+    "OPENCODE_PASSWORD='$E2E_PASSWORD' opencode --server '$API_BASE' $*"
   local pane_pid
   pane_pid="$(tmx display-message -p -t tui '#{pane_pid}' 2>/dev/null || true)"
   if [ -n "$pane_pid" ]; then
-    manifest_pid "$pane_pid" "opencode --port $E2E_PORT $*"
+    manifest_pid "$pane_pid" "opencode --server $API_BASE $*"
   fi
 }
 tui_keys()   { tmx send-keys -t tui "$@"; }
 tui_capture() { tmx capture-pane -p -t tui; }   # plain text, live grid
 tui_frame()  { tmx capture-pane -e -t tui; }    # with colors, for artifacts
 
+tui_stop() { tui_quit 2>/dev/null || true; server_stop; }
+
 pane_contains() { tui_capture | grep -qF -- "$1"; }
 pane_lacks()    { ! pane_contains "$1"; }
 pane_matches()  { tui_capture | grep -qE -- "$1"; }   # anchored/regex variant
 
-# Submit a prompt with exact text via the TUI's own HTTP API — tmux send-keys
-# mangles large pastes often enough to make typed prompts flaky.
+# Submit a prompt through the session API — tmux send-keys mangles large pastes
+# often enough to make typed prompts flaky. SESSION_ID must name the TUI's
+# current session (pre-created with session_create, or resolved after boot).
 tui_http_prompt() { # tui_http_prompt TEXT
   local payload
+  [ -n "${SESSION_ID:-}" ] || { bad "tui_http_prompt: no SESSION_ID"; return 1; }
   payload="$(printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps({"text": sys.stdin.read()}))')"
-  curl -sf -m "$E2E_CURL_TIMEOUT" -X POST "http://127.0.0.1:$E2E_PORT/tui/append-prompt" -H 'Content-Type: application/json' -d "$payload" >/dev/null
-  sleep 0.5
-  curl -sf -m "$E2E_CURL_TIMEOUT" -X POST "http://127.0.0.1:$E2E_PORT/tui/submit-prompt" >/dev/null
+  api_curl -X POST "$API_BASE/api/session/$SESSION_ID/prompt" \
+    -H 'Content-Type: application/json' -d "$payload" >/dev/null
 }
 
 # Compose a prompt that makes the model call the workflow tool with a fixture
@@ -589,51 +666,34 @@ assert_pane_lacks() { # desc text [timeout] — asserts the text disappears
     bad "$desc" "pane still shows: '$text'"
   fi
 }
-
-health_ok() { curl -sf -m "$E2E_CURL_TIMEOUT" "http://127.0.0.1:$E2E_PORT/global/health" >/dev/null 2>&1; }
-
-# Session rows from the TUI's own server, ids extracted tolerantly (the
-# response shape varies across opencode releases). The snapshot/new-since pair
-# mirrors runs_snapshot/runs_new_since; a NEW session row is the honest verify
-# that a prompt landed, because sessions persist in the scratch across reboots
-# and a plain any-session check is pre-satisfied on V4/V5 boots.
-sessions_list() { curl -sf -m "$E2E_CURL_TIMEOUT" "http://127.0.0.1:$E2E_PORT/session" 2>/dev/null | grep -oE 'ses_[A-Za-z0-9]+' | sort -u || true; }
-sessions_snapshot() { sessions_list > "$1"; }                  # usage: sessions_snapshot file
-sessions_new_since() { comm -13 "$1" <(sessions_list) | grep -v '^$' || true; }
-session_landed_since() { [ -n "$(sessions_new_since "$1")" ]; }
+assert_pane_matches() { # desc regex [timeout]
+  local desc="$1" regex="$2" timeout="${3:-30}"
+  if wait_for "$timeout" pane_matches "$regex"; then
+    ok "$desc"
+  else
+    bad "$desc" "pane never matched: '$regex'"
+  fi
+}
 
 wait_tui_ready() { # also gates frame dumps until the UI is stable
   if wait_for "$E2E_WAIT_TIMEOUT" health_ok; then
-    ok "TUI server ready on port $E2E_PORT"
+    ok "opencode server ready on port $E2E_PORT"
   else
-    bad "TUI server never became ready" "poll /global/health on port $E2E_PORT"
+    bad "opencode server never became ready" "poll /api/info on port $E2E_PORT"
     return 1
   fi
 }
 
 tui_quit() {
-  # Exit binding is gated on an empty prompt input (app.tsx:982-988): one
-  # ctrl+c clears any typed text, the second exits. Send twice.
+  # V2 exits on a single ctrl+c with an empty prompt; keep a second only as the
+  # fallback when the first is consumed by a dismissable dialog.
   tui_keys C-c 2>/dev/null || true
-  sleep 1
-  tui_keys C-c 2>/dev/null || true
-  wait_for 10 tmx_has_session_tui_gone || tmx kill-server 2>/dev/null || true
+  if ! wait_for 10 tmx_has_session_tui_gone; then
+    tui_keys C-c 2>/dev/null || true
+    wait_for 5 tmx_has_session_tui_gone || tmx kill-server 2>/dev/null || true
+  fi
 }
 tmx_has_session_tui_gone() { ! tmx has-session -t tui 2>/dev/null; }
-
-# Current session id from the TUI's own server (response shape varies across
-# opencode releases; parse tolerantly and print the newest session id).
-current_session() {
-  curl -sf -m "$E2E_CURL_TIMEOUT" "http://127.0.0.1:$E2E_PORT/session" | python3 -c '
-import json, sys
-data = json.load(sys.stdin)
-sessions = data if isinstance(data, list) else data.get("sessions") or list(data.values())
-best = None
-for s in sessions:
-    if isinstance(s, dict) and "id" in s:
-        best = s["id"]  # keep the last one; /session order is newest-first upstream
-print(best if best else "")' 2>/dev/null || echo ""
-}
 
 # Synthetic run injection: the TUI reads disk, so a fabricated run dir with the
 # live session id renders all three progress surfaces without a model call.

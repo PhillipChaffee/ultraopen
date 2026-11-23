@@ -3,8 +3,10 @@ import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { execute } from "../src/server/tool/workflow.js"
-import { registry } from "../src/server/singleton.js"
-import type { OpencodeClient, PromptBody } from "../src/server/types.js"
+import type { HostPort, HostTurnResult } from "../src/server/host/port.js"
+import { resolveOptions } from "../src/server/options.js"
+import { getCoordinator, resetCoordinatorForTests } from "../src/server/runtime/coordinator.js"
+import type { ProjectRuntime, RuntimeCoordinator } from "../src/server/runtime/coordinator.js"
 
 /**
  * The acceptance gate: the spec's own worked examples, run UNCHANGED.
@@ -29,36 +31,62 @@ afterAll(async () => {
 })
 
 beforeEach(() => {
-  registry.resetForTests()
+  resetCoordinatorForTests()
 })
 
-/** Answers every agent with a schema-shaped object when asked, else echoes the prompt. */
-function makeClient() {
+/**
+ * Answers every agent with a schema-shaped capture when the child has a schema, else echoes the
+ * prompt. The capture is the V2 StructuredOutput contract: the tool stores the payload in the
+ * coordinator's per-attempt slot and the turn itself only reports text.
+ */
+function makeHost(coordinator: RuntimeCoordinator, structuredFor?: (text: string) => Record<string, unknown>): HostPort {
   let n = 0
   return {
-    session: {
-      create: () => Promise.resolve({ data: { id: `c${n++}` } }),
-      get: () => Promise.resolve({ data: { id: "c" } }),
-      delete: () => Promise.resolve({}),
-      abort: () => Promise.resolve({}),
-      prompt: (options: { path: { id: string }; body: PromptBody }) => {
-        const text = options.body.parts[0]?.text ?? "",
-         structured = options.body.format
-          ? { findings: [{ title: `finding for ${text.slice(0, 12)}` }], isReal: true, bugs: [{ desc: text.slice(0, 8) }] }
-          : undefined
-        return Promise.resolve({
-          data: {
-            info: { tokens: { output: 2 }, ...(structured ? { structured } : {}) },
-            parts: [{ type: "text", text: `answer:${text.slice(0, 20)}` }],
-          },
-        })
-      },
+    location: { directory: "/work", canonical: "/work", projectID: "project-1" },
+    defaultModel: () => Promise.resolve(undefined),
+    listModels: () => Promise.resolve([]),
+    getSession: () => Promise.resolve(undefined),
+    getAgent: () => Promise.resolve(undefined),
+    listAgents: () => Promise.resolve([]),
+    listPendingPermissions: () => Promise.resolve([]),
+    rejectPermission: () => Promise.resolve(),
+    createChildSession: () => Promise.resolve({ ok: true, sessionID: `c${n++}` }),
+    moveSession: () => Promise.resolve({ ok: true }),
+    runTurn: (input) => {
+      const child = coordinator.childOf(input.sessionID),
+       structured = structuredFor?.(input.text)
+      if (child !== undefined && child.schema !== undefined && structured !== undefined) {
+        child.captured = { value: structured, attempt: child.currentAttempt }
+      }
+      const turn: HostTurnResult = { outcome: "succeeded", text: `answer:${input.text.slice(0, 20)}`, outputTokens: 2 }
+      return Promise.resolve({ ok: true, turn })
     },
-  } as unknown as OpencodeClient
+    interruptSession: () => Promise.resolve(true),
+    admitSynthetic: () => Promise.resolve("admitted"),
+  }
 }
 
-const run = (script: string, args?: unknown) =>
-  execute({ script, ...(args === undefined ? {} : { args }) }, { client: makeClient(), sessionID: "p", runId: "wf_parity01" })
+const schemaShaped = (text: string): Record<string, unknown> => ({
+  findings: [{ title: `finding for ${text.slice(0, 12)}` }],
+  isReal: true,
+  bugs: [{ desc: text.slice(0, 8) }],
+})
+
+function makeProject(coordinator: RuntimeCoordinator): ProjectRuntime {
+  return coordinator.projectOf(
+    { directory: "/work", project: { id: "project-1", canonical: "/work" } },
+    resolveOptions({}),
+  )
+}
+
+const run = (script: string, args?: unknown) => {
+  const coordinator = getCoordinator(),
+   project = makeProject(coordinator)
+  return execute(
+    { script, ...(args === undefined ? {} : { args }) },
+    { host: makeHost(coordinator, schemaShaped), project, coordinator, sessionID: "p", runId: "wf_parity01" },
+  )
+}
 
 describe("spec §2.9 — canonical multi-stage pipeline", () => {
   test("runs unchanged", async () => {
@@ -134,9 +162,17 @@ while (budget.total && budget.remaining() > 1) {
 }
 return { rounds: bugs.length }
 `,
+     coordinator = getCoordinator(),
      result = await execute(
       { script },
-      { client: makeClient(), sessionID: "p", runId: "wf_parity02", budgetTotal: 6 },
+      {
+        host: makeHost(coordinator, schemaShaped),
+        project: makeProject(coordinator),
+        coordinator,
+        sessionID: "p",
+        runId: "wf_parity02",
+        budgetTotal: 6,
+      },
     )
     // Each agent reports 2 output tokens, so a ceiling of 6 admits exactly three rounds.
     expect((result.value as { rounds: number }).rounds).toBe(3)

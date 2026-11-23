@@ -1,8 +1,10 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test"
 import { execute } from "../src/server/tool/workflow.js"
-import { registry } from "../src/server/singleton.js"
 import type { JournalEntry } from "../src/server/resume/journal.js"
-import type { OpencodeClient, PromptBody } from "../src/server/types.js"
+import type { HostPort, HostTurnResult } from "../src/server/host/port.js"
+import { resolveOptions } from "../src/server/options.js"
+import { getCoordinator, resetCoordinatorForTests } from "../src/server/runtime/coordinator.js"
+import type { ProjectRuntime, RuntimeCoordinator } from "../src/server/runtime/coordinator.js"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -32,53 +34,84 @@ afterAll(async () => {
 const META = "export const meta = { name: 'r', description: 'resume tests' }\n"
 
 /**
- * A client that answers with the prompt text, and records how many LIVE calls happened.
+ * A host that answers with the prompt text, and records how many LIVE calls happened.
  *
  * Latency is scriptable per prompt so a pipeline's stage-1 calls can be made to finish out of
- * order — which is the whole point of these tests.
+ * order — which is the whole point of these tests. A schema'd child gets its capture slot filled,
+ * the V2 StructuredOutput contract, so the retry ladder does not fire spuriously.
  */
-function makeClient(latency: (prompt: string) => number = () => 0) {
-  const livePrompts: string[] = [],
-   client = {
-    session: {
-      create: () => Promise.resolve({ data: { id: `child-${livePrompts.length}` } }),
-      get: () => Promise.resolve({ data: { id: "c" } }),
-      delete: () => Promise.resolve({}),
-      abort: () => Promise.resolve({}),
-      prompt: (options: { path: { id: string }; body: PromptBody }) => {
-        const text = options.body.parts[0]?.text ?? ""
-        livePrompts.push(text)
-        // Honour `format`: a schema'd call must come back with `structured`, or the retry ladder
-        // fires three times and obscures what the resume logic actually did.
-        const structured = options.body.format ? { echoed: text } : undefined
-        return new Promise((resolve) => {
-          setTimeout(
-            () =>
-              resolve({
-                data: {
-                  info: { tokens: { output: 2 }, ...(structured ? { structured } : {}) },
-                  parts: [{ type: "text", text: `R:${text}` }],
-                },
-              }),
-            latency(text),
-          )
-        })
-      },
+function makeHost(
+  coordinator: RuntimeCoordinator,
+  latency: (prompt: string) => number = () => 0,
+): { host: HostPort; livePrompts: string[] } {
+  const livePrompts: string[] = []
+  let nextSession = 0
+  const host: HostPort = {
+    location: { directory: "/work", canonical: "/work", projectID: "project-1" },
+    defaultModel: () => Promise.resolve(undefined),
+    listModels: () => Promise.resolve([]),
+    getSession: () => Promise.resolve(undefined),
+    getAgent: () => Promise.resolve(undefined),
+    listAgents: () => Promise.resolve([]),
+    listPendingPermissions: () => Promise.resolve([]),
+    rejectPermission: () => Promise.resolve(),
+    createChildSession: () => {
+      nextSession++
+      return Promise.resolve({ ok: true, sessionID: `child-${nextSession}` })
     },
-  } as unknown as OpencodeClient
-  return { client, livePrompts }
+    moveSession: () => Promise.resolve({ ok: true }),
+    runTurn: (input) => {
+      const text = input.text
+      livePrompts.push(text)
+      const child = coordinator.childOf(input.sessionID)
+      if (child !== undefined && child.schema !== undefined) {
+        child.captured = { value: { echoed: text }, attempt: child.currentAttempt }
+      }
+      const turn: HostTurnResult = { outcome: "succeeded", text: `R:${text}`, outputTokens: 2 }
+      return new Promise((resolve) => {
+        setTimeout(() => {resolve({ ok: true as const, turn })}, latency(text))
+      })
+    },
+    interruptSession: () => Promise.resolve(true),
+    admitSynthetic: () => Promise.resolve("admitted"),
+  }
+  return { host, livePrompts }
+}
+
+/** Keeps the historical `.client` spelling at the call sites; the value is a HostPort. */
+const makeClient = (latency: (prompt: string) => number = () => 0): { client: HostPort; livePrompts: string[] } => {
+  const made = makeHost(getCoordinator(), latency)
+  return { client: made.host, livePrompts: made.livePrompts }
+}
+
+function makeProject(coordinator: RuntimeCoordinator): ProjectRuntime {
+  return coordinator.projectOf(
+    { directory: "/work", project: { id: "project-1", canonical: "/work" } },
+    resolveOptions({}),
+  )
+}
+
+/** The process-wide cap now lives on the project runtime's semaphore. */
+const configureConcurrency = (limit: number): void => {
+  getCoordinator().projectOf(
+    { directory: "/work", project: { id: "project-1", canonical: "/work" } },
+    { ...resolveOptions({}), concurrency: limit },
+  )
 }
 
 const run = async (
   script: string,
-  client: OpencodeClient,
+  host: HostPort,
   previous?: readonly JournalEntry[],
   extra?: { onJournal?: (entry: JournalEntry) => void },
 ): Promise<{ value: unknown; entries: JournalEntry[] }> => {
+  const coordinator = getCoordinator()
   const result = await execute(
     { script, ...(previous ? { resumeFromRunId: "wf_prev0000" } : {}) },
     {
-      client,
+      host,
+      project: makeProject(coordinator),
+      coordinator,
       sessionID: "parent",
       runId: "wf_test0000",
       ...(previous ? { previousEntries: previous, resumedFrom: "wf_prev0000" } : {}),
@@ -89,7 +122,7 @@ const run = async (
 }
 
 beforeEach(() => {
-  registry.resetForTests()
+  resetCoordinatorForTests()
 })
 
 describe("flat scripts", () => {
@@ -236,7 +269,7 @@ return out
 `
 
   test("resuming an unchanged parallel makes ZERO live calls even with a small cap", async () => {
-    registry.configureConcurrency(2)
+    configureConcurrency(2)
     const first = makeClient((p) => (p === "p0" ? 30 : 1)),
      before = await run(script, first.client)
     expect(first.livePrompts.length).toBe(4)
@@ -248,7 +281,7 @@ return out
   })
 
   test("editing one thunk leaves the others replayable", async () => {
-    registry.configureConcurrency(2)
+    configureConcurrency(2)
     const first = makeClient(),
      before = await run(script, first.client),
 

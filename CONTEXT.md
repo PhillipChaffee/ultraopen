@@ -21,15 +21,36 @@ the resume refusal and the TUI surfaces all key off liveness, not disk status al
 
 **agent transcript**
 The child session stream: the full conversation an `agent()` call produces — prompt, tool calls,
-every part — owned by opencode's message storage, not by the plugin. The native viewer is
-upstream child-session navigation, which renders nothing for schema'd children (decided in #150,
-probe on branch `150-transcript-spike`). The plugin-side representation on disk is the recording.
+every part — owned by opencode's message storage, not by the plugin. V2 has no transcript or
+custom tool-renderer slot, and `GenericTool` renders only a state glyph plus `workflow`; native
+child inspection is the `/workflows` session panel and `/sessions` titles, neither of which shows
+a schema-forced child's stream reliably. The plugin-side representation on disk is the recording.
 
 **agent recording**
 The per-agent capture of that stream's part events, written append-only to the run directory
 while the child works — always on, for every agent of every run (decided in ADR-0004). The
 recording is the transcript's representation on disk, not a second artifact pretending to be the
 session: schema'd children whose native view renders blank are readable only here.
+
+**StructuredOutput**
+The V2 capture tool that replaces V1's request-level `format` field. The plugin registers it
+globally, exposes it only on schema-mode child turns (binding the normalized schema through
+`hook("context")`), validates payloads in-loop, and stores the capture per turn. Validation
+failure throws a tool error so the model self-repairs inside the same turn; there is no
+`info.structured` envelope and no format-poisoned session history.
+
+**reactive slot**
+One of the V2 TUI extension points the plugin claims: `sidebar.content` (run summaries, agent
+rows, stop guidance), `session.composer.top` (live status and interrupted-run hints),
+`prompt.footer` (the compact running indicator), `home.footer.status`, and the `session.panel`
+replacement that `/workflows` opens. Slots are fed by `UltraopenRpc` (`listRuns` on mount,
+`runUpdated` events after) plus a 1 Hz `listRuns` poll for disk-only and remote runs — never a
+direct disk poll from the TUI.
+
+**direct stop**
+`/workflow-stop <runId>` from the TUI, calling `UltraopenRpc.stopRun` with no confirmation. It
+records the run `cancelled` exactly as `workflow({ stop })` does; ESC never stops a background
+run.
 
 **launch**
 A call to the `workflow` tool that starts (or is refused at) the gate. A launch registers a pending
@@ -97,8 +118,8 @@ through env vars the harness fails to redirect.
 **cleanup reaper (e2e)**
 The detached watcher one e2e suite run forks at start. It watches the suite script and, when the
 script dies for any reason, kills the run's recorded processes, sweeps marker-matched leaks, and
-tears down what the EXIT trap would have (scratch, stashed modules, tmux server). Not the plugin's
-boot-time crash reaper, which marks dead runs `orphaned` on disk.
+tears down what the EXIT trap would have (scratch, tmux server, the `opencode serve` half). Not
+the plugin's boot-time crash reaper, which marks dead runs `orphaned` on disk.
 
 **PID manifest (e2e)**
 The per-suite-run file in the suite's artifacts dir listing every process the harness spawned
@@ -122,33 +143,30 @@ for fixed settle sleeps, because no upstream signal marks the end of the input-d
 Gated once per boot, before the first input-bearing step; later keystrokes are outside the
 window.
 
-**open floor**
-The `engines.opencode` lower bound, `>=1.18.20`, declared with no ceiling: an opencode older than
-the floor loads nothing — the version gate skips the plugin at boot with a version error. The
-floor moves only when a feature requires a newer opencode API, never for compatibility
-housekeeping; the standing policy is fix forward, gate last (verify upstream majors against the
-e2e suites proactively, support both lines with compatible code first, touch the range only as a
-last resort — decided in #108, durable record in the README stance line, no ADR).
+**version window**
+The `engines.opencode` range, `>=2.3.2 <3`: V2.3.2 is the verified floor and V3 is never claimed.
+The V1 line is frozen at `0.1.0` — never unpublished, never backported, and no V1 runtime adapter
+is retained. The window moves only when a V2 feature requires a newer 2.x API; the standing policy
+is fix forward, gate last (decided in #108/#174).
 
 **sticky cache**
-The opencode package cache tree an npm-name plugin installs into: `~/.cache/opencode/packages/<spec>`,
-one directory per spec (`ultraopen@latest`, or a pin like `ultraopen@0.1.0` in its own versioned
-tree). `@latest` resolves only on first install — a published update never reaches an existing
-install on its own, which is what the refresh instruction works around; `-f` rewrites config
-entries and never refetches a bare `@latest` (decided in #105).
+The opencode package cache tree an npm-name plugin installs into:
+`~/.cache/opencode/npm/<spec>`. V2 resolves a dist-tag only when an install runs — a published
+update never reaches an existing install on its own, which is what the refresh instruction works
+around. Pinning a version installs into its own versioned tree.
 
 **refresh instruction**
 The canonical sticky-cache refresh shipped with every publish: remove
-`~/.cache/opencode/packages/ultraopen*`, then restart opencode. The npm plugin cache is sticky —
-`@latest` resolves only on first install — so a new release never reaches an existing install on
-its own. Habitual, not situational: it hard-embeds into every release's notes
+`~/.cache/opencode/npm/ultraopen*`, then restart opencode. The npm plugin cache is sticky — a
+dist-tag resolves only when an install runs — so a new release never reaches an existing install
+on its own. Habitual, not situational: it hard-embeds into every release's notes
 (`.github/release-template.md`) and the standing README "Updating" note (decided in #108).
 
 **registry hop**
 The fetch of a published package from the npm registry into the package cache — the one install
 link a packed-tarball proof cannot exercise. Nothing posts or submits anywhere until the hop is
-proven live in a scratch home: the installer exits clean, writes both config files, and the e2e
-suites pass against the registry-installed tree (decided in #111).
+proven live in a scratch home: the installer exits clean, writes the single `plugins` entry, and
+the e2e suites pass against the registry-installed tree (decided in #111).
 
 **trusted publisher**
 The npmjs.com binding that lets the tag-driven `release.yml` publish to npm via GitHub Actions

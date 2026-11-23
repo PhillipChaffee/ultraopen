@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { renderCapRefusal, renderForeignSessionResumeRefusal, renderLaunch, renderRefusal, renderResult, renderSiblingAdvisory, renderStatus, renderStopFailure, renderStringifiedArgsRefusal, renderUnrecordedSessionResumeRefusal, stopReasonOf, transcriptHint } from "../src/server/tool/render.js"
+import { renderCapRefusal, renderForeignSessionResumeRefusal, renderLaunch, renderRefusal, renderResult, renderSiblingAdvisory, renderStatus, renderStopFailure, renderStringifiedArgsRefusal, renderUnrecordedSessionResumeRefusal, statusArgsSchema, stopReasonOf, transcriptHint, workflowArgsSchema } from "../src/server/tool/render.js"
 import { CONTROL_STOP_ABORT_REASON, STOP_ABORT_REASON } from "../src/server/tool/background.js"
 import { runDir } from "../src/server/resume/store.js"
 import type { WorkflowResult } from "../src/server/tool/workflow.js"
@@ -238,11 +238,11 @@ describe("renderLaunch", () => {
     expect(launched.split("\n").length).toBeGreaterThan(1)
   })
 
-  test("the launch result carries the transcript hint (#150)", () => {
+  test("the launch result carries the V2 transcript hint (#150)", () => {
     const launched = renderLaunch("demo", "wf_hint0001", false)
     expect(launched).toContain("Agent transcripts: open `/sessions`")
-    // The gesture is named, the picker named; positional claims are named NOT.
-    expect(launched).toContain("leader+down")
+    // V2 navigation: the picker, the /workflows panel, and the title the child is filed under.
+    expect(launched).toContain("/workflows")
     expect(launched).toContain("ultraopen · <label>")
     expect(launched).not.toContain("row ")
     // The hint is the tag's closing neighbor — the discoverability pointer trails the
@@ -250,12 +250,17 @@ describe("renderLaunch", () => {
     expect(launched.lastIndexOf("Agent transcripts")).toBeLessThan(launched.lastIndexOf("</workflow-launched>"))
   })
 
-  test("the hint is the model-facing sentence, and the TUI renders its own compact twin", () => {
+  test("the V2 hint drops the V1 keymap, whose leader+down and bare left/right gestures are gone", () => {
     // Different readers, same affordances: the launch result speaks to the model at full
     // length; the TUI (src/tui/data.ts, tested over there) renders the compact shape near the
-    // rows. The two never drift in CONTENT — the picker, the gesture, and the no-positional
-    // rule are the same in both — but each keeps its reader's length.
-    expect(transcriptHint()).toContain("bare right/left cycles children")
+    // rows. The V1 navigation claims are no longer true in V2.
+    const hint = transcriptHint()
+    expect(hint).toContain("/sessions")
+    expect(hint).toContain("/workflows")
+    expect(hint).toContain("ultraopen · <label>")
+    expect(hint).not.toContain("leader+down")
+    expect(hint).not.toContain("right/left")
+    expect(hint).not.toMatch(/bare (?:up|right|left)/u)
   })
 
   test("an untitled launch renders exactly as before — no placeholder noise (#142)", () => {
@@ -295,6 +300,7 @@ const statusReport = (over: Partial<StatusReport> = {}): StatusReport => ({
     agentRows: [],
     outputTokens: 120,
     budget: { total: null, spent: 0 },
+    stopping: false,
     logs: [],
     ...over,
   })
@@ -351,6 +357,58 @@ describe("renderStatus", () => {
 
   test("a row with no agents renders no block (an append that adds no empty structure)", () => {
     expect(renderStatus(statusReport())).not.toContain("<agents>")
+  })
+
+  test("a stopping run displays the stopping state on the tag and in the body (#175)", () => {
+    const rendered = renderStatus(statusReport({ stopping: true }))
+    expect(rendered).toContain('stopping="true"')
+    expect(rendered).toContain("stopping:")
+    // The manifest status is still running: the stop is unwinding, not yet cancelled.
+    expect(rendered).toContain('status="running"')
+  })
+
+  test("a run that is not stopping renders no stopping noise", () => {
+    const rendered = renderStatus(statusReport())
+    expect(rendered).not.toContain("stopping")
+  })
+})
+
+describe("tool argument schemas (V2 ToolInfo.input)", () => {
+  // V2 sends the schema verbatim to the provider, so a bare properties map is an invalid
+  // tool input and the tool never mounts. These pin the complete Draft 2020-12 envelope.
+  test("workflowArgsSchema is a complete object schema with every field under properties", () => {
+    const schema = workflowArgsSchema()
+    expect(schema["type"]).toBe("object")
+    expect(schema["additionalProperties"]).toBe(false)
+    expect(schema["required"]).toEqual([])
+    const properties = schema["properties"] as Record<string, unknown>
+    for (const field of [
+      "script",
+      "scriptPath",
+      "args",
+      "resumeFromRunId",
+      "dryRun",
+      "background",
+      "stop",
+      "title",
+      "description",
+    ]) {
+      expect(properties[field]).toBeDefined()
+      // No field leaked to the top level beside the envelope keys.
+      expect(schema[field]).toBeUndefined()
+    }
+  })
+
+  test("statusArgsSchema is a complete object schema requiring runId", () => {
+    const schema = statusArgsSchema()
+    expect(schema["type"]).toBe("object")
+    expect(schema["additionalProperties"]).toBe(false)
+    expect(schema["required"]).toEqual(["runId"])
+    const properties = schema["properties"] as Record<string, unknown>
+    expect(Object.keys(properties).toSorted()).toEqual(["runId", "wait"])
+    expect((properties["runId"] as { type?: string }).type).toBe("string")
+    expect((properties["wait"] as { type?: string }).type).toBe("number")
+    expect(schema["runId"]).toBeUndefined()
   })
 })
 
