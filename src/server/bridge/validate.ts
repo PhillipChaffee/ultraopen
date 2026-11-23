@@ -14,6 +14,37 @@
 
 export type ValidationResult = { valid: true } | { valid: false; errors: string[] }
 
+/** True when the schema's root is an object, so the host can bind it without an envelope. */
+export function isObjectRootSchema(schema: Record<string, unknown>): boolean {
+  return schema["type"] === "object" || schema["properties"] !== undefined
+}
+
+/**
+ * Normalises a child's JSON Schema into the object-rooted shape V2's tool input requires.
+ *
+ * A tool's input schema must have an object root; a non-object root is carried inside a `{ value }`
+ * envelope, which {@link unwrapCaptured} reverses before the script sees the value.
+ */
+export function normalizeStructuredSchema(schema: Record<string, unknown>): Record<string, unknown> {
+  if (isObjectRootSchema(schema)) {return schema}
+  return {
+    type: "object",
+    properties: { value: schema },
+    required: ["value"],
+    additionalProperties: false,
+  }
+}
+
+/**
+ * Unwraps a capture taken through a non-object-root schema's `{ value }` envelope.
+ *
+ * The envelope is a transport detail the script must never see.
+ */
+export function unwrapCaptured(value: unknown, wrapped: boolean): unknown {
+  if (!wrapped || typeof value !== "object" || value === null) {return value}
+  return (value as Record<string, unknown>)["value"]
+}
+
 export function validate(value: unknown, schema: Record<string, unknown>): ValidationResult {
   const errors: string[] = []
   check(value, schema, "", errors)

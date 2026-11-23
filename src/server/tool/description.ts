@@ -7,7 +7,7 @@
  * Adapted from Claude Code's Workflow tool. Differences from the original are deliberate and
  * limited to what opencode actually does — see NOTICE:
  *   - `Workflow({...})` -> `workflow({...})`, the opencode tool id
- *   - "the Agent tool" -> "the task tool"
+ *   - "the Agent tool" -> "the subagent tool" (V2 renamed the built-in `task` tool to `subagent`)
  */
 
 /**

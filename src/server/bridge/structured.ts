@@ -1,24 +1,24 @@
 import { createChild, promptChild } from "./spawn.js"
 import type { SpawnOptions, SpawnOutcome } from "./spawn.js"
 import { validate } from "./validate.js"
-import type { OpencodeClient } from "../types.js"
+import type { HostPort } from "../host/port.js"
 
 /**
  * Schema-forced output with a bounded retry ladder.
  *
- * Three facts shape this, all verified against opencode rather than assumed:
+ * Three facts shape this, all verified against opencode V2 rather than assumed:
  *
- * 1. `format: {type:"json_schema"}` is real — the host injects a StructuredOutput tool, forces the
- *    tool choice, and lands the validated object on `info.structured`. It does NOT prevent the
- *    agent from using ordinary tools first, so a subagent can research and then emit.
+ * 1. There is no native structured-output channel. The host injects a direct `StructuredOutput`
+ *    tool whose input schema is rewritten per child, and the tool's executor stores the validated
+ *    payload in the coordinator's per-attempt capture slot. It does NOT prevent the agent from
+ *    using ordinary tools first, so a subagent can research and then emit.
  *
  * 2. The host's own `retryCount` is decoded with a default and then never read. Retries are ours.
  *
  * 3. Retries go in the SAME session. That preserves the child's research (often dozens of tool
- *    calls), hits the provider's cache prefix, and is the only construction that repairs a
- *    compaction-stripped `format` — a fresh session cannot, because the repair IS a new
- *    format-bearing user message. It also cannot anchor on the bad output, because the host drops
- *    an errored assistant turn from the messages it sends the model.
+ *    calls), hits the provider's cache prefix, and survives auto-compaction. Each attempt
+ *    increments `currentAttempt` and clears `captured` first, so a stale value from the previous
+ *    turn can never satisfy the new one.
  *
  * Three attempts, not five: argument-validation failures already self-repair inside the host's own
  * loop, so the extra attempts were padding.
@@ -29,36 +29,51 @@ const MAX_ATTEMPTS = 3
 
 export type StructuredResult = SpawnOutcome & { attempts: number }
 
-export async function spawnStructured(client: OpencodeClient, options: SpawnOptions): Promise<StructuredResult> {
-  const {schema} = options
+export async function spawnStructured(host: HostPort, options: SpawnOptions): Promise<StructuredResult> {
+  const { schema } = options
   if (!schema) {
-    const outcome = await runOnce(client, options)
+    const outcome = await runOnce(host, options)
     return { ...outcome, attempts: 1 }
   }
 
-  const created = await createChild(client, options)
-  if (!created.ok) {return { ok: false, reason: "spawn-failed", detail: created.detail, attempts: 0 }}
-  const {sessionID} = created
+  const created = await createChild(host, options)
+  if (!created.ok) {
+    return { ok: false, reason: created.reason, detail: created.detail, attempts: 0, outputTokens: 0 }
+  }
+  const { sessionID } = created
 
-  let lastDetail = "no structured output was produced"
+  let lastDetail = "no structured output was produced",
+   outputTokens = 0
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const record = options.coordinator.childOf(sessionID)
+    // The capture slot is per-ATTEMPT, not per-session: a value captured on a previous turn must
+    // never be handed back as this turn's answer.
+    if (record !== undefined) {
+      record.currentAttempt = attempt
+      record.captured = undefined
+      record.lastValidationErrors = undefined
+    }
+
     const prompt = attempt === 1 ? options.prompt : nudge(attempt, schema, lastDetail),
-     outcome = await promptChild(client, sessionID, prompt, options)
+     outcome = await promptChild(host, sessionID, prompt, options)
+    // Tokens are spent whether or not the attempt produced a usable value, so every attempt counts.
+    outputTokens += outcome.outputTokens ?? 0
 
     // Only a schema miss is worth retrying. An abort, a deadline or a context overflow will not
     // improve by asking again — and retrying an aborted run would fight the user.
     if (outcome.ok) {
       const verdict = validate(outcome.structured, schema)
-      if (verdict.valid) {return { ...outcome, attempts: attempt }}
+      if (verdict.valid) {return { ...outcome, outputTokens, attempts: attempt }}
 
       // The host validates against the schema it was given, so a mismatch here means the value
-      // came back through a path that skipped that check — exactly the compaction case.
+      // came back through a path that skipped that check.
       lastDetail = verdict.errors.slice(0, 4).join("; ")
+      if (record !== undefined) {record.lastValidationErrors = verdict.errors}
       continue
     }
 
-    if (outcome.reason !== "schema-failed") {return { ...outcome, attempts: attempt }}
+    if (outcome.reason !== "schema-failed") {return { ...outcome, outputTokens, attempts: attempt }}
     lastDetail = outcome.detail
   }
 
@@ -67,14 +82,15 @@ export async function spawnStructured(client: OpencodeClient, options: SpawnOpti
     reason: "schema-failed",
     detail: `no valid structured output after ${MAX_ATTEMPTS} attempts — ${lastDetail}`,
     sessionID,
+    outputTokens,
     attempts: MAX_ATTEMPTS,
   }
 }
 
-async function runOnce(client: OpencodeClient, options: SpawnOptions): Promise<SpawnOutcome> {
-  const created = await createChild(client, options)
-  if (!created.ok) {return { ok: false, reason: "spawn-failed", detail: created.detail }}
-  return await promptChild(client, created.sessionID, options.prompt, options)
+async function runOnce(host: HostPort, options: SpawnOptions): Promise<SpawnOutcome> {
+  const created = await createChild(host, options)
+  if (!created.ok) {return { ok: false, reason: created.reason, detail: created.detail }}
+  return await promptChild(host, created.sessionID, options.prompt, options)
 }
 
 /**
@@ -110,8 +126,8 @@ function nudge(attempt: number, schema: Record<string, unknown>, detail: string)
 }
 
 function requiredSummary(schema: Record<string, unknown>): string[] {
-  const {required} = schema
-  const {properties} = schema
+  const { required } = schema
+  const { properties } = schema
   if (!Array.isArray(required) || typeof properties !== "object" || properties === null) {return []}
 
   const props = properties as Record<string, unknown>
@@ -127,10 +143,10 @@ function requiredSummary(schema: Record<string, unknown>): string[] {
 
 /** A minimal example instance, used only as a last-resort nudge. */
 function exampleFor(schema: Record<string, unknown>): unknown {
-  const {type} = schema
+  const { type } = schema
 
   if (type === "object" || schema["properties"] !== undefined) {
-    const {properties} = schema
+    const { properties } = schema
     if (typeof properties !== "object" || properties === null) {return {}}
     const out: Record<string, unknown> = {}
     for (const [key, sub] of Object.entries(properties as Record<string, unknown>)) {
@@ -140,7 +156,7 @@ function exampleFor(schema: Record<string, unknown>): unknown {
   }
 
   if (type === "array") {
-    const {items} = schema
+    const { items } = schema
     return typeof items === "object" && items !== null ? [exampleFor(items as Record<string, unknown>)] : []
   }
 

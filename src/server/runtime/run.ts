@@ -1,8 +1,8 @@
 import { fail } from "../script/errors.js"
 import { DEFAULT_AGENT_DEADLINE_MS, DEFAULT_AGENT_IDLE_MS, LARGE_RUN_AGENTS, LARGE_RUN_PROJECTED_TOKENS, MAX_AGENTS_PER_RUN, MAX_AGENT_RESTARTS } from "../script/limits.js"
-import { registry } from "../singleton.js"
 import type { ControlAction, ControlCommand } from "./control.js"
-import type { NullReason } from "../bridge/spawn.js"
+import type { NullReason, SpawnOptions } from "../bridge/spawn.js"
+import { tokensOf } from "../bridge/spawn.js"
 import { spawnStructured } from "../bridge/structured.js"
 import { findContradictions } from "../bridge/validate.js"
 import { Journal } from "../resume/journal.js"
@@ -15,7 +15,8 @@ import { assertWithinBudget, makeBudget, makeFamilySpend } from "./budget.js"
 import type { Budget, FamilySpend } from "./budget.js"
 import { createWorktree } from "../bridge/isolation.js"
 import type { Ruleset } from "../bridge/permission.js"
-import type { OpencodeClient } from "../types.js"
+import type { HostModelRef, HostPort } from "../host/port.js"
+import type { ProjectRuntime, RuntimeCoordinator } from "./coordinator.js"
 
 /** Options a script may pass to `agent()`. Mirrors the Workflow spec's opts bag. */
 export interface AgentOptions {
@@ -68,27 +69,38 @@ export type ProgressEvent =
       index: number
       sessionID: string
     }
-  | { type: "agent-end"; index: number; label: string; phase: string | undefined; ok: boolean; outputTokens?: number; sessionID?: string }
+  | { type: "agent-end"; index: number; label: string; phase: string | undefined; ok: boolean; reason?: string; outputTokens?: number; sessionID?: string }
   | { type: "phase"; title: string }
   | { type: "log"; message: string }
 
 export interface RunOptions {
   runId: string
-  client: OpencodeClient
+  /**
+   * The host this run drives.
+   *
+   * Callers pass the coordinator's `hostFor` proxy, which resolves the current activation's host
+   * at every call. That object is stable across a same-PID plugin reload, so the run never has to
+   * know a handoff happened.
+   */
+  host: HostPort
+  /** The project runtime that owns this run's semaphore, worktree queues and mode. */
+  project: ProjectRuntime
+  /** Process-scoped coordinator: child lineage, activity, abort fan-out and event dedupe. */
+  coordinator: RuntimeCoordinator
   parentSessionID: string
+  /** Sessions above the parent, nearest first, recorded on every child (`#149` recovery). */
+  ancestorSessionIDs: readonly string[]
   /**
    * Resolves an `effort` string against the target model's real variant map.
    *
    * Receives the resolved model, because variants belong to a model and an individual agent() call
    * may pin one that differs from the run default.
    */
-  resolveVariant?:
-    | ((effort: string | undefined, model?: { providerID: string; modelID: string } | undefined) => string | undefined)
-    | undefined
+  resolveVariant?: ((effort: string | undefined, model?: HostModelRef | undefined) => string | undefined) | undefined
   /** Parses a "provider/model" string into the prompt-body model ref. */
-  resolveModel?: ((model: string | undefined) => { providerID: string; modelID: string } | undefined) | undefined
+  resolveModel?: ((model: string | undefined) => HostModelRef | undefined) | undefined
   inheritedPermission?: Ruleset | undefined
-  /** Contract text appended to the child's system prompt (PromptInput.system appends). */
+  /** Contract text the host's context hook appends to the child's system prompt. */
   subagentContract?: ((opts: AgentOptions) => string | undefined) | undefined
   deadlineMs?: number | undefined
   /** Inactivity bound per agent; 0 disables it. Idle resets on observed child progress. */
@@ -120,7 +132,8 @@ export interface RunOptions {
  * The per-run engine context.
  *
  * Owns the agent counter, the phase/log narration, and the null ledger. One instance per workflow
- * invocation; the concurrency gate it uses is process-global (see `singleton.ts`).
+ * invocation; the concurrency gate it uses belongs to the project runtime, and child lineage lives
+ * in the process-scoped coordinator.
  */
 export class Run {
   readonly runId: string
@@ -134,6 +147,10 @@ export class Run {
   /** One controller per in-flight agent, so a stop-agent can abort exactly one child. */
   readonly #agentControllers = new Map<number, AbortController>()
   readonly #options: RunOptions
+  readonly #project: ProjectRuntime
+  readonly #coordinator: RuntimeCoordinator
+  /** The reloadable host proxy: stable across a plugin reload, resolved per call. */
+  readonly #host: HostPort
   readonly #journal: Journal
   readonly #rootScope: Scope
   readonly #resumedFrom: string | undefined
@@ -145,6 +162,9 @@ export class Run {
   constructor(options: RunOptions) {
     this.#options = options
     this.runId = options.runId
+    this.#project = options.project
+    this.#coordinator = options.coordinator
+    this.#host = options.host
     this.#journal = new Journal()
     this.journal = this.#journal
     this.#resumedFrom = options.resumedFrom
@@ -190,12 +210,12 @@ export class Run {
     const who = command.target === undefined ? "" : ` (agent ${command.target})`
     switch (command.action) {
       case "pause": {
-        registry.semaphore.pause()
+        this.#project.semaphore.pause()
         this.log("control: run paused — in-flight agents finish, no new agent starts.")
         break
       }
       case "resume": {
-        registry.semaphore.resume()
+        this.#project.semaphore.resume()
         this.log("control: run resumed.")
         break
       }
@@ -347,7 +367,7 @@ export class Run {
     // The permit is held only for the spawn itself. Combinators deliberately do NOT gate, or a
     // parallel() nested in a pipeline() stage would deadlock behind its own outer item.
     // acquire() also rejects promptly if the parent aborts while queued.
-    const release = await registry.semaphore.acquire(this.#options.signal)
+    const release = await this.#project.semaphore.acquire(this.#options.signal)
     try {
       // Fail HERE rather than after paying for a worktree and a child session that would be
       // aborted on first prompt.
@@ -355,29 +375,40 @@ export class Run {
         fail({ kind: "RuntimeError", message: "The run was aborted before this agent could start." })
       }
       const model = this.#options.resolveModel?.(options.model),
+       worktreeRoot = this.#options.worktreeRoot,
        worktree =
-        options.isolation === "worktree" && this.#options.worktreeRoot
-          ? await createWorktree({ worktreeRoot: this.#options.worktreeRoot, label, onNote: this.log })
+        options.isolation === "worktree" && worktreeRoot !== undefined
+          ? await createWorktree({
+              worktreeRoot,
+              label,
+              onNote: this.log,
+              // Serialize per project AND per repository, never globally: a held creation in one
+              // project must not stall an unrelated project's worktree.
+              queue: queueBox(this.#project.worktreeQueues, worktreeRoot),
+            })
           : undefined
       if (worktree) {this.#worktrees.push(worktree.release)}
-      const spawnOptions = {
+      const spawnOptions: SpawnOptions = {
         prompt,
         runId: this.runId,
         parentSessionID: this.#options.parentSessionID,
+        ancestorSessionIDs: this.#options.ancestorSessionIDs,
+        projectKey: this.#project.projectKey,
+        coordinator: this.#coordinator,
         label,
         agentIndex: index,
-        ...pick("agentType", options.agentType),
-        ...pick("schema", options.schema),
-        ...pick("disallowedTools", options.disallowedTools),
-        ...pick("model", model),
-        ...pick("variant", this.#options.resolveVariant?.(options.effort, model)),
-        ...pick("system", this.#options.subagentContract?.(options)),
-        ...pick("inheritedPermission", this.#options.inheritedPermission),
-        ...pick("deadlineMs", this.#options.deadlineMs ?? DEFAULT_AGENT_DEADLINE_MS),
-        ...pick("idleMs", this.#options.idleMs ?? DEFAULT_AGENT_IDLE_MS),
-        ...pick("signal", agentSignal(this.#options.signal, this.#agentControllers, index)),
-        ...pick("directory", worktree?.directory),
-        ...pick(
+        ...optional("agentType", options.agentType),
+        ...optional("schema", options.schema),
+        ...optional("disallowedTools", options.disallowedTools),
+        ...optional("model", model),
+        ...optional("variant", this.#options.resolveVariant?.(options.effort, model)),
+        ...optional("system", this.#options.subagentContract?.(options)),
+        ...optional("inheritedPermission", this.#options.inheritedPermission),
+        ...optional("deadlineMs", this.#options.deadlineMs ?? DEFAULT_AGENT_DEADLINE_MS),
+        ...optional("idleMs", this.#options.idleMs ?? DEFAULT_AGENT_IDLE_MS),
+        ...optional("signal", agentSignal(this.#options.signal, this.#agentControllers, index)),
+        ...optional("directory", worktree?.directory),
+        ...optional(
           "onChildCreated",
           this.#options.onProgress === undefined
             ? undefined
@@ -386,7 +417,8 @@ export class Run {
               },
         ),
       }
-      let outcome = await spawnStructured(this.#options.client, spawnOptions)
+      // The host is the coordinator's reloadable proxy: each call lands on the current activation.
+      let outcome = await spawnStructured(this.#host, spawnOptions)
 
       // An IDLE kill is a stall, and a fresh attempt usually finishes fast — so the agent restarts
       // in place, reusing the permit this call already holds. Re-acquiring would deadlock at
@@ -419,7 +451,7 @@ export class Run {
         assertWithinBudget(this.#budget)
         attempt++
         this.log(`"${label}" hit its deadline and is being restarted (attempt ${attempt})`)
-        outcome = await spawnStructured(this.#options.client, spawnOptions)
+        outcome = await spawnStructured(this.#host, spawnOptions)
       }
 
       // A parent abort that lands during a stall can win the race as a deadline kill; report it
@@ -447,8 +479,8 @@ export class Run {
             label,
             phase,
             ok: true,
-            outputTokens: outputTokensOf(finalOutcome.info),
-            ...pick("sessionID", finalOutcome.sessionID),
+            outputTokens: tokensOf(finalOutcome.outputTokens),
+            sessionID: finalOutcome.sessionID,
           }
         : {
             index,
@@ -458,7 +490,7 @@ export class Run {
             reason: finalOutcome.reason,
             detail: finalOutcome.detail,
             outputTokens: 0,
-            ...pick("sessionID", finalOutcome.sessionID),
+            ...optional("sessionID", finalOutcome.sessionID),
           }
 
       this.records.push(record)
@@ -485,8 +517,9 @@ export class Run {
         label,
         phase,
         ok: finalOutcome.ok,
-        ...pick("outputTokens", this.records.at(-1)?.outputTokens),
-        ...pick("sessionID", finalOutcome.sessionID),
+        ...(finalOutcome.ok ? {} : { reason: finalOutcome.reason }),
+        ...optional("outputTokens", this.records.at(-1)?.outputTokens),
+        ...optional("sessionID", finalOutcome.sessionID),
       })
       this.maybeWarnLargeRun()
 
@@ -502,40 +535,49 @@ export class Run {
    * Releases every child session this run created.
    *
    * `SessionRunState.cancel` walks BackgroundJob entries, which a plugin cannot register, so plain
-   * `session.create({parentID})` children are never cascaded to. Aborting them is ours to do or
-   * they keep running — and billing — after the parent turn ends.
+   * `session.create` children are never cascaded to. Interrupting them is ours to do or they keep
+   * running — and billing — after the parent turn ends.
+   *
+   * ORDER IS LOAD-BEARING: every child is interrupted BEFORE any worktree is released. A child
+   * tool still executing while its working directory is torn down races the removal the host's own
+   * retry loop exists to paper over — and can operate on a directory that no longer exists.
    */
   async abortAll(): Promise<void> {
-    // Worktrees are released first: they hold the agents' working directories, and removing one
-    // while its session is still live is what the host's own retry loop exists to paper over.
+    const sessions = this.#coordinator.sessionsOf(this.runId)
+    // A failed interrupt must not abandon the rest of the fan-out; `allSettled` is what makes
+    // abortAll itself never reject.
+    await Promise.allSettled(sessions.map((sessionID) => this.#host.interruptSession(sessionID).catch(() => false)))
+    for (const sessionID of sessions) {this.#coordinator.forgetChild(sessionID)}
+    // Also drops children registered after the snapshot was taken.
+    this.#coordinator.forgetRunChildren(this.runId)
+
     await Promise.all(this.#worktrees.map((release) => release().catch(() => undefined)))
     this.#worktrees.length = 0
-
-    const sessions = registry.sessionsOf(this.runId)
-    await Promise.all(
-      sessions.map(async (sessionID) => {
-        await this.#options.client.session.abort({ path: { id: sessionID } }).catch(() => undefined)
-        registry.forget(sessionID)
-      }),
-    )
   }
 }
 
 /**
- * Reads output tokens defensively.
+ * A live view over one project's worktree queue.
  *
- * The SDK types promise `tokens.output`, but the checked-in types have already drifted from the
- * server once, and an unexpected response shape must not crash a whole run with an opaque
- * "undefined is not an object". A missing count degrades to 0 — budget reporting under-counts,
- * which is visible, rather than the run dying, which is not.
+ * `ProjectRuntime.worktreeQueues` stores the current tail promise per repository root, and
+ * `createWorktree` swaps that tail as it serializes creations. The accessor object presents that
+ * map entry as the mutable `{ current }` box the isolation API accepts, so two projects — or two
+ * repositories in one project — never share a queue.
  */
-function outputTokensOf(info: { tokens?: { output?: number } }): number {
-  const output = info.tokens?.output
-  return typeof output === "number" && Number.isFinite(output) ? output : 0
+function queueBox(queues: Map<string, Promise<void>>, key: string): { current: Promise<void> } {
+  return {
+    get current(): Promise<void> {return queues.get(key) ?? Promise.resolve()},
+    set current(value: Promise<void>) {queues.set(key, value)},
+  }
 }
 
-/** Includes a key only when the value is present, which `exactOptionalPropertyTypes` requires. */
-function pick<K extends string, V>(key: K, value: V | undefined): Record<K, V> | Record<string, never> {
+/**
+ * Includes a key only when the value is present, which `exactOptionalPropertyTypes` requires.
+ *
+ * Shared by the engine and the tool layer so an optional field is omitted — never set to
+ * `undefined` — at every seam that feeds a stricter structural type.
+ */
+export function optional<K extends string, V>(key: K, value: V | undefined): Record<K, V> | Record<string, never> {
   return value === undefined ? {} : ({ [key]: value } as Record<K, V>)
 }
 

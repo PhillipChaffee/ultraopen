@@ -3,7 +3,7 @@ import { parse } from "../script/parse.js"
 import { run as runSandbox } from "../script/sandbox.js"
 import type { ArgsDereference } from "../script/lint.js"
 import { parallel, pipeline } from "../runtime/combinators.js"
-import { Run, assertSchemaSatisfiable } from "../runtime/run.js"
+import { Run, assertSchemaSatisfiable, optional } from "../runtime/run.js"
 import type { ControlCommand } from "../runtime/control.js"
 import type { AgentOptions, ProgressEvent } from "../runtime/run.js"
 import { subagentContract } from "../bridge/contract.js"
@@ -14,9 +14,10 @@ import { argsHash } from "../resume/key.js"
 import { runDir } from "../resume/store.js"
 import { MAX_AGENTS_PER_RUN } from "../script/limits.js"
 import type { JournalEntry } from "../resume/journal.js"
-import { registry } from "../singleton.js"
 import type { Ruleset } from "../bridge/permission.js"
-import type { OpencodeClient } from "../types.js"
+import { ultraopenMetadataOf } from "../bridge/permission.js"
+import type { HostModelRef, HostPort } from "../host/port.js"
+import type { ProjectRuntime, RuntimeCoordinator } from "../runtime/coordinator.js"
 import { inspectArgsTransport, stringifiedArgsMessage, stringifiedArgsSuggestion } from "./args-transport.js"
 
 
@@ -50,13 +51,20 @@ export interface WorkflowArgs {
 }
 
 export interface WorkflowContext {
-  client: OpencodeClient
+  /** The host this run drives: sessions, turns, models, interrupts. */
+  host: HostPort
+  /** The project runtime: concurrency, worktree queues, options. */
+  project: ProjectRuntime
+  /** Process-scoped child lineage, activity and event dedupe. */
+  coordinator: RuntimeCoordinator
   sessionID: string
   runId: string
+  /** Sessions above the parent, nearest first, recorded on every child (`#149` recovery). */
+  ancestorSessionIDs?: readonly string[] | undefined
   inheritedPermission?: Ruleset | undefined
-  resolveModel?: ((model: string | undefined) => { providerID: string; modelID: string } | undefined) | undefined
+  resolveModel?: ((model: string | undefined) => HostModelRef | undefined) | undefined
   resolveVariant?:
-    | ((effort: string | undefined, model?: { providerID: string; modelID: string } | undefined) => string | undefined)
+    | ((effort: string | undefined, model?: HostModelRef | undefined) => string | undefined)
     | undefined
   subagentContract?: ((opts: AgentOptions) => string | undefined) | undefined
   /** The session's default model, used to resolve effort against the right variant set. */
@@ -174,7 +182,7 @@ export interface PreparedWorkflow {
  * launch records it loudly.
  */
 export async function prepare(args: WorkflowArgs, context: WorkflowContext): Promise<PreparedWorkflow> {
-  assertNotNested(context.sessionID)
+  await assertNotNested(context.host, context.coordinator, context.sessionID)
   const transport = inspectArgsTransport(args.args)
   if (transport.action === "refuse") {
     throw new WorkflowScriptError({
@@ -198,7 +206,6 @@ export async function prepare(args: WorkflowArgs, context: WorkflowContext): Pro
   }
 }
 
-/** Raised when the projection runs into the lifetime agent backstop and stops counting. */
 /**
  * Raised when the projection hits the lifetime agent backstop and stops counting. A module-private
  * symbol sentinel rather than an Error subclass: it never escapes `projectAgentCount`, which
@@ -328,12 +335,9 @@ async function runPrepared(
 
   // Read the provider catalog once per run so `effort` resolves against each model's REAL variant
   // set. Skipped entirely for a dry run, which makes no model calls.
-  let resolvers: { resolveModel: WorkflowContext["resolveModel"]; resolveVariant: WorkflowContext["resolveVariant"] } = {
-    resolveModel: context.resolveModel,
-    resolveVariant: context.resolveVariant,
-  }
+  let resolvers = { resolveModel: context.resolveModel, resolveVariant: context.resolveVariant }
   if (!args.dryRun && !context.resolveVariant) {
-    const built = await makeResolvers(context.client, {
+    const built = await makeResolvers(context.host, {
       ...(context.defaultModel === undefined ? {} : { defaultModel: context.defaultModel }),
       onNote: note,
     })
@@ -342,8 +346,11 @@ async function runPrepared(
 
   const run = new Run({
     runId: context.runId,
-    client: context.client,
+    host: context.host,
+    project: context.project,
+    coordinator: context.coordinator,
     parentSessionID: context.sessionID,
+    ancestorSessionIDs: context.ancestorSessionIDs ?? [],
     // Every workflow subagent is told its output is a return value, not a reply to a person,
     // unless the caller supplied its own contract.
     subagentContract: context.subagentContract ?? subagentContract,
@@ -424,24 +431,20 @@ async function runPrepared(
       meta: { name: parsed.meta.name, description: parsed.meta.description },
       value,
       agentCount: args.dryRun ? dryRunCount : run.agentCount,
-      nulls: run.nulls.map((record) => ({
-        label: record.label,
-        reason: record.reason ?? "unknown",
-        detail: record.detail ?? "",
-      })),
+      nulls: run.nulls.map((record) => ({ label: record.label, reason: record.reason ?? "unknown", detail: record.detail ?? "" })),
       logs: run.logs,
       outputTokens: run.outputTokens,
       journal: run.journal.entries,
       // Evaluated BEFORE the finally block aborts and forgets every child, so the manifest ends
-      // up with the real list instead of the empty registry it would read afterwards.
-      childSessionIDs: registry.sessionsOf(context.runId),
+      // up with the real list instead of the empty coordinator registry it would read afterwards.
+      childSessionIDs: context.coordinator.sessionsOf(context.runId),
     }
   } catch (error) {
     // Same reasoning, on the failure path: the partial journal and live sessions must survive
     // the cleanup in finally, or persistence would record a run that accomplished nothing.
     throw new WorkflowRunError(error, {
       journal: run.journal.entries,
-      childSessionIDs: registry.sessionsOf(context.runId),
+      childSessionIDs: context.coordinator.sessionsOf(context.runId),
     })
   } finally {
     // Children are never cascaded to by the host, so releasing them is ours to do — otherwise a
@@ -456,9 +459,16 @@ async function runPrepared(
  * Layer 2 of the recursion guard. Layer 1 (the child permission ruleset) already hides the tool
  * from the model, so reaching here means something bypassed it — a forked session, which drops the
  * ruleset entirely, or a config edit. Failing loudly is correct.
+ *
+ * TWO layers are checked because they cover different lifetimes. The coordinator knows children
+ * THIS process created; `metadata.ultraopen` is persisted on the session row, so it still answers
+ * after a restart, when the in-memory registry is empty and a crashed run's child may be resumed
+ * by the host's own restart logic.
  */
-function assertNotNested(sessionID: string): void {
-  if (!registry.owns(sessionID)) {return}
+async function assertNotNested(host: HostPort, coordinator: RuntimeCoordinator, sessionID: string): Promise<void> {
+  const owned = coordinator.owns(sessionID),
+   session = owned ? undefined : await host.getSession(sessionID)
+  if (!owned && ultraopenMetadataOf(session?.metadata) === undefined) {return}
   throw new WorkflowScriptError({
     kind: "RuntimeError",
     message: "workflow() cannot be called from inside a workflow subagent.",
@@ -598,10 +608,6 @@ function resolveNamed(nameOrRef: unknown, context: Pick<WorkflowContext, "named"
     kind: "RuntimeError",
     message: "workflow() expects a saved workflow name or { script }.",
   })
-}
-
-function optional<K extends string, V>(key: K, value: V | undefined): Record<K, V> | Record<string, never> {
-  return value === undefined ? {} : ({ [key]: value } as Record<K, V>)
 }
 
 /** Renders a failure for the model, with the caret line when the script is available. */

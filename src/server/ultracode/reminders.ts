@@ -1,10 +1,12 @@
+import { oneLineText } from "../tool/render.js"
+
 /**
- * The per-turn ultracode reminder.
+ * The per-turn ultracode reminder, for OpenCode V2 request messages.
  *
- * Injected through `experimental.chat.messages.transform`, which operates on messages re-read from
- * the database each step and is therefore EPHEMERAL. The obvious alternative — pushing onto
- * `chat.message`'s output parts — is persisted, so the reminder would accumulate one copy per user
- * turn forever and replay into context on every later step.
+ * Injected through `ctx.session.hook("context")`, which mutates the request messages built for one
+ * model call. Those messages are re-read and rebuilt each step and are NOT persisted, so a
+ * reminder appended here is EPHEMERAL. The V1 alternative — writing onto `chat.message`'s parts —
+ * accumulated one copy per user turn forever.
  *
  * The text is a CONSTANT. Anthropic's prompt cache breaks at the first differing byte, so varying
  * this per turn would re-pay the full prefix every time.
@@ -37,44 +39,33 @@ Ultracode's reasoning effort is still raised, but the user has asked you not to 
 automatically. Do the work yourself unless they explicitly ask for a workflow.
 </system-reminder>`
 
-export interface MessageLike {
-  info?: { id?: string; role?: string; sessionID?: string; agent?: string }
-  parts?: unknown[]
-}
-
 /** Marker used to detect an already-decorated message, so the hook is idempotent. */
 export const REMINDER_MARKER = "Ultracode is on:"
 
-export interface TextPart {
-  id: string
-  messageID: string
-  sessionID: string
-  type: "text"
-  text: string
-  synthetic: true
+/** One text part of an AI SDK request message. */
+export interface RequestContentPart {
+  readonly type: string
+  readonly text?: string | null | undefined
 }
 
 /**
- * Builds a synthetic text part.
+ * The structural subset of `AI.SessionRequestMessage` the reminder cares about.
  *
- * `synthetic: true` is what keeps it out of the persisted transcript. Part ids are generated here
- * because the host's own id helper is not exported to plugins.
+ * `metadata` is the STORED session message's metadata, carried through by V2 for reading only.
+ * `metadata.ultraopenMsgID` is the host message id the prompt hook stamped, and it is what makes
+ * the reminder's start point survive the AI SDK's own `id` being absent.
  */
-export function reminderPart(message: MessageLike, text: string, seq: number): TextPart {
-  const messageID = message.info?.id ?? "unknown"
-  return syntheticPart(message, text, `ultraopen-reminder-${messageID}-${seq}`)
+export interface RequestMessageLike {
+  readonly id?: string | undefined
+  readonly role?: string | undefined
+  readonly content?: readonly RequestContentPart[] | undefined
+  readonly metadata?: Readonly<Record<string, unknown>> | undefined
 }
 
-function syntheticPart(message: MessageLike, text: string, id: string): TextPart {
-  const messageID = message.info?.id ?? "unknown"
-  return {
-    id,
-    messageID,
-    sessionID: message.info?.sessionID ?? "",
-    type: "text",
-    text,
-    synthetic: true,
-  }
+/** A synthetic reminder part — a plain text content part in the V2 request shape. */
+export interface ReminderPart {
+  readonly type: "text"
+  readonly text: string
 }
 
 /**
@@ -84,44 +75,49 @@ function syntheticPart(message: MessageLike, text: string, id: string): TextPart
  * expressible — the model can see when the mode changed mid-conversation — and it keeps the cache
  * prefix byte-stable, since a last-message-only reminder moves every turn and re-pays the whole
  * prefix.
+ *
+ * Returns a NEW messages array: V2 request messages are readonly, so the hook replaces what it
+ * needs instead of mutating in place.
  */
-export function decorate(
-  messages: MessageLike[],
+export function decorate<T extends RequestMessageLike>(
+  messages: readonly T[],
   options: { text: string; fromMessageID?: string | undefined },
-): number {
-  let decorated = 0,
-   reached = options.fromMessageID === undefined
-
-  for (const message of messages) {
-    if (message.info?.role !== "user") {continue}
+): T[] {
+  let reached = options.fromMessageID === undefined
+  return messages.map((message) => {
+    if (message.role !== "user") {return message}
     if (!reached) {
-      if (message.info.id !== options.fromMessageID) {continue}
+      if (messageIDOf(message) !== options.fromMessageID) {return message}
       reached = true
     }
-
-    const {parts} = message
-    if (!Array.isArray(parts)) {continue}
+    const content = message.content ?? []
     // Idempotent: the hook can fire more than once per turn, and duplicate reminders would both
     // waste context and break the cache prefix.
-    if (parts.some((part) => isReminder(part))) {continue}
-
-    parts.push(reminderPart(message, options.text, decorated))
-    decorated++
-  }
-  return decorated
+    if (content.some((part) => isUltracodeReminder(part))) {return message}
+    return { ...message, content: [...content, reminderPart(options.text)] }
+  })
 }
 
-function isReminder(part: unknown): boolean {
-  if (typeof part !== "object" || part === null) {return false}
-  const record = part as Record<string, unknown>
-  return typeof record["id"] === "string" && record["id"].startsWith("ultraopen-reminder-")
+/** The host message id a request message carries, from metadata first and the AI SDK id second. */
+export function messageIDOf(message: RequestMessageLike): string | undefined {
+  const stamped = message.metadata?.["ultraopenMsgID"]
+  if (typeof stamped === "string") {return stamped}
+  return message.id
+}
+
+function reminderPart(text: string): ReminderPart {
+  return { type: "text", text }
+}
+
+function isUltracodeReminder(part: RequestContentPart): boolean {
+  return part.type === "text" && (part.text === ULTRACODE_ON || part.text === ULTRACODE_DEMOTED)
 }
 
 /**
  * The per-turn live-run reminder, shipped by ticket #9.
  *
- * While the launch registry holds a live background run for the session, this reminder re-anchors
- * the model each turn: the run exists, do not duplicate its work, the outcome arrives as a
+ * While the coordinator holds a live background run for the session, this reminder re-anchors the
+ * model each turn: the run exists, do not duplicate its work, the outcome arrives as a
  * notification. Unlike ULTRACODE_ON it is independent of the ultracode mode — any session that
  * launched a background run needs the anchor, whether or not it fans out.
  *
@@ -131,8 +127,8 @@ function isReminder(part: unknown): boolean {
  * decorateLatest for the trade-off it accepts).
  */
 
-/** Part-id prefix marking a live-run reminder, distinct from ULTRACODE's "ultraopen-reminder-". */
-export const RUNS_REMINDER_PREFIX = "ultraopen-runs-"
+/** The fixed header line that marks a live-run reminder part, distinct from ULTRACODE's text. */
+export const RUNS_REMINDER_PREFIX = "<system-reminder>\nBackground workflow runs are live"
 
 /** One live background run as the reminder names it. */
 export interface LiveRunLine {
@@ -160,17 +156,6 @@ export function formatElapsed(ms: number): string {
 }
 
 /**
- * Flattens a free-text title onto one line for the reminder's per-run line (#142).
- *
- * The template's shape is constant header + one line per run + closer; a newline inside a
- * title would inject lines into the system-reminder block and break the shape stability the
- * decoration exists to keep. Display-only: the manifest records the title verbatim.
- */
-function oneLine(title: string): string {
-  return title.replaceAll(/\s+/gu, " ").trim()
-}
-
-/**
  * Renders the live-run reminder for one turn.
  *
  * Header, one line per run, closer — nothing else, so the shape never varies with run count. The
@@ -184,7 +169,7 @@ export function renderRunsReminder(runs: readonly LiveRunLine[], now: number): s
     "and topics they are using; each run's outcome arrives as a <workflow-completed> or <workflow-failed>",
     "notification, and workflow_status reads its progress on demand.",
     ...runs.map((run) =>
-      `- ${run.runId} "${run.name}"${run.title === undefined ? "" : ` (${oneLine(run.title)})`} — ` +
+      `- ${run.runId} "${run.name}"${run.title === undefined ? "" : ` (${oneLineText(run.title)})`} — ` +
       `${run.agents} agents spawned so far, ` +
       `${formatElapsed(Math.max(0, now - run.startedAt))} elapsed`,
     ),
@@ -192,10 +177,8 @@ export function renderRunsReminder(runs: readonly LiveRunLine[], now: number): s
   ].join("\n")
 }
 
-function isRunsReminder(part: unknown): boolean {
-  if (typeof part !== "object" || part === null) {return false}
-  const record = part as Record<string, unknown>
-  return typeof record["id"] === "string" && record["id"].startsWith(RUNS_REMINDER_PREFIX)
+function isRunsReminder(part: RequestContentPart): boolean {
+  return part.type === "text" && typeof part.text === "string" && part.text.startsWith(RUNS_REMINDER_PREFIX)
 }
 
 /**
@@ -210,10 +193,12 @@ function isRunsReminder(part: unknown): boolean {
  * than once per turn, and each fire must leave exactly one reminder carrying the freshest elapsed
  * time.
  */
-export function decorateLatest(messages: MessageLike[], text: string): number {
-  const last = messages.findLast((message) => message.info?.role === "user")
-  if (!last || !Array.isArray(last.parts)) {return 0}
-  last.parts = last.parts.filter((part) => !isRunsReminder(part))
-  last.parts.push(syntheticPart(last, text, `${RUNS_REMINDER_PREFIX}${last.info?.id ?? "unknown"}`))
-  return 1
+export function decorateLatest<T extends RequestMessageLike>(messages: readonly T[], text: string): T[] {
+  const lastIndex = messages.findLastIndex((message) => message.role === "user")
+  if (lastIndex === -1) {return [...messages]}
+  return messages.map((message, index) => {
+    if (index !== lastIndex) {return message}
+    const kept = (message.content ?? []).filter((part) => !isRunsReminder(part))
+    return { ...message, content: [...kept, reminderPart(text)] }
+  })
 }

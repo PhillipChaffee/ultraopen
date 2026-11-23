@@ -1,4 +1,3 @@
-import { readdirSync, readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join, resolve } from "node:path"
 import { parse } from "../script/parse.js"
@@ -29,15 +28,31 @@ export interface NamedOptions {
   workflowPaths?: readonly string[] | undefined
   /** The project directory the session is running in; its `.opencode/ultraopen/workflows` wins. */
   directory?: string | undefined
+  /**
+   * The project's canonical checkout (#175). A session in a git worktree still resolves the
+   * workflows saved in the canonical tree; the worktree's own copy wins a collision.
+   */
+  canonicalDirectory?: string | undefined
   env?: NodeJS.ProcessEnv | undefined
   readDir?: ((path: string) => Promise<string[]>) | undefined
   readFile?: ((path: string) => Promise<string>) | undefined
   onNote?: ((note: string) => void) | undefined
 }
 
-/** The user-level directory: inside the opencode configuration directory. */
+/**
+ * The user-level directory: inside the opencode configuration directory.
+ *
+ * Precedence is V2's own: an explicit `OPENCODE_CONFIG_DIR` (tests, hosts that move the config
+ * root) > `XDG_CONFIG_HOME/opencode` > `~/.config/opencode`. Honoring only the legacy variable
+ * made a saved workflow invisible on a host that sets just `XDG_CONFIG_HOME`; blank values
+ * count as unset rather than resolving a path off the filesystem root.
+ */
 export function userWorkflowDir(env: NodeJS.ProcessEnv = process.env): string {
-  const configDir = env["OPENCODE_CONFIG_DIR"]?.trim() || join(homedir(), ".config", "opencode")
+  const explicit = env["OPENCODE_CONFIG_DIR"]?.trim(),
+   xdg = env["XDG_CONFIG_HOME"]?.trim()
+  let configDir = join(homedir(), ".config", "opencode")
+  if (xdg !== undefined && xdg !== "") {configDir = join(xdg, "opencode")}
+  if (explicit !== undefined && explicit !== "") {configDir = explicit}
   return join(configDir, "ultraopen", "workflows")
 }
 
@@ -47,20 +62,27 @@ export function projectWorkflowDir(directory: string | undefined): string | unde
 }
 
 /**
- * Every configured directory, in scan order: user, custom, project.
+ * Every configured directory, in scan order: user, custom, canonical project, worktree project.
  *
- * Later entries overwrite earlier ones in the returned map, so the project is
- * the strongest. Relative custom paths resolve against the project directory.
+ * Later entries overwrite earlier ones in the returned map, so the worktree project — the most
+ * specific to what the session is editing — is the strongest, with the canonical checkout as
+ * its fallback. The canonical directory is scanned only when it differs from the worktree
+ * directory, so a session running in the canonical checkout does not scan it twice. Relative
+ * custom paths resolve against the worktree directory when there is one, else the canonical.
  */
 export function workflowDirectories(options: NamedOptions = {}): string[] {
   const env = options.env ?? process.env,
    project = options.directory === undefined ? undefined : resolve(options.directory),
+   canonical = options.canonicalDirectory === undefined ? undefined : resolve(options.canonicalDirectory),
+   base = project ?? canonical,
+   canonicalDir = canonical === undefined ? undefined : projectWorkflowDir(canonical),
    projectDir = project === undefined ? undefined : projectWorkflowDir(project)
 
   const dirs = [userWorkflowDir(env)]
   for (const path of options.workflowPaths ?? []) {
-    dirs.push(project !== undefined && !isAbsoluteish(path) ? join(project, path) : path)
+    dirs.push(base !== undefined && !isAbsoluteish(path) ? join(base, path) : path)
   }
+  if (canonicalDir !== undefined && canonicalDir !== projectDir) {dirs.push(canonicalDir)}
   if (projectDir !== undefined) {dirs.push(projectDir)}
   return dirs
 }
@@ -139,40 +161,30 @@ async function defaultReadFile(path: string): Promise<string> {
   const fs = await import("node:fs/promises")
   return await fs.readFile(path, "utf8")
 }
-/**
- * Loads every saved workflow synchronously, with its meta description.
- *
- * Used by the plugin's config hook, which is synchronous by contract — anything
- * awaited there would be discarded. The per-call scan above stays async and is
- * the source of truth for RUNS; this listing is only what the /workflow-…
- * commands are built from at load, so a file saved mid-session gains its command
- * on the next start (its RUN is usable at once).
- */
-export function listSavedWorkflows(options: NamedOptions = {}): { name: string; description: string | undefined }[] {
-  const out: { name: string; description: string | undefined }[] = [],
-   dirs = workflowDirectories(options)
 
-  let scanned = 0
-  for (const dir of dirs) {
-    let names: string[]
+/** One saved workflow as the command surface names it. */
+export interface SavedWorkflow {
+  readonly name: string
+  readonly description: string | undefined
+  /** The file's source, so a same-named edit still refreshes the command surface. */
+  readonly source: string
+}
+
+/**
+ * Parses the asynchronously scanned sources into the command surface's entries.
+ *
+ * The scan validates every file with the same `parse` the engine runs, so a source here is
+ * expected to parse; a file that stopped parsing between the scan and this pass loses its command
+ * rather than taking the plugin load down. The run path notes the skip when the tool asks for it.
+ */
+export function parseSavedWorkflows(named: Record<string, string>): SavedWorkflow[] {
+  const entries: SavedWorkflow[] = []
+  for (const [name, source] of Object.entries(named)) {
     try {
-      names = readdirSync(dir)
+      entries.push({ name, description: parse(source).meta.description, source })
     } catch {
-      continue
-    }
-    for (const fileName of names) {
-      const name = stripExtension(fileName)
-      if (name === undefined) {continue}
-      if (scanned >= MAX_SCAN_FILES) {return out}
-      scanned++
-      try {
-        const parsed = parse(readFileSync(join(dir, fileName), "utf8"))
-        out.push({ name, description: parsed.meta.description })
-      } catch {
-        // A broken save loses its command until it parses; the per-call scan
-        // will note the skip every time the tool runs.
-      }
+      // A broken save loses its command until it parses; the run path notes the skip.
     }
   }
-  return out
+  return entries
 }

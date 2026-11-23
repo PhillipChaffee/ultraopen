@@ -1,5 +1,6 @@
 import { makeEffortResolver } from "./effort.js"
 import type { ModelVariants } from "./effort.js"
+import type { HostModelInfo, HostPort } from "../host/port.js"
 
 /**
  * Reads the live provider catalog so effort can be resolved against a model's REAL variants.
@@ -7,22 +8,17 @@ import type { ModelVariants } from "./effort.js"
  * This has to be fetched rather than assumed: variant sets differ per model family (Claude 5
  * offers low/medium/high/xhigh/max, 4.6-class models have no xhigh, and many models have none at
  * all), and asking for one a model does not have is a silent no-op.
+ *
+ * The catalog arrives through the {@link HostPort} as plain domain values — V2 exposes each
+ * model's variants as an array of `{ id }` entries, which the adapter flattens to `readonly
+ * string[]` — so this module never touches a host SDK.
  */
 
-export interface ProviderCatalog {
-  providers?: {
-    id?: string
-    models?: Record<string, { variants?: Record<string, unknown> } | undefined>
-  }[]
+/** The provider/model pair the domain passes around, without a variant selection. */
+export interface ModelRef {
+  providerID: string
+  modelID: string
 }
-
-export interface CatalogClient {
-  config?: {
-    providers: () => Promise<{ data?: ProviderCatalog; error?: unknown }>
-  }
-}
-
-export interface ModelRef { providerID: string; modelID: string }
 
 /**
  * Splits a "provider/model" string.
@@ -40,13 +36,11 @@ export function parseModelRef(model: string | undefined): ModelRef | undefined {
 }
 
 /** Looks up the variant ids a model actually supports. */
-export function variantsOf(catalog: ProviderCatalog | undefined, ref: ModelRef | undefined): ModelVariants {
-  if (!catalog || !ref) {return { available: [] }}
-  const provider = catalog.providers?.find((entry) => entry.id === ref.providerID),
-   model = provider?.models?.[ref.modelID],
-   variants = model?.variants
+export function variantsOf(models: readonly HostModelInfo[] | undefined, ref: ModelRef | undefined): ModelVariants {
+  if (!models || !ref) {return { available: [] }}
+  const entry = models.find((candidate) => candidate.providerID === ref.providerID && candidate.modelID === ref.modelID)
   return {
-    available: variants ? Object.keys(variants) : [],
+    available: entry?.variants ?? [],
     modelLabel: `${ref.providerID}/${ref.modelID}`,
   }
 }
@@ -63,6 +57,11 @@ export interface ResolverBundle {
   resolveVariant: (effort: string | undefined, model?: ModelRef | undefined) => string | undefined
 }
 
+export interface ResolverOptions {
+  defaultModel?: string | undefined
+  onNote?: ((note: string) => void) | undefined
+}
+
 /**
  * Builds the model and effort resolvers for one run.
  *
@@ -72,12 +71,12 @@ export interface ResolverBundle {
  * variant that may not exist.
  */
 export async function makeResolvers(
-  client: CatalogClient,
-  options: { defaultModel?: string | undefined; onNote?: ((note: string) => void) | undefined },
+  host: Pick<HostPort, "listModels">,
+  options: ResolverOptions,
 ): Promise<ResolverBundle> {
-  let catalog: ProviderCatalog | undefined
+  let models: readonly HostModelInfo[] | undefined
   try {
-    catalog = await client.config?.providers().then((response) => response.data)
+    models = await host.listModels()
   } catch {
     // Non-fatal: the run proceeds with the parent's inherited model and no variant.
     options.onNote?.("could not read the provider catalog — reasoning effort will not be applied")
@@ -100,7 +99,7 @@ export async function makeResolvers(
     const key = ref ? `${ref.providerID}/${ref.modelID}` : "<default>",
      existing = resolvers.get(key)
     if (existing) {return existing}
-    const created = makeEffortResolver(variantsOf(catalog, ref), noteOnce)
+    const created = makeEffortResolver(variantsOf(models, ref), noteOnce)
     resolvers.set(key, created)
     return created
   }
