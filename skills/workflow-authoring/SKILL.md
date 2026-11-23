@@ -1,157 +1,230 @@
 ---
 name: workflow-authoring
-description: Reference for writing a workflow script for the ultraopen `workflow` tool — the script API, the rules the engine enforces, and the patterns worth composing. Read this before authoring a script.
+description: Use when authoring, editing, or debugging an ultraopen workflow script for the `workflow` tool — writing a new multi-agent script, choosing pipeline vs parallel, bounding a fan-out or discovery loop, handling null agent results, defining a JSON schema, or diagnosing a dry-run, journal, resume, or budget failure.
 ---
 
-# Writing a workflow script
+# Authoring a workflow script
 
-A workflow is a deterministic JavaScript driver in which `agent()` is the only nondeterministic
-call. Control flow — fan-out, loops, dedup, thresholds, early exit, synthesis — is real code you
-write. That property is what makes runs reproducible and resumable.
+A workflow is deterministic JavaScript. `agent()` is the only call whose result can change between
+runs; fan-out, loops, dedup, thresholds, early exit and synthesis are ordinary code. That is what
+makes a run reproducible and resumable.
 
-## Anatomy
+Aim for one screen. The engine already enforces the agent cap, budget ceiling, args transport and
+schema validation; re-implementing those in the script adds lines and can turn a loud failure into
+a silent one.
+
+## A complete script
 
 ```javascript
 export const meta = {
-  name: 'review-changes',
-  description: 'Review changed files across dimensions, verify each finding',
-  phases: [{ title: 'Review' }, { title: 'Verify' }],
+  name: 'review-files',
+  description: 'Review files across dimensions, refute every finding, return survivors',
+  phases: [{ title: 'Find' }, { title: 'Verify' }],
 }
 
-const DIMENSIONS = [{ key: 'bugs', prompt: '...' }, { key: 'perf', prompt: '...' }]
+const files = args.files
+const dimensions = args.dimensions ?? ['correctness', 'security', 'performance']
 
-const results = await pipeline(
-  DIMENSIONS,
-  d => agent(d.prompt, { label: `review:${d.key}`, phase: 'Review', schema: FINDINGS }),
-  review => parallel(review.findings.map(f => () =>
-    agent(`Adversarially verify: ${f.title}`, { phase: 'Verify', schema: VERDICT })
-      .then(v => ({ ...f, verdict: v }))
-  )),
+const FINDINGS = {
+  type: 'object', required: ['findings'],
+  properties: {
+    findings: {
+      type: 'array',
+      items: {
+        type: 'object', required: ['file', 'title', 'evidence'],
+        properties: { file: { type: 'string' }, title: { type: 'string' }, evidence: { type: 'string' } },
+      },
+    },
+  },
+}
+
+const VERDICT = {
+  type: 'object', required: ['refuted', 'reason'],
+  properties: { refuted: { type: 'boolean' }, reason: { type: 'string' } },
+}
+
+const refute = (finding, lens) =>
+  agent(`Try to REFUTE this finding. ${lens}\n\n${JSON.stringify(finding)}`, {
+    phase: 'Verify',
+    schema: VERDICT,
+  }).then((verdict) => (verdict?.refuted === false ? finding : null))
+
+const reviewed = await pipeline(
+  files.flatMap((file) => dimensions.map((dimension) => ({ file, dimension }))),
+  ({ file, dimension }) =>
+    agent(`Find ${dimension} defects in ${file}. Quote file and line evidence.`, {
+      label: `find:${file}:${dimension}`,
+      phase: 'Find',
+      schema: FINDINGS,
+    }),
+  async (review) => {
+    const findings = review?.findings ?? []
+    return await pipeline(
+      findings,
+      (finding) => refute(finding, 'Does the quoted evidence actually reproduce the defect?'),
+      (finding) => refute(finding, 'Is the defect in scope for this file and change?'),
+    )
+  },
 )
 
-return { confirmed: results.flat().filter(Boolean).filter(f => f.verdict?.isReal) }
+return { findings: reviewed.flat().filter(Boolean), spent: budget.spent() }
 ```
 
-`meta` must be the FIRST statement and a PURE LITERAL — no variables, calls, spreads or template
-interpolation. It is read statically, before any code runs, so the permission prompt can name the
-workflow.
+The inner `pipeline` short-circuits: a refuted finding becomes `null`, so its remaining skeptic
+never runs.
 
-## Globals
+## API
 
-| | |
+| Global | Contract |
 |---|---|
-| `agent(prompt, opts?)` | Spawns a subagent. Returns its final text, or the validated object when `schema` is set. Returns `null` when it produced nothing usable — always `.filter(Boolean)`. |
-| `pipeline(items, ...stages)` | Each item flows through every stage independently, with NO barrier. Stage callbacks get `(prevResult, originalItem, index)`. |
-| `parallel(thunks)` | A BARRIER over an array of FUNCTIONS (`() => agent(...)`), not promises. |
-| `phase(title)`, `log(msg)` | Progress narration. |
-| `args` | Whatever was passed as `args`, verbatim. Never `""`, `"null"`, or `"undefined"` — that is zero-value decoration, and the tool refuses it; omit `args` for no arguments. |
-| `budget` | `{ total, spent(), remaining() }`. A hard ceiling per launch — nested child spend counts against the same family ceiling. |
-| `workflow({ script } \| 'name', args?)` | Runs another workflow inline — by inline script or by saved name (the shipped plugin populates `context.named`, and the e2e suite exercises the named form live). One level only. THROWS on failure, unlike `agent()`. |
+| `agent(prompt, opts?)` | Returns final text, or the validated object when `schema` is set. Returns `null` when the agent produced nothing usable, and may return `undefined` for empty text, so `.filter(Boolean)`. Agent-level failures return `null`; script-argument errors (empty prompt, unsatisfiable schema) and engine limits throw. |
+| `pipeline(items, ...stages)` | No barrier: each item flows through every stage independently. A stage gets `(prev, originalItem, index)`. A stage that throws an ordinary error, or returns `null`/`undefined`, drops that item; engine faults throw and fail the run. |
+| `parallel(thunks)` | A barrier over an array of functions: `parallel([() => agent(...)])`, never promises. An ordinary thunk failure becomes `null`; engine faults throw. |
+| `phase(title)`, `log(message)` | Progress narration only. |
+| `args` | The caller's value. A stringified JSON object or array is hydrated at the boundary (loudly); a JSON-looking string that does not parse is refused. Omit it for no arguments: `""`, `"null"` and `"undefined"` are refused as decorations. A script that reads `args.X`, destructures `args`, or reads through an alias needs a real object at launch; a scalar or absent `args` throws at script start with zero agents spawned. |
+| `budget` | `{ total, spent(), remaining() }` in output tokens. `total` is `null` when uncapped and `remaining()` is then `Infinity`. The ceiling is hard: the next `agent()` call throws when spend reaches it. Nested runs share the launch family's ledger. |
+| `workflow(ref, args?)` | Runs a saved name or `{ script }` inline. One nesting level only. Throws on failure, unlike `agent()`, and bad references throw synchronously. Shares the launch's concurrency gate, budget family, abort signal and dry-run state; each run has its own 1,000-agent cap. |
 
-`agent()` opts: `label`, `phase`, `schema`, `model`, `effort`, `agentType`, `isolation`,
-`disallowedTools`. `isolation: "worktree"` gives the agent its own git worktree; V2 plumbs the
-worktree root through child creation and verifies the session landed there.
+`agent()` opts: `label`, `phase`, `schema`, `model`, `effort`, `agentType`, `disallowedTools`,
+`isolation`.
 
-## Choosing between pipeline and parallel
-
-**Default to `pipeline`.** Use a `parallel` barrier only when a stage genuinely needs ALL of the
-previous stage's results together — to dedup across the whole set, to early-exit on zero findings,
-or to compare findings against each other.
-
-"I need to flatten or filter first" is not a reason: do that inside a pipeline stage. Barrier
-latency is real — if five finders run and the slowest takes three times the fastest, a barrier
-wastes the fast ones' idle time.
+- `schema` is a JSON Schema; invalid output retries up to three attempts in the same session, and
+  an unsatisfiable schema throws before the session exists.
+- `model` is `"provider/model"`; an unsupported `effort` downgrades to the strongest supported
+  level at or below the request and logs a note.
+- `label` names the agent in progress, journal and child-session title; `phase` defaults to the
+  last `phase()` call. `agentType` selects an opencode agent type; `disallowedTools` hides tools.
+- `isolation: "worktree"` runs the agent in its own detached git worktree under the host's
+  canonical project root; it is ignored with a log note when that root is not a git repository.
 
 ## Rules the engine enforces
 
-- **Plain JavaScript.** Type annotations, interfaces and generics fail to parse.
-- **No clock, no randomness.** `Date.now()`, `Math.random()` and argless `new Date()` are rejected
-  because they break resume. Pass timestamps via `args`; vary behaviour by index.
-- **No imports, no filesystem, no Node globals.** Delegate that to an `agent()`.
-- **Limits:** 1000 agents per run, 4096 items per `parallel`/`pipeline` call, 524288 characters of
-  script. Exceeding one is an explicit error, never a silent truncation.
+- **`meta` first and pure.** `export const meta = { ... }` must be the first statement and a pure
+  literal: no variables, calls, spreads, computed keys, regular expressions or template
+  interpolation. `name` and `description` are required. `phases[].detail` and `phases[].model` are
+  display-only, and `model` does not override the agent model.
+- **Plain JavaScript.** No type annotations, interfaces or generics.
+- **Deterministic.** `Date.now()`, `Math.random()` and argless `new Date()` are rejected. Pass
+  timestamps via `args`; vary behaviour by index. `new Date(args.now)` and `Date.parse` are fine.
+- **No host access.** No imports, filesystem, network or Node globals. `require`, `process`,
+  `fetch`, `Bun`, `global`, `globalThis`, `self`, `eval` and `Function` are rejected, and
+  `.constructor` access is banned. Every identifier must resolve: a typo or undeclared constant is
+  refused before the run starts.
+- **Strict mode.** Writes to undeclared names throw at runtime.
+- **Limits.** 1,000 agents per run, 4,096 items per `parallel`/`pipeline` call, 524,288 characters
+  of script. Exceeding one is an explicit error, never silent truncation.
+
+## Control flow
+
+**Default to `pipeline`.** It streams each item through the stages with no barrier, so wall-clock
+is the slowest item chain, not the sum of per-stage maxima. Use a `parallel` barrier only when a
+stage needs ALL of the previous stage's results together: dedup across the whole set, early-exit on
+zero findings, or pairwise comparison. "I need to flatten or filter first" is not a reason; do it
+inside a pipeline stage.
+
+**Bound loops on data, not on a clock.** A discovery loop needs a round cap, a dry-streak stop and
+a budget guard. Dedup on a stable key against everything seen, not only confirmed findings, or
+rejected findings resurface forever:
+
+```javascript
+const seen = new Set()
+const confirmed = []
+const keyOf = (f) => `${f.file}:${f.line}:${f.title}` // stable key, not object identity
+const headroom = budget.total === null ? 0 : Math.min(50_000, Math.ceil(budget.total * 0.2))
+let dryStreak = 0
+let rounds = 0
+const maxRounds = args.rounds ?? 3
+
+while (dryStreak < 2 && rounds < maxRounds) {
+  // Always run one round; a fixed reserve can starve a small ceiling.
+  if (rounds > 0 && budget.total !== null && budget.remaining() < headroom) break
+  rounds++
+  const found = await agent(`Round ${rounds}. New issues only: ${[...seen].join(', ')}`, {
+    phase: `Round ${rounds}`,
+    schema: FINDINGS, // schema with a findings array
+  })
+  const fresh = (found?.findings ?? []).filter((f) => !seen.has(keyOf(f)))
+  fresh.forEach((f) => { seen.add(keyOf(f)); confirmed.push(f) })
+  dryStreak = fresh.length === 0 ? dryStreak + 1 : 0
+}
+return { confirmed, rounds, spent: budget.spent() }
+```
+
+Without `budget.total !== null`, an uncapped run has `remaining() === Infinity`, the guard never
+fires, and the loop runs to the 1,000-agent backstop. A guard checked before the first round can
+also stop a run with a small ceiling before it does any work.
+
+**Never swallow an engine limit.** The budget ceiling, the agent cap and an abort throw on purpose.
+Wrapping `agent()` in a guard that returns `null` for those conditions makes partial coverage look
+complete. Put bounds in the loop condition and let the engine fail loudly if they are wrong.
 
 ## Patterns
 
-- **Adversarial verify** — several independent skeptics per finding, each asked to REFUTE it. Kill
-  it if a majority refute. Stops plausible-but-wrong findings surviving.
-- **Perspective-diverse verify** — when something can fail in more than one way, give each verifier
-  a distinct lens (correctness, security, performance, does-it-reproduce) rather than N identical ones.
-- **Judge panel** — generate N attempts from different angles, score with parallel judges, then
-  synthesize from the winner while grafting the best ideas from the runners-up.
-- **Loop-until-dry** — for unknown-size discovery, keep spawning finders until K consecutive rounds
-  return nothing new. Dedup against everything SEEN, not everything confirmed, or rejected findings
-  resurface forever and the loop never terminates.
-- **Multi-modal sweep** — parallel agents each searching a different way, since one angle rarely
-  finds everything.
-- **Completeness critic** — a final agent asking "what is missing?" What it finds becomes the next round.
+- **Adversarial verify** — independent skeptics per finding, each asked to REFUTE it with a
+  schema. Require every skeptic to return `refuted: false`, and treat a `null` verdict as a
+  refutation: a failed skeptic must never let a finding survive.
+- **Perspective-diverse verify** — give each skeptic a distinct lens (does it reproduce, is it in
+  scope, is it security-relevant) instead of N identical prompts.
+- **Judge panel** — generate N attempts from different angles, score them with parallel judges,
+  then synthesize from the winner while grafting the best ideas from the runners-up.
+- **Synthesize only what survived.** Feed the synthesis agent the verified survivors, not the raw
+  findings, and return early when there are none: an empty report invites invention and wastes a
+  call.
+- **Completeness critic** — a final agent asking "what is missing: which angle was not run, which
+  claim is unverified?" Feed what it finds into the next round.
+- **Scale to the ask** — "find any bugs" warrants a few finders and one verification pass; "audit
+  this thoroughly" warrants a larger pool, several votes and a synthesis stage.
 
-## Debugging
+## Pre-flight and debugging
 
-**Pre-flight every script.** Launch each authored script once with `dryRun: true` — the whole
-script runs with `agent()` stubbed out, exercising parsing, the meta rules, control flow,
-combinator shape, and `agent()` argument validity (the stub carries the live agent's prompt
-guard) for zero tokens. Launch live only once the dry run has completed. Honest scope: a dry
-pass vouches for the script's structure, not its outcomes — prompt quality, schema fit under
-real provider behavior, and budget behavior under real spend are only visible live.
+**Dry run first.** Launch with `dryRun: true`: the whole script runs with `agent()` stubbed, zero
+tokens, and catches parse errors, meta violations, determinism and undefined-name lint, the `args`
+gate, combinator signatures, contradictory schemas, and empty or non-string agent prompts.
 
-Every run writes a journal, manifest, result and script under
-`<data>/opencode/tool-output/ultraopen/<runId>/`. Read `journal.jsonl` before diagnosing an
-unexpected result: it records each agent's actual return value, and marks replayed entries so a
-cached empty is distinguishable from a fresh one.
+**Know what a dry run cannot see.** The stub returns `[dryRun] <prompt>` for a plain agent and
+`{}` for a schema agent. A stage that reads a schema field therefore sees `undefined`:
+`review.findings.map(...)` throws, and `pipeline`/`parallel` turn that into a dropped item or a
+`null` vote. A broken verify stage can pass a dry run because it never receives a finding. Make
+stages null-tolerant (`review?.findings ?? []`) and smoke-test one real item before trusting the
+full fan-out. Prompt quality, schema fit under real providers and budget behaviour are only
+visible live.
 
-Pass `resumeFromRunId` to replay a previous run. Unchanged calls return instantly; the first edited
-call and everything after it in the same scope runs live.
+**Read the journal before theorizing.** Every run writes `journal.jsonl`, `manifest.json`,
+`result.json` (or `failure.txt`), `script.js` and per-agent recordings under
+`<data>/opencode/tool-output/ultraopen/<runId>/`. The journal records each agent's actual return
+value, its failure reason, and whether it replayed. A cached empty and a fresh empty look identical
+without it.
 
-## Background runs
+**Resume with `resumeFromRunId`.** Unchanged calls replay instantly; the first edited call and
+everything after it in the same scope runs live. Changing `args` invalidates everything, because
+args are part of the replay seed. A failed run keeps its partial journal.
 
-By default the `workflow` tool launches detached: the call returns a `<workflow-launched>` handle
-naming the run id and run directory at once, and the script keeps executing after the turn. Pass
-`background: false` to wait for the final result instead — `dryRun` always waits, whichever way
-the default is set. The plugin's `runMode` option or the env `ULTRAOPEN_WORKFLOW_SYNC=1` flips the
-default for the whole host.
+## Launching
 
-- **The handle carries no outcome.** When the run settles, a `<workflow-completed>` or
-  `<workflow-failed>` notification arrives in the conversation — the body is capped (4096
-  characters, cut at a line boundary) with a pointer line to the full `result.json` or
-  `failure.txt` in the run directory. Until it arrives you know nothing about the run's results.
-- **Don't poll, don't duplicate.** Never sleep, poll for progress, or work the same files and
-  topics the run is on. Poll `workflow_status(runId, { wait })` only when the user asks about the
-  run or the current task cannot finish without its value — one long `wait` beats many short
-  polls, and never re-launch because a status said "running".
-- **One-shot hosts must hold the turn.** In `opencode run` the process exits after the turn, so
-  keep polling `workflow_status` until the run settles before ending the turn. The launch result
-  states which contract applies — follow it.
-- **Stop.** `workflow({ stop: "<runId>" })` aborts the run's subagents, records the run
-  `cancelled`, and hydrates a `<workflow-stopped>` confirmation — no completion notification
-  follows a stop. Interrupting the turn (ESC) never stops a background run. In the TUI,
-  `/workflow-stop <runId>` stops a run directly through `UltraopenRpc` with no confirmation. The
-  `/workflows` panel lists runs and their child sessions. `workflow_status` reports `cancelled`
-  as terminal.
-- **Parallel runs.** A session outside ultracode holds one live run — a second launch is refused
-  naming the active run id. An ultracode-active session may hold `ultracodeMaxRuns` (default 8,
-  clamped 1–32); every launch result names its sibling live runs, oldest first. The stop argument
-  bypasses the gate, so a session can always stop what it has running.
-- **Per-turn reminder.** While the session holds a live run, each turn carries an ephemeral
-  reminder naming the run id, the workflow, the agents spawned and the elapsed time. It is never
-  persisted and refiring replaces it, so there is exactly one per turn.
-- **Crash recovery is automatic.** On the next start of the plugin's location runtime, a run its
-  dead process interrupted re-executes from the journal under the SAME run id: completed agents
-  replay instantly, the missing tail re-runs, and the original session is hydrated with the
-  outcome. In the TUI, a `⠋` hint in the composer names the interrupted run. Guards: the
-  interruption must be younger than `autoResumeTtlHours` (default 24 h), at most `autoResumeMax`
-  (default 1) run adopts per boot, and a run stopped with the stop argument never resumes. Opt
-  out with `autoResume: false`; resume any older run manually with `resumeFromRunId`.
+The tool launches background by default: the call returns a run handle at once and the outcome
+arrives later as a `<workflow-completed>` or `<workflow-failed>` notification. Until it arrives,
+the handle says nothing about results. Do not poll or duplicate the run's work; call
+`workflow_status` only when the user asks about the run or the task cannot finish without its
+value, and pass `wait` so one call blocks. In a one-shot host (`opencode run`) hold the turn by
+polling until the run settles. A background run continues after the turn, so aborting the call
+does not stop it: use `workflow({ stop: "<runId>" })`, or `/workflow-stop <runId>` in the TUI. Do
+not relaunch because a status says "running".
 
-## Gotchas
+## Common mistakes
 
-- `meta` is a pure literal — no variables, calls, spreads or template strings.
-- `parallel()` takes **thunks**, not promises.
-- `.filter(Boolean)` every `parallel`/`pipeline` result — `null` means an agent produced nothing.
-- A pipeline stage that RETURNS `null` drops that item and skips its remaining stages.
-- Guard budget loops on `budget.total`, or with no target set `remaining()` is `Infinity` and the
-  loop runs to the agent cap.
-- The budget ceiling is per launch (`budgetTokens`): nested child spend counts against the same
-  family ceiling — `budget.spent()` reads the whole launch family — and concurrent launches each
-  hold their own, so a session of N live runs can spend N × ceiling.
-- Don't ask a subagent for prose — its final text IS the return value.
+| Mistake | Fix |
+|---|---|
+| `parallel([agent(...), agent(...)])` | Pass thunks: `parallel([() => agent(...)])`. Promises start immediately and are refused. |
+| Consuming results without `.filter(Boolean)` | Every agent call can contribute `null` or `undefined`. |
+| A pipeline stage returns nothing on a branch | `undefined` drops the item. Return a value or `null` deliberately. |
+| Loop guarded only on `budget.remaining()` | Guard `budget.total !== null` first, or the loop runs to the agent cap. Run the first round before the guard, and scale the headroom to the ceiling. |
+| A fixed completion reserve checked before round one | A 5k ceiling never starts. Run one round first and size the reserve as a fraction of `budget.total`. |
+| Dedup by object identity, or only confirmed findings | Use a stable key and add every finding to `seen`, including rejected ones. |
+| A null verdict treated as a pass | Treat a failed skeptic as a refutation; otherwise a null vote protects a bad finding. |
+| `args.foo` with no `args` | Pass a real object, or make the script tolerate absent args. |
+| Asking an agent for prose, then parsing it | Use `schema` for anything you will index into. |
+| Trusting a dry run of a schema-driven verify stage | The stub returns `{}`; smoke-test one live item. |
+| Your own agent cap returning `null` | Let the engine's limit throw; a silent cap hides a runaway loop. |
+| Running the synthesis agent with zero survivors | Return early; an empty report invites invention and wastes a call. |
+| A nested `workflow('dir/name')` | Names are bare lookup keys; a path separator is refused. |
+| Expecting `isolation: "worktree"` outside a git repository | It is ignored with a log note; the agent runs normally in the project root. |
