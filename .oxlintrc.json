@@ -103,19 +103,6 @@
   "overrides": [
     {
       "files": [
-        "src/server/index.ts"
-      ],
-      "rules": {
-        "import/max-dependencies": [
-          "error",
-          // 24: one slot for the args-transport boundary module (#78) — imported directly, not
-          // laundered through a re-export, so the dependency count stays honest.
-          { "max": 24 }
-        ]
-      }
-    },
-    {
-      "files": [
         "test/**/*.ts",
         "test/**/*.mjs"
       ],
